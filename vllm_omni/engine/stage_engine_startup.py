@@ -1420,3 +1420,174 @@ def launch_diffusion_stage_replica(
         if lock_fds:
             release_device_locks(lock_fds)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Public aliases / wrappers for async_omni_engine consumers
+# ---------------------------------------------------------------------------
+
+
+# Public alias for the private _launch_omni_core_engines context manager.
+# Used by AsyncOmniEngine._initialize_llm_replica with ExitStack.enter_context.
+launch_omni_core_engines = _launch_omni_core_engines
+
+
+def spawn_stage_core(
+    *,
+    vllm_config: VllmConfig,
+    executor_class: type[Executor],
+    log_stats: bool,
+    omni_stage_id: int,
+    omni_replica_id: int = 0,
+) -> tuple[EngineZmqAddresses, CoreEngineProcManager, str]:
+    """Spawn a local LLM engine subprocess without completing the handshake.
+
+    Returns ``(addresses, engine_manager, handshake_address)`` so the
+    caller can perform the ZMQ handshake separately via
+    :func:`complete_stage_handshake`.
+    """
+    from vllm.utils.network_utils import get_open_zmq_ipc_path
+
+    from vllm_omni.engine.stage_engine_core_proc_manager import (
+        StageEngineCoreProcManager,
+    )
+
+    addresses = get_engine_zmq_addresses(vllm_config)
+    handshake_address = get_open_zmq_ipc_path()
+    engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
+        local_engine_count=1,
+        start_index=0,
+        local_start_index=0,
+        vllm_config=vllm_config,
+        local_client=True,
+        handshake_address=handshake_address,
+        executor_class=executor_class,
+        log_stats=log_stats,
+        omni_stage_id=omni_stage_id,
+        omni_replica_base_id=omni_replica_id,
+    )
+    return addresses, engine_manager, handshake_address
+
+
+def complete_stage_handshake(
+    proc: CoreEngineProcManager,
+    handshake_address: str,
+    addresses: EngineZmqAddresses,
+    vllm_config: VllmConfig,
+    stage_init_timeout: int,
+) -> None:
+    """Complete the ZMQ startup handshake for a locally-spawned LLM stage.
+
+    This binds the handshake socket, yields control, and blocks until the
+    engine subprocess sends HELLO / READY.
+    """
+    engines_to_handshake = [CoreEngine(index=0, local=True)]
+    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
+        wait_for_engine_startup(
+            handshake_socket,
+            addresses,
+            engines_to_handshake,
+            vllm_config.parallel_config,
+            vllm_config.parallel_config.data_parallel_size > 1 and vllm_config.model_config.is_moe,
+            vllm_config.cache_config,
+            proc,
+            None,  # coordinator_proc
+        )
+
+
+def acquire_diffusion_device_locks(
+    stage_id: int,
+    od_config: Any,
+    stage_init_timeout: int,
+) -> list[int]:
+    """Acquire per-GPU device locks for a diffusion stage.
+
+    Extracts tensor-parallel size from *od_config* and delegates to
+    :func:`~vllm_omni.engine.stage_init_utils.acquire_device_locks`.
+    """
+    parallel_config = getattr(od_config, "parallel_config", None)
+    world_size = getattr(parallel_config, "world_size", 1)
+    try:
+        world_size = max(1, int(world_size))
+    except (TypeError, ValueError):
+        world_size = 1
+    return acquire_device_locks(
+        stage_id,
+        {"tensor_parallel_size": world_size},
+        stage_init_timeout,
+    )
+
+
+def spawn_diffusion_proc(
+    model: str,
+    od_config: Any,
+    *,
+    handshake_address: str | None = None,
+    request_address: str | None = None,
+    response_address: str | None = None,
+    omni_coordinator_address: str | None = None,
+    omni_stage_id: int | None = None,
+    omni_replica_id: int = 0,
+) -> tuple[Any, Any, str | None, str | None]:
+    """Spawn a diffusion stage subprocess without completing the handshake.
+
+    Returns ``(proc, None, request_address, response_address)`` so the
+    caller can perform the handshake separately via
+    :func:`complete_diffusion_handshake`.
+
+    The returned *proc* is a raw :class:`multiprocessing.Process` (not a
+    :class:`StageDiffusionProcManager`), which keeps the handshake phase
+    independent of the manager lifecycle.
+    """
+    from multiprocessing import get_context as get_mp_context
+
+    from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+
+    ctx = get_mp_context()
+    proc = ctx.Process(
+        target=StageDiffusionProc.run_diffusion_proc,
+        name="StageDiffusionProc",
+        kwargs={
+            "model": model,
+            "od_config": od_config,
+            "handshake_address": handshake_address,
+            "local_client": True,
+            "headless": False,
+            "omni_coordinator_address": omni_coordinator_address,
+            "omni_stage_id": omni_stage_id,
+            "omni_replica_id": omni_replica_id,
+        },
+    )
+    proc.start()
+    return proc, None, request_address, response_address
+
+
+def complete_diffusion_handshake(
+    proc: Any,
+    handshake_address: str,
+    stage_init_timeout: int,
+) -> None:
+    """Complete the ZMQ startup handshake for a locally-spawned diffusion stage.
+
+    Binds the handshake socket and blocks until the diffusion subprocess
+    reports READY.
+    """
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.utils import CoreEngine
+
+    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
+        wait_for_engine_startup(
+            handshake_socket,
+            EngineZmqAddresses(inputs=[""], outputs=[""]),
+            [CoreEngine(index=0, local=True)],
+            SimpleNamespace(
+                data_parallel_size_local=1,
+                data_parallel_hybrid_lb=False,
+                data_parallel_external_lb=False,
+            ),
+            False,
+            None,
+            None,
+            None,
+        )

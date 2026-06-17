@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import dataclasses
 import json
+import os
 import queue
 import threading
 import time
 import uuid
 import weakref
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict
 from typing import Any, Literal, cast
 
@@ -33,6 +36,9 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
+from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
+from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -41,6 +47,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
@@ -49,17 +56,50 @@ from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
 )
-from vllm_omni.engine.stage_client import StageClient
-from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
+from vllm_omni.engine.stage_client import StageClient, StagePoolClient
+from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
+from vllm_omni.engine.stage_engine_startup import (
+    OmniMasterServer,
+    acquire_diffusion_device_locks,
+    complete_diffusion_handshake,
+    complete_stage_handshake,
+    connect_remote_engine_cores,
+    launch_omni_core_engines,
+    register_stage_with_omni_master,
+    spawn_diffusion_proc,
+    spawn_stage_core,
+)
+from vllm_omni.engine.stage_init_utils import (
+    LogicalStageInitPlan,
+    ReplicaInitPlan,
+    _inject_inferred_kv_tp_topology,
+    acquire_device_locks,
+    build_diffusion_config,
+    build_engine_args_dict,
+    build_llm_stage_output_processor,
+    build_stage0_input_processor,
+    build_vllm_config,
+    extract_stage_metadata,
+    get_stage_connector_spec,
+    initialize_diffusion_stage,
+    inject_kv_stage_info,
+    release_device_locks,
+    stage_runtime_setup,
+    terminate_alive_proc,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
     StageRuntimeInfo,
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+from vllm_omni.entrypoints.utils import (
+    inject_omni_kv_config,
+    load_and_resolve_stage_configs,
+)
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
