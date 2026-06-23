@@ -64,11 +64,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     ToolCall,
     UsageInfo,
 )
-from vllm.entrypoints.openai.engine.serving import ChatLikeRequest, clamp_prompt_logprobs
+from vllm.entrypoints.openai.engine.serving import clamp_prompt_logprobs
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.serve.engine.typing import ChatLikeRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
 from vllm.inputs import PromptType
@@ -161,6 +162,7 @@ def _parse_chat_output(
     reasoning: str | None = "\n".join(reasoning_texts) or None
     final_content: str | None = "\n".join(final_texts) or None
     return reasoning, final_content, False
+
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     """OpenAI-compatible chat serving for both LLM and Diffusion models.
@@ -404,7 +406,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
             if not self.use_harmony:
-                error_check_ret = self._validate_chat_template(
+                error_check_ret = self.online_renderer.validate_chat_template(
                     request_chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs,
                     trust_request_chat_template=self.trust_request_chat_template,
@@ -437,7 +439,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
             else:
                 should_include_tools = tool_dicts is not None
-                conversation, engine_prompts = self.openai_serving_render._make_request_with_harmony(
+                conversation, engine_prompts = self.online_renderer._make_request_with_harmony(
                     request, should_include_tools
                 )
 
