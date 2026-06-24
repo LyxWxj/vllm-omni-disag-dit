@@ -359,10 +359,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             reasoning_parser: ReasoningParser | None = None
             if self.parser_cls is not None and self.parser_cls.reasoning_parser_cls is not None:
-                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request.chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
+                chat_template_kwargs = self._effective_chat_template_kwargs(request)
                 reasoning_parser = self.parser_cls.reasoning_parser_cls(
                     tokenizer,
                     chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
@@ -414,14 +411,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if error_check_ret is not None:
                     return error_check_ret
 
-                chat_template_kwargs = request.chat_template_kwargs or {}
-                chat_template_kwargs.update(reasoning_effort=request.reasoning_effort)
-
-                # Merge chat_template_kwargs with defaults
-                merged_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
+                # Effective kwargs fold request.chat_template_kwargs, reasoning_effort,
+                # and server defaults — mirrors OpenAIServingChat._effective_chat_template_kwargs.
+                merged_template_kwargs = self._effective_chat_template_kwargs(request)
                 conversation, engine_prompts = await self._preprocess_chat(
                     request,
                     request.messages,
