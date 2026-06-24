@@ -58,6 +58,14 @@ RUN uv pip install --system --force-reinstall \
     "torch==2.11.0" "torchaudio==2.11.0" "torchvision==0.26.0" \
     --torch-backend cu130
 
+# Re-pin numpy LAST. The flashinfer-jit-cache and torch reinstalls above
+# resolve their own dependencies and pull numpy 2.5, which clobbers the
+# numpy==2.2.6 from the flashinfer step and breaks numba at runtime
+# ("Numba needs NumPy 2.4 or less. Got NumPy 2.5." — TTS audio post-processing,
+# build 2349). Assert the numba-compatible version as the final install step so
+# nothing downstream can bump it.
+RUN uv pip install --system --force-reinstall "numpy==2.2.6"
+
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
