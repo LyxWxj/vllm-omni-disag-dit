@@ -90,6 +90,7 @@ from vllm.tokenizers.mistral import (
 )
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
+from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -1606,12 +1607,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 # either finished reasoning or no reasoning at all
                                 content = current_text
 
-                                delta_message, function_name_returned[i] = self.extract_tool_call_required_streaming(
+                                delta_message, function_name_returned[i] = extract_required_tool_call_streaming(
                                     previous_text=previous_text,
                                     current_text=content,
                                     delta_text=delta_text,
                                     function_name_returned=fn_name_returned,
                                     tool_call_idx=history_tool_call_cnt,
+                                    tool_call_id_type=self.tool_call_id_type,
                                 )
                                 if (
                                     delta_message
