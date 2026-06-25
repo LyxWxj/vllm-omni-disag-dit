@@ -22,6 +22,11 @@ stages:
   - stage_id: 0
     max_num_seqs: 8
     gpu_memory_utilization: 0.60
+    # The MOSS talker (custom audio heads + per-request GPU buffers) is not
+    # CUDA-graph-safe; FULL-decode graph capture crashes the worker. Run the
+    # LLM stage eager, matching the other TTS talker configs (ming_tts,
+    # moss_tts_nano).
+    enforce_eager: true
     enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 4096
