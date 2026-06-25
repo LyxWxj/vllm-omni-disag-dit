@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -127,42 +127,6 @@ logger = init_logger(__name__)
 
 async def _identity_async(value: Any) -> Any:
     return value
-
-
-# parse_chat_output was removed from upstream during the harmony refactor
-# (commit f712fd0d7).  Inlined from the last upstream version before removal.
-
-
-def _parse_chat_output(
-    token_ids: Sequence[int],
-) -> tuple[str | None, str | None, bool]:
-    """Parse Harmony output token IDs into reasoning, content, and tool-call flag.
-
-    Replicates the pre-refactor parse_chat_output from
-    vllm.entrypoints.openai.parser.harmony_utils.
-    """
-    parser = get_streamable_parser_for_assistant()
-    for token_id in token_ids:
-        parser.process(token_id)
-    output_msgs = parser.messages
-
-    reasoning_texts = [msg.content[0].text for msg in output_msgs if msg.channel == "analysis"]
-    final_texts = [
-        msg.content[0].text
-        for msg in output_msgs
-        if msg.channel == "final" or (msg.channel == "commentary" and not msg.recipient)
-    ]
-
-    if parser.current_channel == "analysis" and parser.current_content:
-        reasoning_texts.append(parser.current_content)
-    elif parser.current_channel == "final" and parser.current_content:
-        final_texts.append(parser.current_content)
-    elif parser.current_channel == "commentary" and not parser.current_recipient and parser.current_content:
-        final_texts.append(parser.current_content)
-
-    reasoning: str | None = "\n".join(reasoning_texts) or None
-    final_content: str | None = "\n".join(final_texts) or None
-    return reasoning, final_content, False
 
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
@@ -2309,7 +2273,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = _parse_chat_output(token_ids)
+                # Use upstream's HarmonyParser (inherited as self.parser_cls for
+                # gpt_oss/harmony models) instead of vendoring a copy of the
+                # pre-refactor parse_chat_output. We take only reasoning+content;
+                # tool calls are extracted by omni's own path below.
+                if self.parser_cls is not None:
+                    parser = self.parser_cls(tokenizer, request.tools)
+                    reasoning, content, _ = parser.parse(
+                        "",
+                        request,
+                        model_output_token_ids=token_ids,
+                    )
+                else:
+                    reasoning, content = None, None
                 if not request.include_reasoning:
                     reasoning = None
 
