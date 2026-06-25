@@ -2,6 +2,9 @@
 # HF: OpenMOSS-Team/MOSS-VoiceGenerator
 # Zero-shot voice design — create a new voice from a text description.
 async_chunk: true
+# OpenMOSS-Team/MOSS-VoiceGenerator ships custom modeling code; the newer vLLM
+# ModelConfig hard-rejects it at validation without this (was lenient before).
+trust_remote_code: true
 
 connectors:
   shm:
