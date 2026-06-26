@@ -368,7 +368,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
             if not self.use_harmony:
-                error_check_ret = self.online_renderer.validate_chat_template(
+                error_check_ret = self.openai_serving_render.validate_chat_template(
                     request_chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs,
                     trust_request_chat_template=self.trust_request_chat_template,
@@ -396,7 +396,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
             else:
                 should_include_tools = tool_dicts is not None
-                conversation, engine_prompts = self.online_renderer._make_request_with_harmony(
+                conversation, engine_prompts = self.openai_serving_render._make_request_with_harmony(
                     request, should_include_tools
                 )
 
