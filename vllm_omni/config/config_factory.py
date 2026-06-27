@@ -85,9 +85,7 @@ class StageConfigFactory:
             try:
                 explicit_pipeline = load_deploy_config(deploy_config_path).pipeline
             except Exception:
-                logger.exception(
-                    "Failed to read 'pipeline' key from deploy config %s", deploy_config_path
-                )
+                logger.exception("Failed to read 'pipeline' key from deploy config %s", deploy_config_path)
         if explicit_pipeline:
             pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
             if pipeline_cfg is not None:
