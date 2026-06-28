@@ -11,7 +11,7 @@ This guide covers the parallelism methods in vLLM-Omni for speeding up diffusion
 | **[CFG-Parallel](cfg_parallel.md)**                | Runs CFG positive/negative branches on separate GPUs for ~1.8x speedup on guided generation                         |
 | **[Pipeline Parallelism](pipeline_parallel.md)**   | Splits the denoising transformer block-wise across sequential GPU stages to reduce per-GPU model memory             |
 | **[VAE Patch Parallelism](vae_patch_parallel.md)** | Distributes VAE decode spatially across GPUs to reduce peak VAE memory                                              |
-| **[HSDP](hsdp.md)**                                | Shards full model weights via PyTorch FSDP2 to enable large-model inference on memory-constrained GPUs              |
+| **[HSDP](Omni/vllm-omni-batching/docs/user_guide/diffusion/parallelism/hsdp.md)**                                | Shards full model weights via PyTorch FSDP2 to enable large-model inference on memory-constrained GPUs              |
 | **[Expert Parallelism](expert_parallel.md)**       | Shards MoE expert blocks across GPUs for MoE models (e.g. HunyuanImage3.0)                                          |
 
 See [Supported Models](../../diffusion_features.md#supported-models) for per-model compatibility.

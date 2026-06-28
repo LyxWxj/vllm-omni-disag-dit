@@ -28,6 +28,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
@@ -251,15 +252,15 @@ def apply_rotary_emb_qwen(
         return x_out.type_as(x)
 
 
-class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _scheduler_modules: ClassVar[list[str]] = ["scheduler"]
+    _tokenizer_modules: ClassVar[list[str]] = ["tokenizer"]
+
     supports_step_execution: ClassVar[bool] = True
     DEFAULT_VAE_SCALE_FACTOR: ClassVar[int] = 8
-    _STAGE_COMPONENTS: ClassVar[dict[str, set[str]]] = {
-        "diffusion": {"scheduler", "text_encoder", "tokenizer", "vae", "transformer"},
-        "encode": {"scheduler", "text_encoder", "tokenizer"},
-        "denoise": {"scheduler", "transformer"},
-        "decode": {"vae"},
-    }
 
     def __init__(
         self,
@@ -271,10 +272,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.stage = getattr(od_config, "model_stage", None) or "diffusion"
-        try:
-            owned_components = self._STAGE_COMPONENTS[self.stage]
-        except KeyError:
-            raise ValueError(f"Unsupported QwenImage model_stage: {self.stage}") from None
+        owned_components = self.get_stage_components(self.stage)
 
         self.device = get_local_device()
         self._init_model(owned_components)

@@ -63,8 +63,8 @@ class SupportsComponentDiscovery(Protocol):
     """Declares which submodules serve as pipeline components.
 
     Used by the framework to locate DiT, encoder, and VAE modules for
-    CPU offload, HSDP sharding, and other operations that need to know
-    the pipeline's internal structure.
+    CPU offload, HSDP sharding, disaggregated stage separation, and
+    other operations that need to know the pipeline's internal structure.
 
     All attribute names support dotted paths for nested submodules
     (e.g. ``"pipe.transformer"``).
@@ -75,12 +75,63 @@ class SupportsComponentDiscovery(Protocol):
         _vae_modules: VAE(s) (always on GPU).
         _resident_modules: Extra modules pinned on GPU during layerwise
             offloading.  Optional, defaults to ``[]``.
+        _scheduler_modules: Scheduler modules shared across stages.
+            Optional, defaults to ``[]``.
+        _tokenizer_modules: Tokenizer modules used by encoder stages.
+            Optional, defaults to ``[]``.
     """
 
     _dit_modules: ClassVar[list[str]]
     _encoder_modules: ClassVar[list[str]]
     _vae_modules: ClassVar[list[str]]
     _resident_modules: ClassVar[list[str]] = []
+    _scheduler_modules: ClassVar[list[str]] = []
+    _tokenizer_modules: ClassVar[list[str]] = []
+
+    @classmethod
+    def get_stage_components(cls, stage: str) -> set[str]:
+        """Return the set of component names required for *stage*.
+
+        The default implementation derives the mapping from the declared
+        module lists:
+
+        - ``"encode"``  → encoder + tokenizer + scheduler modules
+        - ``"denoise"`` → dit + scheduler modules
+        - ``"decode"``  → vae modules
+
+        Subclasses may override for model-specific mappings (e.g. a model
+        with multiple encoders or non-standard stage names).
+
+        Args:
+            stage: One of ``"encode"``, ``"denoise"``, ``"decode"``, or
+                ``"diffusion"`` (single-stage mode, returns all components).
+
+        Returns:
+            Set of component attribute names (e.g. ``{"text_encoder",
+            "tokenizer", "scheduler"}``).
+        """
+        if stage == "diffusion":
+            # Single-stage mode: all components are needed.
+            return set(
+                cls._encoder_modules
+                + cls._dit_modules
+                + cls._vae_modules
+                + cls._scheduler_modules
+                + cls._tokenizer_modules
+            )
+        mapping: dict[str, list[str]] = {
+            "encode": cls._encoder_modules + cls._tokenizer_modules + cls._scheduler_modules,
+            "denoise": cls._dit_modules + cls._scheduler_modules,
+            "decode": cls._vae_modules,
+        }
+        components = mapping.get(stage)
+        if components is None:
+            raise ValueError(
+                f"Unknown stage {stage!r}. Supported: 'encode', 'denoise', "
+                f"'decode', 'diffusion'. Override get_stage_components() for "
+                f"custom stage names."
+            )
+        return set(components)
 
 
 def supports_step_execution(pipeline: object) -> bool:
