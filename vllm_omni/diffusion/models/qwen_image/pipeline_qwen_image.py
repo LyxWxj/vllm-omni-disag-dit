@@ -258,6 +258,8 @@ class QwenImagePipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _scheduler_modules: ClassVar[list[str]] = ["scheduler"]
+    _tokenizer_modules: ClassVar[list[str]] = ["tokenizer"]
 
     supports_step_execution: ClassVar[bool] = True
 
@@ -270,75 +272,17 @@ class QwenImagePipeline(
         super().__init__()
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            )
-        ]
-
+        self.stage = getattr(od_config, "model_stage", None) or "diffusion"
         self.device = get_local_device()
-        model = od_config.model
-        # Check if model is a local path
-        local_files_only = os.path.isdir(model)
 
-        # See pipeline_qwen_image_edit_plus: guard against transformers v5
-        # multi-worker race on partial subfolder shard sets (Buildkite #1043).
-        qwen_subfolders = ["scheduler", "text_encoder", "vae", "tokenizer"]
-        prefetch_subfolders(
-            model,
-            qwen_subfolders,
+        owned_components = self.get_stage_components(self.stage)
+        self._init_model(owned_components)
+
+        self.vae_scale_factor = (
+            2 ** len(self.vae.temperal_downsample)
+            if getattr(self, "vae", None) is not None
+            else 8
         )
-
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
-        )
-        # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
-        # half-written cache (missing-shard ``OSError`` *and* the default
-        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
-        # could not recover) instead of crashing the worker.
-        self.text_encoder = from_pretrained_with_prefetch(
-            Qwen2_5_VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        )
-        # Qwen2.5-VL ships a vision tower that text-to-image does not use.
-        # Drop it while the model is still on CPU, before moving to GPU, so
-        # the vision tower never consumes GPU memory. Handle both transformers
-        # layouts: newer puts visual under .model, older puts it directly on
-        # the model.
-        visual_owner = None
-        if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
-            visual_owner = self.text_encoder.model
-        elif hasattr(self.text_encoder, "visual"):
-            visual_owner = self.text_encoder
-        if visual_owner is not None:
-            del visual_owner.visual
-        else:
-            logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
-        self.text_encoder = self.text_encoder.to(self.device)
-        self.vae = from_pretrained_with_prefetch(
-            DistributedAutoencoderKLQwenImage.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
-        self.transformer = QwenImageTransformer2DModel(
-            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
-        )
-
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-
-        self.stage = None
-
-        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
@@ -353,6 +297,110 @@ class QwenImagePipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def _init_model(self, owned_components: set[str]) -> None:
+        """Load only the components listed in *owned_components*.
+
+        When ``owned_components`` is empty or contains all components,
+        the full model is loaded (single-stage / diffusion mode).  In
+        disaggregated mode each stage loads only the subset it needs,
+        reducing GPU memory usage.
+        """
+        od_config = self.od_config
+        model = od_config.model
+        local_files_only = os.path.isdir(model)
+        owns_transformer = "transformer" in owned_components
+
+        self.weights_sources = (
+            [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                )
+            ]
+            if owns_transformer
+            else []
+        )
+
+        # See pipeline_qwen_image_edit_plus: guard against transformers v5
+        # multi-worker race on partial subfolder shard sets (Buildkite #1043).
+        prefetch_subfolders(
+            model,
+            [
+                subfolder
+                for subfolder in ("scheduler", "text_encoder", "vae", "tokenizer")
+                if subfolder in owned_components
+            ],
+            local_files_only=local_files_only,
+        )
+
+        self.scheduler = (
+            FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            )
+            if "scheduler" in owned_components
+            else None
+        )
+
+        self.text_encoder = (
+            from_pretrained_with_prefetch(
+                Qwen2_5_VLForConditionalGeneration.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                local_files_only=local_files_only,
+            )
+            if "text_encoder" in owned_components
+            else None
+        )
+        if self.text_encoder is not None:
+            # Qwen2.5-VL ships a vision tower that text-to-image does not use.
+            # Drop it before moving to GPU so it never consumes device memory.
+            visual_owner = None
+            if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
+                visual_owner = self.text_encoder.model
+            elif hasattr(self.text_encoder, "visual"):
+                visual_owner = self.text_encoder
+            if visual_owner is not None:
+                del visual_owner.visual
+            else:
+                logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
+            self.text_encoder = self.text_encoder.to(self.device)
+
+        self.vae = (
+            from_pretrained_with_prefetch(
+                DistributedAutoencoderKLQwenImage.from_pretrained,
+                model,
+                subfolder="vae",
+                local_files_only=local_files_only,
+            ).to(self.device)
+            if "vae" in owned_components
+            else None
+        )
+
+        self.tokenizer = (
+            Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+            if "tokenizer" in owned_components
+            else None
+        )
+
+        if owns_transformer:
+            transformer_kwargs = get_transformer_config_kwargs(
+                od_config.tf_model_config, QwenImageTransformer2DModel
+            )
+            self.transformer = QwenImageTransformer2DModel(
+                od_config=od_config,
+                quant_config=od_config.quantization_config,
+                **transformer_kwargs,
+            )
+            self.transformer_in_channels = self.transformer.in_channels
+            self.transformer_guidance_embeds = self.transformer.guidance_embeds
+        else:
+            self.transformer = None
+            self.transformer_in_channels = int(od_config.tf_model_config.get("in_channels", 64))
+            self.transformer_guidance_embeds = bool(od_config.tf_model_config.get("guidance_embeds", False))
 
     def check_inputs(
         self,
@@ -978,6 +1026,143 @@ class QwenImagePipeline(
         output_type = kwargs.get("output_type", "pil")
 
         return self._decode_latents(state.latents, height, width, output_type)
+
+    # ---- Disaggregated stage execution (submodule path) ----
+
+    @staticmethod
+    def _stage_payload_from_prompts(prompts: list[Any] | None) -> dict[str, Any]:
+        """Extract ``additional_information`` from the first prompt dict."""
+        if not prompts:
+            raise ValueError("QwenImage stage request is missing prompts.")
+        first = prompts[0]
+        if not isinstance(first, dict) or not first.get("additional_information"):
+            raise ValueError("QwenImage stage request is missing additional_information.")
+        return first["additional_information"]
+
+    def execute_encode(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
+        """Run text/latent preparation for the encode submodule stage.
+
+        Called by :class:`DiffusionSubmoduleRunner` when ``model_stage == "encode"``.
+        """
+        if self.stage != "encode":
+            raise RuntimeError(f"execute_encode called on stage={self.stage!r}")
+        if self.text_encoder is None or self.tokenizer is None:
+            raise RuntimeError("encode stage requires text_encoder and tokenizer loaded.")
+
+        outputs: list[dict[str, Any]] = []
+        for req in requests:
+            sampling = req.sampling_params
+            prompt, negative_prompt = self._extract_prompts(req.prompts)
+            height = sampling.height or self.default_sample_size * self.vae_scale_factor
+            width = sampling.width or self.default_sample_size * self.vae_scale_factor
+            num_inference_steps = sampling.num_inference_steps or 50
+            true_cfg_scale = sampling.true_cfg_scale or 4.0
+            guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+            num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+
+            ctx = self._prepare_generation_context(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                sigmas=sampling.sigmas,
+                guidance_scale=guidance_scale,
+                num_images_per_prompt=num_images_per_prompt,
+                generator=sampling.generator,
+                true_cfg_scale=true_cfg_scale,
+                max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
+            )
+            outputs.append(
+                {
+                    "context": ctx["prompt_embeds"],
+                    "context_mask": ctx["prompt_embeds_mask"],
+                    "context_null": ctx["negative_prompt_embeds"],
+                    "context_null_mask": ctx["negative_prompt_embeds_mask"],
+                    "latents": ctx["latents"],
+                    "timesteps": ctx["timesteps"],
+                    "sigmas": sampling.sigmas,
+                    "num_inference_steps": num_inference_steps,
+                    "height": height,
+                    "width": width,
+                    "img_shapes": ctx["img_shapes"],
+                    "guidance": ctx["guidance"],
+                    "guidance_scale": guidance_scale,
+                    "true_cfg_scale": true_cfg_scale,
+                    "do_true_cfg": ctx["do_true_cfg"],
+                    "txt_seq_lens": ctx["txt_seq_lens"],
+                    "negative_txt_seq_lens": ctx["negative_txt_seq_lens"],
+                }
+            )
+        return outputs
+
+    def execute_decode(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
+        """Run VAE decode for the decode submodule stage.
+
+        Called by :class:`DiffusionSubmoduleRunner` when ``model_stage == "decode"``.
+        """
+        if self.stage != "decode":
+            raise RuntimeError(f"execute_decode called on stage={self.stage!r}")
+        if self.vae is None:
+            raise RuntimeError("decode stage requires VAE loaded.")
+
+        outputs: list[dict[str, Any]] = []
+        for req in requests:
+            sampling = req.sampling_params
+            info = self._stage_payload_from_prompts(req.prompts)
+            latents = info["latents"]
+            if torch.is_tensor(latents):
+                latents = latents.to(self.device).contiguous()
+            height = info["height"] or sampling.height
+            width = info["width"] or sampling.width
+            output_type = info.get("output_type") or getattr(sampling, "output_type", None) or "pil"
+            image = self._decode_latents(latents, height, width, output_type).output
+            outputs.append(
+                {
+                    "image": image,
+                    "output_type": output_type,
+                }
+            )
+        return outputs
+
+    @property
+    def produces_intermediate_stage_output(self) -> bool:
+        """Whether this pipeline instance should emit an intermediate stage payload."""
+        return self.stage == "denoise"
+
+    def post_intermediate_output(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Export DiT latents for the downstream decode stage."""
+        del kwargs
+        if self.stage != "denoise":
+            raise RuntimeError(
+                f"post_intermediate_output is only valid for stage='denoise', got {self.stage!r}"
+            )
+
+        sampling = state.sampling
+        height = (
+            state.extra.get("stage_height")
+            or sampling.height
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        width = (
+            state.extra.get("stage_width")
+            or sampling.width
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        latents = state.latents
+        return DiffusionOutput(
+            output=None,
+            multimodal_output={
+                "latents": latents,
+                "height": height,
+                "width": width,
+                "output_type": "latent",
+            },
+        )
 
     def forward(
         self,
