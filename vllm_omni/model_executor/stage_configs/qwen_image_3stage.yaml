@@ -31,7 +31,8 @@ stage_args:
   - stage_id: 1
     stage_type: diffusion
     runtime:
-      devices: "1"
+      devices: "1,2,3,4,5,6,7"
+      num_replicas: 7
       max_batch_size: 1
     engine_args:
       model_class_name: QwenImagePipeline
@@ -41,6 +42,8 @@ stage_args:
       distributed_executor_backend: "mp"
       step_execution: false
       max_num_seqs: 1
+      cache_backend: tea_cache
+      tea_cache_threshold: 0.3
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen_image.encode_to_denoise
     final_output: false
