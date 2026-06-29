@@ -73,6 +73,44 @@ class DiffusionSubmoduleRunner:
             mem.consumed_memory / GiB_bytes,
         )
 
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """Warmup CUDA kernels to avoid first-call latency.
+
+        The first forward pass on GPU triggers CUDA context initialization,
+        CuDNN benchmarking, and memory allocation.  Without warmup the first
+        real request pays ~20s of one-time overhead.  A dummy forward with a
+        tiny tensor pays this cost once at startup instead.
+        """
+        stage = getattr(self.od_config, "model_stage", None)
+        if stage != "decode" or self.pipeline is None:
+            return
+        if not hasattr(self.pipeline, "vae") or self.pipeline.vae is None:
+            return
+
+        logger.info("DiffusionSubmoduleRunner[decode]: warming up VAE decode...")
+        t0 = time.perf_counter()
+        try:
+            with torch.inference_mode():
+                dummy = torch.randn(
+                    1, self.pipeline.vae.config.z_dim, 1, 16, 16,
+                    device=self.device,
+                    dtype=self.pipeline.vae.dtype,
+                )
+                self.pipeline.vae.decode(dummy, return_dict=False)
+            logger.info(
+                "DiffusionSubmoduleRunner[decode]: warmup done in %.3fs",
+                time.perf_counter() - t0,
+            )
+        except Exception:
+            logger.warning(
+                "DiffusionSubmoduleRunner[decode]: warmup failed (%.3fs), "
+                "first real request may be slow",
+                time.perf_counter() - t0,
+                exc_info=True,
+            )
+
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not req.prompts:
