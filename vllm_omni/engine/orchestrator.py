@@ -190,6 +190,10 @@ class Orchestrator:
         for pool in stage_pools:
             for src in pool.input_sources:
                 self._successors.setdefault(src, []).append(pool.stage_id)
+        logger.info(
+            "[Orchestrator] DAG topology: %s",
+            {k: v for k, v in self._successors.items() if v} or "(linear chain)",
+        )
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -954,6 +958,12 @@ class Orchestrator:
         """
         # Buffer this stage's output for any fan-in successors.
         req_state.pending_outputs[src_stage_id] = output
+        logger.info(
+            "[Orchestrator][DAG] req=%s: stage-%d output buffered (pending=%s)",
+            req_id,
+            src_stage_id,
+            sorted(req_state.pending_outputs.keys()),
+        )
 
         successors = self._successors.get(src_stage_id, [])
         for next_logical in successors:
@@ -964,22 +974,36 @@ class Orchestrator:
             if input_sources:
                 ready = all(s in req_state.pending_outputs for s in input_sources)
                 if not ready:
-                    logger.debug(
-                        "[Orchestrator] req=%s: stage-%d not ready for stage-%d "
-                        "(waiting for %s, have %s)",
+                    missing = [s for s in input_sources if s not in req_state.pending_outputs]
+                    logger.info(
+                        "[Orchestrator][DAG] req=%s: stage-%d waiting for %s to complete "
+                        "(have stages %s, need %s)",
                         req_id,
                         next_logical,
-                        src_stage_id,
-                        input_sources,
+                        missing,
                         sorted(req_state.pending_outputs.keys()),
+                        input_sources,
                     )
                     continue
                 # Collect all predecessor outputs in input_sources order.
                 source_outputs = [req_state.pending_outputs[s] for s in input_sources]
+                logger.info(
+                    "[Orchestrator][DAG] req=%s: stage-%d fan-in ready! "
+                    "collected outputs from stages %s",
+                    req_id,
+                    next_logical,
+                    input_sources,
+                )
             else:
                 # Entry stage or linear chain fallback.
                 source_outputs = [output]
 
+            logger.info(
+                "[Orchestrator][DAG] req=%s: routing stage-%d → stage-%d",
+                req_id,
+                src_stage_id,
+                next_logical,
+            )
             await self._submit_to_successor(
                 req_id,
                 src_stage_id,
