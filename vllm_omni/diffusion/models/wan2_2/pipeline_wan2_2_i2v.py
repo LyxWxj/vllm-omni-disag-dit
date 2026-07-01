@@ -186,6 +186,11 @@ class Wan22I2VPipeline(
 
         # Get owned components for this stage
         owned_components = self.get_stage_components(self.stage)
+        logger.info(
+            "Wan22I2VPipeline.__init__: stage=%s, owned_components=%s",
+            self.stage,
+            owned_components,
+        )
 
         # Set up weights sources for transformer(s) only if needed
         owns_transformer = "transformer" in owned_components

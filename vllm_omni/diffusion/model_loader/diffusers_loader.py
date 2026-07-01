@@ -407,6 +407,12 @@ class DiffusersPipelineLoader:
 
     def load_weights(self, model: nn.Module) -> None:
         sources = self._get_weight_sources(model)
+        logger.info(
+            "DiffusersPipelineLoader.load_weights: model=%s, sources=%s, weights_loaded_by_model_init=%s",
+            model.__class__.__name__,
+            [(s.model_or_path, s.subfolder) for s in sources],
+            self._weights_loaded_by_model_init(model),
+        )
         if not sources and self._weights_loaded_by_model_init(model):
             logger.info(
                 "%s declares weights were loaded during model initialization; "
