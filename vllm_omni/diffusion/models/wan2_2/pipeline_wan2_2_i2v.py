@@ -202,6 +202,10 @@ class Wan22I2VPipeline(
             if owns_transformer
             else []
         )
+        # When transformer is not needed (e.g., encode_image stage), tell the
+        # weight loader that weights were loaded during model initialization
+        # so it skips the strict weight check.
+        self.weights_loaded_by_model_init = not owns_transformer
 
         # Load model_index.json to detect available components
         try:
