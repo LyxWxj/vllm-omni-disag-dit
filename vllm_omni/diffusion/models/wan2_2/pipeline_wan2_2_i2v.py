@@ -1007,27 +1007,6 @@ class Wan22I2VPipeline(
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()
-        from diffusers.video_processor import VideoProcessor
-
-        video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
-
-        if isinstance(image, PIL.Image.Image):
-            image = TF.to_tensor(image).to(device)
-            image_tensor = video_processor.preprocess(image, height=height, width=width)
-        else:
-            image_tensor = image
-        image_tensor = image_tensor.to(device=device, dtype=torch.float32)
-
-        # Handle last_image if provided
-        if last_image is not None:
-            if isinstance(last_image, PIL.Image.Image):
-                image = TF.to_tensor(last_image).to(device)
-                last_image_tensor = video_processor.preprocess(last_image, height=height, width=width)
-            else:
-                last_image_tensor = last_image
-            last_image_tensor = last_image_tensor.to(device=device, dtype=torch.float32)
-        else:
-            last_image_tensor = None
 
         # In disaggregated mode, use pre-computed latent_condition and first_frame_mask
         # from encode_image stage if available.
@@ -1041,6 +1020,28 @@ class Wan22I2VPipeline(
             condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
             first_frame_mask = first_frame_mask.repeat(batch_size, 1, 1, 1, 1)
         else:
+            from diffusers.video_processor import VideoProcessor
+
+            video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
+            if isinstance(image, PIL.Image.Image):
+                image = TF.to_tensor(image).to(device)
+                image_tensor = video_processor.preprocess(image, height=height, width=width)
+            else:
+                image_tensor = image
+            image_tensor = image_tensor.to(device=device, dtype=torch.float32)
+
+            # Handle last_image if provided
+            if last_image is not None:
+                if isinstance(last_image, PIL.Image.Image):
+                    image = TF.to_tensor(last_image).to(device)
+                    last_image_tensor = video_processor.preprocess(last_image, height=height, width=width)
+                else:
+                    last_image_tensor = last_image
+                last_image_tensor = last_image_tensor.to(device=device, dtype=torch.float32)
+            else:
+                last_image_tensor = None
+
             latents, condition, first_frame_mask = self.prepare_latents(
                 image=image_tensor,
                 batch_size=batch_size,
@@ -1051,9 +1052,9 @@ class Wan22I2VPipeline(
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-            latents=req.sampling_params.latents,
-            last_image=last_image_tensor,
-        )
+                latents=req.sampling_params.latents,
+                last_image=last_image_tensor,
+            )
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
