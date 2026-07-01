@@ -548,6 +548,99 @@ class Wan22I2VPipeline(
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
 
+    @classmethod
+    def build_dummy_run_request(
+        cls,
+        od_config: OmniDiffusionConfig,
+        *,
+        height: int,
+        width: int,
+        num_inference_steps: int,
+    ) -> OmniDiffusionRequest | None:
+        """Build a stage-aware warmup request.
+
+        Returns None for non-denoise stages (encode_text, encode_image, decode)
+        because they use the submodule path which doesn't need DiffusionEngine
+        dummy run.  For the denoise stage, returns a pre-built request with
+        virtual tensors to avoid requiring text_encoder/vae.
+        """
+        stage = getattr(od_config, "model_stage", None) or "diffusion"
+        if stage != "diffusion" and stage != "denoise":
+            # encode_text, encode_image, decode use submodule path — no dummy run needed
+            return None
+
+        if stage == "diffusion":
+            # Single-stage mode: use default dummy request
+            return OmniDiffusionRequest(
+                prompts=[{"prompt": "dummy run"}],
+                request_id=DUMMY_DIFFUSION_REQUEST_ID,
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=height,
+                    width=width,
+                    num_inference_steps=max(2, num_inference_steps),
+                    guidance_scale=0.0,
+                    num_outputs_per_prompt=1,
+                ),
+            )
+
+        # Denoise stage: build a pre-built request with virtual tensors
+        dtype = getattr(od_config, "dtype", torch.bfloat16)
+        if not isinstance(dtype, torch.dtype):
+            dtype = torch.bfloat16
+
+        # Calculate latent dimensions
+        vae_scale_factor_temporal = 4
+        vae_scale_factor_spatial = 8
+        num_frames = 81  # Default for Wan2.2
+        num_latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
+        latent_height = height // vae_scale_factor_spatial
+        latent_width = width // vae_scale_factor_spatial
+
+        # Get transformer config
+        tf_config = getattr(od_config, "tf_model_config", None)
+        get_tf_config = getattr(tf_config, "get", None)
+        out_channels = int(get_tf_config("out_channels", 16) if callable(get_tf_config) else 16)
+
+        # Build virtual tensors for denoise stage
+        prompt_embeds = torch.zeros((1, 1, 4096), dtype=dtype)  # [batch, seq_len, dim]
+        latents = torch.randn(
+            (1, out_channels, num_latent_frames, latent_height, latent_width),
+            dtype=dtype,
+        )
+        timesteps = torch.linspace(1000, 0, num_inference_steps, dtype=torch.float32)
+
+        info: dict[str, Any] = {
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": None,
+            "latents": latents,
+            "timesteps": timesteps,
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "expand_timesteps": True,
+            "guidance_low": 5.0,
+            "guidance_high": 5.0,
+        }
+
+        return OmniDiffusionRequest(
+            prompts=[
+                OmniTokensPrompt(
+                    prompt_token_ids=[],
+                    additional_information=info,
+                    multi_modal_data=None,
+                    mm_processor_kwargs=None,
+                )
+            ],
+            request_id=DUMMY_DIFFUSION_REQUEST_ID,
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=0.0,
+                num_outputs_per_prompt=1,
+            ),
+        )
+
     # ---- Disaggregated stage execution (submodule path) ----
 
     def execute_encode_text(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
@@ -736,7 +829,17 @@ class Wan22I2VPipeline(
         if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
             prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
             negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+        # In disaggregated mode (denoise stage), prompt_embeds must come from
+        # the encode_text stage via additional_information. If not available,
+        # raise a clear error instead of trying to encode (which would fail
+        # because tokenizer/text_encoder are not loaded).
         if prompt is None and prompt_embeds is None:
+            if self.stage == "denoise":
+                raise ValueError(
+                    "Denoise stage requires prompt_embeds from encode_text stage "
+                    "via additional_information, but none was provided. "
+                    "Ensure the encode_text stage runs first."
+                )
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
         # Get image from request (skip if we have pre-computed latent_condition)
