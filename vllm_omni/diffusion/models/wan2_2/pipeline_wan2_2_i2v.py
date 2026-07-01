@@ -1017,8 +1017,12 @@ class Wan22I2VPipeline(
             latent_width = width // self.vae_scale_factor_spatial
             shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
             latents = randn_tensor(shape, generator=generator, device=device, dtype=torch.float32)
-            condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
-            first_frame_mask = first_frame_mask.repeat(batch_size, 1, 1, 1, 1)
+            # latent_condition from encode_image may have temporal dim > 1 (full video length),
+            # squeeze to temporal=1 before expanding to match latents shape
+            if latent_condition.dim() == 5 and latent_condition.shape[2] > 1:
+                latent_condition = latent_condition[:, :, :1, :, :]
+            condition = latent_condition.repeat(batch_size, 1, num_latent_frames, 1, 1)
+            first_frame_mask = first_frame_mask.repeat(batch_size, 1, num_latent_frames, 1, 1)
         else:
             from diffusers.video_processor import VideoProcessor
 
