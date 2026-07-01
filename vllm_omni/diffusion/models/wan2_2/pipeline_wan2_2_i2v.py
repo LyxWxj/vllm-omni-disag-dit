@@ -844,7 +844,10 @@ class Wan22I2VPipeline(
 
         if DEBUG_PERF:
             _t_img_enc_start = time.perf_counter()
-        if self.has_image_encoder and self.transformer.config.image_dim is not None:
+        # Skip image encoding if we have pre-computed latent_condition
+        if latent_condition is not None:
+            image_embeds = None  # Not needed when using latent_condition
+        elif self.has_image_encoder and self.transformer.config.image_dim is not None:
             if image_embeds is None:
                 if last_image is None:
                     image_embeds = self.encode_image(image, device)
