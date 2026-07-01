@@ -219,7 +219,11 @@ class Wan22I2VPipeline(
             model_index = {}
 
         # Check if this is a two-stage model (MoE with transformer_2)
-        self.has_transformer_2 = "transformer_2" in model_index
+        # transformer_2 may exist in model_index.json but be [null, null]
+        self.has_transformer_2 = (
+            "transformer_2" in model_index
+            and model_index["transformer_2"][0] is not None
+        )
 
         if self.has_transformer_2 and owns_transformer:
             self.weights_sources.append(
