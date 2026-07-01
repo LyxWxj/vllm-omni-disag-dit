@@ -702,6 +702,24 @@ class Wan22I2VPipeline(
         attention_kwargs: dict | None = None,
         **kwargs,
     ) -> DiffusionOutput:
+        # Extract pre-computed data from additional_information early
+        # (disaggregated mode: denoise stage receives data from encode stages).
+        additional_info = {}
+        if req.prompts and isinstance(req.prompts[0], dict):
+            additional_info = req.prompts[0].get("additional_information", {}) or {}
+
+        if prompt_embeds is None and "prompt_embeds" in additional_info:
+            prompt_embeds = additional_info["prompt_embeds"]
+            negative_prompt_embeds = additional_info.get("negative_prompt_embeds")
+            guidance_low = additional_info.get("guidance_low", guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0])
+            guidance_high = additional_info.get("guidance_high", guidance_low)
+
+        if image_embeds is None and "image_embeds" in additional_info:
+            image_embeds = additional_info["image_embeds"]
+
+        latent_condition = additional_info.get("latent_condition")
+        first_frame_mask = additional_info.get("first_frame_mask")
+
         # Get parameters from request or arguments
         if len(req.prompts) > 1:
             raise ValueError(
@@ -714,8 +732,8 @@ class Wan22I2VPipeline(
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
-        # Get image from request
-        if image is None:
+        # Get image from request (skip if we have pre-computed latent_condition)
+        if image is None and latent_condition is None:
             multi_modal_data = (
                 req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
             )
@@ -791,24 +809,7 @@ class Wan22I2VPipeline(
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
-        # Extract pre-computed data from additional_information (disaggregated mode).
-        additional_info = {}
-        if req.prompts and isinstance(req.prompts[0], dict):
-            additional_info = req.prompts[0].get("additional_information", {}) or {}
-
-        if prompt_embeds is None and "prompt_embeds" in additional_info:
-            prompt_embeds = additional_info["prompt_embeds"]
-            negative_prompt_embeds = additional_info.get("negative_prompt_embeds")
-            guidance_low = additional_info.get("guidance_low", guidance_low)
-            guidance_high = additional_info.get("guidance_high", guidance_high)
-            self._guidance_scale = guidance_low
-            self._guidance_scale_2 = guidance_high
-
-        if image_embeds is None and "image_embeds" in additional_info:
-            image_embeds = additional_info["image_embeds"]
-
-        latent_condition = additional_info.get("latent_condition")
-        first_frame_mask = additional_info.get("first_frame_mask")
+        # Move pre-computed tensors to device
         if latent_condition is not None:
             latent_condition = latent_condition.to(device=device, dtype=dtype)
         if first_frame_mask is not None:
