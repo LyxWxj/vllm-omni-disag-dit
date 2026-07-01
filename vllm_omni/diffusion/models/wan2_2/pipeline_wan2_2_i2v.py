@@ -781,17 +781,18 @@ class Wan22I2VPipeline(
             boundary_ratio = 0.875
             logger.warning("boundary_ratio is required for I2V generation. using default value 0.875")
 
-        # Validate inputs
-        self.check_inputs(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            image=image,
-            height=height,
-            width=width,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            image_embeds=image_embeds,
-            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
+        # Validate inputs (skip if we have pre-computed latent_condition)
+        if latent_condition is None:
+            self.check_inputs(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=image,
+                height=height,
+                width=width,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                image_embeds=image_embeds,
+                guidance_scale_2=guidance_high if boundary_ratio is not None else None,
             boundary_ratio=boundary_ratio,
         )
 
