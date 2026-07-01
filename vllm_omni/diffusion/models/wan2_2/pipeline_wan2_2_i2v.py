@@ -168,6 +168,85 @@ class Wan22I2VPipeline(
         "decode":       ["vae_decoder"],
     }
 
+    @classmethod
+    def build_dummy_run_request(
+        cls,
+        od_config: OmniDiffusionConfig,
+        *,
+        height: int,
+        width: int,
+        num_inference_steps: int,
+    ) -> OmniDiffusionRequest | None:
+        """Build a stage-aware warmup request.
+
+        For denoise stage, creates a request with pre-computed tensors in
+        ``additional_information`` so the warmup doesn't need to call
+        tokenizer/text_encoder/VAE.
+        """
+        stage = getattr(od_config, "model_stage", None) or "diffusion"
+        if stage == "diffusion":
+            return OmniDiffusionRequest(
+                prompts=[{"prompt": "dummy run"}],
+                request_id=DUMMY_DIFFUSION_REQUEST_ID,
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=height,
+                    width=width,
+                    num_inference_steps=max(2, num_inference_steps),
+                    guidance_scale=0.0,
+                    num_outputs_per_prompt=1,
+                ),
+            )
+        if stage != "denoise":
+            return None
+
+        dtype = getattr(od_config, "dtype", torch.bfloat16)
+        if not isinstance(dtype, torch.dtype):
+            dtype = torch.bfloat16
+
+        # Build dummy tensors matching the denoise stage's expected inputs.
+        tf_config = getattr(od_config, "tf_model_config", {})
+        get_tf = getattr(tf_config, "get", None)
+        out_channels = int(get_tf("out_channels", 16) if callable(get_tf) else 16)
+        hidden_dim = int(get_tf("hidden_size", 4096) if callable(get_tf) else 4096)
+
+        vae_scale_factor_spatial = 8
+        vae_scale_factor_temporal = 4
+        num_latent_frames = max(1, (num_inference_steps - 1) // vae_scale_factor_temporal + 1)
+        latent_height = height // vae_scale_factor_spatial
+        latent_width = width // vae_scale_factor_spatial
+
+        info: dict[str, Any] = {
+            "prompt_embeds": torch.zeros((1, 1, hidden_dim), dtype=dtype),
+            "negative_prompt_embeds": None,
+            "latent_condition": torch.zeros(
+                (1, out_channels, num_latent_frames, latent_height, latent_width), dtype=dtype
+            ),
+            "first_frame_mask": torch.zeros(
+                (1, 1, num_latent_frames, latent_height, latent_width), dtype=dtype
+            ),
+            "guidance_low": 5.0,
+            "guidance_high": 5.0,
+        }
+        return OmniDiffusionRequest(
+            prompts=[
+                OmniTokensPrompt(
+                    prompt_token_ids=[],
+                    additional_information=info,
+                    multi_modal_data=None,
+                    mm_processor_kwargs=None,
+                )
+            ],
+            request_id=DUMMY_DIFFUSION_REQUEST_ID,
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=0.0,
+                num_outputs_per_prompt=1,
+                num_frames=num_latent_frames * vae_scale_factor_temporal + 1,
+            ),
+        )
+
     def __init__(
         self,
         *,
@@ -705,8 +784,30 @@ class Wan22I2VPipeline(
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
+        # Extract pre-computed data from additional_information (disaggregated mode).
+        additional_info = {}
+        if req.prompts and isinstance(req.prompts[0], dict):
+            additional_info = req.prompts[0].get("additional_information", {}) or {}
+
+        if prompt_embeds is None and "prompt_embeds" in additional_info:
+            prompt_embeds = additional_info["prompt_embeds"]
+            negative_prompt_embeds = additional_info.get("negative_prompt_embeds")
+            guidance_low = additional_info.get("guidance_low", guidance_low)
+            guidance_high = additional_info.get("guidance_high", guidance_high)
+            self._guidance_scale = guidance_low
+            self._guidance_scale_2 = guidance_high
+
+        if image_embeds is None and "image_embeds" in additional_info:
+            image_embeds = additional_info["image_embeds"]
+
+        latent_condition = additional_info.get("latent_condition")
+        first_frame_mask = additional_info.get("first_frame_mask")
+        if latent_condition is not None:
+            latent_condition = latent_condition.to(device=device, dtype=dtype)
+        if first_frame_mask is not None:
+            first_frame_mask = first_frame_mask.to(device=device, dtype=dtype)
+
         if DEBUG_PERF:
-            # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
             _t_pipeline_start = time.perf_counter()
             _t_text_enc_start = _t_pipeline_start
@@ -743,7 +844,11 @@ class Wan22I2VPipeline(
             image_embeds = image_embeds.repeat(batch_size, 1, 1)
             image_embeds = image_embeds.to(dtype)
         else:
-            image_embeds = None
+            if image_embeds is not None:
+                image_embeds = image_embeds.repeat(batch_size, 1, 1)
+                image_embeds = image_embeds.to(dtype)
+            else:
+                image_embeds = None
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -792,16 +897,28 @@ class Wan22I2VPipeline(
         else:
             last_image_tensor = None
 
-        latents, condition, first_frame_mask = self.prepare_latents(
-            image=image_tensor,
-            batch_size=batch_size,
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
+        # In disaggregated mode, use pre-computed latent_condition and first_frame_mask
+        # from encode_image stage if available.
+        if latent_condition is not None and first_frame_mask is not None:
+            # Use pre-computed values from encode_image stage
+            num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+            latent_height = height // self.vae_scale_factor_spatial
+            latent_width = width // self.vae_scale_factor_spatial
+            shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=torch.float32)
+            condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+            first_frame_mask = first_frame_mask.repeat(batch_size, 1, 1, 1, 1)
+        else:
+            latents, condition, first_frame_mask = self.prepare_latents(
+                image=image_tensor,
+                batch_size=batch_size,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
             latents=req.sampling_params.latents,
             last_image=last_image_tensor,
         )
