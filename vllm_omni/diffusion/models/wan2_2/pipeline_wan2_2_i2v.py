@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -28,7 +28,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -143,6 +143,7 @@ class Wan22I2VPipeline(
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     """
     Wan2.2 Image-to-Video Pipeline.
@@ -150,6 +151,22 @@ class Wan22I2VPipeline(
     Supports both Wan2.1-style I2V (with CLIP image embeddings) and
     Wan2.2-style I2V (with expand_timesteps for TI2V-5B).
     """
+
+    # Fine-grained component registry for DAG stage separation.
+    # text_encoder and image_encoder can run in parallel as separate stages.
+    _component_registry: ClassVar[dict[str, set[str]]] = {
+        "text_encoder":  {"tokenizer", "text_encoder"},
+        "image_encoder": {"image_processor", "image_encoder"},
+        "transformer":   {"transformer", "transformer_2"},
+        "scheduler":     {"scheduler"},
+        "vae_decoder":   {"vae"},
+    }
+    _default_stage_layout: ClassVar[dict[str, list[str]]] = {
+        "encode_text":  ["text_encoder", "scheduler"],
+        "encode_image": ["image_encoder"],
+        "denoise":      ["transformer", "scheduler"],
+        "decode":       ["vae_decoder"],
+    }
 
     def __init__(
         self,
@@ -388,6 +405,78 @@ class Wan22I2VPipeline(
         pixel_values = pixel_values.to(device=device, dtype=self.image_encoder.dtype)
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
+
+    # ---- Disaggregated stage execution (submodule path) ----
+
+    def execute_encode_text(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
+        """Run text encoding for the encode_text submodule stage.
+
+        Called by :class:`DiffusionSubmoduleRunner` when ``model_stage == "encode_text"``.
+        """
+        outputs: list[dict[str, Any]] = []
+        for req in requests:
+            sampling = req.sampling_params
+            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
+            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+
+            if prompt is None:
+                raise ValueError("Prompt is required for text encoding.")
+
+            guidance_low = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
+            do_cfg = guidance_low > 1.0
+
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=do_cfg,
+                num_videos_per_prompt=sampling.num_outputs_per_prompt or 1,
+                max_sequence_length=sampling.max_sequence_length or 512,
+            )
+            outputs.append({
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "guidance_low": guidance_low,
+                "guidance_high": sampling.guidance_scale_2 if sampling.guidance_scale_2 is not None else guidance_low,
+            })
+        return outputs
+
+    def execute_encode_image(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
+        """Run image encoding for the encode_image submodule stage.
+
+        Called by :class:`DiffusionSubmoduleRunner` when ``model_stage == "encode_image"``.
+        """
+        outputs: list[dict[str, Any]] = []
+        for req in requests:
+            # Get image from request
+            multi_modal_data = (
+                req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
+            )
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if raw_image is None:
+                raise ValueError("Image is required for image encoding.")
+            if isinstance(raw_image, list):
+                raw_image = raw_image[0]
+            if isinstance(raw_image, str):
+                image = PIL.Image.open(raw_image)
+            else:
+                image = raw_image
+
+            if self.has_image_encoder and self.transformer.config.image_dim is not None:
+                image_embeds = self.encode_image(image, self.device)
+                outputs.append({"image_embeds": image_embeds})
+            else:
+                outputs.append({"image_embeds": None})
+        return outputs
+
+    @staticmethod
+    def _stage_payload_from_prompts(prompts: list[Any] | None) -> dict[str, Any]:
+        """Extract ``additional_information`` from the first prompt dict."""
+        if not prompts:
+            raise ValueError("Wan22I2V stage request is missing prompts.")
+        first = prompts[0]
+        if not isinstance(first, dict) or not first.get("additional_information"):
+            raise ValueError("Wan22I2V stage request is missing additional_information.")
+        return first["additional_information"]
 
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""

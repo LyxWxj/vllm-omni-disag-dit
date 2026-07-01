@@ -1,0 +1,104 @@
+# Wan2.2 I2V disaggregated pipeline with dual encoder DAG.
+#
+# Topology:
+#          ┌─ Stage 0: encode_text  (GPU 0) ─┐
+#          │                                  ├→ Stage 2: denoise (GPU 1) → Stage 3: decode (GPU 0)
+#          └─ Stage 1: encode_image (GPU 0) ─┘
+#
+# Stage 0 and Stage 1 run in parallel (no dependency between them).
+# Stage 2 waits for both Stage 0 and Stage 1 to complete (fan-in).
+# Stage 3 depends only on Stage 2.
+#
+# TODO: Migrate this legacy stage config to deploy config.
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    worker_type: submodule
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Wan22I2VPipeline
+      model_stage: encode_text
+      enforce_eager: true
+      trust_remote_code: true
+      max_num_seqs: 1
+    final_output: false
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 40
+      guidance_scale: 5.0
+      height: 480
+      width: 832
+      num_frames: 81
+
+  - stage_id: 1
+    stage_type: diffusion
+    worker_type: submodule
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Wan22I2VPipeline
+      model_stage: encode_image
+      enforce_eager: true
+      trust_remote_code: true
+      max_num_seqs: 1
+    final_output: false
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 40
+      guidance_scale: 5.0
+      height: 480
+      width: 832
+      num_frames: 81
+
+  - stage_id: 2
+    stage_type: diffusion
+    runtime:
+      devices: "1"
+      num_replicas: 1
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Wan22I2VPipeline
+      model_stage: denoise
+      enforce_eager: false
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      step_execution: false
+      max_num_seqs: 1
+    engine_input_source: [0, 1]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.wan22_i2v.encode_to_denoise
+    final_output: false
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 40
+      guidance_scale: 5.0
+      height: 480
+      width: 832
+      num_frames: 81
+
+  - stage_id: 3
+    stage_type: diffusion
+    worker_type: submodule
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: Wan22I2VPipeline
+      model_stage: decode
+      enforce_eager: true
+      trust_remote_code: true
+      max_num_seqs: 1
+    engine_input_source: [2]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.wan22_i2v.denoise_to_decode
+    final_output: true
+    final_output_type: video
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 40
+      guidance_scale: 5.0
+      height: 480
+      width: 832
+      num_frames: 81
