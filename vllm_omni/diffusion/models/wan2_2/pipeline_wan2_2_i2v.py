@@ -307,6 +307,9 @@ class Wan22I2VPipeline(
         except Exception:
             model_index = {}
 
+        # Read expand_timesteps from model_index.json (for TI2V-5B style)
+        self.expand_timesteps = model_index.get("expand_timesteps", False)
+
         # Check if this is a two-stage model (MoE with transformer_2)
         # transformer_2 may exist in model_index.json but be [null, null]
         self.has_transformer_2 = (
@@ -423,8 +426,7 @@ class Wan22I2VPipeline(
         # MoE boundary ratio for two-stage denoising
         self.boundary_ratio = od_config.boundary_ratio
 
-        # Whether to use expand_timesteps mode (for TI2V-5B style)
-        self.expand_timesteps = getattr(od_config, "expand_timesteps", False)
+        # expand_timesteps is already set from model_index.json above
 
         self._guidance_scale = None
         self._guidance_scale_2 = None
