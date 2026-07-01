@@ -609,6 +609,14 @@ class Wan22I2VPipeline(
         )
         timesteps = torch.linspace(1000, 0, num_inference_steps, dtype=torch.float32)
 
+        # For expand_timesteps mode, we need latent_condition and first_frame_mask
+        latent_condition = torch.randn(
+            (1, out_channels, num_latent_frames, latent_height, latent_width),
+            dtype=dtype,
+        )
+        first_frame_mask = torch.zeros(1, 1, num_latent_frames, latent_height, latent_width, dtype=dtype)
+        first_frame_mask[:, :, 1:, :, :] = 1.0  # Mark non-first frames for denoising
+
         info: dict[str, Any] = {
             "prompt_embeds": prompt_embeds,
             "negative_prompt_embeds": None,
@@ -620,6 +628,8 @@ class Wan22I2VPipeline(
             "expand_timesteps": True,
             "guidance_low": 5.0,
             "guidance_high": 5.0,
+            "latent_condition": latent_condition,
+            "first_frame_mask": first_frame_mask,
         }
 
         return OmniDiffusionRequest(
