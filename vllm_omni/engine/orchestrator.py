@@ -135,6 +135,11 @@ class OrchestratorRequestState:
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
 
+    # DAG fan-in: buffered outputs from completed stages, keyed by stage_id.
+    # Used when a downstream stage has multiple input_sources and needs to
+    # wait for all predecessors to complete before it can be submitted.
+    pending_outputs: dict[int, Any] = field(default_factory=dict)
+
 
 @dataclass
 class StreamingInputState:
@@ -175,6 +180,16 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+
+        # DAG topology: build successor mapping from input_sources.
+        # _successors[stage_id] = list of downstream stage_ids that depend on it.
+        # For linear chains this is {0: [1], 1: [2], ...}; for DAGs a stage
+        # can have multiple successors (fan-out) and a successor can have
+        # multiple predecessors (fan-in).
+        self._successors: dict[int, list[int]] = {i: [] for i in range(self.num_stages)}
+        for pool in stage_pools:
+            for src in pool.input_sources:
+                self._successors.setdefault(src, []).append(pool.stage_id)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -776,9 +791,10 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
+        has_successors = bool(self._successors.get(stage_id, []))
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
-            and stage_id < req_state.final_stage_id
+            and has_successors
             and not self.async_chunk
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
@@ -812,7 +828,11 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
-        return (stage_id + 1) in req_state.stage_submit_ts
+        """Check if all successor stages have already been submitted."""
+        successors = self._successors.get(stage_id, [])
+        if not successors:
+            return False
+        return all(s in req_state.stage_submit_ts for s in successors)
 
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
@@ -925,15 +945,71 @@ class Orchestrator:
         is_streaming_session: bool = False,
         is_final_update: bool = False,
     ) -> None:
-        """Forward output from the current logical stage to the next one."""
-        next_logical = src_stage_id + 1
-        next_pool = self.stage_pools[next_logical]
+        """Forward output from *src_stage_id* to all successor stages.
+
+        Supports DAG topologies: a stage may have multiple successors
+        (fan-out) and a successor may have multiple predecessors (fan-in).
+        For fan-in stages the output is buffered in ``req_state.pending_outputs``
+        until all predecessors have completed.
+        """
+        # Buffer this stage's output for any fan-in successors.
+        req_state.pending_outputs[src_stage_id] = output
+
+        successors = self._successors.get(src_stage_id, [])
+        for next_logical in successors:
+            next_pool = self.stage_pools[next_logical]
+
+            # Fan-in: check if all input_sources are ready.
+            input_sources = next_pool.input_sources
+            if input_sources:
+                ready = all(s in req_state.pending_outputs for s in input_sources)
+                if not ready:
+                    logger.debug(
+                        "[Orchestrator] req=%s: stage-%d not ready for stage-%d "
+                        "(waiting for %s, have %s)",
+                        req_id,
+                        next_logical,
+                        src_stage_id,
+                        input_sources,
+                        sorted(req_state.pending_outputs.keys()),
+                    )
+                    continue
+                # Collect all predecessor outputs in input_sources order.
+                source_outputs = [req_state.pending_outputs[s] for s in input_sources]
+            else:
+                # Entry stage or linear chain fallback.
+                source_outputs = [output]
+
+            await self._submit_to_successor(
+                req_id,
+                src_stage_id,
+                next_logical,
+                next_pool,
+                source_outputs,
+                req_state,
+                is_streaming_session=is_streaming_session,
+                is_final_update=is_final_update,
+            )
+
+    async def _submit_to_successor(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        next_logical: int,
+        next_pool: "StagePool",
+        source_outputs: list[Any],
+        req_state: OrchestratorRequestState,
+        *,
+        is_streaming_session: bool = False,
+        is_final_update: bool = False,
+    ) -> None:
+        """Submit a request to one successor stage."""
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
-        source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
-        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+        already_submitted = next_logical in req_state.stage_submit_ts
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        output = source_outputs[0]  # Primary output for logging / fallback
 
         if next_pool.stage_type == "diffusion":
             companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)

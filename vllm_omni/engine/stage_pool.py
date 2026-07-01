@@ -77,6 +77,7 @@ class StagePool:
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
+        input_sources: list[int] | None = None,
     ) -> None:
         if isinstance(clients, list):
             normalized_clients: list[StagePoolClient] = list(clients)
@@ -86,6 +87,7 @@ class StagePool:
         # Allow empty pools when running in distributed head mode for a
         # non-self stage; clients will arrive via add_client(...).
         self.stage_id = stage_id
+        self.input_sources: list[int] = input_sources or []
         # Slots can become None after a dynamic remove_client (distributed mode);
         # iterate via live_replica_ids() to skip holes.
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
