@@ -9,6 +9,10 @@
 # Stage 2 waits for both Stage 0 and Stage 1 to complete (fan-in).
 # Stage 3 depends only on Stage 2.
 #
+# For TI2V-5B model (expand_timesteps=true, no CLIP image encoder):
+#   - encode_text: UMT5 text encoder → prompt_embeds
+#   - encode_image: VAE encoder → latent_condition + first_frame_mask
+#
 # TODO: Migrate this legacy stage config to deploy config.
 
 stage_args:

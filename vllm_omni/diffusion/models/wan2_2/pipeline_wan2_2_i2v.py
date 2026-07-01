@@ -176,6 +176,7 @@ class Wan22I2VPipeline(
     ):
         super().__init__()
         self.od_config = od_config
+        self.stage = getattr(od_config, "model_stage", None) or "diffusion"
 
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
@@ -183,16 +184,24 @@ class Wan22I2VPipeline(
         model = od_config.model
         local_files_only = os.path.exists(model)
 
-        # Set up weights sources for transformer(s)
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            ),
-        ]
+        # Get owned components for this stage
+        owned_components = self.get_stage_components(self.stage)
+
+        # Set up weights sources for transformer(s) only if needed
+        owns_transformer = "transformer" in owned_components
+        self.weights_sources = (
+            [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                ),
+            ]
+            if owns_transformer
+            else []
+        )
 
         # Load model_index.json to detect available components
         try:
@@ -203,7 +212,7 @@ class Wan22I2VPipeline(
         # Check if this is a two-stage model (MoE with transformer_2)
         self.has_transformer_2 = "transformer_2" in model_index
 
-        if self.has_transformer_2:
+        if self.has_transformer_2 and owns_transformer:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -214,11 +223,15 @@ class Wan22I2VPipeline(
                 )
             )
 
-        # Text encoder
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
-        ).to(self.device)
+        # Text encoder (only if needed by this stage)
+        if "text_encoder" in owned_components:
+            self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+            self.text_encoder = UMT5EncoderModel.from_pretrained(
+                model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            ).to(self.device)
+        else:
+            self.tokenizer = None
+            self.text_encoder = None
 
         # Image encoder (CLIP) - optional, for Wan2.1-style I2V
         self.has_image_encoder = "image_encoder" in model_index and model_index["image_encoder"][0] is not None
@@ -229,7 +242,7 @@ class Wan22I2VPipeline(
             subfolders.extend(["image_processor", "image_encoder"])
         prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
 
-        if self.has_image_encoder:
+        if self.has_image_encoder and "image_encoder" in owned_components:
             self.image_processor = CLIPImageProcessor.from_pretrained(
                 model, subfolder="image_processor", local_files_only=local_files_only
             )
@@ -240,43 +253,70 @@ class Wan22I2VPipeline(
             self.image_processor = None
             self.image_encoder = None
 
-        # VAE
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
-        ).to(self.device)
+        # VAE - load full VAE, then wrap if only encoder is needed
+        if "vae" in owned_components or "vae_encoder" in owned_components:
+            vae_full = DistributedAutoencoderKLWan.from_pretrained(
+                model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
+            ).to(self.device)
+            if self.stage == "encode_image":
+                # Only keep VAE encoder for image encoding stage
+                from vllm_omni.diffusion.distributed.autoencoders.vae_encoder_wrapper import VAEEncoderWrapper
+
+                self.vae = VAEEncoderWrapper(vae_full, device=self.device)
+                self.vae_encoder = self.vae  # Alias for clarity
+                self.vae_decoder = None
+            else:
+                self.vae = vae_full
+                self.vae_encoder = None
+                self.vae_decoder = None
+        else:
+            self.vae = None
+            self.vae_encoder = None
+            self.vae_decoder = None
 
         # Transformers (weights loaded via load_weights)
-        # Load config from model directory or HF Hub to get correct in_channels for I2V models
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(
-            transformer_config,
-            quant_config=od_config.quantization_config,
-        )
-        if self.has_transformer_2:
-            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            t2_quant = transformer_2_config.get("quantization_config")
-            if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-                from vllm_omni.quantization.factory import build_quant_config
-
-                method = t2_quant["quant_method"]
-                kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
-                t2_quant = build_quant_config(method, **kwargs)
-            else:
-                t2_quant = None
-            self.transformer_2 = create_transformer_from_config(
-                transformer_2_config,
-                quant_config=t2_quant,
+        if owns_transformer:
+            # Load config from model directory or HF Hub to get correct in_channels for I2V models
+            transformer_config = load_transformer_config(model, "transformer", local_files_only)
+            self.transformer = create_transformer_from_config(
+                transformer_config,
+                quant_config=od_config.quantization_config,
             )
+            if self.has_transformer_2:
+                transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
+                t2_quant = transformer_2_config.get("quantization_config")
+                if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
+                    from vllm_omni.quantization.factory import build_quant_config
+
+                    method = t2_quant["quant_method"]
+                    kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
+                    t2_quant = build_quant_config(method, **kwargs)
+                else:
+                    t2_quant = None
+                self.transformer_2 = create_transformer_from_config(
+                    transformer_2_config,
+                    quant_config=t2_quant,
+                )
+            else:
+                self.transformer_2 = None
         else:
+            self.transformer = None
             self.transformer_2 = None
 
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        if "scheduler" in owned_components:
+            self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        else:
+            self.scheduler = None
 
         # VAE scale factors
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if hasattr(self.vae, "config") else 8
+        if self.vae is not None:
+            self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
+            self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if hasattr(self.vae, "config") else 8
+        else:
+            self.vae_scale_factor_temporal = 4
+            self.vae_scale_factor_spatial = 8
 
         # MoE boundary ratio for two-stage denoising
         self.boundary_ratio = od_config.boundary_ratio
@@ -444,9 +484,14 @@ class Wan22I2VPipeline(
         """Run image encoding for the encode_image submodule stage.
 
         Called by :class:`DiffusionSubmoduleRunner` when ``model_stage == "encode_image"``.
+
+        For TI2V-5B style (expand_timesteps), uses VAE encoder to encode
+        the image into latent condition.  For Wan2.1-style I2V, uses CLIP
+        image encoder.
         """
         outputs: list[dict[str, Any]] = []
         for req in requests:
+            sampling = req.sampling_params
             # Get image from request
             multi_modal_data = (
                 req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
@@ -457,15 +502,70 @@ class Wan22I2VPipeline(
             if isinstance(raw_image, list):
                 raw_image = raw_image[0]
             if isinstance(raw_image, str):
-                image = PIL.Image.open(raw_image)
+                image = PIL.Image.open(raw_image).convert("RGB")
             else:
                 image = raw_image
 
-            if self.has_image_encoder and self.transformer.config.image_dim is not None:
-                image_embeds = self.encode_image(image, self.device)
-                outputs.append({"image_embeds": image_embeds})
+            height = sampling.height or 480
+            width = sampling.width or 832
+            num_frames = sampling.num_frames or 81
+
+            if self.expand_timesteps:
+                # TI2V-5B style: use VAE encoder
+                if self.vae is None:
+                    raise ValueError("VAE not available for image encoding.")
+
+                from diffusers.video_processor import VideoProcessor
+
+                video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
+                if isinstance(image, PIL.Image.Image):
+                    image_tensor = TF.to_tensor(image).to(self.device)
+                    image_tensor = video_processor.preprocess(image_tensor, height=height, width=width)
+                else:
+                    image_tensor = image
+                image_tensor = image_tensor.to(device=self.device, dtype=torch.float32)
+
+                # Prepare condition: first frame is image, rest is zeros
+                image_tensor = image_tensor.unsqueeze(2)  # [batch, channels, 1, height, width]
+
+                # Adjust num_frames for VAE temporal scaling
+                if num_frames % self.vae_scale_factor_temporal != 1:
+                    num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+                num_frames = max(num_frames, 1)
+
+                # Create video condition (first frame = image, rest = zeros)
+                video_condition = torch.cat(
+                    [image_tensor, image_tensor.new_zeros(image_tensor.shape[0], image_tensor.shape[1], num_frames - 1, height, width)],
+                    dim=2,
+                )
+                video_condition = video_condition.to(device=self.device, dtype=self.vae.dtype)
+
+                # Encode through VAE
+                latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
+
+                # Create first_frame_mask (1 for frames to denoise, 0 for condition)
+                num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+                latent_height = height // self.vae_scale_factor_spatial
+                latent_width = width // self.vae_scale_factor_spatial
+                first_frame_mask = torch.zeros(1, 1, num_latent_frames, latent_height, latent_width, device=self.device)
+                first_frame_mask[:, :, 1:, :, :] = 1.0  # Mark non-first frames for denoising
+
+                outputs.append({
+                    "latent_condition": latent_condition,
+                    "first_frame_mask": first_frame_mask,
+                    "height": height,
+                    "width": width,
+                    "num_frames": num_frames,
+                    "expand_timesteps": True,
+                })
             else:
-                outputs.append({"image_embeds": None})
+                # Wan2.1-style I2V: use CLIP image encoder
+                if self.has_image_encoder and self.transformer is not None and self.transformer.config.image_dim is not None:
+                    image_embeds = self.encode_image(image, self.device)
+                    outputs.append({"image_embeds": image_embeds, "expand_timesteps": False})
+                else:
+                    outputs.append({"image_embeds": None, "expand_timesteps": False})
         return outputs
 
     @staticmethod

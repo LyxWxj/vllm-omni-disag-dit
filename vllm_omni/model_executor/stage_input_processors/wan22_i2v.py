@@ -40,9 +40,10 @@ def encode_to_denoise(
     """Merge text_encoder and image_encoder outputs into denoise inputs.
 
     source_outputs[0] = text_encoder output (prompt_embeds, negative_prompt_embeds, guidance)
-    source_outputs[1] = image_encoder output (image_embeds)
+    source_outputs[1] = image_encoder output (image_embeds or latent_condition)
 
     Both outputs are combined into a single OmniTokensPrompt for the denoise stage.
+    Supports both CLIP image encoder (Wan2.1-style) and VAE encoder (TI2V-5B style).
     """
     denoise_inputs: list[OmniTokensPrompt] = []
 
@@ -61,15 +62,29 @@ def encode_to_denoise(
 
     # Extract image encoder outputs
     image_mm = _read_mm(image_output, "encode_to_denoise_image", 1) if image_output else {}
-    image_embeds = image_mm.get("image_embeds")
+
+    # Check which mode is being used
+    expand_timesteps = image_mm.get("expand_timesteps", False)
 
     info: dict[str, Any] = {
         "prompt_embeds": prompt_embeds,
         "negative_prompt_embeds": negative_prompt_embeds,
-        "image_embeds": image_embeds,
         "guidance_low": guidance_low,
         "guidance_high": guidance_high,
+        "expand_timesteps": expand_timesteps,
     }
+
+    if expand_timesteps:
+        # TI2V-5B style: VAE encoder outputs
+        info["latent_condition"] = image_mm.get("latent_condition")
+        info["first_frame_mask"] = image_mm.get("first_frame_mask")
+        info["height"] = image_mm.get("height")
+        info["width"] = image_mm.get("width")
+        info["num_frames"] = image_mm.get("num_frames")
+    else:
+        # Wan2.1-style I2V: CLIP image encoder outputs
+        info["image_embeds"] = image_mm.get("image_embeds")
+
     denoise_inputs.append(
         OmniTokensPrompt(
             prompt_token_ids=[],
