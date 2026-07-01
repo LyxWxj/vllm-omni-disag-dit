@@ -1103,7 +1103,7 @@ class Wan22I2VPipeline(
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
 
-        if output_type == "latent":
+        if output_type == "latent" or self.vae is None:
             output = latents
         else:
             latents = latents.to(self.vae.dtype)
