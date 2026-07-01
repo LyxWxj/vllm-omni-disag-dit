@@ -90,10 +90,13 @@ def get_wan22_i2v_pre_process_func(
         for i, prompt in enumerate(request.prompts):
             # Skip image processing if additional_information already has
             # pre-computed data (e.g., denoise stage dummy run).
-            if isinstance(prompt, dict) and "additional_information" in prompt:
-                additional_info = prompt["additional_information"]
-                if "latent_condition" in additional_info or "prompt_embeds" in additional_info:
-                    return request
+            additional_info = None
+            if isinstance(prompt, dict):
+                additional_info = prompt.get("additional_information")
+            elif hasattr(prompt, "additional_information"):
+                additional_info = getattr(prompt, "additional_information", None)
+            if additional_info and ("latent_condition" in additional_info or "prompt_embeds" in additional_info):
+                return request
 
             multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
             raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
@@ -705,8 +708,12 @@ class Wan22I2VPipeline(
         # Extract pre-computed data from additional_information early
         # (disaggregated mode: denoise stage receives data from encode stages).
         additional_info = {}
-        if req.prompts and isinstance(req.prompts[0], dict):
-            additional_info = req.prompts[0].get("additional_information", {}) or {}
+        if req.prompts:
+            first_prompt = req.prompts[0]
+            if isinstance(first_prompt, dict):
+                additional_info = first_prompt.get("additional_information", {}) or {}
+            elif hasattr(first_prompt, "additional_information"):
+                additional_info = getattr(first_prompt, "additional_information", None) or {}
 
         if prompt_embeds is None and "prompt_embeds" in additional_info:
             prompt_embeds = additional_info["prompt_embeds"]
