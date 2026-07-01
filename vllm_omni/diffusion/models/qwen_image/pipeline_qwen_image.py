@@ -253,11 +253,20 @@ def apply_rotary_emb_qwen(
 
 
 class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
-    _dit_modules: ClassVar[list[str]] = ["transformer"]
-    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
-    _vae_modules: ClassVar[list[str]] = ["vae"]
-    _scheduler_modules: ClassVar[list[str]] = ["scheduler"]
-    _tokenizer_modules: ClassVar[list[str]] = ["tokenizer"]
+    # Fine-grained component registry: each key is a logical component,
+    # each value is the set of nn.Module attribute names it owns.
+    _component_registry: ClassVar[dict[str, set[str]]] = {
+        "text_encoder":  {"tokenizer", "text_encoder"},
+        "transformer":   {"transformer"},
+        "scheduler":     {"scheduler"},
+        "vae_decoder":   {"vae"},
+    }
+    # Default stage layout: maps stage names to component-group names.
+    _default_stage_layout: ClassVar[dict[str, list[str]]] = {
+        "encode":  ["text_encoder", "scheduler"],
+        "denoise": ["transformer", "scheduler"],
+        "decode":  ["vae_decoder"],
+    }
 
     supports_step_execution: ClassVar[bool] = True
     DEFAULT_VAE_SCALE_FACTOR: ClassVar[int] = 8
