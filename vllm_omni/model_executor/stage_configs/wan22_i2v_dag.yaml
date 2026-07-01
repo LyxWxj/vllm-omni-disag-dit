@@ -23,7 +23,7 @@ stage_args:
       devices: "0"
       max_batch_size: 1
     engine_args:
-      model_class_name: Wan22I2VPipeline
+      model_class_name: WanImageToVideoPipeline
       model_stage: encode_text
       enforce_eager: true
       trust_remote_code: true
@@ -44,7 +44,7 @@ stage_args:
       devices: "0"
       max_batch_size: 1
     engine_args:
-      model_class_name: Wan22I2VPipeline
+      model_class_name: WanImageToVideoPipeline
       model_stage: encode_image
       enforce_eager: true
       trust_remote_code: true
@@ -65,7 +65,7 @@ stage_args:
       num_replicas: 1
       max_batch_size: 1
     engine_args:
-      model_class_name: Wan22I2VPipeline
+      model_class_name: WanImageToVideoPipeline
       model_stage: denoise
       enforce_eager: false
       trust_remote_code: true
@@ -90,7 +90,7 @@ stage_args:
       devices: "0"
       max_batch_size: 1
     engine_args:
-      model_class_name: Wan22I2VPipeline
+      model_class_name: WanImageToVideoPipeline
       model_stage: decode
       enforce_eager: true
       trust_remote_code: true
