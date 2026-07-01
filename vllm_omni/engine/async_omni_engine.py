@@ -1252,6 +1252,7 @@ class AsyncOmniEngine:
                     clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
+                    input_sources=list(getattr(first_client, "engine_input_source", None) or []),
                 )
             )
             default_sampling_params_list.append(first_client.default_sampling_params)
