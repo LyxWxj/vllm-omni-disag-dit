@@ -746,7 +746,7 @@ class Wan22I2VPipeline(
                     [image_tensor, image_tensor.new_zeros(image_tensor.shape[0], image_tensor.shape[1], num_frames - 1, height, width)],
                     dim=2,
                 )
-                video_condition = video_condition.to(device=self.device, dtype=self.vae.dtype)
+                video_condition = video_condition.to(device=self.device, dtype=self.vae.encoder.dtype)
 
                 # Encode through VAE
                 latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
