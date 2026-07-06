@@ -809,6 +809,7 @@ class Wan22I2VPipeline(
 
             # Decode
             video = self.vae.decode(latents, return_dict=False)[0]
+            video = video.to(torch.float32)
 
             outputs.append({
                 "video": video,
