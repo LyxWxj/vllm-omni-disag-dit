@@ -268,7 +268,8 @@ class Wan22I2VPipeline(
         self.stage = getattr(od_config, "model_stage", None) or "diffusion"
 
         self.device = get_local_device()
-        dtype = getattr(od_config, "dtype", torch.bfloat16)
+        self.dtype = getattr(od_config, "dtype", torch.bfloat16)
+        dtype = self.dtype
 
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -1106,7 +1107,7 @@ class Wan22I2VPipeline(
         if output_type == "latent" or self.vae is None:
             output = latents
         else:
-            latents = latents.to(self.vae.dtype)
+            latents = latents.to(self.dtype)
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
                 .view(1, self.vae.config.z_dim, 1, 1, 1)
@@ -1293,7 +1294,7 @@ class Wan22I2VPipeline(
                 dim=2,
             )
 
-        video_condition = video_condition.to(device=device, dtype=self.vae.dtype)
+        video_condition = video_condition.to(device=device, dtype=self.dtype)
 
         # Encode through VAE
         latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
