@@ -1005,18 +1005,17 @@ class Wan22I2VPipeline(
         # In disaggregated mode, use pre-computed latent_condition and first_frame_mask
         # from encode_image stage if available.
         if latent_condition is not None and first_frame_mask is not None:
-            # Use pre-computed values from encode_image stage
-            num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-            latent_height = height // self.vae_scale_factor_spatial
-            latent_width = width // self.vae_scale_factor_spatial
+            # Use pre-computed values from encode_image stage.
+            # latent_condition and first_frame_mask already have the correct
+            # temporal dimension from VAE encoding — use it directly.
+            num_latent_frames = latent_condition.shape[2]
+            latent_height = latent_condition.shape[3]
+            latent_width = latent_condition.shape[4]
             shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
             latents = randn_tensor(shape, generator=generator, device=device, dtype=torch.float32)
-            # latent_condition from encode_image may have temporal dim > 1 (full video length),
-            # squeeze to temporal=1 before expanding to match latents shape
-            if latent_condition.dim() == 5 and latent_condition.shape[2] > 1:
-                latent_condition = latent_condition[:, :, :1, :, :]
-            condition = latent_condition.repeat(batch_size, 1, num_latent_frames, 1, 1)
-            first_frame_mask = first_frame_mask.repeat(batch_size, 1, num_latent_frames, 1, 1)
+            # Expand batch dimension if needed
+            condition = latent_condition.expand(batch_size, -1, -1, -1, -1).contiguous()
+            first_frame_mask = first_frame_mask.expand(batch_size, -1, -1, -1, -1).contiguous()
         else:
             from diffusers.video_processor import VideoProcessor
 
