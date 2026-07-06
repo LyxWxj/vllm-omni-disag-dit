@@ -359,22 +359,13 @@ class Wan22I2VPipeline(
             self.image_processor = None
             self.image_encoder = None
 
-        # VAE - load full VAE, then wrap if only encoder is needed
-        if "vae" in owned_components or "vae_encoder" in owned_components:
-            vae_full = DistributedAutoencoderKLWan.from_pretrained(
+        # VAE - load full VAE for any stage that needs it
+        if "vae" in owned_components:
+            self.vae = DistributedAutoencoderKLWan.from_pretrained(
                 model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
             ).to(self.device)
-            if self.stage == "encode_image":
-                # Only keep VAE encoder for image encoding stage
-                from vllm_omni.diffusion.distributed.autoencoders.vae_encoder_wrapper import VAEEncoderWrapper
-
-                self.vae = VAEEncoderWrapper(vae_full, device=self.device)
-                self.vae_encoder = self.vae  # Alias for clarity
-                self.vae_decoder = None
-            else:
-                self.vae = vae_full
-                self.vae_encoder = None
-                self.vae_decoder = None
+            self.vae_encoder = None
+            self.vae_decoder = None
         else:
             self.vae = None
             self.vae_encoder = None
