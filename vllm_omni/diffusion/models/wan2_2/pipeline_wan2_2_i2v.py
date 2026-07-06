@@ -166,7 +166,7 @@ class Wan22I2VPipeline(
     # text_encoder and image_encoder can run in parallel as separate stages.
     _component_registry: ClassVar[dict[str, set[str]]] = {
         "text_encoder":  {"tokenizer", "text_encoder"},
-        "image_encoder": {"image_processor", "image_encoder"},
+        "image_encoder": {"image_processor", "image_encoder", "vae"},
         "transformer":   {"transformer", "transformer_2"},
         "scheduler":     {"scheduler"},
         "vae_decoder":   {"vae"},
