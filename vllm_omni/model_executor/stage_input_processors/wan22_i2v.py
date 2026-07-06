@@ -14,6 +14,9 @@ logger = init_logger(__name__)
 
 
 def _read_mm(output: Any, stage_label: str, req_idx: int) -> dict[str, Any]:
+    # If output is already a dict (e.g. from a raw stage output), use it directly.
+    if isinstance(output, dict):
+        return output
     mm = getattr(output, "multimodal_output", None)
     if not mm or not isinstance(mm, dict):
         raise RuntimeError(

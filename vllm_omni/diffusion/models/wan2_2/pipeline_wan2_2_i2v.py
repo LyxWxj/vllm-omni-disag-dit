@@ -1133,8 +1133,22 @@ class Wan22I2VPipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
+        # For disaggregated denoise stage, pass latents in multimodal_output
+        # so the decode stage can receive them via denoise_to_decode processor.
+        mm_output: dict[str, Any] = {}
+        if self.stage == "denoise" and output_type == "latent":
+            mm_output = {
+                "latents": output,
+                "height": height,
+                "width": width,
+                "num_frames": frame_num,
+                "output_type": "np",
+            }
+
         return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            output=output if self.stage != "denoise" else None,
+            multimodal_output=mm_output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     def predict_noise(
