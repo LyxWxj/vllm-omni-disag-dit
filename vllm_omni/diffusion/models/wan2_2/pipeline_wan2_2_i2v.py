@@ -1135,8 +1135,9 @@ class Wan22I2VPipeline(
 
         # For disaggregated denoise stage, pass latents in multimodal_output
         # so the decode stage can receive them via denoise_to_decode processor.
+        # When vae is None (denoise stage), output is always latents.
         mm_output: dict[str, Any] = {}
-        if self.stage == "denoise" and output_type == "latent":
+        if self.stage == "denoise" or (self.vae is None and isinstance(output, torch.Tensor)):
             mm_output = {
                 "latents": output,
                 "height": height,
