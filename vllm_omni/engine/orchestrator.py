@@ -1058,7 +1058,10 @@ class Orchestrator:
                     len(companion_outputs),
                     expected,
                 )
-            diffusion_source_outputs = [output, *companion_outputs]
+            # For fan-in stages, source_outputs contains all predecessor outputs.
+            # For linear stages, source_outputs has only one element.
+            # companion_outputs are CFG duplicates, separate from fan-in.
+            diffusion_source_outputs = [*source_outputs, *companion_outputs]
             if next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
