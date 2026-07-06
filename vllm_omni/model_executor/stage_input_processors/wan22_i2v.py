@@ -21,22 +21,36 @@ def _read_mm(output: Any, stage_label: str, req_idx: int) -> dict[str, Any]:
     2. output is a dict with 'multimodal_output' key → extract it
     3. output is a plain dict (the payload itself) → use directly
     """
+    # Debug: log what we receive
+    _keys = list(output.keys()) if isinstance(output, dict) else (
+        list(vars(output).keys()) if hasattr(output, "__dict__") else None
+    )
+    logger.warning(
+        "[_read_mm] %s req#%d: type=%s, is_dict=%s, keys=%s",
+        stage_label, req_idx, type(output).__name__, isinstance(output, dict), _keys,
+    )
+
     if isinstance(output, dict):
         # Case 2: dict with multimodal_output key (serialized DiffusionOutput)
         if "multimodal_output" in output:
             mm = output["multimodal_output"]
             if mm and isinstance(mm, dict):
                 return mm
+            # multimodal_output exists but is empty/None — fall through to
+            # return the whole dict (Case 3)
         # Case 3: plain dict (the payload itself)
         return output
     # Case 1: object with attribute
     mm = getattr(output, "multimodal_output", None)
-    if not mm or not isinstance(mm, dict):
-        raise RuntimeError(
-            f"[wan22_i2v.{stage_label}] upstream req#{req_idx} is missing multimodal_output "
-            f"(got {type(mm).__name__})."
-        )
-    return mm
+    if isinstance(mm, dict):
+        return mm
+    # Fallback: if the object itself behaves like a dict, use it directly
+    if hasattr(output, "keys"):
+        return dict(output)
+    raise RuntimeError(
+        f"[wan22_i2v.{stage_label}] upstream req#{req_idx} is missing multimodal_output "
+        f"(got output type={type(output).__name__}, mm type={type(mm).__name__})."
+    )
 
 
 def _require(mm: dict[str, Any], key: str, stage_label: str, req_idx: int) -> Any:
