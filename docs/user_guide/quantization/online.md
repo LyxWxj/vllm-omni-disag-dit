@@ -34,8 +34,8 @@ MXFP4 are documented for the Ascend NPU path.
 
 | Method | Guide | Example models | Status |
 |--------|-------|----------------|--------|
-| FP8 W8A8 | [FP8](fp8.md) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
-| Int8 W8A8 | [Int8](int8.md) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
+| FP8 W8A8 |[FP8](Omni/vllm-omni-m/docs/user_guide/quantization/fp8.md)) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
+| Int8 W8A8 |[Int8](Omni/vllm-omni-m/docs/user_guide/quantization/int8.md)) | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
 | MXFP8 W8A8 | [MXFP8](mxfp8.md) | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B, Wan2.2-TI2V-5B | Validated on Ascend NPU and Intel XPU |
 | MXFP4 W4A4 | [MXFP4](mxfp4.md) | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B | Ascend NPU only; TI2V-5B is not supported |
 

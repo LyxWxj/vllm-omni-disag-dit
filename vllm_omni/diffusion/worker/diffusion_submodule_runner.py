@@ -111,14 +111,43 @@ class DiffusionSubmoduleRunner:
                 exc_info=True,
             )
 
+    # Stage → pipeline method mapping
+    _STAGE_HANDLERS: dict[str, str] = {
+        "encode": "execute_encode",
+        "encode_text": "execute_encode_text",
+        "encode_image": "execute_encode_image",
+        "decode": "execute_decode",
+    }
+
+    def _execute_stage(self, stage: str, req: OmniDiffusionRequest) -> list:
+        """Dispatch a request to the appropriate pipeline method by stage name.
+
+        Supported stages:
+          - encode:       generic encode (text + image combined)
+          - encode_text:  text encoder only
+          - encode_image: image/VAE encoder only
+          - decode:       VAE decode
+        """
+        handler_name = self._STAGE_HANDLERS.get(stage)
+        if handler_name is None:
+            raise ValueError(
+                f"DiffusionSubmoduleRunner got unknown model_stage {stage!r}. "
+                f"Valid stages: {list(self._STAGE_HANDLERS)}"
+            )
+        handler = getattr(self.pipeline, handler_name, None)
+        if handler is None:
+            raise AttributeError(
+                f"Pipeline {type(self.pipeline).__name__} does not implement {handler_name!r} "
+                f"(required by model_stage={stage!r})."
+            )
+        return handler([req])
+
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not req.prompts:
             raise ValueError("Cannot execute diffusion submodule runner on an empty request.")
 
         stage = getattr(self.od_config, "model_stage", None)
-        if stage not in ("encode", "decode"):
-            raise ValueError(f"DiffusionSubmoduleRunner requires model_stage encode/decode, got {stage!r}.")
 
         sampling = req.sampling_params
         if sampling.generator is None and sampling.seed is not None:
@@ -135,10 +164,7 @@ class DiffusionSubmoduleRunner:
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
             ):
-                if stage == "encode":
-                    results = self.pipeline.execute_encode([req])
-                else:
-                    results = self.pipeline.execute_decode([req])
+                results = self._execute_stage(stage, req)
 
         if not results:
             return DiffusionOutput(error=f"{stage} stage returned no outputs")
@@ -150,4 +176,5 @@ class DiffusionSubmoduleRunner:
         if stage == "decode":
             return DiffusionOutput(output=payload.get("image"), multimodal_output=payload)
 
+        # encode, encode_text, encode_image all return multimodal_output
         return DiffusionOutput(output=None, multimodal_output=payload)

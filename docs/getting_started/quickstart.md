@@ -29,7 +29,7 @@ cd vllm-omni
 uv pip install -e .
 ```
 
-For additional installation methods — please see the [installation guide](installation/README.md).
+For additional installation methods — please see the [installation guide](Omni/vllm-omni-m/docs/getting_started/installation/README.md).
 
 
 !!! note

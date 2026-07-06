@@ -87,9 +87,9 @@ Execution modes control how the diffusion pipeline processes denoise steps.
 
 | Method | Configuration | Description | Best For |
 |--------|--------------|-------------|----------|
-| **[FP8](quantization/fp8.md)** | `quantization="fp8"` | FP8 W8A8 on validated transformer stages | Memory reduction, inference speedup |
-| **[INT8](quantization/int8.md)** | `quantization="int8"` | INT8 W8A8 on validated transformer stages | Memory reduction, broad GPU compatibility |
-| **[GGUF](quantization/gguf.md)** | `quantization="gguf"` | Native GGUF transformer-only weights (Q4, Q8, etc.) | Memory reduction on consumer GPUs |
+| **[FP8](Omni/vllm-omni-m/docs/user_guide/quantization/fp8.md)** | `quantization="fp8"` | FP8 W8A8 on validated transformer stages | Memory reduction, inference speedup |
+| **[INT8](Omni/vllm-omni-m/docs/user_guide/quantization/int8.md)** | `quantization="int8"` | INT8 W8A8 on validated transformer stages | Memory reduction, broad GPU compatibility |
+| **[GGUF](Omni/vllm-omni-m/docs/user_guide/quantization/gguf.md)** | `quantization="gguf"` | Native GGUF transformer-only weights (Q4, Q8, etc.) | Memory reduction on consumer GPUs |
 
 ## Supported Models
 

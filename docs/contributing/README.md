@@ -23,7 +23,7 @@ vLLM-Omni is quickly evolving, please see the [installation guide](../getting_st
 
 ### Adding a new model to vLLM-Omni
 
-Please check [model implementation](model/README.md) for how to add diffusion and omni-modality models to vLLM-Omni.
+Please check [model implementation](Omni/vllm-omni-m/docs/contributing/model/README.md) for how to add diffusion and omni-modality models to vLLM-Omni.
 
 ### Linting
 

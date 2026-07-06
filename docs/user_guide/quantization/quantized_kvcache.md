@@ -17,7 +17,7 @@ that default.
 
 In vLLM-Omni diffusion pipelines, this is a runtime FA path: Q/K/V tensors are
 dynamically quantized before the attention operator. It does not quantize model
-weights and is separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or
+weights and is separate from [FP8 W8A8](Omni/vllm-omni-m/docs/user_guide/quantization/fp8.md), [Int8 W8A8](Omni/vllm-omni-m/docs/user_guide/quantization/int8.md), or
 pre-quantized checkpoint formats.
 
 If `diffusion_kv_cache_dtype` is not set, behavior is unchanged and attention
