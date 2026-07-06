@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections.abc import Iterable
 from typing import Any, ClassVar, cast
 
@@ -47,7 +46,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, O
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
-DEBUG_PERF = False
 
 
 def get_wan22_i2v_post_process_func(
@@ -177,85 +175,6 @@ class Wan22I2VPipeline(
         "denoise":      ["transformer", "scheduler"],
         "decode":       ["vae_decoder"],
     }
-
-    @classmethod
-    def build_dummy_run_request(
-        cls,
-        od_config: OmniDiffusionConfig,
-        *,
-        height: int,
-        width: int,
-        num_inference_steps: int,
-    ) -> OmniDiffusionRequest | None:
-        """Build a stage-aware warmup request.
-
-        For denoise stage, creates a request with pre-computed tensors in
-        ``additional_information`` so the warmup doesn't need to call
-        tokenizer/text_encoder/VAE.
-        """
-        stage = getattr(od_config, "model_stage", None) or "diffusion"
-        if stage == "diffusion":
-            return OmniDiffusionRequest(
-                prompts=[{"prompt": "dummy run"}],
-                request_id=DUMMY_DIFFUSION_REQUEST_ID,
-                sampling_params=OmniDiffusionSamplingParams(
-                    height=height,
-                    width=width,
-                    num_inference_steps=max(2, num_inference_steps),
-                    guidance_scale=0.0,
-                    num_outputs_per_prompt=1,
-                ),
-            )
-        if stage != "denoise":
-            return None
-
-        dtype = getattr(od_config, "dtype", torch.bfloat16)
-        if not isinstance(dtype, torch.dtype):
-            dtype = torch.bfloat16
-
-        # Build dummy tensors matching the denoise stage's expected inputs.
-        tf_config = getattr(od_config, "tf_model_config", {})
-        get_tf = getattr(tf_config, "get", None)
-        out_channels = int(get_tf("out_channels", 16) if callable(get_tf) else 16)
-        hidden_dim = int(get_tf("hidden_size", 4096) if callable(get_tf) else 4096)
-
-        vae_scale_factor_spatial = 8
-        vae_scale_factor_temporal = 4
-        num_latent_frames = max(1, (num_inference_steps - 1) // vae_scale_factor_temporal + 1)
-        latent_height = height // vae_scale_factor_spatial
-        latent_width = width // vae_scale_factor_spatial
-
-        info: dict[str, Any] = {
-            "prompt_embeds": torch.zeros((1, 1, hidden_dim), dtype=dtype),
-            "negative_prompt_embeds": None,
-            "latent_condition": torch.zeros(
-                (1, out_channels, num_latent_frames, latent_height, latent_width), dtype=dtype
-            ),
-            "first_frame_mask": torch.zeros(
-                (1, 1, num_latent_frames, latent_height, latent_width), dtype=dtype
-            ),
-            "guidance_low": 5.0,
-            "guidance_high": 5.0,
-        }
-        return OmniDiffusionRequest(
-            prompts=[
-                OmniTokensPrompt(
-                    prompt_token_ids=[],
-                    additional_information=info,
-                    multi_modal_data=None,
-                    mm_processor_kwargs=None,
-                )
-            ],
-            request_id=DUMMY_DIFFUSION_REQUEST_ID,
-            sampling_params=OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=0.0,
-                num_outputs_per_prompt=1,
-                num_frames=num_latent_frames * vae_scale_factor_temporal + 1,
-            ),
-        )
 
     def __init__(
         self,
@@ -418,7 +337,6 @@ class Wan22I2VPipeline(
         # MoE boundary ratio for two-stage denoising
         self.boundary_ratio = od_config.boundary_ratio
 
-        # expand_timesteps is already set from model_index.json above
 
         self._guidance_scale = None
         self._guidance_scale_2 = None
@@ -982,11 +900,6 @@ class Wan22I2VPipeline(
         if first_frame_mask is not None:
             first_frame_mask = first_frame_mask.to(device=device, dtype=dtype)
 
-        if DEBUG_PERF:
-            current_omni_platform.synchronize()
-            _t_pipeline_start = time.perf_counter()
-            _t_text_enc_start = _t_pipeline_start
-
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -1002,14 +915,8 @@ class Wan22I2VPipeline(
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
 
-        if DEBUG_PERF:
-            current_omni_platform.synchronize()
-            _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
-
         batch_size = prompt_embeds.shape[0]
 
-        if DEBUG_PERF:
-            _t_img_enc_start = time.perf_counter()
         # Skip image encoding if we have pre-computed latent_condition
         if latent_condition is not None:
             image_embeds = None  # Not needed when using latent_condition
@@ -1027,10 +934,6 @@ class Wan22I2VPipeline(
                 image_embeds = image_embeds.to(dtype)
             else:
                 image_embeds = None
-
-        if DEBUG_PERF:
-            current_omni_platform.synchronize()
-            _t_img_enc_ms = (time.perf_counter() - _t_img_enc_start) * 1000
 
         sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
         flow_shift = resolve_wan_flow_shift(req, self.od_config)
@@ -1050,9 +953,6 @@ class Wan22I2VPipeline(
 
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
         num_channels_latents = self.transformer.config.out_channels
-
-        if DEBUG_PERF:
-            _t_latent_prep_start = time.perf_counter()
 
         # In disaggregated mode, use pre-computed latent_condition and first_frame_mask
         # from encode_image stage if available.
@@ -1105,15 +1005,9 @@ class Wan22I2VPipeline(
                 last_image=last_image_tensor,
             )
 
-        if DEBUG_PERF:
-            current_omni_platform.synchronize()
-            _t_latent_prep_ms = (time.perf_counter() - _t_latent_prep_start) * 1000
-
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        if DEBUG_PERF:
-            _t_denoise_start = time.perf_counter()
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -1135,16 +1029,9 @@ class Wan22I2VPipeline(
             current_omni_platform.empty_cache()
         self._current_timestep = None
 
-        if DEBUG_PERF:
-            current_omni_platform.synchronize()
-            _t_denoise_ms = (time.perf_counter() - _t_denoise_start) * 1000
-
         # For expand_timesteps mode, blend final latents with condition
         if self.expand_timesteps:
             latents = (1 - first_frame_mask) * condition + first_frame_mask * latents
-
-        if DEBUG_PERF:
-            _t_decode_start = time.perf_counter()
 
         if output_type == "latent" or self.vae is None:
             output = latents
@@ -1160,30 +1047,6 @@ class Wan22I2VPipeline(
             )
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
-
-        if DEBUG_PERF:
-            current_omni_platform.synchronize()
-            _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
-            _t_pipeline_wall_ms = (time.perf_counter() - _t_pipeline_start) * 1000
-            _t_stages_sum = _t_text_enc_ms + _t_img_enc_ms + _t_latent_prep_ms + _t_denoise_ms + _t_decode_ms
-
-            if _is_rank_zero():
-                logger.info(
-                    "Pipeline stage timing summary: "
-                    "TextEncoding=%.2f ms, ImageEncoding=%.2f ms, "
-                    "LatentPreparation=%.2f ms, Denoising=%.2f ms (%d steps), "
-                    "Decoding=%.2f ms, StagesSum=%.2f ms, PipelineWall=%.2f ms, "
-                    "Unaccounted=%.2f ms",
-                    _t_text_enc_ms,
-                    _t_img_enc_ms,
-                    _t_latent_prep_ms,
-                    _t_denoise_ms,
-                    len(timesteps),
-                    _t_decode_ms,
-                    _t_stages_sum,
-                    _t_pipeline_wall_ms,
-                    _t_pipeline_wall_ms - _t_stages_sum,
-                )
 
         # For disaggregated denoise stage, pass latents in multimodal_output
         # so the decode stage can receive them via denoise_to_decode processor.
