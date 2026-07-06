@@ -175,7 +175,9 @@ class DiffusionSubmoduleRunner:
 
         if stage == "decode":
             # Video pipelines use "video" key; image pipelines use "image" key.
-            decoded = payload.get("video") or payload.get("image")
+            decoded = payload.get("video")
+            if decoded is None:
+                decoded = payload.get("image")
             return DiffusionOutput(output=decoded, multimodal_output=payload)
 
         # encode, encode_text, encode_image all return multimodal_output
