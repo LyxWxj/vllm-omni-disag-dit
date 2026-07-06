@@ -14,9 +14,22 @@ logger = init_logger(__name__)
 
 
 def _read_mm(output: Any, stage_label: str, req_idx: int) -> dict[str, Any]:
-    # If output is already a dict (e.g. from a raw stage output), use it directly.
+    """Extract multimodal_output from a stage output.
+
+    Handles three cases:
+    1. output is a DiffusionOutput object → access .multimodal_output
+    2. output is a dict with 'multimodal_output' key → extract it
+    3. output is a plain dict (the payload itself) → use directly
+    """
     if isinstance(output, dict):
+        # Case 2: dict with multimodal_output key (serialized DiffusionOutput)
+        if "multimodal_output" in output:
+            mm = output["multimodal_output"]
+            if mm and isinstance(mm, dict):
+                return mm
+        # Case 3: plain dict (the payload itself)
         return output
+    # Case 1: object with attribute
     mm = getattr(output, "multimodal_output", None)
     if not mm or not isinstance(mm, dict):
         raise RuntimeError(
