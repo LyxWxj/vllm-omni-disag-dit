@@ -767,6 +767,57 @@ class Wan22I2VPipeline(
                     outputs.append({"image_embeds": None, "expand_timesteps": False})
         return outputs
 
+    def execute_decode(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
+        """Run VAE decode for the decode submodule stage.
+
+        Called by :class:`DiffusionSubmoduleRunner` when ``model_stage == "decode"``.
+        Receives latents from the denoise stage and decodes them to video frames.
+        """
+        if self.vae is None:
+            raise ValueError("VAE not available for decoding.")
+
+        outputs: list[dict[str, Any]] = []
+        for req in requests:
+            # Extract latents and metadata from additional_information
+            additional_info = {}
+            if req.prompts:
+                first_prompt = req.prompts[0]
+                if isinstance(first_prompt, dict):
+                    additional_info = first_prompt.get("additional_information", {}) or {}
+                elif hasattr(first_prompt, "additional_information"):
+                    additional_info = getattr(first_prompt, "additional_information", None) or {}
+
+            latents = additional_info.get("latents")
+            if latents is None:
+                raise ValueError("Latents are required for decode stage.")
+
+            height = additional_info.get("height", 480)
+            width = additional_info.get("width", 832)
+            num_frames = additional_info.get("num_frames", 81)
+
+            # Denormalize latents
+            latents = latents.to(device=self.device, dtype=self.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+
+            # Decode
+            video = self.vae.decode(latents, return_dict=False)[0]
+
+            outputs.append({
+                "video": video,
+                "height": height,
+                "width": width,
+                "num_frames": num_frames,
+            })
+        return outputs
+
     @staticmethod
     def _stage_payload_from_prompts(prompts: list[Any] | None) -> dict[str, Any]:
         """Extract ``additional_information`` from the first prompt dict."""

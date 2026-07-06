@@ -174,7 +174,9 @@ class DiffusionSubmoduleRunner:
         payload = {k: v for k, v in stage_items if k != "req_id" and v is not None and not (k == "metadata" and not v)}
 
         if stage == "decode":
-            return DiffusionOutput(output=payload.get("image"), multimodal_output=payload)
+            # Video pipelines use "video" key; image pipelines use "image" key.
+            decoded = payload.get("video") or payload.get("image")
+            return DiffusionOutput(output=decoded, multimodal_output=payload)
 
         # encode, encode_text, encode_image all return multimodal_output
         return DiffusionOutput(output=None, multimodal_output=payload)
