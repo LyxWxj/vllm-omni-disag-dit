@@ -190,9 +190,14 @@ class Orchestrator:
         for pool in stage_pools:
             for src in pool.input_sources:
                 self._successors.setdefault(src, []).append(pool.stage_id)
+        # Root stages: stages with no input_sources (receive the initial request).
+        self._root_stages: list[int] = [
+            pool.stage_id for pool in stage_pools if not pool.input_sources
+        ]
         logger.info(
-            "[Orchestrator] DAG topology: %s",
+            "[Orchestrator] DAG topology: %s, root stages: %s",
             {k: v for k, v in self._successors.items() if v} or "(linear chain)",
+            self._root_stages,
         )
 
         # PD disaggregation state
@@ -382,21 +387,24 @@ class Orchestrator:
                 logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
-        """Handle an add_request message from the main thread."""
-        stage_id = 0
+        """Handle an add_request message from the main thread.
+
+        For DAG pipelines the initial request is submitted to all root stages
+        (stages with no input_sources) so they can run in parallel.
+        """
         request_id = msg.request_id
         prompt = msg.prompt
         original_prompt = msg.original_prompt
         sampling_params_list = msg.sampling_params_list
         if not sampling_params_list:
-            raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
+            raise ValueError(f"Missing sampling params. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg.final_stage_id
 
         logger.debug(
-            "[Orchestrator] _handle_add_request: stage=%s req=%s "
+            "[Orchestrator] _handle_add_request: root_stages=%s req=%s "
             "prompt_type=%s original_prompt_type=%s final_stage=%s "
             "num_sampling_params=%d",
-            stage_id,
+            self._root_stages,
             request_id,
             type(prompt).__name__,
             type(original_prompt).__name__,
@@ -413,21 +421,25 @@ class Orchestrator:
         )
         self.request_states[request_id] = req_state
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
+
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        await self.stage_pools[stage_id].submit_initial(
-            request_id,
-            req_state,
-            prompt,
-            prompt_text=msg.output_prompt_text,
-        )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        # Submit to all root stages (DAG fan-out from the entry point).
+        for root_stage_id in self._root_stages:
+            req_state.stage_submit_ts[root_stage_id] = _time.time()
+            await self.stage_pools[root_stage_id].submit_initial(
+                request_id,
+                req_state,
+                prompt,
+                prompt_text=msg.output_prompt_text,
+            )
+
+        if self.async_chunk and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
