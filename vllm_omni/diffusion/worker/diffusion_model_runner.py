@@ -659,6 +659,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         for state in states:
             if interrupted or state.request_denoise_completed:
+                # Clean up cache state (e.g., TeaCache) before removing from state_cache
+                self._cleanup_cache_state(state)
                 self.state_cache.pop(state.request_id, None)
 
     def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
@@ -670,16 +672,33 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return {}
         return prepare_attn(input_batch)
 
+    def _inject_cache_state(self, state: DiffusionRequestState) -> None:
+        """Inject per-request cache state into the backend."""
+        if self.cache_backend is None or self.pipeline is None:
+            return
+        if state.cache_state is not None:
+            self.cache_backend.load_step_state(self.pipeline, state.cache_state)
+
+    def _save_cache_state(self, state: DiffusionRequestState) -> None:
+        """Save cache state from the backend to the request."""
+        if self.cache_backend is None or self.pipeline is None:
+            return
+        saved = self.cache_backend.save_step_state(self.pipeline)
+        if saved is not None:
+            state.cache_state = saved
+
+    def _cleanup_cache_state(self, state: DiffusionRequestState) -> None:
+        """Clean up cache state when request is completed."""
+        if self.cache_backend is None or self.pipeline is None:
+            return
+        self.cache_backend.reset_step_state(self.pipeline)
+        state.cache_state = None
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not self.supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, editing inputs, and
-        # similar features are not supported here yet.
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Step mode does not support cache_backend yet.")
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
@@ -692,6 +711,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = self._prepare_attn_metadata(input_batch)
 
+            # Inject per-request cache state before denoise step
+            has_cache = self.cache_backend is not None and self.cache_backend.is_enabled()
+            if has_cache:
+                for state in states:
+                    self._inject_cache_state(state)
+
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
@@ -700,6 +725,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 clear_pipeline_stage_durations(self.pipeline)
                 noise_pred = self.pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
+
+                # Save cache state back to requests after denoise step
+                if has_cache:
+                    for state in states:
+                        self._save_cache_state(state)
                 for state in states:
                     merge_stage_durations(
                         state,

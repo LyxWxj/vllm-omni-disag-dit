@@ -100,6 +100,47 @@ class CacheBackend(ABC):
         """
         return self.enabled
 
+    # ── Step-wise state management (optional, for step-wise execution) ──
+
+    def save_step_state(self, pipeline: Any) -> Any:
+        """Extract and return current cache state from the pipeline.
+
+        Called after each denoise step in step-wise mode to persist
+        per-request cache state. Override in subclasses that need
+        cross-step state persistence (e.g., TeaCache).
+
+        Args:
+            pipeline: Diffusion pipeline instance.
+
+        Returns:
+            Serializable state object, or None if not supported.
+        """
+        return None
+
+    def load_step_state(self, pipeline: Any, state: Any) -> None:
+        """Inject previously saved cache state back into the pipeline.
+
+        Called before each denoise step in step-wise mode to restore
+        per-request cache state. Override in subclasses that need
+        cross-step state persistence (e.g., TeaCache).
+
+        Args:
+            pipeline: Diffusion pipeline instance.
+            state: Previously saved state from save_step_state().
+        """
+        pass
+
+    def reset_step_state(self, pipeline: Any) -> None:
+        """Clean up cache state when a request completes.
+
+        Called when a request finishes in step-wise mode.
+        Override in subclasses that need cleanup (e.g., TeaCache).
+
+        Args:
+            pipeline: Diffusion pipeline instance.
+        """
+        pass
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(config={self.config})"
 

@@ -114,6 +114,11 @@ class DiffusionRequestState:
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
 
+    # ── Cache state for step-wise mode (e.g., TeaCache) ──
+    # Stores per-request cache state across denoise steps.
+    # Format: {"positive": TeaCacheState, "negative": TeaCacheState} or None
+    cache_state: dict[str, Any] | None = None
+
     # ── Runner-owned profiling metadata ──
     stage_durations: dict[str, float] = field(default_factory=dict)
 

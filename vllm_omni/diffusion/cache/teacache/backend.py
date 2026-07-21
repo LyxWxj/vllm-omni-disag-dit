@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache_hook
+from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
@@ -212,3 +213,49 @@ class TeaCacheBackend(CacheBackend):
         else:
             if verbose:
                 logger.warning("Transformer has no hook registry, TeaCache may not be applied")
+
+    def _get_hook(self, pipeline: Any) -> TeaCacheHook | None:
+        """Get the TeaCacheHook from the pipeline's transformer."""
+        transformer = pipeline.transformer
+        if not hasattr(transformer, "_hook_registry"):
+            return None
+        hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)
+        return hook if isinstance(hook, TeaCacheHook) else None
+
+    def save_step_state(self, pipeline: Any) -> dict[str, TeaCacheState] | None:
+        """Extract TeaCache state from the hook's StateManager.
+
+        Returns a dict mapping context names to TeaCacheState instances.
+        """
+        hook = self._get_hook(pipeline)
+        if hook is None:
+            return None
+
+        state = {}
+        for key, val in hook.state_manager._states.items():
+            if isinstance(val, TeaCacheState):
+                state[key] = val
+        return state if state else None
+
+    def load_step_state(self, pipeline: Any, state: dict[str, TeaCacheState] | None) -> None:
+        """Inject saved TeaCache state back into the hook's StateManager."""
+        if state is None:
+            return
+
+        hook = self._get_hook(pipeline)
+        if hook is None:
+            return
+
+        for key, val in state.items():
+            hook.state_manager._states[key] = val
+
+    def reset_step_state(self, pipeline: Any) -> None:
+        """Clean up TeaCache state from the hook's StateManager."""
+        hook = self._get_hook(pipeline)
+        if hook is None:
+            return
+
+        # Remove all teacache-prefixed states
+        keys_to_remove = [k for k in hook.state_manager._states if k.startswith("teacache_")]
+        for key in keys_to_remove:
+            del hook.state_manager._states[key]
