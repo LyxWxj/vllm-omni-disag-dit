@@ -229,25 +229,30 @@ class TeaCacheBackend(CacheBackend):
         """
         hook = self._get_hook(pipeline)
         if hook is None:
+            logger.debug("[TeaCache] save_step_state: hook not found")
             return None
 
         state = {}
         for key, val in hook.state_manager._states.items():
             if isinstance(val, TeaCacheState):
                 state[key] = val
+        logger.debug("[TeaCache] save_step_state: saved %d states, keys=%s", len(state), list(state.keys()))
         return state if state else None
 
     def load_step_state(self, pipeline: Any, state: dict[str, TeaCacheState] | None) -> None:
         """Inject saved TeaCache state back into the hook's StateManager."""
         if state is None:
+            logger.debug("[TeaCache] load_step_state: state is None, skipping")
             return
 
         hook = self._get_hook(pipeline)
         if hook is None:
+            logger.debug("[TeaCache] load_step_state: hook not found")
             return
 
         for key, val in state.items():
             hook.state_manager._states[key] = val
+        logger.debug("[TeaCache] load_step_state: loaded %d states, keys=%s", len(state), list(state.keys()))
 
     def reset_step_state(self, pipeline: Any) -> None:
         """Clean up TeaCache state from the hook's StateManager."""
@@ -259,3 +264,4 @@ class TeaCacheBackend(CacheBackend):
         keys_to_remove = [k for k in hook.state_manager._states if k.startswith("teacache_")]
         for key in keys_to_remove:
             del hook.state_manager._states[key]
+        logger.debug("[TeaCache] reset_step_state: removed %d states", len(keys_to_remove))

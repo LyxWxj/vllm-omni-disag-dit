@@ -715,6 +715,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             has_cache = self.cache_backend is not None and self.cache_backend.is_enabled()
             if has_cache:
                 for state in states:
+                    logger.debug(
+                        "[StepCache] Injecting cache state for req=%s step=%d has_state=%s",
+                        state.request_id, state.step_index, state.cache_state is not None
+                    )
                     self._inject_cache_state(state)
 
             with set_forward_context(
@@ -730,6 +734,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 if has_cache:
                     for state in states:
                         self._save_cache_state(state)
+                        logger.debug(
+                            "[StepCache] Saved cache state for req=%s step=%d state_keys=%s",
+                            state.request_id, state.step_index,
+                            list(state.cache_state.keys()) if state.cache_state else None
+                        )
                 for state in states:
                     merge_stage_durations(
                         state,

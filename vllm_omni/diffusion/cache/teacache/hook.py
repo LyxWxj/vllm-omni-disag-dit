@@ -144,6 +144,10 @@ class TeaCacheHook(ModelHook):
             # ============================================================================
             # FAST PATH: Reuse cached residuals
             # ============================================================================
+            logger.debug(
+                "[TeaCache] FAST PATH: Reusing cached residual (cnt=%d, branch=%s, accumulated_dist=%.4f)",
+                state.cnt, cache_branch, state.accumulated_rel_l1_distance
+            )
             ctx.hidden_states = ctx.hidden_states + state.previous_residual
             if state.previous_residual_encoder is not None and ctx.encoder_hidden_states is not None:
                 ctx.encoder_hidden_states = ctx.encoder_hidden_states + state.previous_residual_encoder
@@ -152,6 +156,10 @@ class TeaCacheHook(ModelHook):
             # ============================================================================
             # SLOW PATH: Full transformer computation
             # ============================================================================
+            logger.debug(
+                "[TeaCache] SLOW PATH: Full computation (cnt=%d, branch=%s, accumulated_dist=%.4f)",
+                state.cnt, cache_branch, state.accumulated_rel_l1_distance
+            )
             ori_hidden_states = ctx.hidden_states.clone()
             ori_encoder_hidden_states = (
                 ctx.encoder_hidden_states.clone() if ctx.encoder_hidden_states is not None else None
