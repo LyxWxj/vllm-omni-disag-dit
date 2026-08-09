@@ -18,6 +18,18 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
     resolve_prompt_embed_cache_config,
     uninstall_prompt_embed_cache,
 )
+from vllm_omni.diffusion.cache.request_scope import (
+    CacheCapabilities,
+    CacheCloseReason,
+    CacheDecisionScope,
+    CacheHandle,
+    CacheRequestMetadata,
+    CacheStateScope,
+    CacheTransaction,
+    ExclusiveCacheAdapter,
+    RequestCacheAdapter,
+    RequestScopedCacheRuntime,
+)
 from vllm_omni.diffusion.cache.teacache import (
     CacheContext,
     TeaCacheConfig,
@@ -27,11 +39,21 @@ from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
 
 __all__ = [
     "CacheBackend",
+    "CacheCapabilities",
+    "CacheCloseReason",
     "CacheContext",
+    "CacheDecisionScope",
+    "CacheHandle",
+    "CacheRequestMetadata",
+    "CacheStateScope",
+    "CacheTransaction",
+    "ExclusiveCacheAdapter",
     "TeaCacheBackend",
     "TeaCacheConfig",
     "apply_teacache_hook",
     "PromptEmbedCache",
+    "RequestCacheAdapter",
+    "RequestScopedCacheRuntime",
     "install_prompt_embed_cache",
     "resolve_prompt_embed_cache_config",
     "uninstall_prompt_embed_cache",
