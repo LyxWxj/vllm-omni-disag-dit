@@ -12,6 +12,7 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.sched.step_cost import StepCostObservation
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -184,6 +185,7 @@ class RunnerOutput(BaseRunnerOutput):
     finished: bool = False
     result: DiffusionOutput | None = None
     async_output_id: str | None = None
+    step_cost_observation: StepCostObservation | None = None
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None

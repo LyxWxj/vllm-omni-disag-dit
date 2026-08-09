@@ -12,6 +12,12 @@ from vllm_omni.diffusion.sched.interface import (
     StepBatchSamplingParamsKey,
 )
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
+from vllm_omni.diffusion.sched.step_cost import (
+    RequestStepCost,
+    StepCostCandidate,
+    StepCostObservation,
+    order_step_cost_candidates,
+)
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 
 Scheduler = RequestScheduler
@@ -27,6 +33,10 @@ __all__ = [
     "SchedulerInterface",
     "StepBatchSamplingParamsKey",
     "RequestScheduler",
+    "RequestStepCost",
+    "StepCostCandidate",
+    "StepCostObservation",
+    "order_step_cost_candidates",
     "StepScheduler",
     "Scheduler",
 ]

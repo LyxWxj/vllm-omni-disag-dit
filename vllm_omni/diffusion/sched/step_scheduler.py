@@ -14,6 +14,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
 )
+from vllm_omni.diffusion.sched.step_cost import RequestStepCost
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -25,6 +26,7 @@ logger = init_logger(__name__)
 class _StepProgress:
     current_step: int
     total_steps: int
+    cost: RequestStepCost
 
 
 class StepScheduler(BaseScheduler):
@@ -52,7 +54,11 @@ class StepScheduler(BaseScheduler):
 
         request.sampling_params.step_index = current_step
         request_id = self._add_request_with_request_id(request_id, request)
-        self._request_progress[request_id] = _StepProgress(current_step=current_step, total_steps=total_steps)
+        self._request_progress[request_id] = _StepProgress(
+            current_step=current_step,
+            total_steps=total_steps,
+            cost=RequestStepCost(),
+        )
         logger.debug(
             "StepScheduler add_request: %s (step=%d/%d, waiting=%d)",
             request_id,
@@ -107,6 +113,8 @@ class StepScheduler(BaseScheduler):
             # We assume that the decoding stage is executed immediately after the denoising stage completes.
             progress.current_step = req_output.step_index
             state.req.sampling_params.step_index = req_output.step_index
+            if req_output.step_cost_observation is not None:
+                progress.cost.observe(req_output.step_cost_observation)
             if req_output.finished:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[request_id] = None
@@ -117,6 +125,10 @@ class StepScheduler(BaseScheduler):
 
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
+
+    def get_step_cost(self, request_id: str) -> RequestStepCost | None:
+        progress = self._request_progress.get(request_id)
+        return progress.cost if progress is not None else None
 
     def _get_total_steps(self, request: OmniDiffusionRequest) -> int:
         sampling = request.sampling_params
