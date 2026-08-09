@@ -15,7 +15,7 @@ from vllm_omni.diffusion.sched import (
     StepScheduler,
     order_step_cost_candidates,
 )
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -134,6 +134,31 @@ class TestStepSchedulerCostCommit:
         assert cost is not None
         assert cost.observed_steps == 1
         assert cost.mean_service_time_ms == 8.0
+
+    def test_commits_multiple_deferred_observations_for_an_active_request(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2, cache_backend="tea_cache"))
+        request_a = scheduler.add_request(_request("a"))
+        request_b = scheduler.add_request(_request("b"))
+        first = scheduler.schedule()
+        scheduler.update_from_output(first, RunnerOutput(request_id=request_a, step_index=1))
+        second = scheduler.schedule()
+
+        scheduler.update_from_output(
+            second,
+            BatchRunnerOutput.from_list(
+                [RunnerOutput(request_id=request_b, step_index=1)],
+                step_cost_observations=[
+                    (request_a, StepCostObservation(10.0, "signature")),
+                    (request_a, StepCostObservation(20.0, "signature")),
+                ],
+            ),
+        )
+
+        cost = scheduler.get_step_cost(request_a)
+        assert cost is not None
+        assert cost.observed_steps == 2
+        assert cost.mean_service_time_ms == 15.0
 
     @pytest.mark.parametrize(
         "output",

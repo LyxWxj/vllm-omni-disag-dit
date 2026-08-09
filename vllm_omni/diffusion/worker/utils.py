@@ -194,6 +194,7 @@ class RunnerOutput(BaseRunnerOutput):
 @dataclass
 class BatchRunnerOutput(BaseRunnerOutput):
     runner_outputs: list[RunnerOutput]
+    step_cost_observations: list[tuple[str, StepCostObservation]] = field(default_factory=list)
     _id_to_idx: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -215,5 +216,13 @@ class BatchRunnerOutput(BaseRunnerOutput):
         return len(self.runner_outputs)
 
     @classmethod
-    def from_list(cls, runner_output_list: list[RunnerOutput]) -> BatchRunnerOutput:
-        return cls(runner_outputs=runner_output_list)
+    def from_list(
+        cls,
+        runner_output_list: list[RunnerOutput],
+        *,
+        step_cost_observations: list[tuple[str, StepCostObservation]] | None = None,
+    ) -> BatchRunnerOutput:
+        return cls(
+            runner_outputs=runner_output_list,
+            step_cost_observations=step_cost_observations or [],
+        )

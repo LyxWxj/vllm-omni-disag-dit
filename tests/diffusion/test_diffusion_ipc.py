@@ -23,6 +23,7 @@ from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
+from vllm_omni.diffusion.sched.step_cost import StepCostObservation
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -289,7 +290,10 @@ def test_batch_runner_output_round_trips_nested_results_through_shm() -> None:
             RunnerOutput(request_id="req-0", finished=True, result=DiffusionOutput(output=first)),
             RunnerOutput(request_id="req-1", finished=True, result=DiffusionOutput(output={"image": second})),
             RunnerOutput(request_id="req-error", finished=True, result=DiffusionOutput(error="boom")),
-        ]
+        ],
+        step_cost_observations=[
+            ("req-0", StepCostObservation(12.5, ("qwen", "tea_cache"))),
+        ],
     )
 
     pack_diffusion_output_shm(output)
@@ -297,12 +301,18 @@ def test_batch_runner_output_round_trips_nested_results_through_shm() -> None:
     assert output.runner_outputs[0].result.output["__tensor_shm__"] is True
     assert output.runner_outputs[1].result.output["image"]["__tensor_shm__"] is True
     assert output.runner_outputs[2].result.error == "boom"
+    assert output.step_cost_observations == [
+        ("req-0", StepCostObservation(12.5, ("qwen", "tea_cache"))),
+    ]
 
     unpack_diffusion_output_shm(output)
 
     torch.testing.assert_close(output["req-0"].result.output, first)
     torch.testing.assert_close(output["req-1"].result.output["image"], second)
     assert output["req-error"].result.error == "boom"
+    assert output.step_cost_observations == [
+        ("req-0", StepCostObservation(12.5, ("qwen", "tea_cache"))),
+    ]
 
 
 def test_pack_value_keeps_tensor_at_threshold_inline() -> None:

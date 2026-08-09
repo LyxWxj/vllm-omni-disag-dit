@@ -170,6 +170,12 @@ class StepScheduler(BaseScheduler):
         return scheduler_output
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+        for request_id, observation in getattr(output, "step_cost_observations", ()):
+            state = self._request_states.get(request_id)
+            progress = self._request_progress.get(request_id)
+            if state is not None and progress is not None and not state.is_finished():
+                progress.cost.observe(observation)
+
         scheduled_request_ids = sched_output.scheduled_request_ids
         if not scheduled_request_ids:
             return set()

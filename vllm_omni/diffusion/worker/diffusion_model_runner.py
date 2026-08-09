@@ -14,6 +14,7 @@ import copy
 import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -51,6 +52,7 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.sched.step_cost import StepCostObservation
 from vllm_omni.diffusion.worker.batch_layout import DenoiseStepOutput, RequestRowLayout
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -72,6 +74,22 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _StepServiceTimer:
+    wall_started_at: float
+    start_event: Any | None
+    use_wall_time: bool
+
+
+@dataclass(frozen=True)
+class _PendingStepServiceTime:
+    request_id: str
+    execution_signature: tuple[Any, ...]
+    start_event: Any
+    end_event: Any
+    wall_elapsed_ms: float
 
 
 def _split_denoise_step_output(
@@ -166,6 +184,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.input_batch: InputBatch | None = None
         self.step_cache_runtime: RequestScopedCacheRuntime | None = None
         self.step_cache_handles: dict[str, CacheHandle] = {}
+        self._pending_step_service_times: list[_PendingStepServiceTime] = []
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
@@ -712,6 +731,92 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             *(getattr(parallel, name, None) for name in parallel_fields),
         )
 
+    def _collect_step_cost_observations(self) -> list[tuple[str, StepCostObservation]]:
+        ready: list[tuple[str, StepCostObservation]] = []
+        remaining: list[_PendingStepServiceTime] = []
+        for pending in getattr(self, "_pending_step_service_times", ()):
+            try:
+                if not pending.end_event.query():
+                    remaining.append(pending)
+                    continue
+                device_elapsed_ms = float(pending.start_event.elapsed_time(pending.end_event))
+                ready.append(
+                    (
+                        pending.request_id,
+                        StepCostObservation(
+                            service_time_ms=max(pending.wall_elapsed_ms, device_elapsed_ms),
+                            execution_signature=pending.execution_signature,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Dropping failed asynchronous step timing sample: %s", exc)
+        self._pending_step_service_times = remaining
+        return ready
+
+    def _start_step_service_timer(self) -> _StepServiceTimer | None:
+        if getattr(self, "step_cache_runtime", None) is None:
+            return None
+        wall_started_at = time.perf_counter()
+        if self.device.type == "cpu":
+            return _StepServiceTimer(
+                wall_started_at=wall_started_at,
+                start_event=None,
+                use_wall_time=True,
+            )
+        if self.device.type != "cuda":
+            return None
+        try:
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        except Exception as exc:
+            logger.warning("Unable to start asynchronous CUDA step timing: %s", exc)
+            return None
+        return _StepServiceTimer(
+            wall_started_at=wall_started_at,
+            start_event=start_event,
+            use_wall_time=False,
+        )
+
+    def _finish_step_service_timer(
+        self,
+        timer: _StepServiceTimer | None,
+        state: StepRequestState,
+        row_layout: RequestRowLayout,
+    ) -> list[tuple[str, StepCostObservation]]:
+        if timer is None:
+            return []
+        wall_elapsed_ms = (time.perf_counter() - timer.wall_started_at) * 1000.0
+        execution_signature = self._step_execution_signature(state, row_layout)
+        if timer.use_wall_time:
+            return [
+                (
+                    state.request_id,
+                    StepCostObservation(
+                        service_time_ms=wall_elapsed_ms,
+                        execution_signature=execution_signature,
+                    ),
+                )
+            ]
+
+        assert timer.start_event is not None
+        try:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+        except Exception as exc:
+            logger.warning("Unable to finish asynchronous CUDA step timing: %s", exc)
+            return []
+        self._pending_step_service_times.append(
+            _PendingStepServiceTime(
+                request_id=state.request_id,
+                execution_signature=execution_signature,
+                start_event=timer.start_event,
+                end_event=end_event,
+                wall_elapsed_ms=wall_elapsed_ms,
+            )
+        )
+        return []
+
     def _close_step_cache_handle(self, request_id: str, reason: CacheCloseReason) -> None:
         runtime = getattr(self, "step_cache_runtime", None)
         handles = getattr(self, "step_cache_handles", None)
@@ -838,8 +943,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return resolved, new_request_ids
 
-    def _prepare_batch_inputs(self, states: list[StepRequestState], new_request_ids: list[str]) -> InputBatch:
-        # process new reqs
+    def _prepare_new_step_states(self, states: list[StepRequestState], new_request_ids: list[str]) -> None:
         for state in states:
             if state.request_id in new_request_ids:
                 self._initialize_generator(state.sampling)
@@ -851,6 +955,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     consume_pipeline_stage_durations(self.pipeline),
                 )
 
+    def _build_step_input_batch(self, states: list[StepRequestState]) -> InputBatch:
         input_batch = InputBatch.make_batch(
             states,
             cached_batch=getattr(self, "input_batch", None),
@@ -896,12 +1001,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
+            step_cost_observations = self._collect_step_cost_observations()
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
                 current_omni_platform.reset_peak_memory_stats()
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
+            self._prepare_new_step_states(states, new_request_ids)
+            step_service_timer = self._start_step_service_timer()
+            input_batch = self._build_step_input_batch(states)
             attn_metadata = {}
 
             with (
@@ -1024,7 +1132,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 runner_output_list,
                 interrupted=pipeline_interrupted,
             )
-            return BatchRunnerOutput.from_list(runner_output_list)
+            if step_succeeded:
+                step_cost_observations.extend(
+                    self._finish_step_service_timer(
+                        step_service_timer,
+                        states[0],
+                        input_batch.row_layout,
+                    )
+                )
+            return BatchRunnerOutput.from_list(
+                runner_output_list,
+                step_cost_observations=step_cost_observations,
+            )
 
     def submit_interaction(
         self,

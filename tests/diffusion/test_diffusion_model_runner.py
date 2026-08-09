@@ -456,9 +456,15 @@ def test_execute_stepwise_commits_and_closes_request_cache(monkeypatch):
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
 
-    output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")
+    batch_output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    output = batch_output.get_request_output("req")
 
     assert output.finished is True
+    assert len(batch_output.step_cost_observations) == 1
+    observation_request_id, observation = batch_output.step_cost_observations[0]
+    assert observation_request_id == "req"
+    assert observation.service_time_ms >= 0
+    assert observation.execution_signature[2] == "tea_cache"
     assert [event[0] for event in adapter.events] == [
         "open",
         "activate",
@@ -580,6 +586,78 @@ def test_stepwise_finished_id_closes_live_cache_as_aborted(monkeypatch):
     assert adapter.events[-1] == ("close", "req", CacheCloseReason.ABORTED)
     assert runner.step_cache_handles == {}
     assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_stepwise_cuda_timing_is_deferred_without_synchronize(monkeypatch):
+    class _FakeEvent:
+        def __init__(self, elapsed_ms=0.0):
+            self.elapsed_ms = elapsed_ms
+            self.record_calls = 0
+            self.query_calls = 0
+
+        def record(self):
+            self.record_calls += 1
+
+        def query(self):
+            self.query_calls += 1
+            return True
+
+        def elapsed_time(self, end_event):
+            del end_event
+            return self.elapsed_ms
+
+    first_start = _FakeEvent(elapsed_ms=10_000.0)
+    first_end = _FakeEvent()
+    second_start = _FakeEvent(elapsed_ms=20_000.0)
+    second_end = _FakeEvent()
+    events = [first_start, first_end, second_start, second_end]
+    event_kwargs = []
+
+    def _make_event(**kwargs):
+        event_kwargs.append(kwargs)
+        return events.pop(0)
+
+    runner = _make_runner(cache_backend=object(), cache_backend_name="tea_cache")
+    runner.device = torch.device("cuda")
+    runner.pipeline = _TwoStepPipeline()
+    runner.od_config.step_execution = True
+    _enable_step_cache_runtime(runner)
+    _patch_stepwise_cpu_runtime(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "Event", _make_event)
+    monkeypatch.setattr(
+        model_runner_module.current_omni_platform,
+        "synchronize",
+        lambda: pytest.fail("step timing must not synchronize the device"),
+    )
+    req = _make_request()
+    req.request_id = "req"
+    req.sampling_params.num_inference_steps = 2
+    first_schedule = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    first_output = DiffusionModelRunner.execute_stepwise(runner, first_schedule)
+    second_schedule = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+    )
+    second_output = DiffusionModelRunner.execute_stepwise(runner, second_schedule)
+
+    assert first_output.step_cost_observations == []
+    assert len(second_output.step_cost_observations) == 1
+    request_id, observation = second_output.step_cost_observations[0]
+    assert request_id == "req"
+    assert observation.service_time_ms == 10_000.0
+    assert first_start.record_calls == 1
+    assert first_end.record_calls == 1
+    assert first_end.query_calls == 1
+    assert event_kwargs == [{"enable_timing": True}] * 4
+    assert len(runner._pending_step_service_times) == 1
 
 
 @pytest.mark.core_model
