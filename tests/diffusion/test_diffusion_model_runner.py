@@ -9,6 +9,13 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.cache.request_scope import (
+    CacheCapabilities,
+    CacheCloseReason,
+    CacheDecisionScope,
+    CacheStateScope,
+    RequestScopedCacheRuntime,
+)
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
@@ -121,6 +128,63 @@ class _FinalOnlyStepPipeline:
         return DiffusionOutput(output=state.latents.clone())
 
 
+class _TwoStepPipeline(_FinalOnlyStepPipeline):
+    def prepare_encode(self, state):
+        super().prepare_encode(state)
+        state.timesteps = torch.tensor([1.0, 0.0])
+        return state
+
+
+class _FailingStepPipeline(_FinalOnlyStepPipeline):
+    def step_scheduler(self, state, noise_pred):
+        del state, noise_pred
+        raise RuntimeError("scheduler failed")
+
+
+class _RecordingRequestCacheAdapter:
+    capabilities = CacheCapabilities(
+        state_scope=CacheStateScope.REQUEST_SWAPPABLE,
+        decision_scope=CacheDecisionScope.REQUEST,
+    )
+
+    def __init__(self):
+        self.events = []
+
+    def open_request(self, metadata):
+        self.events.append(("open", metadata.request_id, metadata.execution_signature))
+        return {"version": 0}
+
+    def activate(self, handles, row_layout):
+        self.events.append(("activate", handles[0].request_id, row_layout.request_ids))
+
+    def capture(self, handles):
+        self.events.append(("capture", handles[0].request_id))
+        return [{"version": handles[0].opaque_state["version"] + 1}]
+
+    def invalidate(self, handles):
+        self.events.append(("invalidate", tuple(handle.request_id for handle in handles)))
+
+    def deactivate(self, handles):
+        self.events.append(("deactivate", handles[0].request_id))
+
+    def close_request(self, handle, reason):
+        self.events.append(("close", handle.request_id, reason))
+
+
+def _enable_step_cache_runtime(runner):
+    adapter = _RecordingRequestCacheAdapter()
+    runner.step_cache_runtime = RequestScopedCacheRuntime(adapter)
+    runner.step_cache_handles = {}
+    return adapter
+
+
+def _patch_stepwise_cpu_runtime(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+
+
 class _CompileTrackingModel:
     def __init__(self):
         self.compile_calls = []
@@ -186,6 +250,8 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner.offload_backend = None
     runner.state_cache = {}
     runner.prompt_embed_cache = None
+    runner.step_cache_runtime = None
+    runner.step_cache_handles = {}
     runner.od_config = SimpleNamespace(
         cache_backend=cache_backend_name,
         enable_cache_dit_summary=enable_cache_dit_summary,
@@ -371,6 +437,177 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
     assert output.finished is True
     assert output.result is not None
     assert torch.equal(output.result.output, torch.ones(1, 1))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_commits_and_closes_request_cache(monkeypatch):
+    runner = _make_runner(cache_backend=object(), cache_backend_name="tea_cache")
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.step_execution = True
+    adapter = _enable_step_cache_runtime(runner)
+    _patch_stepwise_cpu_runtime(monkeypatch)
+    req = _make_request()
+    req.request_id = "req"
+    req.sampling_params.num_inference_steps = 1
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")
+
+    assert output.finished is True
+    assert [event[0] for event in adapter.events] == [
+        "open",
+        "activate",
+        "capture",
+        "deactivate",
+        "close",
+    ]
+    assert adapter.events[-1] == ("close", "req", CacheCloseReason.FINISHED)
+    assert runner.step_cache_handles == {}
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_invalidates_cache_on_request_error(monkeypatch):
+    runner = _make_runner(cache_backend=object(), cache_backend_name="tea_cache")
+    runner.pipeline = _FailingStepPipeline()
+    runner.od_config.step_execution = True
+    adapter = _enable_step_cache_runtime(runner)
+    _patch_stepwise_cpu_runtime(monkeypatch)
+    req = _make_request()
+    req.request_id = "req"
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")
+
+    assert output.finished is True
+    assert output.result.error == "scheduler failed"
+    assert [event[0] for event in adapter.events] == [
+        "open",
+        "activate",
+        "invalidate",
+        "deactivate",
+        "close",
+    ]
+    assert adapter.events[-1] == ("close", "req", CacheCloseReason.ERROR)
+    assert runner.step_cache_handles == {}
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_reopens_cache_after_signature_change(monkeypatch):
+    runner = _make_runner(cache_backend=object(), cache_backend_name="tea_cache")
+    runner.pipeline = _TwoStepPipeline()
+    runner.od_config.step_execution = True
+    runner.od_config.dtype = "bfloat16"
+    adapter = _enable_step_cache_runtime(runner)
+    _patch_stepwise_cpu_runtime(monkeypatch)
+    req = _make_request()
+    req.request_id = "req"
+    req.sampling_params.num_inference_steps = 2
+    first_schedule = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    first = DiffusionModelRunner.execute_stepwise(runner, first_schedule).get_request_output("req")
+    assert first.finished is False
+    runner.od_config.dtype = "float16"
+    second_schedule = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+    )
+    second = DiffusionModelRunner.execute_stepwise(runner, second_schedule).get_request_output("req")
+
+    assert second.finished is True
+    event_names = [event[0] for event in adapter.events]
+    assert event_names == [
+        "open",
+        "activate",
+        "capture",
+        "deactivate",
+        "invalidate",
+        "close",
+        "open",
+        "activate",
+        "capture",
+        "deactivate",
+        "close",
+    ]
+    assert adapter.events[5] == ("close", "req", CacheCloseReason.INVALIDATED)
+    assert adapter.events[-1] == ("close", "req", CacheCloseReason.FINISHED)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_stepwise_finished_id_closes_live_cache_as_aborted(monkeypatch):
+    runner = _make_runner(cache_backend=object(), cache_backend_name="tea_cache")
+    runner.pipeline = _TwoStepPipeline()
+    runner.od_config.step_execution = True
+    adapter = _enable_step_cache_runtime(runner)
+    _patch_stepwise_cpu_runtime(monkeypatch)
+    req = _make_request()
+    req.request_id = "req"
+    req.sampling_params.num_inference_steps = 2
+    first_schedule = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    DiffusionModelRunner.execute_stepwise(runner, first_schedule)
+
+    cleanup = SimpleNamespace(
+        finished_req_ids={"req"},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    states, new_request_ids = DiffusionModelRunner._update_states(runner, cleanup)
+
+    assert states == []
+    assert new_request_ids == []
+    assert adapter.events[-1] == ("close", "req", CacheCloseReason.ABORTED)
+    assert runner.step_cache_handles == {}
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_rejects_cache_cohort_and_cleans_new_states(monkeypatch):
+    runner = _make_runner(cache_backend=object(), cache_backend_name="tea_cache")
+    runner.pipeline = _TwoStepPipeline()
+    runner.od_config.step_execution = True
+    _enable_step_cache_runtime(runner)
+    _patch_stepwise_cpu_runtime(monkeypatch)
+    req_a = _make_request()
+    req_a.request_id = "req-a"
+    req_b = _make_request()
+    req_b.request_id = "req-b"
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[
+            SimpleNamespace(request_id="req-a", req=req_a),
+            SimpleNamespace(request_id="req-b", req=req_b),
+        ],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one physical request"):
+        DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    assert runner.step_cache_handles == {}
+    assert runner.state_cache == {}
 
 
 @pytest.mark.core_model

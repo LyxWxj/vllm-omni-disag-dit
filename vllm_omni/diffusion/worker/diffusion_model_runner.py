@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import copy
 import time
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -27,7 +27,15 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
 )
+from vllm_omni.diffusion.cache.request_scope import (
+    CacheCloseReason,
+    CacheHandle,
+    CacheRequestMetadata,
+    CacheTransaction,
+    RequestScopedCacheRuntime,
+)
 from vllm_omni.diffusion.cache.selector import get_cache_backend
+from vllm_omni.diffusion.cache.teacache.request_adapter import TeaCacheRequestAdapter
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
@@ -156,6 +164,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
+        self.step_cache_runtime: RequestScopedCacheRuntime | None = None
+        self.step_cache_handles: dict[str, CacheHandle] = {}
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
@@ -346,6 +356,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         type(self.pipeline).__name__,
                     )
                     self.cache_backend = None
+                elif (
+                    getattr(self.od_config, "step_execution", False)
+                    and str(self.od_config.cache_backend).lower() == "tea_cache"
+                ):
+                    self.step_cache_runtime = RequestScopedCacheRuntime(
+                        TeaCacheRequestAdapter.from_pipeline(self.pipeline)
+                    )
 
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
@@ -645,9 +662,142 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _step_execution_signature(
+        self,
+        state: StepRequestState,
+        row_layout: RequestRowLayout,
+    ) -> tuple[Any, ...]:
+        sampling = state.sampling
+        lora_request = getattr(sampling, "lora_request", None)
+        sampling_fields = (
+            "height",
+            "width",
+            "num_frames",
+            "resolution",
+            "do_classifier_free_guidance",
+            "guidance_scale",
+            "guidance_scale_2",
+            "guidance_rescale",
+            "true_cfg_scale",
+            "cfg_normalize",
+            "quality",
+            "num_outputs_per_prompt",
+        )
+        parallel = getattr(self.od_config, "parallel_config", None)
+        parallel_fields = (
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "tensor_parallel_size",
+            "sequence_parallel_size",
+            "ulysses_degree",
+            "ring_degree",
+            "allgather_degree",
+            "ulysses_mode",
+            "cfg_parallel_size",
+        )
+        return (
+            "step-execution-v1",
+            type(self.pipeline).__name__,
+            str(getattr(self.od_config, "cache_backend", "none") or "none").lower(),
+            str(getattr(self.od_config, "dtype", None)),
+            str(self.device),
+            row_layout.request_row_count(state.request_id),
+            state.do_true_cfg,
+            tuple(state.prompt_embeds.shape) if state.prompt_embeds is not None else None,
+            tuple(state.negative_prompt_embeds.shape) if state.negative_prompt_embeds is not None else None,
+            int(state.extra.get("prompt_update_version", 0)),
+            *(getattr(sampling, name, None) for name in sampling_fields),
+            getattr(lora_request, "lora_int_id", None),
+            getattr(sampling, "lora_scale", 1.0),
+            *(getattr(parallel, name, None) for name in parallel_fields),
+        )
+
+    def _close_step_cache_handle(self, request_id: str, reason: CacheCloseReason) -> None:
+        runtime = getattr(self, "step_cache_runtime", None)
+        handles = getattr(self, "step_cache_handles", None)
+        if runtime is None or handles is None:
+            return
+        handle = handles.pop(request_id, None)
+        if handle is not None:
+            runtime.close_request(handle, reason)
+
+    def _get_step_cache_handle(
+        self,
+        state: StepRequestState,
+        row_layout: RequestRowLayout,
+    ) -> CacheHandle:
+        runtime = self.step_cache_runtime
+        assert runtime is not None
+        signature = self._step_execution_signature(state, row_layout)
+        handle = self.step_cache_handles.get(state.request_id)
+        if handle is not None and (handle.invalidated or handle.metadata.execution_signature != signature):
+            if not handle.invalidated:
+                runtime.invalidate_request(handle)
+            self._close_step_cache_handle(state.request_id, CacheCloseReason.INVALIDATED)
+            handle = None
+
+        if handle is None:
+            total_steps = state.total_steps or int(getattr(state.sampling, "num_inference_steps", 0) or 0)
+            handle = runtime.open_request(
+                CacheRequestMetadata(
+                    request_id=state.request_id,
+                    num_inference_steps=total_steps,
+                    execution_signature=signature,
+                )
+            )
+            self.step_cache_handles[state.request_id] = handle
+        return handle
+
+    @contextmanager
+    def _step_cache_transaction(
+        self,
+        states: list[StepRequestState],
+        row_layout: RequestRowLayout,
+    ) -> Iterator[CacheTransaction | None]:
+        runtime = getattr(self, "step_cache_runtime", None)
+        if runtime is None:
+            yield None
+            return
+
+        try:
+            if len(states) != 1:
+                raise RuntimeError("Request-swappable cache execution requires exactly one physical request per step.")
+            handle = self._get_step_cache_handle(states[0], row_layout)
+            with runtime.transaction([handle], row_layout) as transaction:
+                yield transaction
+        except Exception:
+            for state in states:
+                self._close_step_cache_handle(state.request_id, CacheCloseReason.ERROR)
+                self.state_cache.pop(state.request_id, None)
+            raise
+
+    def _finish_step_cache_requests(
+        self,
+        runner_outputs: list[RunnerOutput],
+        *,
+        interrupted: bool,
+    ) -> None:
+        if getattr(self, "step_cache_runtime", None) is None:
+            return
+        for output in runner_outputs:
+            result = output.result
+            has_error = result is not None and result.error is not None
+            was_aborted = result is not None and result.aborted
+            if interrupted or was_aborted:
+                reason = CacheCloseReason.ABORTED
+            elif has_error:
+                reason = CacheCloseReason.ERROR
+            elif output.finished:
+                reason = CacheCloseReason.FINISHED
+            else:
+                continue
+            self._close_step_cache_handle(output.request_id, reason)
+            self.state_cache.pop(output.request_id, None)
+
     def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for request_id in scheduler_output.finished_req_ids:
+            self._close_step_cache_handle(request_id, CacheCloseReason.ABORTED)
             self.state_cache.pop(request_id, None)
 
         resolved: list[StepRequestState] = []
@@ -737,11 +887,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, editing inputs, and
-        # similar features are not supported here yet.
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Step mode does not support cache_backend yet.")
+        cache_backend_name = str(self.od_config.cache_backend or "none").lower()
+        if cache_backend_name not in ("none", "tea_cache"):
+            raise ValueError(f"Step mode does not support cache_backend={cache_backend_name!r} yet.")
+        if cache_backend_name == "tea_cache" and getattr(self, "step_cache_runtime", None) is None:
+            raise RuntimeError("TeaCache step mode requires an initialized request-scoped cache runtime.")
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
@@ -754,10 +904,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = {}
 
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
+            with (
+                self._step_cache_transaction(states, input_batch.row_layout) as cache_transaction,
+                set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata=attn_metadata,
+                ),
             ):
                 clear_pipeline_stage_durations(self.pipeline)
                 denoise_output = self.pipeline.denoise_step(input_batch, states=states)
@@ -858,9 +1011,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             state.peak_memory_mb,
                         )
 
+                step_succeeded = not pipeline_interrupted and all(
+                    output.result is None or (output.result.error is None and not output.result.aborted)
+                    for output in runner_output_list
+                )
+                if cache_transaction is not None and step_succeeded:
+                    cache_transaction.commit()
+
                 self._update_states_after(states, input_batch, pipeline_interrupted)
 
-                return BatchRunnerOutput.from_list(runner_output_list)
+            self._finish_step_cache_requests(
+                runner_output_list,
+                interrupted=pipeline_interrupted,
+            )
+            return BatchRunnerOutput.from_list(runner_output_list)
 
     def submit_interaction(
         self,
