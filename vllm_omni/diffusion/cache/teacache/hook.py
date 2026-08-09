@@ -19,7 +19,7 @@ import torch
 
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
-from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
+from vllm_omni.diffusion.cache.teacache.state import TeaCacheRequestState, TeaCacheState
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -250,6 +250,28 @@ class TeaCacheHook(ModelHook):
         self.state_manager.reset()
         self._forward_cnt = 0
         return module
+
+    def bind_request_state(self, request_state: TeaCacheRequestState) -> None:
+        """Bind an opaque request snapshot without copying its tensors."""
+        if self.state_manager._states:
+            raise RuntimeError("TeaCache hook already has bound request state.")
+        self.state_manager._states = request_state.branch_states
+        self.state_manager._context = request_state.active_context
+        self._forward_cnt = request_state.forward_count
+
+    def capture_request_state(self) -> TeaCacheRequestState:
+        """Capture every CFG context plus the hook-wide forward counter."""
+        return TeaCacheRequestState(
+            branch_states=self.state_manager._states,
+            active_context=self.state_manager._context,
+            forward_count=self._forward_cnt,
+        )
+
+    def unbind_request_state(self) -> None:
+        """Release the active snapshot while preserving its state container."""
+        self.state_manager._states = {}
+        self.state_manager._context = "teacache"
+        self._forward_cnt = 0
 
 
 def apply_teacache_hook(module: torch.nn.Module, config: TeaCacheConfig) -> None:

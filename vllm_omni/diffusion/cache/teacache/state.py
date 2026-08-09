@@ -7,6 +7,10 @@ TeaCache state management.
 This module manages the state for TeaCache hooks across diffusion timesteps.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
 import torch
 
 
@@ -36,3 +40,12 @@ class TeaCacheState:
         self.previous_modulated_input = None
         self.previous_residual = None
         self.previous_residual_encoder = None
+
+
+@dataclass
+class TeaCacheRequestState:
+    """Opaque ownership bundle for one request's complete TeaCache state."""
+
+    branch_states: dict[str, TeaCacheState] = field(default_factory=dict)
+    active_context: str = "teacache"
+    forward_count: int = 0

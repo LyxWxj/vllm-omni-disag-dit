@@ -33,6 +33,7 @@ from vllm_omni.diffusion.cache.request_scope import (
 from vllm_omni.diffusion.cache.teacache import (
     CacheContext,
     TeaCacheConfig,
+    TeaCacheRequestAdapter,
     apply_teacache_hook,
 )
 from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
@@ -50,6 +51,7 @@ __all__ = [
     "ExclusiveCacheAdapter",
     "TeaCacheBackend",
     "TeaCacheConfig",
+    "TeaCacheRequestAdapter",
     "apply_teacache_hook",
     "PromptEmbedCache",
     "RequestCacheAdapter",

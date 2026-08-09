@@ -32,14 +32,21 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     register_extractor,
 )
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache_hook
-from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
+from vllm_omni.diffusion.cache.teacache.request_adapter import (
+    TeaCacheRequestAdapter,
+    find_teacache_hook,
+)
+from vllm_omni.diffusion.cache.teacache.state import TeaCacheRequestState, TeaCacheState
 
 __all__ = [
     "TeaCacheBackend",
     "TeaCacheConfig",
+    "TeaCacheRequestAdapter",
+    "TeaCacheRequestState",
     "TeaCacheState",
     "TeaCacheHook",
     "apply_teacache_hook",
     "register_extractor",
     "CacheContext",
+    "find_teacache_hook",
 ]
