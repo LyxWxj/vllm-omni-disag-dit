@@ -43,6 +43,7 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.worker.batch_layout import DenoiseStepOutput, RequestRowLayout
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
@@ -63,6 +64,28 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
 
 logger = init_logger(__name__)
+
+
+def _split_denoise_step_output(
+    output: torch.Tensor | DenoiseStepOutput | None,
+    default_layout: RequestRowLayout,
+) -> dict[str, torch.Tensor | None]:
+    """Normalize legacy tensor output and split it with an explicit row map."""
+    if isinstance(output, DenoiseStepOutput):
+        prediction = output.prediction
+        row_layout = output.row_layout
+    else:
+        prediction = output
+        row_layout = default_layout
+
+    row_layout.validate_compatible(default_layout)
+    if prediction is None:
+        return {request_id: None for request_id in row_layout.request_ids}
+    if not isinstance(prediction, torch.Tensor):
+        raise TypeError(
+            f"denoise_step must return a Tensor, DenoiseStepOutput, or None; got {type(prediction).__name__}."
+        )
+    return row_layout.split_tensor(prediction)
 
 
 def _normalize_pipeline_outputs(
@@ -738,7 +761,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 attn_metadata=attn_metadata,
             ):
                 clear_pipeline_stage_durations(self.pipeline)
-                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
+                denoise_output = self.pipeline.denoise_step(input_batch, states=states)
+                prediction_is_none = (
+                    denoise_output.prediction is None
+                    if isinstance(denoise_output, DenoiseStepOutput)
+                    else denoise_output is None
+                )
+                predictions_by_request = _split_denoise_step_output(
+                    denoise_output,
+                    input_batch.row_layout,
+                )
                 denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
                 for state in states:
                     merge_stage_durations(
@@ -748,7 +780,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
+                if prediction_is_none and pipeline_interrupted:
                     for state in states:
                         runner_output_list.append(
                             RunnerOutput(
@@ -760,12 +792,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         )
 
                 else:
-                    offset = 0
                     for req in states:
-                        row_num = req.latents.shape[0]
                         try:
                             self.pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                req,
+                                predictions_by_request[req.request_id],
                             )
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
@@ -796,9 +827,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                     result=result,
                                 )
                             )
-                            offset = offset + row_num
                         except Exception as per_req_exc:
-                            offset = offset + row_num
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,
@@ -813,12 +842,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                     result=DiffusionOutput(error=str(per_req_exc)),
                                 )
                             )
-
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
 
                 if is_primary:
                     batch_peak_memory_mb = self._sample_peak_memory_mb()

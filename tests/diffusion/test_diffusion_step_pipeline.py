@@ -40,6 +40,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     NewRequestData,
 )
+from vllm_omni.diffusion.worker.batch_layout import DenoiseStepOutput, RequestRowLayout
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -128,6 +129,42 @@ class _ProfilingStepPipeline(_StepPipeline):
         result = super().post_decode(state, **kwargs)
         self._stage_durations["QwenImagePipeline.vae.decode"] = 3.0
         return result
+
+
+class _MappedOutputStepPipeline(_StepPipeline):
+    """Return interleaved prediction rows with an explicit output mapping."""
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        self.prepare_calls += 1
+        state.timesteps = [torch.tensor(1.0)]
+        row_count = 2 if state.request_id == "req-1" else 1
+        state.latents = torch.zeros((row_count, 1))
+        return state
+
+    def denoise_step(self, input_batch, **kwargs):
+        del kwargs
+        self.denoise_calls += 1
+        assert input_batch.request_ids == ["req-1", "req-2"]
+        return DenoiseStepOutput(
+            prediction=torch.tensor([[20.0], [11.0], [10.0]]),
+            row_layout=RequestRowLayout(
+                request_ids=("req-1", "req-2"),
+                row_to_request=(1, 0, 0),
+                row_to_request_row=(0, 1, 0),
+            ),
+        )
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        self.scheduler_calls += 1
+        state.extra["noise_pred"] = noise_pred.clone()
+        state.step_index += 1
+
+    def post_decode(self, state, **kwargs):
+        del kwargs
+        self.decode_calls += 1
+        return DiffusionOutput(output=state.extra["noise_pred"])
 
 
 class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
@@ -615,6 +652,26 @@ class TestRunner:
 
         result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
         assert len(result) == 2
+
+    def test_uses_explicit_output_mapping_for_reordered_multirow_predictions(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _MappedOutputStepPipeline()
+        req_1 = _make_step_request(num_inference_steps=1)
+        req_2 = _make_step_request(num_inference_steps=1)
+        req_2.request_id = "req-2"
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        result = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_batch_scheduler_output([req_1, req_2]),
+        )
+
+        req_1_output = result.get_request_output("req-1")
+        req_2_output = result.get_request_output("req-2")
+        assert req_1_output is not None and req_1_output.result is not None
+        assert req_2_output is not None and req_2_output.result is not None
+        torch.testing.assert_close(req_1_output.result.output, torch.tensor([[10.0], [11.0]]))
+        torch.testing.assert_close(req_2_output.result.output, torch.tensor([[20.0]]))
 
     def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
         runner = _make_runner()

@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.prompt_update import prompt_update_versions
+from vllm_omni.diffusion.worker.batch_layout import RequestRowLayout
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
@@ -537,12 +538,15 @@ def _same_composition(
     request_ids: list[str],
     idx_mapping_np: np.ndarray,
     states: Sequence[StepRequestState],
+    row_layout: RequestRowLayout,
 ) -> bool:
     if cached_batch is None:
         return False
     if cached_batch.request_ids != request_ids:
         return False
     if not np.array_equal(cached_batch.idx_mapping_np, idx_mapping_np):
+        return False
+    if cached_batch.row_layout != row_layout:
         return False
     # Midway prompt updates (typically for video generation) can change prompt_embeds without changing ids/mapping.
     # In this case, each request state manages the embedding's "version". Use it to determine if cache is still valid.
@@ -596,6 +600,11 @@ class InputBatch:
     ``states`` is a narrow escape hatch for Hunyuan-style state-driven
     pipelines that need request-private KV/cache metadata during denoise.
     Other pipelines should continue to use the standard batch fields.
+
+    ``row_layout`` explicitly maps the gathered latent/prediction rows back to
+    request-local rows. Pipelines that preserve this identity layout may keep
+    returning a tensor; pipelines that reorder output rows return their own
+    layout with ``DenoiseStepOutput``.
     """
 
     request_ids: list[str]
@@ -603,6 +612,7 @@ class InputBatch:
     num_reqs_after_padding: int
     idx_mapping: torch.Tensor
     idx_mapping_np: np.ndarray
+    row_layout: RequestRowLayout
 
     latents: torch.Tensor
     timesteps: torch.Tensor
@@ -632,6 +642,10 @@ class InputBatch:
             raise ValueError("`num_reqs` must match the number of request ids.")
         if self.num_reqs_after_padding < self.num_reqs:
             raise ValueError("`num_reqs_after_padding` must be >= `num_reqs`.")
+        if tuple(self.request_ids) != self.row_layout.request_ids:
+            raise ValueError("`request_ids` must match `row_layout.request_ids`.")
+        if self.row_layout.num_rows != int(self.latents.shape[0]):
+            raise ValueError("`row_layout` row count must match the latent batch row count.")
 
     def _refresh_dynamic_fields(
         self,
@@ -686,6 +700,10 @@ class InputBatch:
         self.num_reqs_after_padding = len(request_ids)
         self.idx_mapping = idx_mapping
         self.idx_mapping_np = idx_mapping_np
+        self.row_layout = RequestRowLayout.from_request_row_counts(
+            request_ids,
+            [int(state.latents.shape[0]) if state.latents is not None else 0 for state in selected_states],
+        )
         self.states = tuple(selected_states)
         self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
@@ -703,8 +721,12 @@ class InputBatch:
         """Build a temporary step-local batch view from request states."""
         selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
         request_ids = _prepare_request_ids(selected_states)
+        row_layout = RequestRowLayout.from_request_row_counts(
+            request_ids,
+            [int(state.latents.shape[0]) if state.latents is not None else 0 for state in selected_states],
+        )
 
-        if _same_composition(cached_batch, request_ids, idx_mapping_np, selected_states):
+        if _same_composition(cached_batch, request_ids, idx_mapping_np, selected_states, row_layout):
             assert cached_batch is not None
             cached_batch._repack_dynamic_fields(selected_states)
             return cached_batch
@@ -726,6 +748,7 @@ class InputBatch:
             num_reqs_after_padding=len(selected_states),
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
+            row_layout=row_layout,
             latents=_prepare_latents(selected_states),
             timesteps=_prepare_timesteps(selected_states),
             guidance=_prepare_guidance(selected_states),
