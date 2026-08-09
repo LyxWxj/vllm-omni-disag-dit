@@ -104,7 +104,7 @@ def order_step_cost_candidates(
     def priority(indexed: tuple[int, StepCostCandidate]) -> tuple[int, float, int]:
         index, candidate = indexed
         if not candidate.cost.is_observed:
-            return (0, 0.0, index)
+            return (0, -float(candidate.age_ticks), index)
         effective_cost = max(
             0.0,
             candidate.cost.mean_service_time_ms - candidate.age_ticks * aging_credit,

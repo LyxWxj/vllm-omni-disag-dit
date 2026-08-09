@@ -832,6 +832,9 @@ class OmniDiffusionConfig:
 
     # Step mode settings
     step_execution: bool = False
+    # Fairness credit subtracted from observed step cost per waiting scheduler
+    # tick when cache-enabled step execution serializes physical requests.
+    step_schedule_aging_credit_ms_per_tick: float = 1.0
 
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks

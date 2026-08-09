@@ -82,6 +82,16 @@ class TestObservedCostOrdering:
 
         assert ordered == ["unknown-a", "unknown-b", "known"]
 
+    def test_older_unknown_request_runs_first(self) -> None:
+        ordered = order_step_cost_candidates(
+            [
+                StepCostCandidate("newer", RequestStepCost(), age_ticks=1),
+                StepCostCandidate("older", RequestStepCost(), age_ticks=5),
+            ]
+        )
+
+        assert ordered == ["older", "newer"]
+
     def test_known_requests_are_ordered_by_mean_cost(self) -> None:
         ordered = order_step_cost_candidates(
             [

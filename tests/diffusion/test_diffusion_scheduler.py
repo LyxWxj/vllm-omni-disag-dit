@@ -18,6 +18,7 @@ from vllm_omni.diffusion.sched import (
     DiffusionRequestStatus,
     RequestScheduler,
     Scheduler,
+    StepCostObservation,
     StepScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
@@ -941,6 +942,110 @@ class TestStepScheduler:
         assert _new_ids(sched_output) == [req_a, req_b]
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
+
+    def test_cache_mode_interleaves_one_request_by_observed_cost(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=3,
+                cache_backend="tea_cache",
+                step_schedule_aging_credit_ms_per_tick=1.0,
+            )
+        )
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(_make_step_request("b"))
+        req_c = scheduler.add_request(_make_step_request("c"))
+        signature = ("qwen", "tea_cache")
+
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_a]
+        assert first.num_scheduled_reqs == 1
+        scheduler.update_from_output(
+            first,
+            RunnerOutput(
+                request_id=req_a,
+                step_index=1,
+                step_cost_observation=StepCostObservation(30.0, signature),
+            ),
+        )
+
+        second = scheduler.schedule()
+        assert _new_ids(second) == [req_b]
+        assert second.num_scheduled_reqs == 1
+        assert second.num_running_reqs == 2
+        scheduler.update_from_output(
+            second,
+            RunnerOutput(
+                request_id=req_b,
+                step_index=1,
+                step_cost_observation=StepCostObservation(10.0, signature),
+            ),
+        )
+
+        third = scheduler.schedule()
+        assert _new_ids(third) == [req_c]
+        assert third.num_scheduled_reqs == 1
+        assert third.num_running_reqs == 3
+        scheduler.update_from_output(
+            third,
+            RunnerOutput(
+                request_id=req_c,
+                step_index=1,
+                step_cost_observation=StepCostObservation(20.0, signature),
+            ),
+        )
+
+        fourth = scheduler.schedule()
+        assert _cached_ids(fourth) == [req_b]
+        assert fourth.num_scheduled_reqs == 1
+
+    def test_cache_mode_rotates_unknown_requests_without_timing_samples(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3, cache_backend="tea_cache"))
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(_make_step_request("b"))
+        req_c = scheduler.add_request(_make_step_request("c"))
+
+        first = scheduler.schedule()
+        scheduler.update_from_output(first, _make_step_output(req_a, step_index=1))
+        second = scheduler.schedule()
+        scheduler.update_from_output(second, _make_step_output(req_b, step_index=1))
+        third = scheduler.schedule()
+        scheduler.update_from_output(third, _make_step_output(req_c, step_index=1))
+        fourth = scheduler.schedule()
+
+        assert _new_ids(first) == [req_a]
+        assert _new_ids(second) == [req_b]
+        assert _new_ids(third) == [req_c]
+        assert _cached_ids(fourth) == [req_a]
+        assert all(output.num_scheduled_reqs == 1 for output in (first, second, third, fourth))
+
+    def test_cache_mode_preserves_fifo_batch_key_boundary(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2, cache_backend="tea_cache"))
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
+        req_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=768,
+                    num_inference_steps=2,
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+        scheduler.update_from_output(first, _make_step_output(req_a, step_index=1))
+        second = scheduler.schedule()
+
+        assert _cached_ids(second) == [req_a]
+        assert second.num_waiting_reqs == 1
+
+        scheduler.update_from_output(second, _make_step_output(req_a, step_index=2, finished=True))
+        third = scheduler.schedule()
+
+        assert _new_ids(third) == [req_b]
+        assert third.finished_req_ids == {req_a}
 
     def test_step_batch_allows_different_num_inference_steps(self) -> None:
         scheduler = StepScheduler()
