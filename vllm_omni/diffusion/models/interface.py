@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.batch_layout import DenoiseStepOutput
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -63,8 +64,8 @@ class SupportsStepExecution(Protocol):
 
     def denoise_step(
         self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None, **kwargs: Any
-    ) -> torch.Tensor | None:
-        """Run one denoise forward on the runner-assembled batch."""
+    ) -> torch.Tensor | DenoiseStepOutput | None:
+        """Run one denoise forward and optionally return an explicit output row layout."""
         ...
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
