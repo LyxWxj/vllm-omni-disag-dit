@@ -8,6 +8,7 @@ Model specific tests for CacheDiT enablement.
 import ast
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -81,7 +82,9 @@ def test_cachedit_public_api_is_explicit():
         "CacheDiTAdapterConfig",
         "CacheDiTBackend",
         "CacheDiTConfig",
+        "CacheDiTRequestAdapter",
         "CacheDiTRequestSpec",
+        "CacheDiTRequestState",
         "RequestScopedCacheDiTRuntime",
         "SensenovaCachedAdapter",
         "cache_summary",
@@ -89,6 +92,19 @@ def test_cachedit_public_api_is_explicit():
     }
     assert not hasattr(cd_backend, "enable_cache_for_wan22")
     assert not hasattr(cd_backend, "enable_cache_for_wan22_s2v")
+
+
+def test_cache_dit_backend_exposes_unique_request_context_managers():
+    backend = CacheDiTBackend()
+    manager_a = object()
+    manager_b = object()
+    backend._cache_targets = [
+        SimpleNamespace(_context_manager=manager_a),
+        SimpleNamespace(_context_manager=manager_a),
+        SimpleNamespace(_context_manager=manager_b),
+    ]
+
+    assert backend.get_request_context_managers() == (manager_a, manager_b)
 
 
 def test_cachedit_consumers_use_package_api():

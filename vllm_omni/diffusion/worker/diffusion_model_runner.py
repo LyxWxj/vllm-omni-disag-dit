@@ -23,7 +23,7 @@ from vllm.config import LoadConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cachedit import cache_summary
+from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestAdapter, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
@@ -387,13 +387,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     getattr(self.od_config, "step_execution", False)
                     and str(self.od_config.cache_backend).lower() == "cache_dit"
                 ):
-                    # Generic Cache-DiT hooks hold one mutable trajectory.  The
-                    # common runtime still gives it the same request lifecycle
-                    # as TeaCache, while its exclusive capability prevents
-                    # unsafe overlap until a state-swappable adapter exists.
-                    self.step_cache_runtime = RequestScopedCacheRuntime(
-                        ExclusiveCacheAdapter(self.cache_backend, self.pipeline)
-                    )
+                    try:
+                        cache_adapter = CacheDiTRequestAdapter(self.cache_backend, self.pipeline)
+                    except (TypeError, ValueError) as exc:
+                        logger.warning(
+                            "Cache-DiT request state is not swappable for %s (%s); "
+                            "falling back to one exclusive trajectory.",
+                            type(self.pipeline).__name__,
+                            exc,
+                        )
+                        cache_adapter = ExclusiveCacheAdapter(self.cache_backend, self.pipeline)
+                    self.step_cache_runtime = RequestScopedCacheRuntime(cache_adapter)
 
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op

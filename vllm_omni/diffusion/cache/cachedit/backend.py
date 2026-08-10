@@ -297,6 +297,23 @@ class CacheDiTBackend(CacheBackend):
             self._cache_targets = []
             self.enabled = False
 
+    def get_request_context_managers(self) -> tuple[Any, ...]:
+        """Return the installed mutable context managers, without duplicates."""
+
+        managers = []
+        seen: set[int] = set()
+        for target in self._cache_targets:
+            candidates = [target]
+            if isinstance(target, BlockAdapter):
+                candidates.extend(BlockAdapter.flatten(target.transformer))
+            for candidate in candidates:
+                manager = getattr(candidate, "_context_manager", None)
+                if manager is None or id(manager) in seen:
+                    continue
+                seen.add(id(manager))
+                managers.append(manager)
+        return tuple(managers)
+
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
         if not self.enabled or not self._refresh_funcs:
             logger.warning("Cache-dit is not enabled. Cannot refresh cache context.")
