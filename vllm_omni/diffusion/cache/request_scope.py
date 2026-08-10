@@ -9,8 +9,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
+from vllm.logger import init_logger
+
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.worker.batch_layout import RequestRowLayout
+
+logger = init_logger(__name__)
 
 
 class CacheStateScope(str, Enum):
@@ -296,7 +300,14 @@ class RequestScopedCacheRuntime:
             self._adapter.activate(handles, row_layout)
         except Exception:
             try:
-                self._invalidate_handles(handles)
+                try:
+                    self._invalidate_handles(handles)
+                except Exception:
+                    logger.warning("Cache adapter invalidate failed during activation rollback.", exc_info=True)
+                try:
+                    self._adapter.deactivate(handles)
+                except Exception:
+                    logger.warning("Cache adapter deactivate failed during activation rollback.", exc_info=True)
             finally:
                 self._active_handles = ()
             raise

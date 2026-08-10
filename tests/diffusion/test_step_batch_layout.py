@@ -128,3 +128,22 @@ def test_input_batch_rejects_duplicate_idx_mapping_entries():
             states,
             idx_mapping=torch.tensor([0, 0], dtype=torch.int32),
         )
+
+
+@pytest.mark.parametrize(
+    "idx_mapping",
+    [
+        torch.tensor([0.9], dtype=torch.float32),
+        torch.tensor([False], dtype=torch.bool),
+    ],
+)
+def test_input_batch_rejects_non_integer_idx_mapping(idx_mapping):
+    with pytest.raises(TypeError, match="must use an integer dtype"):
+        InputBatch.make_batch([_state("req-a", 1)], idx_mapping=idx_mapping)
+
+
+def test_input_batch_checks_idx_mapping_range_before_int32_cast():
+    idx_mapping = torch.tensor([2**32], dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="4294967296 is out of range"):
+        InputBatch.make_batch([_state("req-a", 1)], idx_mapping=idx_mapping)

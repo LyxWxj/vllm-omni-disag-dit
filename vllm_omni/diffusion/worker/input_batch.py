@@ -21,6 +21,16 @@ from vllm_omni.diffusion.prompt_update import prompt_update_versions
 from vllm_omni.diffusion.worker.batch_layout import RequestRowLayout
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
+_INTEGER_INDEX_DTYPES = frozenset(
+    {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+)
+
 
 def _normalize_prompt_embeds(x: torch.Tensor) -> torch.Tensor:
     if x.ndim == 2:
@@ -78,7 +88,8 @@ def _select_states(
     else:
         if idx_mapping.ndim != 1:
             raise ValueError("idx_mapping must be a 1D tensor.")
-        idx_mapping = idx_mapping.to(dtype=torch.int32)
+        if idx_mapping.dtype not in _INTEGER_INDEX_DTYPES:
+            raise TypeError(f"idx_mapping must use an integer dtype; got {idx_mapping.dtype}.")
 
     state_indices = idx_mapping.tolist()
     if len(set(state_indices)) != len(state_indices):
@@ -89,6 +100,7 @@ def _select_states(
         if state_idx < 0 or state_idx >= len(states):
             raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
         selected_states.append(states[state_idx])
+    idx_mapping = idx_mapping.to(dtype=torch.int32)
     return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
 
 

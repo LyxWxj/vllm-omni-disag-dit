@@ -220,6 +220,42 @@ def test_adapter_failure_makes_handle_unusable(operation):
         runtime.transaction([handle], _layout("req-a"))
 
 
+def test_activation_failure_attempts_full_rollback_and_preserves_original_error():
+    adapter = _RecordingAdapter(CacheStateScope.REQUEST_SWAPPABLE, fail_operation="activate")
+    runtime = RequestScopedCacheRuntime(adapter)
+    handle = runtime.open_request(_metadata("req-a"))
+    original_invalidate = adapter.invalidate
+    original_deactivate = adapter.deactivate
+
+    def failing_invalidate(handles):
+        original_invalidate(handles)
+        raise RuntimeError("rollback invalidate failed")
+
+    def failing_deactivate(handles):
+        original_deactivate(handles)
+        raise RuntimeError("rollback deactivate failed")
+
+    adapter.invalidate = failing_invalidate
+    adapter.deactivate = failing_deactivate
+    with pytest.raises(RuntimeError, match="activate failed"):
+        with runtime.transaction([handle], _layout("req-a")):
+            pass
+
+    assert handle.invalidated is True
+    assert adapter.events[-3:] == [
+        ("activate", ("req-a",), ("req-a",)),
+        ("invalidate", ("req-a",)),
+        ("deactivate", ("req-a",)),
+    ]
+
+    adapter.fail_operation = None
+    adapter.invalidate = original_invalidate
+    adapter.deactivate = original_deactivate
+    second = runtime.open_request(_metadata("req-b"))
+    with runtime.transaction([second], _layout("req-b")) as transaction:
+        transaction.commit()
+
+
 def test_runtime_rejects_nested_transactions():
     adapter = _RecordingAdapter(CacheStateScope.REQUEST_SWAPPABLE)
     runtime = RequestScopedCacheRuntime(adapter)
