@@ -44,6 +44,7 @@ class StepScheduler(BaseScheduler):
         self._request_progress: dict[str, _StepProgress] = {}
         self._request_age_ticks: dict[str, int] = {}
         self._serial_cache_execution = False
+        self._exclusive_cache_execution = False
         self._aging_credit_ms_per_tick = 1.0
 
     def _reset_scheduler_state(self) -> None:
@@ -51,6 +52,10 @@ class StepScheduler(BaseScheduler):
         self._request_age_ticks.clear()
         cache_backend = str(getattr(self.od_config, "cache_backend", "none") or "none").lower()
         self._serial_cache_execution = cache_backend != "none"
+        # Generic Cache-DiT hooks own one mutable trajectory.  Keep the
+        # scheduler's active cohort at one until a backend exposes a
+        # request-swappable or batch-native adapter.
+        self._exclusive_cache_execution = cache_backend == "cache_dit"
         self._aging_credit_ms_per_tick = float(getattr(self.od_config, "step_schedule_aging_credit_ms_per_tick", 1.0))
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -93,7 +98,8 @@ class StepScheduler(BaseScheduler):
             self._waiting.popleft()
 
         waiting_candidate: str | None = None
-        if self._waiting and len(self._running) < self.max_num_running_reqs:
+        max_active_reqs = 1 if self._exclusive_cache_execution else self.max_num_running_reqs
+        if self._waiting and len(self._running) < max_active_reqs:
             request_id = self._waiting[0]
             state = self._request_states[request_id]
             if self._can_schedule_waiting(state):

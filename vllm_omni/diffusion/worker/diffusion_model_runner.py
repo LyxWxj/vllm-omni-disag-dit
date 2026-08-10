@@ -33,6 +33,7 @@ from vllm_omni.diffusion.cache.request_scope import (
     CacheHandle,
     CacheRequestMetadata,
     CacheTransaction,
+    ExclusiveCacheAdapter,
     RequestScopedCacheRuntime,
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
@@ -381,6 +382,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 ):
                     self.step_cache_runtime = RequestScopedCacheRuntime(
                         TeaCacheRequestAdapter.from_pipeline(self.pipeline)
+                    )
+                elif (
+                    getattr(self.od_config, "step_execution", False)
+                    and str(self.od_config.cache_backend).lower() == "cache_dit"
+                ):
+                    # Generic Cache-DiT hooks hold one mutable trajectory.  The
+                    # common runtime still gives it the same request lifecycle
+                    # as TeaCache, while its exclusive capability prevents
+                    # unsafe overlap until a state-swappable adapter exists.
+                    self.step_cache_runtime = RequestScopedCacheRuntime(
+                        ExclusiveCacheAdapter(self.cache_backend, self.pipeline)
                     )
 
         # Install prompt-embedding cache (transparent wrapper around
@@ -993,10 +1005,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         cache_backend_name = str(self.od_config.cache_backend or "none").lower()
-        if cache_backend_name not in ("none", "tea_cache"):
+        if cache_backend_name not in ("none", "tea_cache", "cache_dit"):
             raise ValueError(f"Step mode does not support cache_backend={cache_backend_name!r} yet.")
-        if cache_backend_name == "tea_cache" and getattr(self, "step_cache_runtime", None) is None:
-            raise RuntimeError("TeaCache step mode requires an initialized request-scoped cache runtime.")
+        if cache_backend_name in ("tea_cache", "cache_dit") and getattr(self, "step_cache_runtime", None) is None:
+            if not (cache_backend_name == "cache_dit" and is_request_scoped_cache_dit_enabled(self.pipeline)):
+                raise RuntimeError(
+                    f"{cache_backend_name} step mode requires an initialized request-scoped cache runtime."
+                )
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()

@@ -14,6 +14,7 @@ from vllm_omni.diffusion.cache.request_scope import (
     CacheCloseReason,
     CacheDecisionScope,
     CacheStateScope,
+    ExclusiveCacheAdapter,
     RequestScopedCacheRuntime,
 )
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -473,6 +474,44 @@ def test_execute_stepwise_commits_and_closes_request_cache(monkeypatch):
         "close",
     ]
     assert adapter.events[-1] == ("close", "req", CacheCloseReason.FINISHED)
+    assert runner.step_cache_handles == {}
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_stepwise_supports_exclusive_cache_dit_runtime(monkeypatch):
+    class _ExclusiveBackend:
+        def __init__(self):
+            self.enabled = True
+            self.refresh_calls = []
+
+        def is_enabled(self):
+            return self.enabled
+
+        def refresh(self, pipeline, num_inference_steps, verbose=True):
+            self.refresh_calls.append((pipeline, num_inference_steps, verbose))
+
+    backend = _ExclusiveBackend()
+    runner = _make_runner(cache_backend=backend, cache_backend_name="cache_dit")
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.step_execution = True
+    runner.step_cache_runtime = RequestScopedCacheRuntime(ExclusiveCacheAdapter(backend, runner.pipeline))
+    runner.step_cache_handles = {}
+    _patch_stepwise_cpu_runtime(monkeypatch)
+    req = _make_request()
+    req.request_id = "req"
+    req.sampling_params.num_inference_steps = 1
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")
+
+    assert output.finished is True
+    assert backend.refresh_calls == [(runner.pipeline, 1, True)]
     assert runner.step_cache_handles == {}
     assert runner.state_cache == {}
 

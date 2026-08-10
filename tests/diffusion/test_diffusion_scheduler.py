@@ -1020,6 +1020,29 @@ class TestStepScheduler:
         assert _cached_ids(fourth) == [req_a]
         assert all(output.num_scheduled_reqs == 1 for output in (first, second, third, fourth))
 
+    def test_cache_dit_keeps_one_exclusive_request_active(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3, cache_backend="cache_dit"))
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=2))
+
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_a]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+        scheduler.update_from_output(first, _make_step_output(req_a, step_index=1))
+
+        second = scheduler.schedule()
+        assert _cached_ids(second) == [req_a]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 1
+        scheduler.update_from_output(second, _make_step_output(req_a, step_index=2, finished=True))
+
+        third = scheduler.schedule()
+        assert _new_ids(third) == [req_b]
+        assert third.num_running_reqs == 1
+        assert third.num_waiting_reqs == 0
+
     def test_cache_mode_preserves_fifo_batch_key_boundary(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2, cache_backend="tea_cache"))
