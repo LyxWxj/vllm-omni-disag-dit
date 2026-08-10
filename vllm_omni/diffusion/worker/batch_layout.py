@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -23,6 +23,11 @@ class RequestRowLayout:
     request_ids: tuple[str, ...]
     row_to_request: tuple[int, ...]
     row_to_request_row: tuple[int, ...]
+    _contiguous_row_ranges: tuple[tuple[int, int], ...] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.request_ids:
@@ -56,6 +61,20 @@ class RequestRowLayout:
                     f"Rows for request {self.request_ids[request_index]!r} must be a permutation of "
                     f"{expected}; got {rows}."
                 )
+
+        contiguous_ranges: list[tuple[int, int]] = []
+        row_offset = 0
+        for request_index, rows in enumerate(local_rows):
+            next_row_offset = row_offset + len(rows)
+            if self.row_to_request[row_offset:next_row_offset] != (request_index,) * len(
+                rows
+            ) or self.row_to_request_row[row_offset:next_row_offset] != tuple(range(len(rows))):
+                object.__setattr__(self, "_contiguous_row_ranges", None)
+                break
+            contiguous_ranges.append((row_offset, next_row_offset))
+            row_offset = next_row_offset
+        else:
+            object.__setattr__(self, "_contiguous_row_ranges", tuple(contiguous_ranges))
 
     @classmethod
     def from_request_row_counts(
@@ -94,6 +113,16 @@ class RequestRowLayout:
             raise ValueError("Cannot split a scalar tensor with RequestRowLayout.")
         if int(value.shape[0]) != self.num_rows:
             raise ValueError(f"RequestRowLayout describes {self.num_rows} rows, but tensor has {int(value.shape[0])}.")
+
+        if self._contiguous_row_ranges is not None:
+            return {
+                request_id: value[row_start:row_end]
+                for request_id, (row_start, row_end) in zip(
+                    self.request_ids,
+                    self._contiguous_row_ranges,
+                    strict=True,
+                )
+            }
 
         physical_rows: list[list[tuple[int, int]]] = [[] for _ in self.request_ids]
         for physical_row, (request_index, request_row) in enumerate(

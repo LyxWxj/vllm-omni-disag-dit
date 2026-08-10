@@ -48,13 +48,18 @@ def test_metadata_and_capabilities_reject_invalid_contracts():
 
 
 class _RecordingAdapter:
-    def __init__(self, state_scope: CacheStateScope) -> None:
+    def __init__(self, state_scope: CacheStateScope, fail_operation: str | None = None) -> None:
         self.capabilities = CacheCapabilities(
             state_scope=state_scope,
             decision_scope=CacheDecisionScope.REQUEST,
             supports_packed_subset=state_scope == CacheStateScope.BATCH_NATIVE,
         )
         self.events = []
+        self.fail_operation = fail_operation
+
+    def _fail_if_requested(self, operation: str) -> None:
+        if self.fail_operation == operation:
+            raise RuntimeError(f"{operation} failed")
 
     def open_request(self, metadata):
         state = {"request_id": metadata.request_id, "version": 0}
@@ -69,6 +74,7 @@ class _RecordingAdapter:
                 row_layout.request_ids,
             )
         )
+        self._fail_if_requested("activate")
 
     def capture(self, handles):
         states = [
@@ -79,13 +85,16 @@ class _RecordingAdapter:
             for handle in handles
         ]
         self.events.append(("capture", tuple(handle.request_id for handle in handles)))
+        self._fail_if_requested("capture")
         return states
 
     def invalidate(self, handles):
         self.events.append(("invalidate", tuple(handle.request_id for handle in handles)))
+        self._fail_if_requested("invalidate")
 
     def deactivate(self, handles):
         self.events.append(("deactivate", tuple(handle.request_id for handle in handles)))
+        self._fail_if_requested("deactivate")
 
     def close_request(self, handle, reason):
         self.events.append(("close", handle.request_id, reason))
@@ -159,6 +168,24 @@ def test_capture_count_mismatch_invalidates_and_deactivates_handle():
         ("invalidate", ("req-a",)),
         ("deactivate", ("req-a",)),
     ]
+
+
+@pytest.mark.parametrize("operation", ["activate", "capture", "invalidate", "deactivate"])
+def test_adapter_failure_makes_handle_unusable(operation):
+    adapter = _RecordingAdapter(CacheStateScope.REQUEST_SWAPPABLE, fail_operation=operation)
+    runtime = RequestScopedCacheRuntime(adapter)
+    handle = runtime.open_request(_metadata("req-a"))
+
+    with pytest.raises(RuntimeError, match=rf"{operation} failed"):
+        if operation == "invalidate":
+            runtime.invalidate_request(handle)
+        else:
+            with runtime.transaction([handle], _layout("req-a")) as transaction:
+                transaction.commit()
+
+    assert handle.invalidated is True
+    with pytest.raises(RuntimeError, match="invalidated"):
+        runtime.transaction([handle], _layout("req-a"))
 
 
 def test_runtime_rejects_nested_transactions():

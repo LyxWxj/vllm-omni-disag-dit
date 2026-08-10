@@ -64,6 +64,11 @@ def _select_states(
     states: Sequence[StepRequestState],
     idx_mapping: torch.Tensor | None,
 ) -> tuple[list[StepRequestState], torch.Tensor, np.ndarray]:
+    """Select a permutation or subset of logical requests for one step.
+
+    Repeated indices are intentionally unsupported: ``idx_mapping`` maps one
+    batch entry to one distinct logical request and is not a padding map.
+    """
     if not states:
         raise ValueError("Cannot build InputBatch from empty states.")
 
@@ -75,8 +80,12 @@ def _select_states(
             raise ValueError("idx_mapping must be a 1D tensor.")
         idx_mapping = idx_mapping.to(dtype=torch.int32)
 
+    state_indices = idx_mapping.tolist()
+    if len(set(state_indices)) != len(state_indices):
+        raise ValueError("idx_mapping must not contain duplicate state indices.")
+
     selected_states: list[StepRequestState] = []
-    for batch_idx, state_idx in enumerate(idx_mapping.tolist()):
+    for batch_idx, state_idx in enumerate(state_indices):
         if state_idx < 0 or state_idx >= len(states):
             raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
         selected_states.append(states[state_idx])
@@ -718,7 +727,12 @@ class InputBatch:
         idx_mapping: torch.Tensor | None = None,
         cached_batch: InputBatch | None = None,
     ) -> InputBatch:
-        """Build a temporary step-local batch view from request states."""
+        """Build a temporary step-local batch view from request states.
+
+        ``idx_mapping`` may reorder or select requests, but each state index
+        may appear at most once. Physical row padding belongs in request-local
+        tensors and :class:`RequestRowLayout`, not in this logical mapping.
+        """
         selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
         request_ids = _prepare_request_ids(selected_states)
         row_layout = RequestRowLayout.from_request_row_counts(

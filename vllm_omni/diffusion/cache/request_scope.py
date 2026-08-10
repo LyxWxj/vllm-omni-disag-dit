@@ -234,8 +234,7 @@ class RequestScopedCacheRuntime:
         self._validate_handle(handle)
         if handle in self._active_handles:
             raise RuntimeError("Cannot invalidate an active cache handle.")
-        self._adapter.invalidate((handle,))
-        handle._invalidated = True
+        self._invalidate_handles((handle,))
 
     def close_request(self, handle: CacheHandle, reason: CacheCloseReason) -> Any:
         self._validate_handle(handle, allow_invalidated=True)
@@ -320,13 +319,17 @@ class RequestScopedCacheRuntime:
         finally:
             try:
                 self._adapter.deactivate(handles)
+            except Exception:
+                if any(not handle.invalidated for handle in handles):
+                    self._invalidate_handles(handles)
+                raise
             finally:
                 self._active_handles = ()
 
     def _invalidate_handles(self, handles: Sequence[CacheHandle]) -> None:
-        self._adapter.invalidate(handles)
         for handle in handles:
             handle._invalidated = True
+        self._adapter.invalidate(handles)
 
 
 __all__ = [

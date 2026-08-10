@@ -36,6 +36,18 @@ def test_contiguous_layout_splits_multiple_rows_per_request():
     torch.testing.assert_close(split["req-b"], torch.tensor([[20.0]]))
 
 
+def test_contiguous_layout_split_returns_views_without_copying():
+    layout = RequestRowLayout.from_request_row_counts(["req-a", "req-b"], [2, 1])
+    value = torch.tensor([[10.0], [11.0], [20.0]])
+
+    split = layout.split_tensor(value)
+
+    split["req-a"][0, 0] = 99.0
+    split["req-b"][0, 0] = 77.0
+    assert value[0, 0].item() == 99.0
+    assert value[2, 0].item() == 77.0
+
+
 def test_layout_restores_request_local_order_from_interleaved_rows():
     layout = RequestRowLayout(
         request_ids=("req-a", "req-b"),
@@ -43,10 +55,13 @@ def test_layout_restores_request_local_order_from_interleaved_rows():
         row_to_request_row=(0, 1, 0),
     )
 
-    split = layout.split_tensor(torch.tensor([[20.0], [11.0], [10.0]]))
+    value = torch.tensor([[20.0], [11.0], [10.0]])
+    split = layout.split_tensor(value)
 
     torch.testing.assert_close(split["req-a"], torch.tensor([[10.0], [11.0]]))
     torch.testing.assert_close(split["req-b"], torch.tensor([[20.0]]))
+    split["req-a"][0, 0] = 99.0
+    torch.testing.assert_close(value, torch.tensor([[20.0], [11.0], [10.0]]))
 
 
 @pytest.mark.parametrize(
@@ -103,3 +118,13 @@ def test_input_batch_layout_follows_selected_request_order_and_row_counts():
         ["req-b", "req-a"],
         [1, 2],
     )
+
+
+def test_input_batch_rejects_duplicate_idx_mapping_entries():
+    states = [_state("req-a", 1), _state("req-b", 1)]
+
+    with pytest.raises(ValueError, match="must not contain duplicate"):
+        InputBatch.make_batch(
+            states,
+            idx_mapping=torch.tensor([0, 0], dtype=torch.int32),
+        )
