@@ -255,7 +255,10 @@ def test_pipeline_owned_cache_dit_reports_exclusive_contract():
     runner = object.__new__(DiffusionModelRunner)
     runner.step_cache_runtime = None
     runner.od_config = SimpleNamespace(cache_backend="cache_dit")
-    runner.pipeline = SimpleNamespace(is_cache_dit_enabled=lambda: True)
+    runner.pipeline = SimpleNamespace(
+        adopt_cache_dit_backend=lambda backend: None,
+        is_cache_dit_enabled=lambda: True,
+    )
 
     assert runner.get_step_cache_capabilities() == ExclusiveCacheAdapter.capabilities
 
