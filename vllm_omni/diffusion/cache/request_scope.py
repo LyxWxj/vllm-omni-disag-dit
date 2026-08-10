@@ -43,6 +43,12 @@ class CacheCapabilities:
     supports_packed_subset: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.state_scope, CacheStateScope):
+            raise TypeError("Cache state_scope must be a CacheStateScope.")
+        if not isinstance(self.decision_scope, CacheDecisionScope):
+            raise TypeError("Cache decision_scope must be a CacheDecisionScope.")
+        if not isinstance(self.supports_packed_subset, bool):
+            raise TypeError("Cache supports_packed_subset must be a bool.")
         if self.supports_packed_subset and self.state_scope != CacheStateScope.BATCH_NATIVE:
             raise ValueError("Packed cache subsets require batch-native request state.")
 

@@ -47,6 +47,38 @@ def test_metadata_and_capabilities_reject_invalid_contracts():
         )
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {
+                "state_scope": "request_swappable",
+                "decision_scope": CacheDecisionScope.REQUEST,
+            },
+            "state_scope must be a CacheStateScope",
+        ),
+        (
+            {
+                "state_scope": CacheStateScope.REQUEST_SWAPPABLE,
+                "decision_scope": "request",
+            },
+            "decision_scope must be a CacheDecisionScope",
+        ),
+        (
+            {
+                "state_scope": CacheStateScope.REQUEST_SWAPPABLE,
+                "decision_scope": CacheDecisionScope.REQUEST,
+                "supports_packed_subset": 1,
+            },
+            "supports_packed_subset must be a bool",
+        ),
+    ],
+)
+def test_capabilities_reject_wrong_runtime_types(kwargs, message):
+    with pytest.raises(TypeError, match=message):
+        CacheCapabilities(**kwargs)
+
+
 class _RecordingAdapter:
     def __init__(self, state_scope: CacheStateScope, fail_operation: str | None = None) -> None:
         self.capabilities = CacheCapabilities(
