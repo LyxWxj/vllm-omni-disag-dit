@@ -504,6 +504,12 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def get_step_cache_capabilities(self) -> dict[str, object] | None:
+        """Return the worker-local step cache contract for engine startup."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        capabilities = self.model_runner.get_step_cache_capabilities()
+        return None if capabilities is None else capabilities.to_wire()
+
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
 

@@ -29,6 +29,7 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
     resolve_prompt_embed_cache_config,
 )
 from vllm_omni.diffusion.cache.request_scope import (
+    CacheCapabilities,
     CacheCloseReason,
     CacheHandle,
     CacheRequestMetadata,
@@ -423,6 +424,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """
         if self.prompt_embed_cache is not None:
             self.prompt_embed_cache.clear()
+
+    def get_step_cache_capabilities(self) -> CacheCapabilities | None:
+        """Report the cache state contract used by step execution."""
+        runtime = getattr(self, "step_cache_runtime", None)
+        if runtime is not None:
+            return runtime.capabilities
+        pipeline = getattr(self, "pipeline", None)
+        if (
+            str(getattr(getattr(self, "od_config", None), "cache_backend", "") or "").lower() == "cache_dit"
+            and pipeline is not None
+            and is_request_scoped_cache_dit_enabled(pipeline)
+        ):
+            return ExclusiveCacheAdapter.capabilities
+        return None
 
     def get_prompt_embed_cache_stats(self) -> dict | None:
         """Return hit/miss statistics for the prompt-embedding cache, if enabled.

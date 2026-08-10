@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.diffusion.cache.request_scope import CacheCapabilities
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
@@ -169,6 +170,7 @@ class DiffusionEngine:
     # Class-level default so tests using object.__new__ (without __init__)
     # don't hit AttributeError when _busy_loop accesses self.dp_concurrent.
     dp_concurrent: bool = False
+    cache_capabilities: CacheCapabilities | None = None
 
     def __init__(
         self,
@@ -188,6 +190,7 @@ class DiffusionEngine:
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
+        self.cache_capabilities = self._resolve_step_cache_capabilities(od_config)
         self._init_scheduler(od_config, scheduler)
         self._init_runtime_state()
         self._init_execute_fn()
@@ -224,6 +227,38 @@ class DiffusionEngine:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
 
+    def _resolve_step_cache_capabilities(self, od_config: OmniDiffusionConfig) -> CacheCapabilities | None:
+        """Collect and validate the worker cache contract before scheduling."""
+        if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
+            return None
+        backend = str(getattr(od_config, "cache_backend", "") or "").lower()
+        if backend in ("", "none"):
+            return None
+
+        responses = self.executor.collective_rpc(
+            "get_step_cache_capabilities",
+            exec_all_ranks=True,
+        )
+        if isinstance(responses, (list, tuple)):
+            responses = list(responses)
+        else:
+            responses = [responses]
+        if not responses:
+            raise RuntimeError("Step cache capability handshake returned no worker responses.")
+        if all(response is None for response in responses):
+            return None
+        if any(response is None for response in responses):
+            raise RuntimeError(f"Inconsistent step cache capabilities across workers: {responses!r}")
+        wire_responses = []
+        for response in responses:
+            if isinstance(response, dict) and "wave_id" in response:
+                response = {key: value for key, value in response.items() if key != "wave_id"}
+            wire_responses.append(response)
+        capabilities = [CacheCapabilities.from_wire(response) for response in wire_responses]
+        if any(candidate != capabilities[0] for candidate in capabilities[1:]):
+            raise RuntimeError(f"Inconsistent step cache capabilities across workers: {responses!r}")
+        return capabilities[0]
+
     def _init_scheduler(
         self,
         od_config: OmniDiffusionConfig,
@@ -232,7 +267,7 @@ class DiffusionEngine:
         if scheduler is not None:
             self.scheduler = scheduler
         elif self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
-            self.scheduler = StepScheduler()
+            self.scheduler = StepScheduler(cache_capabilities=self.cache_capabilities)
         else:
             self.scheduler = RequestScheduler()
         self.scheduler.initialize(od_config)

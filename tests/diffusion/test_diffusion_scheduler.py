@@ -10,6 +10,11 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
+from vllm_omni.diffusion.cache.request_scope import (
+    CacheCapabilities,
+    CacheDecisionScope,
+    CacheStateScope,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -26,6 +31,20 @@ from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+_REQUEST_SWAPPABLE_CACHE = CacheCapabilities(
+    state_scope=CacheStateScope.REQUEST_SWAPPABLE,
+    decision_scope=CacheDecisionScope.REQUEST,
+)
+_EXCLUSIVE_CACHE = CacheCapabilities(
+    state_scope=CacheStateScope.EXCLUSIVE_TRAJECTORY,
+    decision_scope=CacheDecisionScope.BATCH,
+)
+_BATCH_NATIVE_CACHE = CacheCapabilities(
+    state_scope=CacheStateScope.BATCH_NATIVE,
+    decision_scope=CacheDecisionScope.REQUEST,
+    supports_packed_subset=True,
+)
 
 
 def _make_request(req_id: str) -> OmniDiffusionRequest:
@@ -944,11 +963,10 @@ class TestStepScheduler:
         assert sched_output.num_waiting_reqs == 0
 
     def test_cache_mode_interleaves_one_request_by_observed_cost(self) -> None:
-        scheduler = StepScheduler()
+        scheduler = StepScheduler(cache_capabilities=_REQUEST_SWAPPABLE_CACHE)
         scheduler.initialize(
             SimpleNamespace(
                 max_num_seqs=3,
-                cache_backend="tea_cache",
                 step_schedule_aging_credit_ms_per_tick=1.0,
             )
         )
@@ -1000,8 +1018,8 @@ class TestStepScheduler:
         assert fourth.num_scheduled_reqs == 1
 
     def test_cache_mode_rotates_unknown_requests_without_timing_samples(self) -> None:
-        scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=3, cache_backend="tea_cache"))
+        scheduler = StepScheduler(cache_capabilities=_REQUEST_SWAPPABLE_CACHE)
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
         req_a = scheduler.add_request(_make_step_request("a"))
         req_b = scheduler.add_request(_make_step_request("b"))
         req_c = scheduler.add_request(_make_step_request("c"))
@@ -1020,9 +1038,9 @@ class TestStepScheduler:
         assert _cached_ids(fourth) == [req_a]
         assert all(output.num_scheduled_reqs == 1 for output in (first, second, third, fourth))
 
-    def test_cache_dit_keeps_one_exclusive_request_active(self) -> None:
-        scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=3, cache_backend="cache_dit"))
+    def test_exclusive_cache_keeps_one_request_active(self) -> None:
+        scheduler = StepScheduler(cache_capabilities=_EXCLUSIVE_CACHE)
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
         req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
         req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=2))
 
@@ -1044,8 +1062,8 @@ class TestStepScheduler:
         assert third.num_waiting_reqs == 0
 
     def test_cache_mode_preserves_fifo_batch_key_boundary(self) -> None:
-        scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=2, cache_backend="tea_cache"))
+        scheduler = StepScheduler(cache_capabilities=_REQUEST_SWAPPABLE_CACHE)
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
         req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
         req_b = scheduler.add_request(
             _make_step_request(
@@ -1069,6 +1087,17 @@ class TestStepScheduler:
 
         assert _new_ids(third) == [req_b]
         assert third.finished_req_ids == {req_a}
+
+    def test_batch_native_cache_uses_dense_step_batching(self) -> None:
+        scheduler = StepScheduler(cache_capabilities=_BATCH_NATIVE_CACHE)
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(_make_step_request("b"))
+
+        output = scheduler.schedule()
+
+        assert _new_ids(output) == [req_a, req_b]
+        assert output.num_scheduled_reqs == 2
 
     def test_step_batch_allows_different_num_inference_steps(self) -> None:
         scheduler = StepScheduler()

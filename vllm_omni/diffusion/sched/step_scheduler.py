@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.cache.request_scope import CacheCapabilities, CacheStateScope
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -39,8 +40,9 @@ class _StepProgress:
 class StepScheduler(BaseScheduler):
     """Scheduler that advances each request by one denoise step per update."""
 
-    def __init__(self) -> None:
+    def __init__(self, cache_capabilities: CacheCapabilities | None = None) -> None:
         super().__init__()
+        self._cache_capabilities = cache_capabilities
         self._request_progress: dict[str, _StepProgress] = {}
         self._request_age_ticks: dict[str, int] = {}
         self._serial_cache_execution = False
@@ -50,13 +52,16 @@ class StepScheduler(BaseScheduler):
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
         self._request_age_ticks.clear()
-        cache_backend = str(getattr(self.od_config, "cache_backend", "none") or "none").lower()
-        self._serial_cache_execution = cache_backend != "none"
-        # Generic Cache-DiT hooks own one mutable trajectory.  Keep the
-        # scheduler's active cohort at one until a backend exposes a
-        # request-swappable or batch-native adapter.
-        self._exclusive_cache_execution = cache_backend == "cache_dit"
+        capabilities = self._cache_capabilities
+        self._serial_cache_execution = capabilities is not None and not capabilities.supports_packed_subset
+        self._exclusive_cache_execution = (
+            capabilities is not None and capabilities.state_scope == CacheStateScope.EXCLUSIVE_TRAJECTORY
+        )
         self._aging_credit_ms_per_tick = float(getattr(self.od_config, "step_schedule_aging_credit_ms_per_tick", 1.0))
+
+    @property
+    def cache_capabilities(self) -> CacheCapabilities | None:
+        return self._cache_capabilities
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         request_id = request.request_id

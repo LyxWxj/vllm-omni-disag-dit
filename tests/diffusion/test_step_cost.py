@@ -6,6 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.diffusion.cache.request_scope import (
+    CacheCapabilities,
+    CacheDecisionScope,
+    CacheStateScope,
+)
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
@@ -19,6 +24,11 @@ from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+_REQUEST_SWAPPABLE_CACHE = CacheCapabilities(
+    state_scope=CacheStateScope.REQUEST_SWAPPABLE,
+    decision_scope=CacheDecisionScope.REQUEST,
+)
 
 
 def _observed_cost(value: float, signature: object = ("shape-a", "cache-a")) -> RequestStepCost:
@@ -136,8 +146,8 @@ class TestStepSchedulerCostCommit:
         assert cost.mean_service_time_ms == 8.0
 
     def test_commits_multiple_deferred_observations_for_an_active_request(self) -> None:
-        scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=2, cache_backend="tea_cache"))
+        scheduler = StepScheduler(cache_capabilities=_REQUEST_SWAPPABLE_CACHE)
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
         request_a = scheduler.add_request(_request("a"))
         request_b = scheduler.add_request(_request("b"))
         first = scheduler.schedule()

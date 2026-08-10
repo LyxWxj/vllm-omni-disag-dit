@@ -47,6 +47,33 @@ def test_metadata_and_capabilities_reject_invalid_contracts():
         )
 
 
+def test_capabilities_wire_round_trip_and_validation():
+    capabilities = CacheCapabilities(
+        state_scope=CacheStateScope.REQUEST_SWAPPABLE,
+        decision_scope=CacheDecisionScope.REQUEST,
+    )
+
+    assert CacheCapabilities.from_wire(capabilities.to_wire()) == capabilities
+    with pytest.raises(ValueError, match="contain exactly"):
+        CacheCapabilities.from_wire({"state_scope": "request_swappable"})
+    with pytest.raises(TypeError, match="must be a bool"):
+        CacheCapabilities.from_wire(
+            {
+                "state_scope": "request_swappable",
+                "decision_scope": "request",
+                "supports_packed_subset": 0,
+            }
+        )
+    with pytest.raises(ValueError, match="Invalid cache capability enum"):
+        CacheCapabilities.from_wire(
+            {
+                "state_scope": "unknown",
+                "decision_scope": "request",
+                "supports_packed_subset": False,
+            }
+        )
+
+
 class _RecordingAdapter:
     def __init__(self, state_scope: CacheStateScope) -> None:
         self.capabilities = CacheCapabilities(

@@ -15,6 +15,11 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.cache.request_scope import (
+    CacheCapabilities,
+    CacheDecisionScope,
+    CacheStateScope,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
@@ -29,6 +34,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
+from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -141,6 +147,77 @@ def _make_request_mode_sched_output(*request_ids: str) -> RealDiffusionScheduler
         num_running_reqs=len(new_reqs),
         num_waiting_reqs=0,
     )
+
+
+class TestStepCacheCapabilityHandshake:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @staticmethod
+    def _engine(mocker: MockerFixture, responses):
+        engine = object.__new__(DiffusionEngine)
+        engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+        engine.executor = SimpleNamespace(collective_rpc=mocker.Mock(return_value=responses))
+        return engine
+
+    @staticmethod
+    def _config():
+        return SimpleNamespace(cache_backend="cache_dit")
+
+    def test_collects_one_consistent_capability_from_reported_workers(self, mocker: MockerFixture) -> None:
+        wire = {
+            "state_scope": "request_swappable",
+            "decision_scope": "request",
+            "supports_packed_subset": False,
+            "wave_id": 7,
+        }
+        engine = self._engine(mocker, [wire, wire])
+
+        capabilities = engine._resolve_step_cache_capabilities(self._config())
+
+        assert capabilities == CacheCapabilities(
+            state_scope=CacheStateScope.REQUEST_SWAPPABLE,
+            decision_scope=CacheDecisionScope.REQUEST,
+        )
+        engine.executor.collective_rpc.assert_called_once_with(
+            "get_step_cache_capabilities",
+            exec_all_ranks=True,
+        )
+
+    def test_rejects_inconsistent_worker_capabilities(self, mocker: MockerFixture) -> None:
+        engine = self._engine(
+            mocker,
+            [
+                {
+                    "state_scope": "request_swappable",
+                    "decision_scope": "request",
+                    "supports_packed_subset": False,
+                },
+                None,
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="Inconsistent step cache capabilities"):
+            engine._resolve_step_cache_capabilities(self._config())
+
+    def test_disabled_cache_skips_handshake(self, mocker: MockerFixture) -> None:
+        engine = self._engine(mocker, [])
+
+        assert engine._resolve_step_cache_capabilities(SimpleNamespace(cache_backend="none")) is None
+        engine.executor.collective_rpc.assert_not_called()
+
+    def test_scheduler_receives_worker_capability(self, mocker: MockerFixture) -> None:
+        wire = {
+            "state_scope": "exclusive_trajectory",
+            "decision_scope": "batch",
+            "supports_packed_subset": False,
+        }
+        engine = self._engine(mocker, [wire])
+        engine.cache_capabilities = engine._resolve_step_cache_capabilities(self._config())
+
+        engine._init_scheduler(SimpleNamespace(max_num_seqs=2))
+
+        assert isinstance(engine.scheduler, StepScheduler)
+        assert engine.scheduler.cache_capabilities == engine.cache_capabilities
 
 
 class TestRequestBatchCapability:

@@ -242,6 +242,33 @@ def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
     assert events == [backend]
 
 
+def test_step_cache_capabilities_report_actual_runtime_contract():
+    runner = object.__new__(DiffusionModelRunner)
+    runner.step_cache_runtime = RequestScopedCacheRuntime(_RecordingRequestCacheAdapter())
+    runner.od_config = SimpleNamespace(cache_backend="cache_dit")
+    runner.pipeline = object()
+
+    assert runner.get_step_cache_capabilities() == _RecordingRequestCacheAdapter.capabilities
+
+
+def test_pipeline_owned_cache_dit_reports_exclusive_contract():
+    runner = object.__new__(DiffusionModelRunner)
+    runner.step_cache_runtime = None
+    runner.od_config = SimpleNamespace(cache_backend="cache_dit")
+    runner.pipeline = SimpleNamespace(is_cache_dit_enabled=lambda: True)
+
+    assert runner.get_step_cache_capabilities() == ExclusiveCacheAdapter.capabilities
+
+
+def test_step_cache_capabilities_are_none_without_active_runtime():
+    runner = object.__new__(DiffusionModelRunner)
+    runner.step_cache_runtime = None
+    runner.od_config = SimpleNamespace(cache_backend="tea_cache")
+    runner.pipeline = object()
+
+    assert runner.get_step_cache_capabilities() is None
+
+
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()

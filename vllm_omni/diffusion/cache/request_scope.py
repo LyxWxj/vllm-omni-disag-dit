@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
@@ -45,6 +45,40 @@ class CacheCapabilities:
     def __post_init__(self) -> None:
         if self.supports_packed_subset and self.state_scope != CacheStateScope.BATCH_NATIVE:
             raise ValueError("Packed cache subsets require batch-native request state.")
+
+    def to_wire(self) -> dict[str, object]:
+        """Return the primitive representation exchanged during startup."""
+        return {
+            "state_scope": self.state_scope.value,
+            "decision_scope": self.decision_scope.value,
+            "supports_packed_subset": self.supports_packed_subset,
+        }
+
+    @classmethod
+    def from_wire(cls, value: object) -> CacheCapabilities:
+        """Validate and decode a worker capability response."""
+        if not isinstance(value, Mapping):
+            raise TypeError(f"Cache capabilities must be a mapping, got {type(value).__name__}.")
+        required = {"state_scope", "decision_scope", "supports_packed_subset"}
+        if set(value) != required:
+            raise ValueError(f"Cache capabilities must contain exactly {sorted(required)}, got {sorted(value)}.")
+        packed = value["supports_packed_subset"]
+        if not isinstance(packed, bool):
+            raise TypeError("Cache capabilities supports_packed_subset must be a bool.")
+        state_scope_value = value["state_scope"]
+        decision_scope_value = value["decision_scope"]
+        if not isinstance(state_scope_value, str) or not isinstance(decision_scope_value, str):
+            raise TypeError("Cache capability scope values must be strings.")
+        try:
+            state_scope = CacheStateScope(state_scope_value)
+            decision_scope = CacheDecisionScope(decision_scope_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid cache capability enum value: {value!r}.") from exc
+        return cls(
+            state_scope=state_scope,
+            decision_scope=decision_scope,
+            supports_packed_subset=packed,
+        )
 
 
 @dataclass(frozen=True)
