@@ -15,6 +15,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pp_group,
     is_pipeline_first_stage,
 )
+from vllm_omni.diffusion.distributed.pp_trace import span as pp_trace_span
 
 
 class AsyncLatents:
@@ -226,13 +227,17 @@ class PipelineParallelMixin:
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
-            for kwargs, it in zip(all_kwargs, its):
-                result = self.predict_noise(**kwargs, intermediate_tensors=it)
+            for branch, (kwargs, it) in enumerate(zip(all_kwargs, its)):
+                with pp_trace_span("pp_stage_forward", cfg_branch=branch):
+                    result = self.predict_noise(**kwargs, intermediate_tensors=it)
                 self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
 
         # Last rank: run full forward
-        noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
+        noise_preds = []
+        for branch, (kwargs, it) in enumerate(zip(all_kwargs, its)):
+            with pp_trace_span("pp_stage_forward", cfg_branch=branch):
+                noise_preds.append(self.predict_noise(**kwargs, intermediate_tensors=it))
 
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine
