@@ -87,7 +87,6 @@ class StageRemoteFactoryContext:
     base_metadata: Any
     vllm_config: Any | None = None
     executor_class: type | None = None
-    diffusion_batch_size: int = 1
 
 
 def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
@@ -124,7 +123,6 @@ class StageRuntime:
         config_path: str,
         *,
         stage_init_timeout: int,
-        diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
         log_stats: bool = False,
@@ -133,7 +131,6 @@ class StageRuntime:
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
-        self._diffusion_batch_size = diffusion_batch_size
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         self._log_stats = log_stats
@@ -659,7 +656,6 @@ class StageRuntime:
                     stage_config=plan.stage_cfg,
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
-                    batch_size=self._diffusion_batch_size,
                     use_inline=self._num_stages == 1 and plan.num_replicas == 1,
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
@@ -667,10 +663,9 @@ class StageRuntime:
                 )
 
             logger.info(
-                "[StageRuntime] Stage %s replica %s initialized (diffusion, batch_size=%d)",
+                "[StageRuntime] Stage %s replica %s initialized (diffusion)",
                 plan.metadata.stage_id,
                 plan.replica_id,
-                self._diffusion_batch_size,
             )
             return client
         except Exception:
@@ -754,7 +749,6 @@ class DistStageRuntime(StageRuntime):
         config_path: str,
         *,
         stage_init_timeout: int,
-        diffusion_batch_size: int,
         async_chunk: bool,
         single_stage_id_filter: int | None,
         omni_master_address: str,
@@ -771,7 +765,6 @@ class DistStageRuntime(StageRuntime):
             model=model,
             config_path=config_path,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
             log_stats=log_stats,
@@ -900,7 +893,6 @@ class DistStageRuntime(StageRuntime):
             base_metadata=metadata,
             vllm_config=plan.stage_vllm_config,
             executor_class=plan.executor_class,
-            diffusion_batch_size=self._diffusion_batch_size,
         )
         return self._create_remote_replica_client(ctx, plan.replica_id)
 
@@ -963,7 +955,6 @@ class DistStageRuntime(StageRuntime):
                 base_metadata=template.metadata,
                 vllm_config=template.stage_vllm_config,
                 executor_class=template.executor_class,
-                diffusion_batch_size=self._diffusion_batch_size,
             )
         return contexts
 
@@ -1031,7 +1022,6 @@ class DistStageRuntime(StageRuntime):
                 metadata,
                 request_address=resources.addresses.inputs[0],
                 response_address=resources.addresses.outputs[0],
-                batch_size=ctx.diffusion_batch_size,
             )
             logger.info(
                 "[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d",
@@ -1095,7 +1085,6 @@ def create_stage_runtime(
     *,
     single_stage_mode: bool,
     stage_init_timeout: int,
-    diffusion_batch_size: int,
     async_chunk: bool,
     tokenizer: str | None = None,
     # Distributed-only params:
@@ -1117,7 +1106,6 @@ def create_stage_runtime(
             model=model,
             config_path=config_path,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
             log_stats=log_stats,
@@ -1134,7 +1122,6 @@ def create_stage_runtime(
         model=model,
         config_path=config_path,
         stage_init_timeout=stage_init_timeout,
-        diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
         log_stats=log_stats,

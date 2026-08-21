@@ -1530,7 +1530,6 @@ def launch_diffusion_stage_replica(
     stage_config: Any,
     metadata: Any,
     stage_init_timeout: int,
-    batch_size: int,
     use_inline: bool,
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
@@ -1549,7 +1548,6 @@ def launch_diffusion_stage_replica(
             stage_config,
             metadata,
             stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
             use_inline=use_inline,
         )
         return client, StageReplicaResources()
@@ -1558,7 +1556,6 @@ def launch_diffusion_stage_replica(
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
     od_config = build_diffusion_config(model, stage_config, metadata)
-    od_config.max_num_seqs = batch_size
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:
@@ -1609,7 +1606,6 @@ def launch_diffusion_stage_replica(
             request_address=proc_manager.addresses.inputs[0],
             response_address=proc_manager.addresses.outputs[0],
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
         return client, StageReplicaResources(
             manager=proc_manager,

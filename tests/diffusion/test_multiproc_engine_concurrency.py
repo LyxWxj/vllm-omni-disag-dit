@@ -1109,7 +1109,6 @@ class TestStageDiffusionClientErrorPropagation:
                 metadata,
                 "tcp://req",
                 "tcp://resp",
-                batch_size=1,
             )
 
     @pytest.mark.asyncio
