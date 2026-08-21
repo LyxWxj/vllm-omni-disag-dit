@@ -4,6 +4,7 @@
 # Example:
 #   tools/benchmark/run_diffusion_pp_timeline.sh \
 #     --name a100 --port 8000 \
+#     --max-num-seqs 4 \
 #     --server-command 'CUDA_VISIBLE_DEVICES=0,1 vllm serve MODEL --omni --pipeline-parallel-size 2' \
 #     --request-count 4 \
 #     --request-command 'curl -fsS http://127.0.0.1:8000/v1/videos/sync -H "Content-Type: application/json" -d @request.json -o "$VLLM_OMNI_RESULT_DIR/result-${VLLM_OMNI_REQUEST_INDEX}.json"'
@@ -14,6 +15,7 @@ TIMELINE_TOOL="${SCRIPT_DIR}/trace_diffusion_pp_timeline.py"
 name=pp; server_command=""; request_command=""; output_root="${PWD}/pp-timeline-results"
 port=""; startup_timeout_s=180; request_timeout_s=1800; shutdown_timeout_s=30; bin_us=100
 request_count=1
+max_num_seqs=""
 sync_trace=1; keep_server_log=1
 
 usage() {
@@ -23,6 +25,7 @@ usage() {
 Options:
   --name NAME, --server-command COMMAND, --request-command COMMAND
   --request-count N
+  --max-num-seqs N
   --output-root DIR, --port PORT, --startup-timeout-s SEC
   --request-timeout-s SEC, --shutdown-timeout-s SEC, --bin-us US
   --no-sync-trace, --remove-server-log, -h/--help
@@ -35,6 +38,7 @@ while (($#)); do
         --server-command) server_command="$2"; shift 2;;
         --request-command) request_command="$2"; shift 2;;
         --request-count) request_count="$2"; shift 2;;
+        --max-num-seqs) max_num_seqs="$2"; shift 2;;
         --output-root) output_root="$2"; shift 2;;
         --port) port="$2"; shift 2;;
         --startup-timeout-s) startup_timeout_s="$2"; shift 2;;
@@ -53,6 +57,13 @@ if [[ -z "$server_command" || -z "$request_command" ]]; then
 fi
 if ! [[ "$startup_timeout_s" =~ ^[0-9]+$ && "$request_timeout_s" =~ ^[0-9]+$ && "$shutdown_timeout_s" =~ ^[0-9]+$ && "$bin_us" =~ ^[0-9]+$ && "$request_count" =~ ^[1-9][0-9]*$ ]]; then
     echo "Timeouts and --bin-us must be non-negative integers; --request-count must be positive." >&2; exit 2
+fi
+if [[ -n "$max_num_seqs" ]] && ! [[ "$max_num_seqs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--max-num-seqs must be a positive integer." >&2; exit 2
+fi
+
+if [[ -n "$max_num_seqs" ]]; then
+    server_command+=" --max-num-seqs ${max_num_seqs}"
 fi
 
 result_dir="${output_root}/${name}"; trace_dir="${result_dir}/trace"; server_log="${result_dir}/server.log"
@@ -77,7 +88,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[pp-timeline] result_dir=${result_dir} trace_sync=${sync_trace}"
+echo "[pp-timeline] result_dir=${result_dir} trace_sync=${sync_trace} request_count=${request_count} max_num_seqs=${max_num_seqs:-server-default}"
 bash -lc "$server_command" >"$server_log" 2>&1 &
 server_pid=$!
 ready=0
