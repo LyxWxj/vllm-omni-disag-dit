@@ -74,6 +74,79 @@ def _intervals(events: list[dict[str, Any]], name: str = "pp_stage_forward") -> 
     return result
 
 
+def _all_intervals(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair all named spans, including nested spans of different names."""
+    open_events: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    result: list[dict[str, Any]] = []
+    for event in sorted(events, key=lambda item: int(item["ts_ns"])):
+        key = (int(event["pid"]), str(event.get("name", "unknown")))
+        if event["ph"] == "B":
+            open_events.setdefault(key, []).append(event)
+            continue
+        pending_stack = open_events.get(key)
+        if not pending_stack:
+            continue
+        pending = pending_stack.pop()
+        if not pending_stack:
+            open_events.pop(key, None)
+        start_ns = int(pending["ts_ns"])
+        end_ns = int(event["ts_ns"])
+        if end_ns <= start_ns:
+            continue
+        result.append(
+            {
+                "name": str(pending.get("name", "unknown")),
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "pid": int(pending["pid"]),
+                "pp_rank": int(pending.get("pp_rank", 0)),
+                "args": pending.get("args", {}),
+            }
+        )
+    return result
+
+
+def _render_detailed_text(intervals: list[dict[str, Any]]) -> str:
+    """Render component spans and rank-local gaps in chronological order."""
+    if not intervals:
+        return "# No complete spans found\n"
+    origin = min(item["start_ns"] for item in intervals)
+    lines = [
+        "# Detailed diffusion timeline",
+        "# name pp_rank start_ms duration_ms args_json",
+    ]
+    for item in sorted(intervals, key=lambda value: int(value["start_ns"])):
+        args = json.dumps(item.get("args", {}), separators=(",", ":"), sort_keys=True)
+        lines.append(
+            f"{item['name']} {item['pp_rank']} "
+            f"{(item['start_ns'] - origin) / 1e6:.3f} "
+            f"{(item['end_ns'] - item['start_ns']) / 1e6:.3f} {args}"
+        )
+
+    lines.extend(["", "# Span summary", "# name pp_rank count total_ms max_ms"])
+    summary: dict[tuple[str, int], list[float]] = {}
+    for item in intervals:
+        key = (item["name"], item["pp_rank"])
+        summary.setdefault(key, []).append((item["end_ns"] - item["start_ns"]) / 1e6)
+    for (name, rank), durations in sorted(summary.items()):
+        lines.append(f"{name} {rank} {len(durations)} {sum(durations):.3f} {max(durations):.3f}")
+
+    lines.extend(["", "# Rank-local gaps greater than 1 ms", "# pp_rank start_ms gap_ms previous_name next_name"])
+    by_rank: dict[int, list[dict[str, Any]]] = {}
+    for item in intervals:
+        by_rank.setdefault(item["pp_rank"], []).append(item)
+    for rank, rank_intervals in sorted(by_rank.items()):
+        rank_intervals.sort(key=lambda value: int(value["start_ns"]))
+        for previous, current in zip(rank_intervals, rank_intervals[1:]):
+            gap_ms = (current["start_ns"] - previous["end_ns"]) / 1e6
+            if gap_ms > 1.0:
+                lines.append(
+                    f"{rank} {(current['start_ns'] - origin) / 1e6:.3f} {gap_ms:.3f} "
+                    f"{previous['name']} {current['name']}"
+                )
+    return "\n".join(lines) + "\n"
+
+
 def _activity_stats(intervals: list[dict[str, Any]]) -> tuple[float, float, float]:
     points: list[tuple[int, int, int]] = []
     for interval in intervals:
@@ -136,6 +209,7 @@ def _render_text(intervals: list[dict[str, Any]], bin_us: int) -> str:
 def render(trace_dir: Path, output_prefix: Path, bin_us: int) -> None:
     events = _load_events(trace_dir)
     intervals = _intervals(events)
+    all_intervals = _all_intervals(events)
     if not intervals:
         raise ValueError("no complete pp_stage_forward intervals found")
     origin = min(item["start_ns"] for item in intervals)
@@ -155,6 +229,9 @@ def render(trace_dir: Path, output_prefix: Path, bin_us: int) -> None:
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     output_prefix.with_suffix(".json").write_text(json.dumps({"traceEvents": chrome}, indent=2), encoding="utf-8")
     output_prefix.with_suffix(".txt").write_text(_render_text(intervals, bin_us), encoding="utf-8")
+    output_prefix.with_name(f"{output_prefix.name}_detailed.txt").write_text(
+        _render_detailed_text(all_intervals), encoding="utf-8"
+    )
     one_stage_ms, overlap_ms, any_stage_ms = _activity_stats(intervals)
     ratio = one_stage_ms / any_stage_ms if any_stage_ms else math.nan
     print(f"events={len(events)} intervals={len(intervals)}")
@@ -164,6 +241,7 @@ def render(trace_dir: Path, output_prefix: Path, bin_us: int) -> None:
     print(f"single_stage_only_ratio={ratio:.6f}")
     print(f"chrome_trace={output_prefix.with_suffix('.json')}")
     print(f"text_timeline={output_prefix.with_suffix('.txt')}")
+    print(f"detailed_timeline={output_prefix.with_name(f'{output_prefix.name}_detailed.txt')}")
 
 
 def main() -> None:

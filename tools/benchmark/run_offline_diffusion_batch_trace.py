@@ -9,6 +9,9 @@ The output directory contains:
 
 * ``pp_trace/pp_rank_*.jsonl``: low-overhead PP spans;
 * ``timeline.json`` and ``timeline.txt``: rendered PP activity timeline;
+* ``timeline_detailed.txt``: TextEncoder/DIT/VAE/communication spans and gaps;
+* ``visualization/components_*.html`` and ``visualization/summary_*.json``:
+  component visualization and request/batch-aware trace summary;
 * ``requests.json``: request success, output metadata, and wall times;
 * ``torch_profile/``: optional worker profiler traces.
 
@@ -150,6 +153,15 @@ def _render_timeline(trace_dir: Path, output_dir: Path, bin_us: int) -> None:
     completed = subprocess.run(command, check=False, text=True)
     if completed.returncode != 0:
         raise RuntimeError(f"timeline rendering failed with exit code {completed.returncode}")
+
+    visualizer = Path(__file__).with_name("visualize_pp_trace.py")
+    completed = subprocess.run(
+        [sys.executable, str(visualizer), str(trace_dir), "--output-dir", str(output_dir / "visualization")],
+        check=False,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"component visualization failed with exit code {completed.returncode}")
 
 
 async def _run(args: argparse.Namespace) -> int:

@@ -11,6 +11,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_pipeline_parallel_rank,
     get_pipeline_parallel_world_size,
     get_pp_group,
     is_pipeline_first_stage,
@@ -133,7 +134,12 @@ class PipelineParallelMixin:
                         latents = torch.as_tensor(latents)  # avoid copying
                     return latents
                 finally:
-                    self._sync_pp_send()
+                    with pp_trace_span(
+                        "pp_send_wait",
+                        component="pp_send_wait",
+                        **self._pp_trace_metadata(),
+                    ):
+                        self._sync_pp_send()
 
             cls.diffuse = wrapped_diffuse
 
@@ -142,17 +148,40 @@ class PipelineParallelMixin:
 
         @wraps(orig_decode)
         def wrapped_decode(z: torch.Tensor, *args: Any, **kwargs: Any):
+            metadata = self._pp_trace_metadata(
+                component="vae_decode",
+                batch_size=int(z.shape[0]) if hasattr(z, "shape") and z.ndim > 0 else None,
+            )
             if hasattr(vae, "is_distributed_enabled") and vae.is_distributed_enabled():
                 # Middle ranks (world size 3 or more) hold stale latents after the denoising loop.
                 # Broadcast from rank 0 so every rank splits identical tiles.
                 if get_pipeline_parallel_world_size() > 2:
-                    z = get_pp_group().broadcast(z, src=0)
-                return orig_decode(z, *args, **kwargs)
+                    broadcast_metadata = dict(metadata)
+                    broadcast_metadata["component"] = "vae_decode_broadcast"
+                    with pp_trace_span("vae_decode_broadcast", **broadcast_metadata):
+                        z = get_pp_group().broadcast(z, src=0)
+                with pp_trace_span("vae_decode", **metadata):
+                    return orig_decode(z, *args, **kwargs)
             elif is_pipeline_first_stage():
-                return orig_decode(z, *args, **kwargs)
-            return (None,)  # decoder returns a tuple
+                with pp_trace_span("vae_decode", **metadata):
+                    return orig_decode(z, *args, **kwargs)
+            skip_metadata = dict(metadata)
+            skip_metadata.update(component="vae_decode_skip", pp_role="non_first_rank")
+            with pp_trace_span("vae_decode_skip", **skip_metadata):
+                return (None,)  # decoder returns a tuple
 
         self.vae.decode = wrapped_decode
+
+    def _pp_trace_metadata(self, **extra: Any) -> dict[str, Any]:
+        """Return request/step context for low-overhead PP trace spans."""
+        metadata: dict[str, Any] = {
+            "request_ids": list(getattr(self, "_pp_trace_request_ids", ()) or ()),
+            "batch_size": getattr(self, "_pp_trace_batch_size", None),
+            "step_idx": getattr(self, "_pp_trace_step_idx", None),
+            "pp_rank": int(get_pipeline_parallel_rank()),
+        }
+        metadata.update(extra)
+        return metadata
 
     @property
     def _pp_send_work(self) -> list[torch.distributed.Work]:
@@ -228,7 +257,10 @@ class PipelineParallelMixin:
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for branch, (kwargs, it) in enumerate(zip(all_kwargs, its)):
-                with pp_trace_span("pp_stage_forward", cfg_branch=branch):
+                with pp_trace_span(
+                    "pp_stage_forward",
+                    **self._pp_trace_metadata(component="dit", cfg_branch=branch),
+                ):
                     result = self.predict_noise(**kwargs, intermediate_tensors=it)
                 self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
@@ -236,7 +268,10 @@ class PipelineParallelMixin:
         # Last rank: run full forward
         noise_preds = []
         for branch, (kwargs, it) in enumerate(zip(all_kwargs, its)):
-            with pp_trace_span("pp_stage_forward", cfg_branch=branch):
+            with pp_trace_span(
+                "pp_stage_forward",
+                **self._pp_trace_metadata(component="dit", cfg_branch=branch),
+            ):
                 noise_preds.append(self.predict_noise(**kwargs, intermediate_tensors=it))
 
         if cfg_parallel_ready:

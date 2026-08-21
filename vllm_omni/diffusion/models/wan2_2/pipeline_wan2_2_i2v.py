@@ -23,6 +23,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pp_trace import span as pp_trace_span
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
@@ -382,6 +383,7 @@ class Wan22I2VPipeline(
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+                self._pp_trace_step_idx = step_idx
 
                 # Select model and guidance scale based on timestep
                 current_model = self.transformer
@@ -440,7 +442,12 @@ class Wan22I2VPipeline(
                 )
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                with pp_trace_span(
+                    "scheduler_step",
+                    component="scheduler_step",
+                    **self._pp_trace_metadata(),
+                ):
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
                 pbar.update()
 
         return latents
@@ -466,6 +473,8 @@ class Wan22I2VPipeline(
         return create_transformer_from_config(config, quant_config=quant_config)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        self._pp_trace_request_ids = [request.request_id for request in req.requests]
+        self._pp_trace_batch_size = len(req.requests)
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
         prompt_texts = [prompt if isinstance(prompt, str) else (prompt.get("prompt") or "") for prompt in req.prompts]
@@ -716,7 +725,12 @@ class Wan22I2VPipeline(
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
         if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
+            with pp_trace_span(
+                "cache_cleanup",
+                component="cache_cleanup",
+                **self._pp_trace_metadata(),
+            ):
+                current_omni_platform.empty_cache()
         self._current_timestep = None
 
         if DEBUG_PERF:
@@ -733,16 +747,21 @@ class Wan22I2VPipeline(
         if output_type == "latent":
             output = latents
         else:
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
+            with pp_trace_span(
+                "vae_decode_prepare",
+                component="vae_decode_prepare",
+                **self._pp_trace_metadata(),
+            ):
+                latents = latents.to(self.vae.dtype)
+                latents_mean = (
+                    torch.tensor(self.vae.config.latents_mean)
+                    .view(1, self.vae.config.z_dim, 1, 1, 1)
+                    .to(latents.device, latents.dtype)
+                )
+                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                    1, self.vae.config.z_dim, 1, 1, 1
+                ).to(latents.device, latents.dtype)
+                latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
         if DEBUG_PERF:
@@ -828,7 +847,13 @@ class Wan22I2VPipeline(
         ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        prompt_embeds = self.text_encoder(ids.to(device), mask.to(device)).last_hidden_state
+        with pp_trace_span(
+            "text_encoder",
+            component="text_encoder",
+            cfg_branch=0,
+            **self._pp_trace_metadata(),
+        ):
+            prompt_embeds = self.text_encoder(ids.to(device), mask.to(device)).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
@@ -854,7 +879,13 @@ class Wan22I2VPipeline(
             )
             ids_neg, mask_neg = neg_text_inputs.input_ids, neg_text_inputs.attention_mask
             seq_lens_neg = mask_neg.gt(0).sum(dim=1).long()
-            negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device)).last_hidden_state
+            with pp_trace_span(
+                "text_encoder",
+                component="text_encoder",
+                cfg_branch=1,
+                **self._pp_trace_metadata(),
+            ):
+                negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device)).last_hidden_state
             negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
             negative_prompt_embeds = [u[:v] for u, v in zip(negative_prompt_embeds, seq_lens_neg)]
             negative_prompt_embeds = torch.stack(
@@ -928,7 +959,12 @@ class Wan22I2VPipeline(
         video_condition = video_condition.to(device=device, dtype=self.vae.dtype)
 
         # Encode through VAE
-        latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
+        with pp_trace_span(
+            "vae_encode",
+            component="vae_encode",
+            **self._pp_trace_metadata(batch_size=int(video_condition.shape[0])),
+        ):
+            latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
 
         # Normalize latents
         latents_mean = (
