@@ -5,13 +5,15 @@
 #   tools/benchmark/run_diffusion_pp_timeline.sh \
 #     --name a100 --port 8000 \
 #     --server-command 'CUDA_VISIBLE_DEVICES=0,1 vllm serve MODEL --omni --pipeline-parallel-size 2' \
-#     --request-command 'curl -fsS http://127.0.0.1:8000/v1/images/generations -H "Content-Type: application/json" -d @request.json'
+#     --request-count 4 \
+#     --request-command 'curl -fsS http://127.0.0.1:8000/v1/videos/sync -H "Content-Type: application/json" -d @request.json -o "$VLLM_OMNI_RESULT_DIR/result-${VLLM_OMNI_REQUEST_INDEX}.json"'
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMELINE_TOOL="${SCRIPT_DIR}/trace_diffusion_pp_timeline.py"
 name=pp; server_command=""; request_command=""; output_root="${PWD}/pp-timeline-results"
 port=""; startup_timeout_s=180; request_timeout_s=1800; shutdown_timeout_s=30; bin_us=100
+request_count=1
 sync_trace=1; keep_server_log=1
 
 usage() {
@@ -20,6 +22,7 @@ usage() {
 
 Options:
   --name NAME, --server-command COMMAND, --request-command COMMAND
+  --request-count N
   --output-root DIR, --port PORT, --startup-timeout-s SEC
   --request-timeout-s SEC, --shutdown-timeout-s SEC, --bin-us US
   --no-sync-trace, --remove-server-log, -h/--help
@@ -31,6 +34,7 @@ while (($#)); do
         --name) name="$2"; shift 2;;
         --server-command) server_command="$2"; shift 2;;
         --request-command) request_command="$2"; shift 2;;
+        --request-count) request_count="$2"; shift 2;;
         --output-root) output_root="$2"; shift 2;;
         --port) port="$2"; shift 2;;
         --startup-timeout-s) startup_timeout_s="$2"; shift 2;;
@@ -47,8 +51,8 @@ done
 if [[ -z "$server_command" || -z "$request_command" ]]; then
     echo "Both --server-command and --request-command are required." >&2; exit 2
 fi
-if ! [[ "$startup_timeout_s" =~ ^[0-9]+$ && "$request_timeout_s" =~ ^[0-9]+$ && "$shutdown_timeout_s" =~ ^[0-9]+$ && "$bin_us" =~ ^[0-9]+$ ]]; then
-    echo "Timeouts and --bin-us must be non-negative integers." >&2; exit 2
+if ! [[ "$startup_timeout_s" =~ ^[0-9]+$ && "$request_timeout_s" =~ ^[0-9]+$ && "$shutdown_timeout_s" =~ ^[0-9]+$ && "$bin_us" =~ ^[0-9]+$ && "$request_count" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Timeouts and --bin-us must be non-negative integers; --request-count must be positive." >&2; exit 2
 fi
 
 result_dir="${output_root}/${name}"; trace_dir="${result_dir}/trace"; server_log="${result_dir}/server.log"
@@ -93,8 +97,34 @@ if [[ "$ready" -ne 1 ]]; then
     tail -80 "$server_log" >&2 || true; exit 1
 fi
 
-echo "[pp-timeline] sending request"
-if command -v timeout >/dev/null 2>&1; then timeout --signal=TERM "${request_timeout_s}s" bash -lc "$request_command"; else bash -lc "$request_command"; fi
+echo "[pp-timeline] sending ${request_count} request(s) concurrently"
+request_pids=()
+for ((request_index=0; request_index<request_count; request_index++)); do
+    request_stdout="${result_dir}/request-${request_index}.stdout"
+    request_stderr="${result_dir}/request-${request_index}.stderr"
+    (
+        export VLLM_OMNI_REQUEST_INDEX="$request_index"
+        export VLLM_OMNI_REQUEST_COUNT="$request_count"
+        export VLLM_OMNI_RESULT_DIR="$result_dir"
+        if command -v timeout >/dev/null 2>&1; then
+            timeout --signal=TERM "${request_timeout_s}s" bash -lc "$request_command"
+        else
+            bash -lc "$request_command"
+        fi
+    ) >"$request_stdout" 2>"$request_stderr" &
+    request_pids+=("$!")
+done
+
+request_failed=0
+for request_pid in "${request_pids[@]}"; do
+    if ! wait "$request_pid"; then
+        request_failed=1
+    fi
+done
+if [[ "$request_failed" -ne 0 ]]; then
+    echo "At least one request failed; inspect ${result_dir}/request-*.stderr." >&2
+    exit 1
+fi
 echo "[pp-timeline] stopping server"
 kill -INT "$server_pid" 2>/dev/null || kill -TERM "$server_pid" 2>/dev/null || true
 for ((i=0; i<shutdown_timeout_s*10; i++)); do
