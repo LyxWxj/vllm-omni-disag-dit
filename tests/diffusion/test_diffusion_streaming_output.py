@@ -441,7 +441,6 @@ class TestPipelineStreamingOutputToEntrypoint:
                     model="test_model",
                     od_config=od_config,
                     metadata=metadata,
-                    batch_size=1,
                 )
 
     @staticmethod

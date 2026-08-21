@@ -168,7 +168,6 @@ def _make_stage_runtime() -> StageRuntime:
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -192,7 +191,6 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
-    engine.diffusion_batch_size = 1
     engine.async_chunk = False
     engine.tokenizer = None
     engine._single_stage_id_filter = None
@@ -278,7 +276,6 @@ def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -367,7 +364,6 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -404,7 +400,6 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=4,
         async_chunk=False,
     )
 
@@ -417,7 +412,6 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     def _capture_launch_diffusion_stage_replica(**kwargs):
         captured["stage_id"] = kwargs["metadata"].stage_id
         captured["stage_init_timeout"] = kwargs["stage_init_timeout"]
-        captured["batch_size"] = kwargs["batch_size"]
         captured["use_inline"] = kwargs["use_inline"]
         captured["omni_master_server"] = kwargs["omni_master_server"]
         return types.SimpleNamespace(), StageReplicaResources()
@@ -429,7 +423,6 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     assert captured == {
         "stage_id": 0,
         "stage_init_timeout": 302,
-        "batch_size": 4,
         "use_inline": True,
         "omni_master_server": None,
     }
@@ -470,21 +463,20 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     assert os.environ[runtime_env_var] == "parent-value"
 
 
-def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypatch):
+def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.engine.stage_init_utils as init_mod
 
-    od_config = types.SimpleNamespace(max_num_seqs=1)
+    od_config = types.SimpleNamespace(max_num_seqs=4)
     captured: dict[str, object] = {}
     monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
 
-    def _capture_client(model, config, metadata, stage_init_timeout, batch_size, use_inline):
+    def _capture_client(model, config, metadata, stage_init_timeout, use_inline):
         captured.update(
             model=model,
             config=config,
             metadata=metadata,
             stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
             use_inline=use_inline,
         )
         return object()
@@ -498,7 +490,6 @@ def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypa
         types.SimpleNamespace(),
         metadata,
         stage_init_timeout=12,
-        batch_size=4,
         use_inline=True,
     )
 
@@ -508,17 +499,16 @@ def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypa
         "config": od_config,
         "metadata": metadata,
         "stage_init_timeout": 12,
-        "batch_size": 4,
         "use_inline": True,
     }
 
 
-def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch):
+def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
     import vllm_omni.engine.stage_engine_startup as startup_mod
 
-    od_config = types.SimpleNamespace(max_num_seqs=1, parallel_config=types.SimpleNamespace(world_size=1))
+    od_config = types.SimpleNamespace(max_num_seqs=4, parallel_config=types.SimpleNamespace(world_size=1))
     monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
     monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
     monkeypatch.setattr(
@@ -555,7 +545,6 @@ def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch
         stage_config=types.SimpleNamespace(),
         metadata=types.SimpleNamespace(stage_id=0),
         stage_init_timeout=12,
-        batch_size=4,
         use_inline=False,
         omni_master_server=omni_master_server,
     )
@@ -573,7 +562,6 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -639,7 +627,6 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
         log_stats=True,
     )
@@ -682,7 +669,6 @@ def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
         log_stats=True,
     )
@@ -735,7 +721,6 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -776,7 +761,6 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=123,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -814,7 +798,6 @@ def test_remote_replicas_use_distinct_init_group_keys():
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=123,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
     plan = _make_llm_plan(
@@ -840,7 +823,6 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -877,7 +859,6 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -916,7 +897,6 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
     stage_init_timeout = 302
