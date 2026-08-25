@@ -52,7 +52,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -554,6 +554,7 @@ class DiffusionEngine:
                 self._wait_for_admission_if_needed_locked()
 
                 sched_output = self.scheduler.schedule()
+                self._mark_step_requests_in_flight(sched_output)
 
             if sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
@@ -912,6 +913,7 @@ class DiffusionEngine:
             while True:
                 self._process_aborts_queue()
                 sched_output = self.scheduler.schedule()
+                self._mark_step_requests_in_flight(sched_output)
                 if sched_output.is_empty:
                     if target_request_id in sched_output.finished_req_ids:
                         self._remove_diffusion_kv_requests([target_request_id])
@@ -955,6 +957,11 @@ class DiffusionEngine:
                         fut = self.executor.wait_output_ready(output.async_output_id)
                         output = fut.result(timeout=_async_output_timeout())
                     return output
+
+    def _mark_step_requests_in_flight(self, sched_output: DiffusionSchedulerOutput) -> None:
+        """Record submitted step work before the executor advances a tick."""
+        if isinstance(self.scheduler, StepScheduler):
+            self.scheduler.mark_in_flight(sched_output)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling on all diffusion workers.

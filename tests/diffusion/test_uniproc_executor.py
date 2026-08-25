@@ -13,6 +13,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -108,6 +110,25 @@ def test_collective_rpc_returns_list_when_no_reply_rank(executor):
     worker.execute_method.return_value = "result"
 
     assert exec_.collective_rpc("some_method") == ["result"]
+
+
+def test_execute_pipeline_tick_uses_dedicated_worker_rpc(executor):
+    exec_, worker = executor
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=0,
+        num_waiting_reqs=0,
+    )
+    expected = RunnerOutput(request_id="req-tick", step_index=1, finished=False, result=None)
+    worker.execute_method.return_value = expected
+
+    output = exec_.execute_pipeline_tick(scheduler_output)
+
+    assert output is expected
+    worker.execute_method.assert_called_once_with("execute_pipeline_tick", scheduler_output)
 
 
 def test_collective_rpc_propagates_worker_exceptions(executor):

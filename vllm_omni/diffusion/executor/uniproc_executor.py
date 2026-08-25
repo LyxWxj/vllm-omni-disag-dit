@@ -184,6 +184,21 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def execute_pipeline_tick(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Forward one PP clock tick to the local worker."""
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+        self._ensure_open()
+        result = self.collective_rpc(
+            "execute_pipeline_tick",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if isinstance(result, BaseRunnerOutput):
+            return result
+        raise RuntimeError(f"Unexpected response type for execute_pipeline_tick: {type(result)!r}")
+
     def _device_is_usable(self) -> bool:
         """Whether the accelerator context survived the failure we just caught.
 

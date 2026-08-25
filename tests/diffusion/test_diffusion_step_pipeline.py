@@ -917,6 +917,17 @@ class TestWorker:
 
         assert output is expected
 
+    def test_execute_pipeline_tick_delegates_to_stepwise(self, mocker: MockerFixture):
+        worker = _make_step_worker()
+        scheduler_output = _make_scheduler_output(_make_engine_request("req-tick"), request_id="req-tick")
+        expected = RunnerOutput(request_id="req-tick", step_index=1, finished=False, result=None)
+        execute_stepwise = mocker.patch.object(DiffusionWorker, "execute_stepwise", return_value=expected)
+
+        output = DiffusionWorker.execute_pipeline_tick(worker, scheduler_output)
+
+        assert output is expected
+        execute_stepwise.assert_called_once_with(scheduler_output)
+
     def test_deactivates_lora_when_request_has_no_adapter(self):
         manager = _RecordingLoRAManager()
         worker = _make_step_worker(lora_manager=manager)
@@ -1012,7 +1023,7 @@ class TestWorker:
 
 @pytest.mark.cpu
 class TestExecutor:
-    """MultiprocDiffusionExecutor.execute_step"""
+    """MultiprocDiffusionExecutor step RPCs."""
 
     def test_execute_step_passes_through_runner_output(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
@@ -1027,6 +1038,27 @@ class TestExecutor:
         output = MultiprocDiffusionExecutor.execute_step(executor, scheduler_output)
 
         assert output is expected
+
+    def test_execute_pipeline_tick_uses_dedicated_worker_rpc(self, mocker: MockerFixture):
+        executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(streaming_output=False)
+        executor._ensure_open = lambda: None
+        expected = RunnerOutput(request_id="req-tick", step_index=1, finished=False, result=None)
+        executor.collective_rpc = mocker.Mock(return_value=expected)
+        scheduler_output = _make_scheduler_output(
+            _make_engine_request("req-tick", num_inference_steps=2),
+            request_id="req-tick",
+        )
+
+        output = MultiprocDiffusionExecutor.execute_pipeline_tick(executor, scheduler_output)
+
+        assert output is expected
+        executor.collective_rpc.assert_called_once_with(
+            "execute_pipeline_tick",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
 
 
 @pytest.mark.cpu
@@ -1064,6 +1096,7 @@ class TestEngine:
     def test_step_execution_completes(self, mocker: MockerFixture):
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace())
+        mark_in_flight = mocker.spy(scheduler, "mark_in_flight")
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-step", num_inference_steps=2)
 
@@ -1084,6 +1117,7 @@ class TestEngine:
         output = engine.add_req_and_wait_for_response(request)
 
         assert call_count["n"] == 2
+        assert mark_in_flight.call_count == 2
         assert output.error is None
         assert torch.equal(output.output, torch.tensor([2.0]))
 

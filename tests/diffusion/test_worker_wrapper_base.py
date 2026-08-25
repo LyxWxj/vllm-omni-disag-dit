@@ -174,6 +174,19 @@ class TestWorkerWrapperBaseDelegation:
         wrapper.worker.execute_model.assert_called_once_with(mock_req, mock_od_config, kv_prefetch_job=None)
         assert result == mock_output
 
+    def test_execute_pipeline_tick_delegation(self, mocker: MockerFixture, mock_od_config):
+        """The dedicated clock RPC reaches the wrapped diffusion worker."""
+        mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        scheduler_output = mocker.Mock()
+        expected = mocker.Mock()
+        wrapper.worker.execute_pipeline_tick = mocker.Mock(return_value=expected)
+
+        result = wrapper.execute_pipeline_tick(scheduler_output)
+
+        wrapper.worker.execute_pipeline_tick.assert_called_once_with(scheduler_output)
+        assert result is expected
+
     def test_sleep_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that sleep() delegates to worker.sleep()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)

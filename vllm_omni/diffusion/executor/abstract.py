@@ -100,6 +100,14 @@ class DiffusionExecutor(ABC):
         """Execute step-mode work from a scheduler output."""
         pass
 
+    def execute_pipeline_tick(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Advance one pipeline clock.
+
+        The default preserves compatibility with custom executors until they
+        implement the dedicated PP control-plane RPC.
+        """
+        return self.execute_step(scheduler_output)
+
     @abstractmethod
     def collective_rpc(
         self,

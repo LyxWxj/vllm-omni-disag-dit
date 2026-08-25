@@ -20,6 +20,7 @@ class DiffusionRequestStatus(enum.IntEnum):
 
     WAITING = enum.auto()
     RUNNING = enum.auto()
+    IN_FLIGHT = enum.auto()
     PREEMPTED = enum.auto()
 
     # if any status is after or equal to FINISHED_COMPLETED, it is considered finished

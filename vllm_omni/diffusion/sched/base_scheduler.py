@@ -126,10 +126,12 @@ class BaseScheduler(ABC):
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_request_ids: list[str] = []
 
-        # First, schedule the RUNNING request(s)
+        # First, schedule the local RUNNING request(s). StepScheduler keeps
+        # submitted work in ``_running`` for capacity and cohort accounting,
+        # but marks it IN_FLIGHT until its tick returns.
         for request_id in self._running:
             state = self._request_states.get(request_id)
-            if state is not None:
+            if state is not None and state.status == DiffusionRequestStatus.RUNNING:
                 scheduled_cached_request_ids.append(request_id)
 
         # Second, schedule WAITING requests while capacity remains.

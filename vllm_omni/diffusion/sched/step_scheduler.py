@@ -33,9 +33,33 @@ class StepScheduler(BaseScheduler):
     def __init__(self) -> None:
         super().__init__()
         self._request_progress: dict[str, _StepProgress] = {}
+        self._in_flight: set[str] = set()
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
+        self._in_flight.clear()
+
+    @property
+    def num_in_flight_requests(self) -> int:
+        """Number of step requests submitted to a tick but not yet completed."""
+        return len(self._in_flight)
+
+    def mark_in_flight(self, sched_output: DiffusionSchedulerOutput) -> None:
+        """Retain submitted work for capacity without scheduling it twice.
+
+        A future interleaved PP clock can return before each submitted token
+        reaches the final stage. Keeping the request in ``_running`` preserves
+        its active-slot ownership and compatibility cohort, while this method
+        excludes it from the next local tick until ``update_from_output``.
+        """
+        for request_id in sched_output.scheduled_request_ids:
+            state = self._request_states.get(request_id)
+            if state is None or state.is_finished():
+                continue
+            if state.status != DiffusionRequestStatus.RUNNING:
+                raise RuntimeError(f"Cannot mark request {request_id!r} in flight from status {state.status.name}.")
+            state.status = DiffusionRequestStatus.IN_FLIGHT
+            self._in_flight.add(request_id)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         request_id = request.request_id
@@ -112,11 +136,23 @@ class StepScheduler(BaseScheduler):
                 terminal_errors[request_id] = None
             else:
                 state.error = None
+                state.status = DiffusionRequestStatus.RUNNING
 
+        self._in_flight.difference_update(scheduled_request_ids)
         return self._finalize_update_from_output(sched_output, terminal_statuses, terminal_errors)
+
+    def _finish_requests(
+        self,
+        statuses: dict[str, DiffusionRequestStatus],
+        errors: dict[str, str | None] | None = None,
+    ) -> set[str]:
+        finished_request_ids = super()._finish_requests(statuses, errors)
+        self._in_flight.difference_update(finished_request_ids)
+        return finished_request_ids
 
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
+        self._in_flight.discard(request_id)
 
     def _get_total_steps(self, request: OmniDiffusionRequest) -> int:
         sampling = request.sampling_params

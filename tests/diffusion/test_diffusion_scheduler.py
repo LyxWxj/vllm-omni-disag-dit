@@ -1423,6 +1423,31 @@ class TestStepScheduler:
         assert request.sampling_params.step_index == 3
         assert self.scheduler.has_requests() is False
 
+    def test_in_flight_request_allows_compatible_admission(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
+        first = scheduler.schedule()
+        scheduler.mark_in_flight(first)
+        assert scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.IN_FLIGHT
+        assert scheduler.num_in_flight_requests == 1
+
+        req_id_b = scheduler.add_request(_make_step_request("b", num_inference_steps=2))
+        second = scheduler.schedule()
+        assert _new_ids(second) == [req_id_b]
+        assert _cached_ids(second) == []
+        scheduler.mark_in_flight(second)
+        assert scheduler.num_in_flight_requests == 2
+
+        assert scheduler.update_from_output(first, _make_step_output(req_id_a, step_index=1)) == set()
+        assert scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.RUNNING
+        assert scheduler.num_in_flight_requests == 1
+
+        third = scheduler.schedule()
+        assert _new_ids(third) == []
+        assert _cached_ids(third) == [req_id_a]
+
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=2))
         req_id_b = self.scheduler.add_request(_make_step_request("b", num_inference_steps=2))

@@ -644,6 +644,10 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def execute_pipeline_tick(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Advance the PP control plane until the stateful runtime is installed."""
+        return self.execute_stepwise(scheduler_output)
+
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
 
@@ -1561,6 +1565,10 @@ class WorkerWrapperBase:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
+
+    def execute_pipeline_tick(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Advance one pipeline clock on the wrapped worker."""
+        return self.worker.execute_pipeline_tick(scheduler_output)
 
     def sleep(self, level: int = 1) -> int:
         """
