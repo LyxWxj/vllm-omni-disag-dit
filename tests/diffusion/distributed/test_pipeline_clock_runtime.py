@@ -146,28 +146,33 @@ def _run_p2p_channel_worker(
         timeout=timedelta(seconds=30),
     )
     try:
+        edge_groups = [
+            dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for edge_rank in range(world_size - 1)
+        ]
         incoming = None
         if rank > 0:
             incoming = PipelineP2PChannel(
-                source_rank=rank - 1,
-                destination_rank=rank,
+                source_rank=0,
+                destination_rank=1,
                 tensor_shape=(2,),
                 tensor_dtype=torch.float32,
                 device="cpu",
                 slots_per_edge=slots_per_edge,
                 tag_base=(rank - 1) * 100,
+                group=edge_groups[rank - 1],
             )
 
         outgoing = None
         if rank < world_size - 1:
             outgoing = PipelineP2PChannel(
-                source_rank=rank,
-                destination_rank=rank + 1,
+                source_rank=0,
+                destination_rank=1,
                 tensor_shape=(2,),
                 tensor_dtype=torch.float32,
                 device="cpu",
                 slots_per_edge=slots_per_edge,
                 tag_base=rank * 100,
+                group=edge_groups[rank],
             )
 
         next_token_id = 0
