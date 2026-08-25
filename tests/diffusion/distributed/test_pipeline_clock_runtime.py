@@ -152,8 +152,8 @@ def _run_p2p_channel_worker(
         incoming = None
         if rank > 0:
             incoming = PipelineP2PChannel(
-                source_rank=0,
-                destination_rank=1,
+                source_rank=rank - 1,
+                destination_rank=rank,
                 tensor_shape=(2,),
                 tensor_dtype=torch.float32,
                 device="cpu",
@@ -165,8 +165,8 @@ def _run_p2p_channel_worker(
         outgoing = None
         if rank < world_size - 1:
             outgoing = PipelineP2PChannel(
-                source_rank=0,
-                destination_rank=1,
+                source_rank=rank,
+                destination_rank=rank + 1,
                 tensor_shape=(2,),
                 tensor_dtype=torch.float32,
                 device="cpu",

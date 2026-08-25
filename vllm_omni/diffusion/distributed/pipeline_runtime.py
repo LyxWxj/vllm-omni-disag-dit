@@ -264,7 +264,7 @@ class PipelineP2PChannel:
         self.tensor_shape = tuple(tensor_shape)
         self.tensor_dtype = tensor_dtype
         self.device = torch.device(device)
-        self.rank = dist.get_rank(group)
+        self.rank = dist.get_rank()
         if self.rank not in (source_rank, destination_rank):
             raise ValueError(f"rank {self.rank} is not an endpoint of channel {source_rank}->{destination_rank}")
 
