@@ -135,6 +135,7 @@ def _run_p2p_channel_worker(
     token_count: int,
     slots_per_edge: int,
     stage_one_stall_until: int,
+    rebuild_after_close: bool,
     result_queue,
 ) -> None:
     """Run one rank of a tensor-only PP lane without loading a model."""
@@ -251,6 +252,64 @@ def _run_p2p_channel_worker(
                     shutdown_sent = True
             dist.barrier()
 
+        rebuild_succeeded = False
+        if rebuild_after_close:
+            second_incoming = None
+            if rank > 0:
+                second_incoming = PipelineP2PChannel(
+                    source_rank=rank - 1,
+                    destination_rank=rank,
+                    tensor_shape=(2,),
+                    tensor_dtype=torch.float32,
+                    device="cpu",
+                    slots_per_edge=1,
+                    tag_base=(rank - 1) * 100,
+                    group=edge_groups[rank - 1],
+                )
+            second_outgoing = None
+            if rank < world_size - 1:
+                second_outgoing = PipelineP2PChannel(
+                    source_rank=rank,
+                    destination_rank=rank + 1,
+                    tensor_shape=(2,),
+                    tensor_dtype=torch.float32,
+                    device="cpu",
+                    slots_per_edge=1,
+                    tag_base=rank * 100,
+                    group=edge_groups[rank],
+                )
+
+            if rank == 0:
+                while not second_outgoing.can_send:
+                    second_outgoing.poll()
+                second_outgoing.send(
+                    PipelineTransportHeader(token_id=99, step_idx=0, cfg_branch=0),
+                    torch.full((2,), 99.0, dtype=torch.float32),
+                )
+            dist.barrier()
+            if rank == world_size - 1:
+                while not second_incoming.has_ready_message:
+                    second_incoming.poll()
+                message = second_incoming.begin_compute()
+                rebuild_succeeded = message.header.token_id == 99
+                second_incoming.release_after_compute(message)
+            dist.barrier()
+            if rank == 0:
+                second_outgoing.send_shutdown()
+            dist.barrier()
+            if rank == world_size - 1:
+                while not second_incoming.has_ready_message:
+                    second_incoming.poll()
+                message = second_incoming.begin_compute()
+                second_incoming.release_after_compute(message)
+            dist.barrier()
+            if second_incoming is not None:
+                second_incoming.wait_for_sends()
+                rebuild_succeeded = rebuild_succeeded and second_incoming.pending_work_count == 0
+            if second_outgoing is not None:
+                second_outgoing.wait_for_sends()
+                rebuild_succeeded = rebuild_succeeded and second_outgoing.pending_work_count == 0
+
         if incoming is not None:
             incoming.wait_for_sends()
         if outgoing is not None:
@@ -265,6 +324,7 @@ def _run_p2p_channel_worker(
                     "sent_clocks": sent_clocks,
                     "saw_credit_exhaustion": saw_credit_exhaustion,
                     "incoming_max_occupied": incoming.max_occupied if incoming is not None else 0,
+                    "incoming_pending_work_count": incoming.pending_work_count if incoming is not None else 0,
                     "receive_histories": (
                         [[state.name for state in history] for history in incoming.receive_slot_state_histories]
                         if incoming is not None
@@ -275,6 +335,8 @@ def _run_p2p_channel_worker(
                         if outgoing is not None
                         else []
                     ),
+                    "outgoing_pending_work_count": outgoing.pending_work_count if outgoing is not None else 0,
+                    "rebuild_succeeded": rebuild_succeeded,
                 },
             )
         )
@@ -290,6 +352,7 @@ def _run_p2p_channel_lane(
     token_count: int,
     slots_per_edge: int,
     stage_one_stall_until: int = 0,
+    rebuild_after_close: bool = False,
 ) -> dict[int, dict[str, object]]:
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
@@ -303,6 +366,7 @@ def _run_p2p_channel_lane(
                 token_count,
                 slots_per_edge,
                 stage_one_stall_until,
+                rebuild_after_close,
                 result_queue,
             ),
             nprocs=world_size,
@@ -334,6 +398,7 @@ class TestPipelineP2PChannel:
             token_count=5,
             slots_per_edge=slots_per_edge,
             stage_one_stall_until=10,
+            rebuild_after_close=True,
         )
 
         source = results[0]
@@ -343,6 +408,10 @@ class TestPipelineP2PChannel:
         assert source["sent_clocks"][slots_per_edge] >= 10
         assert destination["incoming_max_occupied"] == slots_per_edge
         assert [token_id for token_id, _ in destination["completed"]] == [0, 1, 2, 3, 4]
+        assert source["outgoing_pending_work_count"] == 0
+        assert destination["incoming_pending_work_count"] == 0
+        assert source["rebuild_succeeded"] is True
+        assert destination["rebuild_succeeded"] is True
 
     def test_pp4_preserves_fifo_and_buffer_lifetimes(self) -> None:
         results = _run_p2p_channel_lane(
@@ -374,3 +443,5 @@ class TestPipelineP2PChannel:
             for history in results[rank]["send_histories"]:
                 assert all(after in send_transitions[before] for before, after in zip(history, history[1:]))
             assert any("SEND_PENDING" in history for history in results[rank]["send_histories"])
+        assert all(results[rank]["incoming_pending_work_count"] == 0 for rank in range(1, 4))
+        assert all(results[rank]["outgoing_pending_work_count"] == 0 for rank in range(3))

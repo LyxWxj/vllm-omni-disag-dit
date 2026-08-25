@@ -372,6 +372,17 @@ class PipelineP2PChannel:
         self.poll()
         return sum(slot.is_send_pending for slot in self._send_slots)
 
+    @property
+    def pending_work_count(self) -> int:
+        """Number of live send/receive Work handles retained by this edge."""
+        if self._is_source:
+            return sum(
+                work is not None for slot in self._send_slots for work in (slot.header_work, slot.payload_work)
+            ) + sum(work is not None for work in self._credit_works)
+        return sum(
+            work is not None for slot in self._receive_slots for work in (slot.header_work, slot.payload_work)
+        ) + sum(work is not None for work in self._credit_works)
+
     def poll(self) -> None:
         """Advance local non-blocking work without waiting for a peer."""
         if self._is_source:
@@ -391,6 +402,8 @@ class PipelineP2PChannel:
 
         transport_header = header.for_slot(slot_id, self._next_send_sequence)
         self._next_send_sequence += 1
+        if not self._shutdown_requested:
+            self._post_credit_receive(slot_id)
         transport_header.encode_into(slot.header_buffer)
         slot.payload_buffer.copy_(payload)
         slot.begin_send()
@@ -471,8 +484,9 @@ class PipelineP2PChannel:
                 self._wait_for_works(slot.header_work, slot.payload_work)
             self._poll_source()
             return
-        for work in self._credit_works:
+        for slot_id, work in enumerate(self._credit_works):
             self._wait_for_works(work)
+            self._credit_works[slot_id] = None
         self._poll_destination()
 
     def _poll_source(self) -> None:
@@ -485,6 +499,7 @@ class PipelineP2PChannel:
             if not self._works_complete(work):
                 continue
             self._wait_for_works(work)
+            self._credit_works[expected_slot_id] = None
             credit_slot_id = int(self._credit_buffers[expected_slot_id].item())
             if credit_slot_id != expected_slot_id:
                 raise RuntimeError(
@@ -494,8 +509,6 @@ class PipelineP2PChannel:
                 raise RuntimeError(f"received duplicate credit for slot {credit_slot_id}")
             self._credit_slot_ids.append(credit_slot_id)
             self._credit_slot_id_set.add(credit_slot_id)
-            if not self._shutdown_requested:
-                self._post_credit_receive(expected_slot_id)
 
     def _poll_destination(self) -> None:
         for slot in self._receive_slots:
@@ -504,6 +517,8 @@ class PipelineP2PChannel:
             if not self._works_complete(slot.header_work, slot.payload_work):
                 continue
             self._wait_for_works(slot.header_work, slot.payload_work)
+            slot.header_work = None
+            slot.payload_work = None
             header = PipelineTransportHeader.decode(slot.header_buffer)
             if header.slot_id != slot.slot_id:
                 raise RuntimeError(f"header for receive slot {slot.slot_id} carries mismatched slot {header.slot_id}")
