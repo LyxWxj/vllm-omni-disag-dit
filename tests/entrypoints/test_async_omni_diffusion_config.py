@@ -279,6 +279,29 @@ def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
     assert stage_cfg["engine_args"]["task_type"] == "fl2va"
 
 
+def test_serve_cli_forwards_diffusion_pp_microbatch_size_to_stage():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Wan-AI/Wan2.2-TI2V-5B",
+            "--omni",
+            "--diffusion-pp-microbatch-size",
+            "3",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.diffusion_pp_microbatch_size == 3
+    assert explicit_kwargs["diffusion_pp_microbatch_size"] == 3
+    assert stage_cfg["engine_args"]["diffusion_pp_microbatch_size"] == 3
+
+
 def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     """Ensure diffusion serve CLI exposes the profiler switch."""
     parser = TrackingArgumentParser()

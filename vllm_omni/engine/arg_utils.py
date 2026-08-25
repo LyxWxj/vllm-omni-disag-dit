@@ -550,6 +550,8 @@ class OrchestratorArgs:
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
+    # Wan interleaved PP: maximum compatible request rows per local clock.
+    diffusion_pp_microbatch_size: int = 1
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True

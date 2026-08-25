@@ -2451,6 +2451,7 @@ stages:
       diffusion_attention_backend: FLASH_ATTN
       diffusion_kv_cache_dtype: auto
       step_execution: false
+      diffusion_pp_microbatch_size: 3
       vae_use_tiling: false
       enable_cpu_offload: false
       max_generated_image_size: 1048576
@@ -2491,6 +2492,7 @@ stages:
         assert stage.yaml_engine_args["diffusion_attention_backend"] == "FLASH_ATTN"
         assert stage.yaml_engine_args["diffusion_kv_cache_dtype"] == "auto"
         assert stage.yaml_engine_args["step_execution"] is False
+        assert stage.yaml_engine_args["diffusion_pp_microbatch_size"] == 3
         assert stage.yaml_engine_args["vae_use_tiling"] is False
         assert stage.yaml_engine_args["enable_cpu_offload"] is False
         assert stage.yaml_engine_args["max_generated_image_size"] == 1048576
@@ -2515,6 +2517,7 @@ stages:
                 "diffusion_attention_backend": "SAGE_ATTN",
                 "diffusion_kv_cache_dtype": "fp8",
                 "step_execution": True,
+                "diffusion_pp_microbatch_size": 5,
                 "vae_use_tiling": True,
                 "enable_cpu_offload": True,
                 "max_generated_image_size": 2097152,
@@ -2528,6 +2531,7 @@ stages:
         assert omega_config.engine_args.diffusion_attention_backend == "SAGE_ATTN"
         assert omega_config.engine_args.diffusion_kv_cache_dtype == "fp8"
         assert omega_config.engine_args.step_execution is True
+        assert omega_config.engine_args.diffusion_pp_microbatch_size == 5
         assert omega_config.engine_args.vae_use_tiling is True
         assert omega_config.engine_args.enable_cpu_offload is True
         assert omega_config.engine_args.max_generated_image_size == 2097152

@@ -368,6 +368,7 @@ class StageDeployConfig:
     cache_config: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None
+    diffusion_pp_microbatch_size: int | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
     boundary_ratio: float | None = None

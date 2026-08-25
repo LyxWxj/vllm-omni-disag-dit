@@ -1392,10 +1392,12 @@ class TestSupportedPipelines:
         stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
             {
                 "step_execution": True,
+                "diffusion_pp_microbatch_size": 3,
             }
         )[0]
 
         assert stage_cfg["engine_args"]["step_execution"] is True
+        assert stage_cfg["engine_args"]["diffusion_pp_microbatch_size"] == 3
 
     def test_qwen_image_supports_step_execution(self):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
