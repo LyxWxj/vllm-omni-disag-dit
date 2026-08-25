@@ -84,7 +84,10 @@ def test_emit_step_outputs_finalizes_finished_request_without_stream() -> None:
     request_id = engine.scheduler.add_request(_make_request("step-drained"))
     engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
 
-    engine._emit_outputs({request_id}, [request_id], SimpleNamespace(get_request_output=lambda _request_id: None))
+    engine._emit_outputs(
+        {request_id},
+        SimpleNamespace(completed_request_ids=[], get_request_output=lambda _request_id: None),
+    )
 
     assert engine.scheduler.get_request_state(request_id) is None
 
