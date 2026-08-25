@@ -44,7 +44,6 @@ class InlineStageDiffusionClient(StageClientBase):
         model: str,
         od_config: OmniDiffusionConfig,
         metadata: StageMetadata,
-        batch_size: int = 1,
     ) -> None:
         self.model = model
         self.od_config = od_config
@@ -57,7 +56,6 @@ class InlineStageDiffusionClient(StageClientBase):
         self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
         self.engine_input_source = metadata.engine_input_source
-        self.batch_size = batch_size
 
         self._enrich_config()
         self._engine = DiffusionEngine.make_engine(self.od_config)
@@ -73,10 +71,10 @@ class InlineStageDiffusionClient(StageClientBase):
         self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
         logger.info(
-            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (max_num_seqs=%d)",
             self.stage_id,
             self.replica_id,
-            self.batch_size,
+            self.od_config.max_num_seqs,
         )
 
     def _enrich_config(self) -> None:

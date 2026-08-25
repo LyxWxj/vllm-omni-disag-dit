@@ -302,6 +302,55 @@ def test_serve_cli_forwards_diffusion_pp_microbatch_size_to_stage():
     assert stage_cfg["engine_args"]["diffusion_pp_microbatch_size"] == 3
 
 
+def test_serve_cli_max_num_seqs_reaches_diffusion_client(monkeypatch):
+    """A CLI capacity override remains the client capacity for the stage."""
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Wan-AI/Wan2.2-TI2V-5B",
+            "--omni",
+            "--max-num-seqs",
+            "4",
+        ]
+    )
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(args.get_explicit_kwargs_dict())[0]
+    stage_config = SimpleNamespace(**stage_cfg)
+    captured: dict[str, object] = {}
+
+    def _capture_client(model, od_config, metadata, stage_init_timeout, use_inline):
+        captured.update(
+            model=model,
+            od_config=od_config,
+            metadata=metadata,
+            stage_init_timeout=stage_init_timeout,
+            use_inline=use_inline,
+        )
+        return SimpleNamespace(od_config=od_config)
+
+    monkeypatch.setattr(client_mod, "create_diffusion_client", _capture_client)
+    client = init_mod.initialize_diffusion_stage(
+        0,
+        "Wan-AI/Wan2.2-TI2V-5B",
+        stage_config,
+        SimpleNamespace(stage_id=0, cfg_kv_collect_func=None),
+        stage_init_timeout=12,
+        use_inline=True,
+    )
+
+    assert args.max_num_seqs == 4
+    assert stage_cfg["engine_args"]["max_num_seqs"] == 4
+    assert captured["od_config"].max_num_seqs == 4
+    assert client.od_config.max_num_seqs == 4
+
+
 def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     """Ensure diffusion serve CLI exposes the profiler switch."""
     parser = TrackingArgumentParser()
