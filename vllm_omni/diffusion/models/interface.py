@@ -102,9 +102,13 @@ class SupportsComponentDiscovery(Protocol):
 
 
 def supports_step_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
+    """Return whether ``pipeline`` explicitly enables step execution."""
 
-    return isinstance(pipeline, SupportsStepExecution)
+    # Structural protocol checks alone cannot distinguish a model that happens
+    # to expose the four methods from one that has validated request-local
+    # state for this runtime.  Subclasses may explicitly disable inherited
+    # implementations (for example Wan VACE) with ``False``.
+    return getattr(pipeline, "supports_step_execution", False) is True and isinstance(pipeline, SupportsStepExecution)
 
 
 @runtime_checkable

@@ -666,6 +666,23 @@ class Wan22Pipeline(
             context["latent_condition"] is not None,
         )
 
+    @staticmethod
+    def _extract_request_image(prompt: Any) -> PIL.Image.Image | torch.Tensor | None:
+        """Read the standard multimodal image envelope used by Wan requests."""
+        if isinstance(prompt, str) or not isinstance(prompt, dict):
+            return None
+        multi_modal_data = prompt.get("multi_modal_data", {}) or {}
+        raw_image = multi_modal_data.get("image")
+        if isinstance(raw_image, list):
+            if len(raw_image) > 1:
+                logger.warning("Received multiple images for one Wan request; using only the first image.")
+            raw_image = raw_image[0] if raw_image else None
+        if isinstance(raw_image, str):
+            raw_image = PIL.Image.open(raw_image).convert("RGB")
+        if raw_image is not None and not isinstance(raw_image, (PIL.Image.Image, torch.Tensor)):
+            raise TypeError(f"Unsupported Wan image condition type: {type(raw_image)!r}")
+        return cast(PIL.Image.Image | torch.Tensor | None, raw_image)
+
     def build_microbatches(self, states: Sequence[StepRequestState]) -> list[tuple[StepRequestState, ...]]:
         """Build ordered homogeneous Wan microbatches for one denoise clock."""
         microbatch_size = int(getattr(self.od_config, "diffusion_pp_microbatch_size", 1))
@@ -775,11 +792,7 @@ class Wan22Pipeline(
         timesteps = scheduler.timesteps
         boundary_timestep = boundary_ratio * scheduler.config.num_train_timesteps
 
-        raw_image = DiffusionRequestBatch.get_prompt_field(prompt_data, "image")
-        if isinstance(raw_image, list):
-            if len(raw_image) > 1:
-                logger.warning("Wan step execution uses only the first image condition per request.")
-            raw_image = raw_image[0] if raw_image else None
+        raw_image = self._extract_request_image(prompt_data)
         latent_condition = None
         first_frame_mask = None
         if self.expand_timesteps and raw_image is not None:
@@ -1126,17 +1139,7 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()
-        images: list[PIL.Image.Image | torch.Tensor | None] = []
-        for request_prompt in req.prompts:
-            multi_modal_data = request_prompt.get("multi_modal_data", {}) if not isinstance(request_prompt, str) else {}
-            raw_image = multi_modal_data.get("image")
-            if isinstance(raw_image, list):
-                if len(raw_image) > 1:
-                    logger.warning("Received multiple images for one Wan request; using only the first image.")
-                raw_image = raw_image[0] if raw_image else None
-            if isinstance(raw_image, str):
-                raw_image = PIL.Image.open(raw_image)
-            images.append(cast(PIL.Image.Image | torch.Tensor | None, raw_image))
+        images = [self._extract_request_image(request_prompt) for request_prompt in req.prompts]
 
         latent_condition = None
         first_frame_mask = None

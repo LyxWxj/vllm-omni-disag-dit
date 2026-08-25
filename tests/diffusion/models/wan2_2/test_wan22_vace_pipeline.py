@@ -9,6 +9,7 @@ from PIL import Image
 from torch import nn
 
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
+from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace import (
     Wan22VACEPipeline,
     create_vace_transformer_from_config,
@@ -52,6 +53,13 @@ def _make_vace_sampling(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def test_vace_explicitly_disables_inherited_step_execution() -> None:
+    pipeline = _make_vace_pipeline()
+
+    assert Wan22VACEPipeline.supports_step_execution is False
+    assert supports_step_execution(pipeline) is False
 
 
 def test_vace_preprocess_collects_reference_video_and_mask_inputs() -> None:

@@ -479,6 +479,77 @@ def test_step_execution_matches_full_forward_for_fixed_seed(monkeypatch) -> None
     torch.testing.assert_close(step_output, full_output)
 
 
+def test_step_execution_matches_full_forward_for_ti2v_envelope(monkeypatch) -> None:
+    class _VideoProcessor:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def preprocess(self, image, height, width):
+            del image, height, width
+            return torch.zeros(1, 3, 16, 16)
+
+    class _StubVAE:
+        dtype = torch.float32
+        config = SimpleNamespace(z_dim=4, latents_mean=[0.0] * 4, latents_std=[1.0] * 4)
+
+        def encode(self, image):
+            return SimpleNamespace(latents=torch.ones(image.shape[0], 4, 1, 2, 2))
+
+    def make_ti2v_pipeline() -> Wan22Pipeline:
+        pipeline = _make_pipeline()
+        pipeline.vae = _StubVAE()
+        pipeline.expand_timesteps = True
+        pipeline.prepare_latents = lambda **kwargs: torch.zeros((1, 4, 1, 2, 2), dtype=kwargs["dtype"])
+        pipeline.predict_noise_maybe_with_cfg = _step_noise_from_latents  # type: ignore[method-assign]
+        pipeline.scheduler_step_maybe_with_cfg = step_scheduler  # type: ignore[method-assign]
+        pipeline.od_config.diffusion_pp_microbatch_size = 2
+        return pipeline
+
+    def step_scheduler(noise_pred, timestep, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        del do_true_cfg, generator
+        scheduler = per_request_scheduler or full_pipeline.scheduler
+        return scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+
+    monkeypatch.setattr("diffusers.video_processor.VideoProcessor", _VideoProcessor)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.build_wan_scheduler",
+        lambda sample_solver, flow_shift: _StubScheduler([9, 5]),
+    )
+    full_pipeline = make_ti2v_pipeline()
+    step_pipeline = make_ti2v_pipeline()
+    prompt = {"prompt": "ti2v", "multi_modal_data": {"image": torch.zeros(3, 16, 16)}}
+    full_request = OmniDiffusionRequest(
+        prompt=prompt,
+        request_id="ti2v-full",
+        sampling_params=_make_sampling(
+            height=16,
+            width=16,
+            num_frames=1,
+            generator=torch.Generator(device="cpu").manual_seed(1234),
+        ),
+    )
+    full_output = full_pipeline.forward(DiffusionRequestBatch(requests=[full_request]))[0].output
+
+    state = StepRequestState(
+        request_id="ti2v-step",
+        prompt=prompt,
+        sampling=_make_sampling(
+            height=16,
+            width=16,
+            num_frames=1,
+            generator=torch.Generator(device="cpu").manual_seed(1234),
+        ),
+    )
+    step_pipeline.prepare_encode(state)
+    assert state.extra["wan22"]["latent_condition"] is not None
+    assert state.extra["wan22"]["first_frame_mask"] is not None
+    while not state.denoise_completed:
+        input_batch = InputBatch.make_batch([state])
+        step_pipeline.step_scheduler(state, step_pipeline.denoise_step(input_batch, states=[state]))
+
+    torch.testing.assert_close(step_pipeline.post_decode(state).output, full_output)
+
+
 def _make_manual_step_state(request_id: str, latent_value: float, timestep: float) -> StepRequestState:
     state = StepRequestState(
         request_id=request_id,

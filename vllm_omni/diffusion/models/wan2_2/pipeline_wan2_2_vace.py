@@ -190,6 +190,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
 
+    # VACE has additional reference/video/mask context and does not yet have a
+    # request-local step protocol.  Do not inherit Wan2.2's generic methods.
+    supports_step_execution = False
+
     def __init__(
         self,
         *,
