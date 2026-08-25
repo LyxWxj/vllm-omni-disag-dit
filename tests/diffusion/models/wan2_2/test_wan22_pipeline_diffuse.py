@@ -442,6 +442,14 @@ def test_step_execution_matches_full_forward_for_fixed_seed(monkeypatch) -> None
     step_pipeline.prepare_latents = _seeded_latents  # type: ignore[method-assign]
     step_pipeline.od_config.diffusion_pp_microbatch_size = 2
 
+    def step_scheduler(noise_pred, timestep, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        del do_true_cfg, generator
+        scheduler = per_request_scheduler or full_pipeline.scheduler
+        return scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+
+    full_pipeline.scheduler_step_maybe_with_cfg = step_scheduler  # type: ignore[method-assign]
+    step_pipeline.scheduler_step_maybe_with_cfg = step_scheduler  # type: ignore[method-assign]
+
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.build_wan_scheduler",
         lambda sample_solver, flow_shift: _StubScheduler([9, 5]),
