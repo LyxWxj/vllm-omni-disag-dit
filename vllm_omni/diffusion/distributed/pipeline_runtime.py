@@ -203,6 +203,15 @@ class _P2PReceiveSlot:
         self.history.append(new)
 
 
+class _TrackedWork:
+    """Gloo work plus the event/error state owned by its progress thread."""
+
+    def __init__(self, work: Any) -> None:
+        self.work = work
+        self.completed = Event()
+        self.error: BaseException | None = None
+
+
 class PipelineP2PChannel:
     """Retained-state P2P runtime for one directed, fixed-shape PP edge.
 
@@ -247,9 +256,7 @@ class PipelineP2PChannel:
         self._dist = dist
         self._group = group
         self._requires_wait_thread = dist.get_backend(group) == "gloo"
-        self._work_events: dict[int, Event] = {}
-        self._work_errors: dict[int, BaseException] = {}
-        self._work_wait_queue: deque[tuple[int, Any]] = deque()
+        self._work_wait_queue: deque[_TrackedWork] = deque()
         self._work_wait_condition = Condition()
         if self._requires_wait_thread:
             Thread(target=self._gloo_wait_loop, daemon=True).start()
@@ -557,12 +564,11 @@ class PipelineP2PChannel:
         if not self._requires_wait_thread:
             return work
 
-        completed = Event()
-        self._work_events[id(work)] = completed
+        tracked_work = _TrackedWork(work)
         with self._work_wait_condition:
-            self._work_wait_queue.append((id(work), work))
+            self._work_wait_queue.append(tracked_work)
             self._work_wait_condition.notify()
-        return work
+        return tracked_work
 
     def _gloo_wait_loop(self) -> None:
         """Serialize Gloo ``Work.wait`` calls for one edge.
@@ -577,21 +583,20 @@ class PipelineP2PChannel:
             with self._work_wait_condition:
                 while not self._work_wait_queue:
                     self._work_wait_condition.wait()
-                work_id, work = self._work_wait_queue.popleft()
+                tracked_work = self._work_wait_queue.popleft()
             try:
-                work.wait()
+                tracked_work.work.wait()
             except BaseException as exc:  # pragma: no cover - backend failure path.
-                self._work_errors[work_id] = exc
+                tracked_work.error = exc
             finally:
-                self._work_events[work_id].set()
+                tracked_work.completed.set()
 
     def _works_complete(self, *works: Any | None) -> bool:
         for work in works:
             if work is None:
                 return False
-            completed = self._work_events.get(id(work))
-            if completed is not None:
-                if not completed.is_set():
+            if isinstance(work, _TrackedWork):
+                if not work.completed.is_set():
                     return False
             elif not work.is_completed():
                 return False
@@ -601,12 +606,10 @@ class PipelineP2PChannel:
         for work in works:
             if work is None:
                 continue
-            completed = self._work_events.pop(id(work), None)
-            if completed is not None:
-                completed.wait()
-                error = self._work_errors.pop(id(work), None)
-                if error is not None:
-                    raise error
+            if isinstance(work, _TrackedWork):
+                work.completed.wait()
+                if work.error is not None:
+                    raise work.error
             else:
                 work.wait()
 
