@@ -58,7 +58,28 @@ class TestPipelineClockSimulator:
         assert records[1].active_stages == (0, 1)
         assert [token.token_id for token in runtime.completed_tokens] == ["A", "B"]
 
-    def test_slot_capacity_and_state_transitions_prevent_overwrite(self) -> None:
+    def test_stalled_downstream_fills_credits_then_resumes_in_fifo_order(self) -> None:
+        runtime = PipelineClockSimulator(num_stages=2, slots_per_edge=2)
+        runtime.set_stage_ready(1, False)
+        for index, token_id in enumerate(("A", "B", "C")):
+            runtime.submit(_token(token_id, index))
+
+        blocked = tuple(runtime.progress_one_clock() for _ in range(3))
+
+        assert [record.active_stages for record in blocked] == [(0,), (0,), ()]
+        assert [record.edge_credits for record in blocked] == [(1,), (0,), (0,)]
+        assert runtime.edge_max_occupancy == (2,)
+
+        runtime.set_stage_ready(1, True)
+        resumed = runtime.progress_one_clock()
+        runtime.run_until_idle(max_clocks=8)
+
+        assert resumed.active_stages == (0, 1)
+        assert resumed.completed_token_ids == ("A",)
+        assert [token.token_id for token in runtime.completed_tokens] == ["A", "B", "C"]
+        assert [token.slot_id for token in runtime.completed_tokens] == [0, 1, 0]
+
+    def test_slot_state_transitions_prevent_overwrite(self) -> None:
         runtime = PipelineClockSimulator(num_stages=4, slots_per_edge=1)
         for index in range(8):
             runtime.submit(_token(str(index), index))

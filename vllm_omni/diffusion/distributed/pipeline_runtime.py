@@ -89,23 +89,22 @@ class _PipelineSlot:
         self.slot_id = slot_id
         self.state = PipelineSlotState.FREE
         self.token: PipelineToken | None = None
+        self.send_sequence: int | None = None
         self.history = [self.state]
 
     def _transition(self, expected: PipelineSlotState, new: PipelineSlotState) -> None:
         if self.state is not expected:
-            raise RuntimeError(
-                f"slot {self.slot_id} transition {self.state.name}->{new.name} "
-                f"requires {expected.name}"
-            )
+            raise RuntimeError(f"slot {self.slot_id} transition {self.state.name}->{new.name} requires {expected.name}")
         self.state = new
         self.history.append(new)
 
     def post_receive(self) -> None:
         self._transition(PipelineSlotState.FREE, PipelineSlotState.RECV_POSTED)
 
-    def begin_send(self, token: PipelineToken) -> None:
+    def begin_send(self, token: PipelineToken, send_sequence: int) -> None:
         self._transition(PipelineSlotState.RECV_POSTED, PipelineSlotState.SEND_PENDING)
         self.token = token.for_slot(self.slot_id)
+        self.send_sequence = send_sequence
 
     def complete_send(self) -> None:
         self._transition(PipelineSlotState.SEND_PENDING, PipelineSlotState.READY)
@@ -118,6 +117,7 @@ class _PipelineSlot:
     def release_after_compute(self) -> None:
         self._transition(PipelineSlotState.COMPUTING, PipelineSlotState.FREE)
         self.token = None
+        self.send_sequence = None
 
 
 class _PipelineEdge:
@@ -125,6 +125,8 @@ class _PipelineEdge:
 
     def __init__(self, slot_count: int) -> None:
         self.slots = [_PipelineSlot(slot_id) for slot_id in range(slot_count)]
+        self._next_send_sequence = 0
+        self._ready_slot_ids: deque[int] = deque()
         self.max_occupied = 0
 
     @property
@@ -136,19 +138,21 @@ class _PipelineEdge:
         return any(slot.state is PipelineSlotState.READY for slot in self.slots)
 
     def peek_ready_token(self) -> PipelineToken | None:
-        for slot in self.slots:
-            if slot.state is PipelineSlotState.READY:
-                return slot.token
-        return None
+        slot = self._peek_ready_slot()
+        return slot.token if slot is not None else None
 
     @property
     def has_work(self) -> bool:
         return any(slot.token is not None for slot in self.slots)
 
     def complete_sends(self) -> None:
-        for slot in self.slots:
-            if slot.state is PipelineSlotState.SEND_PENDING:
-                slot.complete_send()
+        pending_slots = sorted(
+            (slot for slot in self.slots if slot.state is PipelineSlotState.SEND_PENDING),
+            key=lambda slot: slot.send_sequence,
+        )
+        for slot in pending_slots:
+            slot.complete_send()
+            self._ready_slot_ids.append(slot.slot_id)
 
     def post_receives(self) -> None:
         for slot in self.slots:
@@ -166,10 +170,11 @@ class _PipelineEdge:
         return self.credits > 0 or (consumer_will_run and self.has_ready_token)
 
     def begin_compute(self) -> PipelineToken:
-        for slot in self.slots:
-            if slot.state is PipelineSlotState.READY:
-                return slot.begin_compute()
-        raise RuntimeError("attempted to consume an edge with no READY token")
+        slot = self._peek_ready_slot()
+        if slot is None:
+            raise RuntimeError("attempted to consume an edge with no READY token")
+        self._ready_slot_ids.popleft()
+        return slot.begin_compute()
 
     def release_after_compute(self, token_id: str) -> None:
         for slot in self.slots:
@@ -183,7 +188,8 @@ class _PipelineEdge:
     def send(self, token: PipelineToken) -> None:
         for slot in self.slots:
             if slot.state is PipelineSlotState.RECV_POSTED:
-                slot.begin_send(token)
+                slot.begin_send(token, self._next_send_sequence)
+                self._next_send_sequence += 1
                 self.max_occupied = max(self.max_occupied, self._occupied_count())
                 return
         raise RuntimeError("attempted to send without receiver credit")
@@ -193,6 +199,24 @@ class _PipelineEdge:
 
     def _occupied_count(self) -> int:
         return sum(slot.token is not None for slot in self.slots)
+
+    def _peek_ready_slot(self) -> _PipelineSlot | None:
+        if not self._ready_slot_ids:
+            return None
+        slot = self.slots[self._ready_slot_ids[0]]
+        if slot.state is not PipelineSlotState.READY:
+            raise RuntimeError("READY queue references a slot that is not READY")
+        return slot
+
+    def assert_invariants(self) -> None:
+        ready_slot_ids = tuple(slot.slot_id for slot in self.slots if slot.state is PipelineSlotState.READY)
+        if len(self._ready_slot_ids) != len(set(self._ready_slot_ids)):
+            raise RuntimeError("READY queue contains a duplicate slot")
+        if set(self._ready_slot_ids) != set(ready_slot_ids):
+            raise RuntimeError("READY queue and slot states disagree")
+        for slot in self.slots:
+            if slot.state is PipelineSlotState.SEND_PENDING and slot.send_sequence is None:
+                raise RuntimeError("SEND_PENDING slot has no send sequence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +246,7 @@ class PipelineClockSimulator:
         self._admitted_token_ids: set[str] = set()
         self._completed: list[PipelineToken] = []
         self._active_compatibility_key: Hashable | None = None
+        self._stage_ready = [True] * num_stages
         self._clock = 0
         self.records: list[PipelineClockRecord] = []
 
@@ -244,6 +269,18 @@ class PipelineClockSimulator:
     @property
     def slot_state_histories(self) -> tuple[tuple[tuple[PipelineSlotState, ...], ...], ...]:
         return tuple(edge.state_histories() for edge in self._edges)
+
+    @property
+    def stage_readiness(self) -> tuple[bool, ...]:
+        return tuple(self._stage_ready)
+
+    def set_stage_ready(self, stage: int, ready: bool) -> None:
+        """Inject stage readiness for deterministic backpressure simulations."""
+        if stage < 0 or stage >= self.num_stages:
+            raise ValueError(f"stage {stage} is outside [0, {self.num_stages})")
+        if not isinstance(ready, bool):
+            raise TypeError("stage readiness must be a bool")
+        self._stage_ready[stage] = ready
 
     def submit(self, token: PipelineToken) -> None:
         """Queue a token for stage-0 admission, rejecting duplicates and mixed shapes."""
@@ -269,6 +306,8 @@ class PipelineClockSimulator:
 
         plans: list[_StagePlan | None] = [None] * self.num_stages
         for stage in range(self.num_stages - 1, -1, -1):
+            if not self._stage_ready[stage]:
+                continue
             if stage == 0:
                 token = self._waiting[0] if self._waiting else None
             else:
@@ -345,6 +384,7 @@ class PipelineClockSimulator:
     def _assert_invariants(self) -> None:
         resident_ids = [token.token_id for token in self._waiting]
         for edge in self._edges:
+            edge.assert_invariants()
             for slot in edge.slots:
                 if slot.state in (PipelineSlotState.FREE, PipelineSlotState.RECV_POSTED):
                     assert slot.token is None
