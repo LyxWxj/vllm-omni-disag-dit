@@ -343,18 +343,15 @@ class BaseScheduler(ABC):
         statuses: dict[str, DiffusionRequestStatus],
         errors: dict[str, str | None] | None = None,
     ) -> set[str]:
-        # A scheduled request may be aborted after schedule() but before
-        # update_from_output() processes the runner output. It is already
-        # marked finished at that point, but we still need to surface its id
-        # in this update so the engine can observe the terminal state.
-        # Also surface admission failures recorded while schedule() built this
-        # output. Older finished ids retained only for Worker cleanup have
-        # already been popped by the Engine and are deliberately ignored.
+        # A request may finish after schedule() but before update_from_output()
+        # processes the runner output. This includes an abort received while a
+        # drain tick is executing, where sched_output has no request IDs. Keep
+        # surfacing every terminal ID still backed by request state; IDs already
+        # emitted and popped by the Engine are filtered out and cannot replay.
         finished_req_ids = {
-            request_id for request_id in sched_output.finished_req_ids if request_id in self._request_states
-        }
-        finished_req_ids |= {
-            request_id for request_id in sched_output.scheduled_request_ids if request_id in self._finished_req_ids
+            request_id
+            for request_id in sched_output.finished_req_ids | self._finished_req_ids
+            if request_id in self._request_states
         }
         finished_req_ids |= self._finish_requests(statuses, errors)
         return finished_req_ids
