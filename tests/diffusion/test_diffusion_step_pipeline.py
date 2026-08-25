@@ -1135,7 +1135,12 @@ class TestEngine:
         engine.od_config.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
         engine.stop_event = threading.Event()
         engine._rpc_queue = queue.Queue()
-        engine._emit_outputs = mocker.Mock(side_effect=lambda *_: engine.stop_event.set())
+
+        def emit_outputs(finished_ids, _runner_output):
+            if "req-drain" in finished_ids:
+                engine.stop_event.set()
+
+        engine._emit_outputs = mocker.Mock(side_effect=emit_outputs)
 
         ticks: list[list[str]] = []
 
@@ -1160,7 +1165,7 @@ class TestEngine:
         engine._busy_loop()
 
         assert ticks == [["req-drain"], []]
-        engine._emit_outputs.assert_called_once()
+        assert engine._emit_outputs.call_count == 2
 
     def test_pipeline_tick_sync_wait_drains_empty_schedule(self):
         scheduler = StepScheduler()
