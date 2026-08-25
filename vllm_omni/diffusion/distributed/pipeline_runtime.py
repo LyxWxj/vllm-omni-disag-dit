@@ -16,7 +16,7 @@ from collections import deque
 from collections.abc import Hashable
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from threading import Condition, Event, Thread
+from threading import Event, Thread
 from typing import Any, ClassVar
 
 
@@ -257,10 +257,6 @@ class PipelineP2PChannel:
         self._dist = dist
         self._group = group
         self._requires_wait_thread = dist.get_backend(group) == "gloo"
-        self._work_wait_queue: deque[_TrackedWork] = deque()
-        self._work_wait_condition = Condition()
-        if self._requires_wait_thread:
-            Thread(target=self._gloo_wait_loop, daemon=True).start()
         self.source_rank = source_rank
         self.destination_rank = destination_rank
         self.slots_per_edge = slots_per_edge
@@ -602,31 +598,17 @@ class PipelineP2PChannel:
             return work
 
         tracked_work = _TrackedWork(work)
-        with self._work_wait_condition:
-            self._work_wait_queue.append(tracked_work)
-            self._work_wait_condition.notify()
-        return tracked_work
 
-    def _gloo_wait_loop(self) -> None:
-        """Serialize Gloo ``Work.wait`` calls for one edge.
-
-        Gloo's CPU backend does not advance a nonblocking work from
-        ``is_completed()`` alone, and concurrent waits on several P2P works in
-        one process are not reliable on all supported builds. A single waiter
-        preserves the nonblocking public ``poll`` API while keeping native
-        progress serialized per edge.
-        """
-        while True:
-            with self._work_wait_condition:
-                while not self._work_wait_queue:
-                    self._work_wait_condition.wait()
-                tracked_work = self._work_wait_queue.popleft()
+        def wait_for_gloo_work() -> None:
             try:
                 tracked_work.work.wait()
             except BaseException as exc:  # pragma: no cover - backend failure path.
                 tracked_work.error = exc
             finally:
                 tracked_work.completed.set()
+
+        Thread(target=wait_for_gloo_work, daemon=True).start()
+        return tracked_work
 
     def _works_complete(self, *works: Any | None) -> bool:
         for work in works:
