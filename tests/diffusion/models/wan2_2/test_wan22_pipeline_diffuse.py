@@ -411,8 +411,22 @@ def _step_noise_from_latents(*, positive_kwargs, **kwargs):
 
 def _seeded_latents(**kwargs):
     generator = kwargs["generator"]
+    shape = (1, kwargs["num_channels_latents"], 1, 8, 8)
+    if isinstance(generator, list):
+        return torch.cat(
+            [
+                torch.randn(
+                    shape,
+                    generator=item,
+                    dtype=kwargs["dtype"],
+                    device=kwargs["device"],
+                )
+                for item in generator
+            ],
+            dim=0,
+        )
     return torch.randn(
-        (kwargs["batch_size"], kwargs["num_channels_latents"], 1, 8, 8),
+        (kwargs["batch_size"], *shape[1:]),
         generator=generator,
         dtype=kwargs["dtype"],
         device=kwargs["device"],
