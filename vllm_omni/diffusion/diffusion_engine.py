@@ -378,7 +378,11 @@ class DiffusionEngine:
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
-            self.execute_fn = self.executor.execute_step
+            pp_size = getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1)
+            if int(pp_size or 1) > 1:
+                self.execute_fn = self.executor.execute_pipeline_tick
+            else:
+                self.execute_fn = self.executor.execute_step
         else:
             self.execute_fn = self.executor.execute_batch
 
@@ -581,7 +585,7 @@ class DiffusionEngine:
             self._process_aborts_queue()
             self._process_rpc_queue()
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            self._emit_outputs(finished_req_ids, sched_output.scheduled_request_ids, runner_output)
+            self._emit_outputs(finished_req_ids, runner_output)
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
@@ -712,7 +716,6 @@ class DiffusionEngine:
     def _emit_outputs(
         self,
         finished_ids: set[str],
-        scheduled_request_ids: list[str],
         runner_output: BaseRunnerOutput,
     ) -> None:
         """Emit output chunks for every request through the unified output stream."""
@@ -724,9 +727,9 @@ class DiffusionEngine:
 
         delivered_finished_req_ids: set[str] = set()
 
-        # finished_ids may have some requests that are not scheduler in this round.
-        # First handle this-round requests.
-        for request_id in scheduled_request_ids:
+        # A pipeline tick can complete a request scheduled by an earlier
+        # clock, so runner output IDs are the source of truth here.
+        for request_id in runner_output.completed_request_ids:
             req_output = runner_output.get_request_output(request_id)
             if request_id in finished_ids:
                 # This entire request is finished (this is the last chunk)

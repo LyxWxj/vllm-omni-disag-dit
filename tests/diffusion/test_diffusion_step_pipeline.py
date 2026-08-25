@@ -16,7 +16,7 @@ from pytest_mock import MockerFixture
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -1126,6 +1126,28 @@ class TestEngine:
         assert mark_in_flight.call_count == 2
         assert output.error is None
         assert torch.equal(output.output, torch.tensor([2.0]))
+
+    def test_step_engine_emits_delayed_completed_request(self, mocker: MockerFixture):
+        engine = _make_engine(StepScheduler())
+        engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+        engine._remove_diffusion_kv_requests = mocker.Mock()
+        engine._finalize_finished_request = mocker.Mock(return_value=DiffusionOutput(output=torch.tensor([2.0])))
+        engine._put_output = mocker.Mock()
+        delayed_output = RunnerOutput(
+            request_id="a",
+            step_index=1,
+            finished=True,
+            result=DiffusionOutput(output=torch.tensor([2.0])),
+        )
+
+        engine._emit_outputs({"a"}, delayed_output)
+
+        engine._finalize_finished_request.assert_called_once_with(
+            "a",
+            delayed_output,
+            missing_result_error="Diffusion step execution finished without a final output.",
+        )
+        engine._put_output.assert_called_once()
 
     def test_step_abort_stops_rescheduling_after_first_step(self, mocker: MockerFixture):
         scheduler = StepScheduler()

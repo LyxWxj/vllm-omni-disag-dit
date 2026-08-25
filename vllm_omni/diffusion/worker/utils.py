@@ -168,8 +168,22 @@ class StepRequestState:
 
 
 class BaseRunnerOutput(ABC):
+    """Results that completed during one executor invocation.
+
+    In a pipeline tick, the completed requests need not be the requests
+    scheduled to stage 0 for that same tick. Consumers must use
+    ``completed_request_ids`` rather than scheduler input IDs when applying
+    request progress or emitting results.
+    """
+
     @abstractmethod
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
+        pass
+
+    @property
+    @abstractmethod
+    def completed_request_ids(self) -> list[str]:
+        """Stable request IDs represented by this tick's returned outputs."""
         pass
 
 
@@ -191,6 +205,10 @@ class RunnerOutput(BaseRunnerOutput):
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None
 
+    @property
+    def completed_request_ids(self) -> list[str]:
+        return [self.request_id]
+
 
 @dataclass
 class BatchRunnerOutput(BaseRunnerOutput):
@@ -211,6 +229,10 @@ class BatchRunnerOutput(BaseRunnerOutput):
     @property
     def request_ids(self) -> list[str]:
         return list(self._id_to_idx.keys())
+
+    @property
+    def completed_request_ids(self) -> list[str]:
+        return self.request_ids
 
     def __len__(self) -> int:
         return len(self.runner_outputs)

@@ -161,6 +161,10 @@ class _SingleRequestOverridePipeline(_BatchCapablePipeline):
         return DiffusionOutput(output=None)
 
 
+class _StepPipeline:
+    supports_step_execution = True
+
+
 def _make_request_mode_sched_output(*request_ids: str) -> RealDiffusionSchedulerOutput:
     new_reqs = [
         NewRequestData(
@@ -466,6 +470,48 @@ class TestRequestBatchCapability:
         assert output == "batch"
         fake_executor.execute_batch.assert_called_once()
         fake_executor.execute_request.assert_not_called()
+
+    def test_pp_step_engine_dispatches_pipeline_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="StepPipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            step_execution=True,
+            max_num_seqs=2,
+            parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=2),
+        )
+        fake_executor = SimpleNamespace(
+            execute_request=mocker.Mock(return_value="per-request"),
+            execute_batch=mocker.Mock(return_value="batch"),
+            execute_step=mocker.Mock(return_value="step"),
+            execute_pipeline_tick=mocker.Mock(return_value="pipeline-tick"),
+        )
+        fake_executor_cls = mocker.Mock(return_value=fake_executor)
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+
+        engine = DiffusionEngine(od_config)
+        output = engine.execute_fn(_make_request_mode_sched_output("req-a"))
+
+        assert engine.execution_mode == DiffusionExecutionMode.STEP_BATCH
+        assert output == "pipeline-tick"
+        fake_executor.execute_pipeline_tick.assert_called_once()
+        fake_executor.execute_step.assert_not_called()
 
     def test_make_engine_runs_startup_warmup(self, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
         od_config = SimpleNamespace(

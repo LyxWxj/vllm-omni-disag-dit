@@ -1448,6 +1448,41 @@ class TestStepScheduler:
         assert _new_ids(third) == []
         assert _cached_ids(third) == [req_id_a]
 
+    def test_delayed_tick_output_updates_request_by_completed_id(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
+        first = scheduler.schedule()
+        scheduler.mark_in_flight(first)
+
+        # A pipeline clock may advance A to a middle stage without producing
+        # a rank-0 result. This is not a scheduler error.
+        assert scheduler.update_from_output(first, BatchRunnerOutput.from_list([])) == set()
+        assert scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.IN_FLIGHT
+        assert scheduler.num_in_flight_requests == 1
+
+        req_id_b = scheduler.add_request(_make_step_request("b", num_inference_steps=2))
+        second = scheduler.schedule()
+        assert _new_ids(second) == [req_id_b]
+        scheduler.mark_in_flight(second)
+
+        # The next tick schedules B but completes A. The update must follow
+        # A's stable output ID instead of second.scheduled_request_ids.
+        assert (
+            scheduler.update_from_output(
+                second,
+                BatchRunnerOutput.from_list([_make_step_output(req_id_a, step_index=1)]),
+            )
+            == set()
+        )
+        assert scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.RUNNING
+        assert scheduler.get_request_state(req_id_b).status == DiffusionRequestStatus.IN_FLIGHT
+        assert scheduler.num_in_flight_requests == 1
+
+        third = scheduler.schedule()
+        assert _cached_ids(third) == [req_id_a]
+
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=2))
         req_id_b = self.scheduler.add_request(_make_step_request("b", num_inference_steps=2))

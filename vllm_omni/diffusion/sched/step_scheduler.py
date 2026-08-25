@@ -16,7 +16,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -86,14 +86,14 @@ class StepScheduler(BaseScheduler):
         )
         return request_id
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        scheduled_request_ids = sched_output.scheduled_request_ids
-        if not scheduled_request_ids:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
+        completed_request_ids = output.completed_request_ids
+        if not completed_request_ids:
             return set()
 
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
-        for request_id in scheduled_request_ids:
+        for request_id in completed_request_ids:
             state = self._request_states.get(request_id)
             progress = self._request_progress.get(request_id)
             if state is None or progress is None or state.is_finished():
@@ -138,7 +138,7 @@ class StepScheduler(BaseScheduler):
                 state.error = None
                 state.status = DiffusionRequestStatus.RUNNING
 
-        self._in_flight.difference_update(scheduled_request_ids)
+        self._in_flight.difference_update(completed_request_ids)
         return self._finalize_update_from_output(sched_output, terminal_statuses, terminal_errors)
 
     def _finish_requests(
