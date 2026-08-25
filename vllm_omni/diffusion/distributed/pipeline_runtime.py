@@ -16,6 +16,7 @@ from collections import deque
 from collections.abc import Hashable
 from dataclasses import dataclass, replace
 from enum import Enum, auto
+from threading import Event, Thread
 from typing import Any, ClassVar
 
 
@@ -245,6 +246,9 @@ class PipelineP2PChannel:
         self._torch = torch
         self._dist = dist
         self._group = group
+        self._requires_wait_thread = dist.get_backend(group) == "gloo"
+        self._work_events: dict[int, Event] = {}
+        self._work_errors: dict[int, BaseException] = {}
         self.source_rank = source_rank
         self.destination_rank = destination_rank
         self.slots_per_edge = slots_per_edge
@@ -374,17 +378,21 @@ class PipelineP2PChannel:
         transport_header.encode_into(slot.header_buffer)
         slot.payload_buffer.copy_(payload)
         slot.begin_send()
-        slot.header_work = self._dist.isend(
-            slot.header_buffer,
-            dst=self._peer_rank,
-            group=self._group,
-            tag=self._header_tag(slot_id),
+        slot.header_work = self._start_work(
+            self._dist.isend(
+                slot.header_buffer,
+                dst=self._peer_rank,
+                group=self._group,
+                tag=self._header_tag(slot_id),
+            )
         )
-        slot.payload_work = self._dist.isend(
-            slot.payload_buffer,
-            dst=self._peer_rank,
-            group=self._group,
-            tag=self._payload_tag(slot_id),
+        slot.payload_work = self._start_work(
+            self._dist.isend(
+                slot.payload_buffer,
+                dst=self._peer_rank,
+                group=self._group,
+                tag=self._payload_tag(slot_id),
+            )
         )
         return transport_header
 
@@ -431,7 +439,7 @@ class PipelineP2PChannel:
                 slot.finish_send()
 
         for expected_slot_id, work in enumerate(self._credit_works):
-            if work is None or not work.is_completed():
+            if not self._works_complete(work):
                 continue
             work.wait()
             credit_slot_id = int(self._credit_buffers[expected_slot_id].item())
@@ -473,37 +481,45 @@ class PipelineP2PChannel:
             self._next_receive_sequence += 1
 
     def _post_credit_receive(self, slot_id: int) -> None:
-        self._credit_works[slot_id] = self._dist.irecv(
-            self._credit_buffers[slot_id],
-            src=self._peer_rank,
-            group=self._group,
-            tag=self._credit_tag(slot_id),
+        self._credit_works[slot_id] = self._start_work(
+            self._dist.irecv(
+                self._credit_buffers[slot_id],
+                src=self._peer_rank,
+                group=self._group,
+                tag=self._credit_tag(slot_id),
+            )
         )
 
     def _post_receive(self, slot: _P2PReceiveSlot) -> None:
         slot.transition(PipelineSlotState.FREE, PipelineSlotState.RECV_POSTED)
-        slot.header_work = self._dist.irecv(
-            slot.header_buffer,
-            src=self._peer_rank,
-            group=self._group,
-            tag=self._header_tag(slot.slot_id),
+        slot.header_work = self._start_work(
+            self._dist.irecv(
+                slot.header_buffer,
+                src=self._peer_rank,
+                group=self._group,
+                tag=self._header_tag(slot.slot_id),
+            )
         )
-        slot.payload_work = self._dist.irecv(
-            slot.payload_buffer,
-            src=self._peer_rank,
-            group=self._group,
-            tag=self._payload_tag(slot.slot_id),
+        slot.payload_work = self._start_work(
+            self._dist.irecv(
+                slot.payload_buffer,
+                src=self._peer_rank,
+                group=self._group,
+                tag=self._payload_tag(slot.slot_id),
+            )
         )
 
     def _send_credit(self, slot_id: int) -> None:
         previous_work = self._credit_works[slot_id]
         self._wait_for_works(previous_work)
         self._credit_buffers[slot_id].fill_(slot_id)
-        self._credit_works[slot_id] = self._dist.isend(
-            self._credit_buffers[slot_id],
-            dst=self._peer_rank,
-            group=self._group,
-            tag=self._credit_tag(slot_id),
+        self._credit_works[slot_id] = self._start_work(
+            self._dist.isend(
+                self._credit_buffers[slot_id],
+                dst=self._peer_rank,
+                group=self._group,
+                tag=self._credit_tag(slot_id),
+            )
         )
 
     def _take_send_credit(self) -> int:
@@ -533,14 +549,47 @@ class PipelineP2PChannel:
     def _credit_tag(self, slot_id: int) -> int:
         return self._header_tag(slot_id) + 2
 
-    @staticmethod
-    def _works_complete(*works: Any | None) -> bool:
-        return all(work is not None and work.is_completed() for work in works)
+    def _start_work(self, work: Any) -> Any:
+        if not self._requires_wait_thread:
+            return work
 
-    @staticmethod
-    def _wait_for_works(*works: Any | None) -> None:
+        completed = Event()
+        self._work_events[id(work)] = completed
+
+        def wait_for_gloo_work() -> None:
+            try:
+                work.wait()
+            except BaseException as exc:  # pragma: no cover - backend failure path.
+                self._work_errors[id(work)] = exc
+            finally:
+                completed.set()
+
+        Thread(target=wait_for_gloo_work, daemon=True).start()
+        return work
+
+    def _works_complete(self, *works: Any | None) -> bool:
         for work in works:
-            if work is not None:
+            if work is None:
+                return False
+            completed = self._work_events.get(id(work))
+            if completed is not None:
+                if not completed.is_set():
+                    return False
+            elif not work.is_completed():
+                return False
+        return True
+
+    def _wait_for_works(self, *works: Any | None) -> None:
+        for work in works:
+            if work is None:
+                continue
+            completed = self._work_events.pop(id(work), None)
+            if completed is not None:
+                completed.wait()
+                error = self._work_errors.pop(id(work), None)
+                if error is not None:
+                    raise error
+            else:
                 work.wait()
 
     def _require_source(self) -> None:
