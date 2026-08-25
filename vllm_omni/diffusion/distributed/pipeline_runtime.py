@@ -89,6 +89,7 @@ class PipelineTransportHeader:
     send_sequence: int | None = None
 
     FIELD_COUNT: ClassVar[int] = 6
+    SHUTDOWN_FLAG: ClassVar[int] = 1
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -278,6 +279,9 @@ class PipelineP2PChannel:
         self._ready_slot_ids: deque[int] = deque()
         self._received_by_sequence: dict[int, _P2PReceiveSlot] = {}
         self._max_occupied = 0
+        self._shutdown_requested = False
+        self._shutdown_slot_ids: set[int] = set()
+        self._closed = False
 
         if self._is_source:
             self._send_slots = [
@@ -320,6 +324,11 @@ class PipelineP2PChannel:
     @property
     def is_destination(self) -> bool:
         return not self._is_source
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether this edge has completed its explicit shutdown handshake."""
+        return self._closed
 
     @property
     def available_credits(self) -> int:
@@ -429,8 +438,35 @@ class PipelineP2PChannel:
             raise RuntimeError("attempted to release a message that is not currently computing")
         slot.transition(PipelineSlotState.COMPUTING, PipelineSlotState.FREE)
         slot.header = None
+        if message.header.flags & PipelineTransportHeader.SHUTDOWN_FLAG:
+            self._shutdown_slot_ids.add(slot_id)
+            self._closed = len(self._shutdown_slot_ids) == self.slots_per_edge
+            return
         self._post_receive(slot)
         self._send_credit(slot_id)
+
+    def send_shutdown(self) -> None:
+        """Send one tombstone per physical slot and finish the edge cleanly."""
+        self._require_source()
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        self.wait_for_sends()
+        payload = self._torch.zeros(self.tensor_shape, dtype=self.tensor_dtype, device=self.device)
+        for _ in range(self.slots_per_edge):
+            while not self.can_send:
+                self.poll()
+            self.send(
+                PipelineTransportHeader(
+                    token_id=0,
+                    step_idx=0,
+                    cfg_branch=0,
+                    flags=PipelineTransportHeader.SHUTDOWN_FLAG,
+                ),
+                payload,
+            )
+        self.wait_for_sends()
+        self._closed = True
 
     def wait_for_sends(self) -> None:
         """Wait for locally-issued sends; receive work remains non-blocking."""
@@ -462,7 +498,8 @@ class PipelineP2PChannel:
                 raise RuntimeError(f"received duplicate credit for slot {credit_slot_id}")
             self._credit_slot_ids.append(credit_slot_id)
             self._credit_slot_id_set.add(credit_slot_id)
-            self._post_credit_receive(expected_slot_id)
+            if not self._shutdown_requested:
+                self._post_credit_receive(expected_slot_id)
 
     def _poll_destination(self) -> None:
         for slot in self._receive_slots:
