@@ -865,6 +865,7 @@ class TestRunner:
             enforce_eager=True,
             cache_backend=None,
             cache_config=None,
+            max_num_seqs=1,
             step_execution=True,
             model_class_name="RequestOnlyPipeline",
             parallel_config=SimpleNamespace(use_hsdp=False),
