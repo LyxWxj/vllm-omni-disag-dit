@@ -90,6 +90,7 @@ class PipelineTransportHeader:
 
     FIELD_COUNT: ClassVar[int] = 6
     SHUTDOWN_FLAG: ClassVar[int] = 1
+    INT64_MAX: ClassVar[int] = 2**63 - 1
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -98,11 +99,11 @@ class PipelineTransportHeader:
             ("cfg_branch", self.cfg_branch),
             ("flags", self.flags),
         ):
-            if not isinstance(value, int) or value < 0:
-                raise ValueError(f"PipelineTransportHeader.{field_name} must be a non-negative int")
+            if not isinstance(value, int) or not 0 <= value <= self.INT64_MAX:
+                raise ValueError(f"PipelineTransportHeader.{field_name} must fit in signed int64")
         for field_name, value in (("slot_id", self.slot_id), ("send_sequence", self.send_sequence)):
-            if value is not None and (not isinstance(value, int) or value < 0):
-                raise ValueError(f"PipelineTransportHeader.{field_name} must be a non-negative int when assigned")
+            if value is not None and (not isinstance(value, int) or not 0 <= value <= self.INT64_MAX):
+                raise ValueError(f"PipelineTransportHeader.{field_name} must fit in signed int64 when assigned")
 
     def for_slot(self, slot_id: int, send_sequence: int) -> PipelineTransportHeader:
         """Return this header stamped with one physical slot and FIFO sequence."""
@@ -395,18 +396,22 @@ class PipelineP2PChannel:
         self._require_source()
         self.poll()
         self._validate_payload(payload)
-        slot_id = self._take_send_credit()
+        # Prepare all local data before mutating credit, sequence, or Work
+        # state. A failed header conversion or payload copy is retryable.
+        slot_id = self._peek_send_credit()
         slot = self._send_slots[slot_id]
         if slot.is_send_pending:
             raise RuntimeError(f"slot {slot_id} credit returned before its previous send completed")
 
         transport_header = header.for_slot(slot_id, self._next_send_sequence)
+        transport_header.encode_into(slot.header_buffer)
+        slot.payload_buffer.copy_(payload)
+
+        self._consume_send_credit(slot_id)
+        slot.begin_send()
         self._next_send_sequence += 1
         if not self._shutdown_requested:
             self._post_credit_receive(slot_id)
-        transport_header.encode_into(slot.header_buffer)
-        slot.payload_buffer.copy_(payload)
-        slot.begin_send()
         slot.header_work = self._start_work(
             self._dist.isend(
                 slot.header_buffer,
@@ -581,15 +586,17 @@ class PipelineP2PChannel:
             )
         )
 
-    def _take_send_credit(self) -> int:
-        for _ in range(len(self._credit_slot_ids)):
-            slot_id = self._credit_slot_ids.popleft()
-            self._credit_slot_id_set.remove(slot_id)
+    def _peek_send_credit(self) -> int:
+        for slot_id in self._credit_slot_ids:
             if self._send_slots[slot_id].state is PipelineSlotState.FREE:
                 return slot_id
-            self._credit_slot_ids.append(slot_id)
-            self._credit_slot_id_set.add(slot_id)
         raise RuntimeError("attempted to send without a downstream credit")
+
+    def _consume_send_credit(self, slot_id: int) -> None:
+        if slot_id not in self._credit_slot_id_set:
+            raise RuntimeError(f"credit for slot {slot_id} is no longer available")
+        self._credit_slot_ids.remove(slot_id)
+        self._credit_slot_id_set.remove(slot_id)
 
     def _validate_payload(self, payload: Any) -> None:
         if tuple(payload.shape) != self.tensor_shape:

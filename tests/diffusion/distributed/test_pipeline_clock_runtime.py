@@ -136,6 +136,7 @@ def _run_p2p_channel_worker(
     slots_per_edge: int,
     stage_one_stall_until: int,
     rebuild_after_close: bool,
+    inject_prepare_failure: bool,
     result_queue,
 ) -> None:
     """Run one rank of a tensor-only PP lane without loading a model."""
@@ -176,8 +177,36 @@ def _run_p2p_channel_worker(
                 group=edge_groups[rank],
             )
 
+        prepare_failure_preserved = not inject_prepare_failure
+        if inject_prepare_failure:
+            dist.barrier()
+            if rank == 0:
+                while outgoing.available_credits < slots_per_edge:
+                    outgoing.poll()
+
+                class InvalidCopyPayload:
+                    shape = (2,)
+                    dtype = torch.float32
+                    device = torch.device("cpu")
+
+                before_credits = outgoing.available_credits
+                before_pending = outgoing.pending_work_count
+                try:
+                    outgoing.send(
+                        PipelineTransportHeader(token_id=1, step_idx=0, cfg_branch=0),
+                        InvalidCopyPayload(),
+                    )
+                except (TypeError, RuntimeError):
+                    pass
+                outgoing.poll()
+                prepare_failure_preserved = (
+                    outgoing.available_credits == before_credits and outgoing.pending_work_count == before_pending
+                )
+            dist.barrier()
+
         next_token_id = 0
         sent_token_ids: list[int] = []
+        sent_sequences: list[int] = []
         sent_clocks: list[int] = []
         completed: list[tuple[int, float]] = []
         saw_credit_exhaustion = False
@@ -198,8 +227,9 @@ def _run_p2p_channel_worker(
                             cfg_branch=0,
                         )
                         payload = torch.full((2,), float(next_token_id), dtype=torch.float32)
-                        outgoing.send(header, payload)
+                        sent_header = outgoing.send(header, payload)
                         sent_token_ids.append(next_token_id)
+                        sent_sequences.append(sent_header.send_sequence)
                         sent_clocks.append(clock)
                         next_token_id += 1
                     elif next_token_id >= slots_per_edge:
@@ -321,6 +351,7 @@ def _run_p2p_channel_worker(
                 {
                     "completed": completed,
                     "sent_token_ids": sent_token_ids,
+                    "sent_sequences": sent_sequences,
                     "sent_clocks": sent_clocks,
                     "saw_credit_exhaustion": saw_credit_exhaustion,
                     "incoming_max_occupied": incoming.max_occupied if incoming is not None else 0,
@@ -337,6 +368,7 @@ def _run_p2p_channel_worker(
                     ),
                     "outgoing_pending_work_count": outgoing.pending_work_count if outgoing is not None else 0,
                     "rebuild_succeeded": rebuild_succeeded,
+                    "prepare_failure_preserved": prepare_failure_preserved,
                 },
             )
         )
@@ -353,6 +385,7 @@ def _run_p2p_channel_lane(
     slots_per_edge: int,
     stage_one_stall_until: int = 0,
     rebuild_after_close: bool = False,
+    inject_prepare_failure: bool = False,
 ) -> dict[int, dict[str, object]]:
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
@@ -367,6 +400,7 @@ def _run_p2p_channel_lane(
                 slots_per_edge,
                 stage_one_stall_until,
                 rebuild_after_close,
+                inject_prepare_failure,
                 result_queue,
             ),
             nprocs=world_size,
@@ -377,6 +411,10 @@ def _run_p2p_channel_lane(
 
 
 class TestPipelineP2PChannel:
+    def test_header_rejects_values_that_do_not_fit_int64(self) -> None:
+        with pytest.raises(ValueError, match="signed int64"):
+            PipelineTransportHeader(token_id=2**63, step_idx=0, cfg_branch=0)
+
     def test_fixed_header_round_trips_without_object_metadata(self) -> None:
         encoded = PipelineTransportHeader(
             token_id=7,
@@ -399,11 +437,13 @@ class TestPipelineP2PChannel:
             slots_per_edge=slots_per_edge,
             stage_one_stall_until=10,
             rebuild_after_close=True,
+            inject_prepare_failure=True,
         )
 
         source = results[0]
         destination = results[1]
         assert source["sent_token_ids"] == [0, 1, 2, 3, 4]
+        assert source["sent_sequences"] == [0, 1, 2, 3, 4]
         assert source["saw_credit_exhaustion"] is True
         assert source["sent_clocks"][slots_per_edge] >= 10
         assert destination["incoming_max_occupied"] == slots_per_edge
@@ -412,6 +452,7 @@ class TestPipelineP2PChannel:
         assert destination["incoming_pending_work_count"] == 0
         assert source["rebuild_succeeded"] is True
         assert destination["rebuild_succeeded"] is True
+        assert source["prepare_failure_preserved"] is True
 
     def test_pp4_preserves_fifo_and_buffer_lifetimes(self) -> None:
         results = _run_p2p_channel_lane(
