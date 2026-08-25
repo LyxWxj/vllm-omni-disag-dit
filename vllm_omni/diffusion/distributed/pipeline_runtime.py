@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reference clock and credit model for interleaved diffusion PP.
+"""Clock, credit, and P2P transport primitives for interleaved diffusion PP.
 
-This module deliberately has no torch or distributed dependency.  It fixes the
-ordering and buffer-lifetime contract before the device transport is added:
-each call to :meth:`PipelineClockSimulator.progress_one_clock` advances at
-most one microbatch at every stage, while edge credits bound the number of
-tokens that may be in flight.
+``PipelineClockSimulator`` is the CPU-only reference for the retained-state
+clock. ``PipelineP2PChannel`` applies the same bounded-slot contract to one
+real ``torch.distributed`` PP edge: receive buffers belong to the downstream
+stage, credits return only after local consumption, and an explicit send
+sequence restores FIFO delivery when distinct physical slots complete out of
+order.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from collections import deque
 from collections.abc import Hashable
 from dataclasses import dataclass, replace
 from enum import Enum, auto
+from typing import Any, ClassVar
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,488 @@ class PipelineSlotState(Enum):
     READY = auto()
     COMPUTING = auto()
     SEND_PENDING = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineTransportHeader:
+    """Fixed-size control header carried with one PP tensor payload.
+
+    ``cfg_branch`` is intentionally an integer transport value. Model code
+    owns the mapping from a branch name to that value, keeping P2P metadata
+    fixed length and avoiding object collectives in the clock hot path.
+    ``slot_id`` and ``send_sequence`` are assigned by the outgoing edge.
+    """
+
+    token_id: int
+    step_idx: int
+    cfg_branch: int
+    flags: int = 0
+    slot_id: int | None = None
+    send_sequence: int | None = None
+
+    FIELD_COUNT: ClassVar[int] = 6
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("token_id", self.token_id),
+            ("step_idx", self.step_idx),
+            ("cfg_branch", self.cfg_branch),
+            ("flags", self.flags),
+        ):
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(f"PipelineTransportHeader.{field_name} must be a non-negative int")
+        for field_name, value in (("slot_id", self.slot_id), ("send_sequence", self.send_sequence)):
+            if value is not None and (not isinstance(value, int) or value < 0):
+                raise ValueError(f"PipelineTransportHeader.{field_name} must be a non-negative int when assigned")
+
+    def for_slot(self, slot_id: int, send_sequence: int) -> PipelineTransportHeader:
+        """Return this header stamped with one physical slot and FIFO sequence."""
+        return replace(self, slot_id=slot_id, send_sequence=send_sequence)
+
+    def encode_into(self, buffer: Any) -> None:
+        """Write the fixed transport representation into a preallocated tensor."""
+        if self.slot_id is None or self.send_sequence is None:
+            raise ValueError("slot_id and send_sequence must be assigned before transport")
+        if buffer.numel() != self.FIELD_COUNT:
+            raise ValueError(f"header buffer must contain exactly {self.FIELD_COUNT} values")
+        buffer.copy_(
+            buffer.new_tensor(
+                (
+                    self.token_id,
+                    self.slot_id,
+                    self.step_idx,
+                    self.cfg_branch,
+                    self.flags,
+                    self.send_sequence,
+                )
+            )
+        )
+
+    @classmethod
+    def decode(cls, buffer: Any) -> PipelineTransportHeader:
+        """Decode a fixed transport header after its receive work completes."""
+        if buffer.numel() != cls.FIELD_COUNT:
+            raise ValueError(f"header buffer must contain exactly {cls.FIELD_COUNT} values")
+        token_id, slot_id, step_idx, cfg_branch, flags, send_sequence = (int(value) for value in buffer.tolist())
+        return cls(
+            token_id=token_id,
+            slot_id=slot_id,
+            step_idx=step_idx,
+            cfg_branch=cfg_branch,
+            flags=flags,
+            send_sequence=send_sequence,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineTransportMessage:
+    """A received transport header and its receiver-owned payload buffer."""
+
+    header: PipelineTransportHeader
+    payload: Any
+
+
+class _P2PSendSlot:
+    """A sender-owned output buffer that cannot be overwritten while in use."""
+
+    def __init__(self, slot_id: int, header_buffer: Any, payload_buffer: Any) -> None:
+        self.slot_id = slot_id
+        self.header_buffer = header_buffer
+        self.payload_buffer = payload_buffer
+        self.header_work: Any | None = None
+        self.payload_work: Any | None = None
+        self.state = PipelineSlotState.FREE
+        self.history = [self.state]
+
+    @property
+    def is_send_pending(self) -> bool:
+        return self.state is PipelineSlotState.SEND_PENDING
+
+    def begin_send(self) -> None:
+        if self.state is not PipelineSlotState.FREE:
+            raise RuntimeError(f"send slot {self.slot_id} is not free")
+        self.state = PipelineSlotState.SEND_PENDING
+        self.history.append(self.state)
+
+    def finish_send(self) -> None:
+        if self.state is not PipelineSlotState.SEND_PENDING:
+            raise RuntimeError(f"send slot {self.slot_id} has no pending transfer")
+        self.header_work = None
+        self.payload_work = None
+        self.state = PipelineSlotState.FREE
+        self.history.append(self.state)
+
+
+class _P2PReceiveSlot:
+    """A receiver-owned input buffer with an explicit reuse lifecycle."""
+
+    def __init__(self, slot_id: int, header_buffer: Any, payload_buffer: Any) -> None:
+        self.slot_id = slot_id
+        self.header_buffer = header_buffer
+        self.payload_buffer = payload_buffer
+        self.header_work: Any | None = None
+        self.payload_work: Any | None = None
+        self.header: PipelineTransportHeader | None = None
+        self.state = PipelineSlotState.FREE
+        self.history = [self.state]
+
+    def transition(self, expected: PipelineSlotState, new: PipelineSlotState) -> None:
+        if self.state is not expected:
+            raise RuntimeError(
+                f"receive slot {self.slot_id} transition {self.state.name}->{new.name} requires {expected.name}"
+            )
+        self.state = new
+        self.history.append(new)
+
+
+class PipelineP2PChannel:
+    """Retained-state P2P runtime for one directed, fixed-shape PP edge.
+
+    The destination owns the receive ring. It pre-posts one header and tensor
+    receive per physical slot, then returns a slot credit only after
+    :meth:`release_after_compute`. The source can send only after it has
+    received that credit, and copies each payload into its own per-slot output
+    buffer before starting ``isend``. This gives bounded memory and protects
+    both input and output buffer lifetimes without a blocking metadata path.
+    """
+
+    _TAGS_PER_SLOT = 3
+
+    def __init__(
+        self,
+        *,
+        source_rank: int,
+        destination_rank: int,
+        tensor_shape: tuple[int, ...],
+        tensor_dtype: Any,
+        device: Any,
+        slots_per_edge: int = 2,
+        tag_base: int = 0,
+        group: Any = None,
+    ) -> None:
+        if source_rank < 0 or destination_rank < 0 or source_rank == destination_rank:
+            raise ValueError("source_rank and destination_rank must be distinct non-negative ranks")
+        if slots_per_edge < 1:
+            raise ValueError("slots_per_edge must be at least one")
+        if tag_base < 0:
+            raise ValueError("tag_base must be non-negative")
+        if any(not isinstance(dim, int) or dim < 0 for dim in tensor_shape):
+            raise ValueError("tensor_shape dimensions must be non-negative ints")
+
+        import torch
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("PipelineP2PChannel requires an initialized torch.distributed process group")
+
+        self._torch = torch
+        self._dist = dist
+        self._group = group
+        self.source_rank = source_rank
+        self.destination_rank = destination_rank
+        self.slots_per_edge = slots_per_edge
+        self.tag_base = tag_base
+        self.tensor_shape = tuple(tensor_shape)
+        self.tensor_dtype = tensor_dtype
+        self.device = torch.device(device)
+        self.rank = dist.get_rank(group)
+        if self.rank not in (source_rank, destination_rank):
+            raise ValueError(f"rank {self.rank} is not an endpoint of channel {source_rank}->{destination_rank}")
+
+        self._is_source = self.rank == source_rank
+        self._peer_rank = destination_rank if self._is_source else source_rank
+        self._next_send_sequence = 0
+        self._next_receive_sequence = 0
+        self._ready_slot_ids: deque[int] = deque()
+        self._received_by_sequence: dict[int, _P2PReceiveSlot] = {}
+        self._max_occupied = 0
+
+        if self._is_source:
+            self._send_slots = [
+                _P2PSendSlot(
+                    slot_id,
+                    torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64, device=self.device),
+                    torch.empty(self.tensor_shape, dtype=tensor_dtype, device=self.device),
+                )
+                for slot_id in range(slots_per_edge)
+            ]
+            self._credit_buffers = [
+                torch.empty(1, dtype=torch.int64, device=self.device) for _ in range(slots_per_edge)
+            ]
+            self._credit_works: list[Any | None] = [None] * slots_per_edge
+            self._credit_slot_ids: deque[int] = deque()
+            self._credit_slot_id_set: set[int] = set()
+            for slot_id in range(slots_per_edge):
+                self._post_credit_receive(slot_id)
+        else:
+            self._receive_slots = [
+                _P2PReceiveSlot(
+                    slot_id,
+                    torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64, device=self.device),
+                    torch.empty(self.tensor_shape, dtype=tensor_dtype, device=self.device),
+                )
+                for slot_id in range(slots_per_edge)
+            ]
+            self._credit_buffers = [
+                torch.empty(1, dtype=torch.int64, device=self.device) for _ in range(slots_per_edge)
+            ]
+            self._credit_works = [None] * slots_per_edge
+            for slot in self._receive_slots:
+                self._post_receive(slot)
+                self._send_credit(slot.slot_id)
+
+    @property
+    def is_source(self) -> bool:
+        return self._is_source
+
+    @property
+    def is_destination(self) -> bool:
+        return not self._is_source
+
+    @property
+    def available_credits(self) -> int:
+        """Credits visible to the source after it has polled incoming messages."""
+        self._require_source()
+        return len(self._credit_slot_ids)
+
+    @property
+    def can_send(self) -> bool:
+        """Whether the source can begin one new payload transfer now."""
+        self._require_source()
+        self.poll()
+        return any(self._send_slots[slot_id].state is PipelineSlotState.FREE for slot_id in self._credit_slot_ids)
+
+    @property
+    def has_ready_message(self) -> bool:
+        self._require_destination()
+        self.poll()
+        return bool(self._ready_slot_ids)
+
+    @property
+    def num_ready_messages(self) -> int:
+        self._require_destination()
+        self.poll()
+        return len(self._ready_slot_ids)
+
+    @property
+    def max_occupied(self) -> int:
+        self._require_destination()
+        return self._max_occupied
+
+    @property
+    def receive_slot_state_histories(self) -> tuple[tuple[PipelineSlotState, ...], ...]:
+        self._require_destination()
+        return tuple(tuple(slot.history) for slot in self._receive_slots)
+
+    @property
+    def send_slot_state_histories(self) -> tuple[tuple[PipelineSlotState, ...], ...]:
+        self._require_source()
+        return tuple(tuple(slot.history) for slot in self._send_slots)
+
+    @property
+    def in_flight_send_count(self) -> int:
+        self._require_source()
+        self.poll()
+        return sum(slot.is_send_pending for slot in self._send_slots)
+
+    def poll(self) -> None:
+        """Advance local non-blocking work without waiting for a peer."""
+        if self._is_source:
+            self._poll_source()
+        else:
+            self._poll_destination()
+
+    def send(self, header: PipelineTransportHeader, payload: Any) -> PipelineTransportHeader:
+        """Copy and send one payload after reserving a downstream receive credit."""
+        self._require_source()
+        self.poll()
+        self._validate_payload(payload)
+        slot_id = self._take_send_credit()
+        slot = self._send_slots[slot_id]
+        if slot.is_send_pending:
+            raise RuntimeError(f"slot {slot_id} credit returned before its previous send completed")
+
+        transport_header = header.for_slot(slot_id, self._next_send_sequence)
+        self._next_send_sequence += 1
+        transport_header.encode_into(slot.header_buffer)
+        slot.payload_buffer.copy_(payload)
+        slot.begin_send()
+        slot.header_work = self._dist.isend(
+            slot.header_buffer,
+            dst=self._peer_rank,
+            group=self._group,
+            tag=self._header_tag(slot_id),
+        )
+        slot.payload_work = self._dist.isend(
+            slot.payload_buffer,
+            dst=self._peer_rank,
+            group=self._group,
+            tag=self._payload_tag(slot_id),
+        )
+        return transport_header
+
+    def begin_compute(self) -> PipelineTransportMessage:
+        """Reserve the oldest FIFO-ready input buffer for local stage compute."""
+        self._require_destination()
+        self.poll()
+        if not self._ready_slot_ids:
+            raise RuntimeError("attempted to compute without a READY pipeline message")
+        slot = self._receive_slots[self._ready_slot_ids.popleft()]
+        slot.transition(PipelineSlotState.READY, PipelineSlotState.COMPUTING)
+        assert slot.header is not None
+        return PipelineTransportMessage(header=slot.header, payload=slot.payload_buffer)
+
+    def release_after_compute(self, message: PipelineTransportMessage) -> None:
+        """Release a consumed input and return its physical slot credit upstream."""
+        self._require_destination()
+        slot_id = message.header.slot_id
+        if slot_id is None:
+            raise ValueError("received PipelineTransportMessage has no slot_id")
+        slot = self._receive_slots[slot_id]
+        if slot.state is not PipelineSlotState.COMPUTING or slot.header != message.header:
+            raise RuntimeError("attempted to release a message that is not currently computing")
+        slot.transition(PipelineSlotState.COMPUTING, PipelineSlotState.FREE)
+        slot.header = None
+        self._post_receive(slot)
+        self._send_credit(slot_id)
+
+    def wait_for_sends(self) -> None:
+        """Wait for locally-issued sends; receive work remains non-blocking."""
+        if self._is_source:
+            for slot in self._send_slots:
+                self._wait_for_works(slot.header_work, slot.payload_work)
+            self._poll_source()
+            return
+        for work in self._credit_works:
+            self._wait_for_works(work)
+        self._poll_destination()
+
+    def _poll_source(self) -> None:
+        for slot in self._send_slots:
+            if slot.is_send_pending and self._works_complete(slot.header_work, slot.payload_work):
+                self._wait_for_works(slot.header_work, slot.payload_work)
+                slot.finish_send()
+
+        for expected_slot_id, work in enumerate(self._credit_works):
+            if work is None or not work.is_completed():
+                continue
+            work.wait()
+            credit_slot_id = int(self._credit_buffers[expected_slot_id].item())
+            if credit_slot_id != expected_slot_id:
+                raise RuntimeError(
+                    f"credit tag for slot {expected_slot_id} carried slot {credit_slot_id}; PP edge is desynchronized"
+                )
+            if credit_slot_id in self._credit_slot_id_set:
+                raise RuntimeError(f"received duplicate credit for slot {credit_slot_id}")
+            self._credit_slot_ids.append(credit_slot_id)
+            self._credit_slot_id_set.add(credit_slot_id)
+            self._post_credit_receive(expected_slot_id)
+
+    def _poll_destination(self) -> None:
+        for slot in self._receive_slots:
+            if slot.state is not PipelineSlotState.RECV_POSTED or slot.header is not None:
+                continue
+            if not self._works_complete(slot.header_work, slot.payload_work):
+                continue
+            self._wait_for_works(slot.header_work, slot.payload_work)
+            header = PipelineTransportHeader.decode(slot.header_buffer)
+            if header.slot_id != slot.slot_id:
+                raise RuntimeError(f"header for receive slot {slot.slot_id} carries mismatched slot {header.slot_id}")
+            assert header.send_sequence is not None
+            if header.send_sequence < self._next_receive_sequence:
+                raise RuntimeError(f"received stale sequence {header.send_sequence} on PP edge")
+            if header.send_sequence in self._received_by_sequence:
+                raise RuntimeError(f"received duplicate sequence {header.send_sequence} on PP edge")
+            slot.header = header
+            self._received_by_sequence[header.send_sequence] = slot
+            self._max_occupied = max(
+                self._max_occupied,
+                sum(receive_slot.header is not None for receive_slot in self._receive_slots),
+            )
+
+        while (slot := self._received_by_sequence.pop(self._next_receive_sequence, None)) is not None:
+            slot.transition(PipelineSlotState.RECV_POSTED, PipelineSlotState.READY)
+            self._ready_slot_ids.append(slot.slot_id)
+            self._next_receive_sequence += 1
+
+    def _post_credit_receive(self, slot_id: int) -> None:
+        self._credit_works[slot_id] = self._dist.irecv(
+            self._credit_buffers[slot_id],
+            src=self._peer_rank,
+            group=self._group,
+            tag=self._credit_tag(slot_id),
+        )
+
+    def _post_receive(self, slot: _P2PReceiveSlot) -> None:
+        slot.transition(PipelineSlotState.FREE, PipelineSlotState.RECV_POSTED)
+        slot.header_work = self._dist.irecv(
+            slot.header_buffer,
+            src=self._peer_rank,
+            group=self._group,
+            tag=self._header_tag(slot.slot_id),
+        )
+        slot.payload_work = self._dist.irecv(
+            slot.payload_buffer,
+            src=self._peer_rank,
+            group=self._group,
+            tag=self._payload_tag(slot.slot_id),
+        )
+
+    def _send_credit(self, slot_id: int) -> None:
+        previous_work = self._credit_works[slot_id]
+        self._wait_for_works(previous_work)
+        self._credit_buffers[slot_id].fill_(slot_id)
+        self._credit_works[slot_id] = self._dist.isend(
+            self._credit_buffers[slot_id],
+            dst=self._peer_rank,
+            group=self._group,
+            tag=self._credit_tag(slot_id),
+        )
+
+    def _take_send_credit(self) -> int:
+        for _ in range(len(self._credit_slot_ids)):
+            slot_id = self._credit_slot_ids.popleft()
+            self._credit_slot_id_set.remove(slot_id)
+            if self._send_slots[slot_id].state is PipelineSlotState.FREE:
+                return slot_id
+            self._credit_slot_ids.append(slot_id)
+            self._credit_slot_id_set.add(slot_id)
+        raise RuntimeError("attempted to send without a downstream credit")
+
+    def _validate_payload(self, payload: Any) -> None:
+        if tuple(payload.shape) != self.tensor_shape:
+            raise ValueError(f"payload shape {tuple(payload.shape)} does not match fixed shape {self.tensor_shape}")
+        if payload.dtype != self.tensor_dtype:
+            raise ValueError(f"payload dtype {payload.dtype} does not match channel dtype {self.tensor_dtype}")
+        if payload.device != self.device:
+            raise ValueError(f"payload device {payload.device} does not match channel device {self.device}")
+
+    def _header_tag(self, slot_id: int) -> int:
+        return self.tag_base + slot_id * self._TAGS_PER_SLOT
+
+    def _payload_tag(self, slot_id: int) -> int:
+        return self._header_tag(slot_id) + 1
+
+    def _credit_tag(self, slot_id: int) -> int:
+        return self._header_tag(slot_id) + 2
+
+    @staticmethod
+    def _works_complete(*works: Any | None) -> bool:
+        return all(work is not None and work.is_completed() for work in works)
+
+    @staticmethod
+    def _wait_for_works(*works: Any | None) -> None:
+        for work in works:
+            if work is not None:
+                work.wait()
+
+    def _require_source(self) -> None:
+        if not self._is_source:
+            raise RuntimeError("operation is only valid on the source rank of a PipelineP2PChannel")
+
+    def _require_destination(self) -> None:
+        if self._is_source:
+            raise RuntimeError("operation is only valid on the destination rank of a PipelineP2PChannel")
 
 
 class PipelineDeadlockError(RuntimeError):

@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU-only contract tests for the interleaved PP clock reference model."""
+"""CPU-only contract tests for interleaved PP clock and P2P transport runtimes."""
 
 from __future__ import annotations
 
-import pytest
+from datetime import timedelta
 
+import pytest
+import torch
+import torch.distributed as dist
+
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineClockSimulator,
+    PipelineP2PChannel,
     PipelineSlotState,
     PipelineToken,
+    PipelineTransportHeader,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -119,3 +126,219 @@ class TestPipelineClockSimulator:
 
         with pytest.raises(ValueError, match="already admitted"):
             runtime.submit(_token("A", 1))
+
+
+def _run_p2p_channel_worker(
+    rank: int,
+    world_size: int,
+    master_port: int,
+    token_count: int,
+    slots_per_edge: int,
+    stage_one_stall_until: int,
+    result_queue,
+) -> None:
+    """Run one rank of a tensor-only PP lane without loading a model."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{master_port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        incoming = None
+        if rank > 0:
+            incoming = PipelineP2PChannel(
+                source_rank=rank - 1,
+                destination_rank=rank,
+                tensor_shape=(2,),
+                tensor_dtype=torch.float32,
+                device="cpu",
+                slots_per_edge=slots_per_edge,
+                tag_base=(rank - 1) * 100,
+            )
+
+        outgoing = None
+        if rank < world_size - 1:
+            outgoing = PipelineP2PChannel(
+                source_rank=rank,
+                destination_rank=rank + 1,
+                tensor_shape=(2,),
+                tensor_dtype=torch.float32,
+                device="cpu",
+                slots_per_edge=slots_per_edge,
+                tag_base=rank * 100,
+            )
+
+        next_token_id = 0
+        sent_token_ids: list[int] = []
+        sent_clocks: list[int] = []
+        completed: list[tuple[int, float]] = []
+        saw_credit_exhaustion = False
+        max_clocks = max(128, token_count * world_size * 12)
+
+        for clock in range(max_clocks):
+            if incoming is not None:
+                incoming.poll()
+            if outgoing is not None:
+                outgoing.poll()
+
+            if rank == 0:
+                if next_token_id < token_count and outgoing is not None:
+                    if outgoing.can_send:
+                        header = PipelineTransportHeader(
+                            token_id=next_token_id,
+                            step_idx=0,
+                            cfg_branch=0,
+                        )
+                        payload = torch.full((2,), float(next_token_id), dtype=torch.float32)
+                        outgoing.send(header, payload)
+                        sent_token_ids.append(next_token_id)
+                        sent_clocks.append(clock)
+                        next_token_id += 1
+                    elif next_token_id >= slots_per_edge:
+                        saw_credit_exhaustion = True
+                continue
+
+            if rank == 1 and clock < stage_one_stall_until:
+                continue
+            if incoming is None or not incoming.has_ready_message:
+                continue
+
+            if rank == world_size - 1:
+                message = incoming.begin_compute()
+                completed.append((message.header.token_id, float(message.payload[0])))
+                incoming.release_after_compute(message)
+                continue
+
+            if outgoing is not None and outgoing.can_send:
+                message = incoming.begin_compute()
+                # Each intermediate stage mutates a fresh local output before
+                # releasing its receiver-owned input buffer.
+                output = message.payload + rank
+                incoming.release_after_compute(message)
+                outgoing.send(message.header, output)
+
+        if incoming is not None:
+            incoming.wait_for_sends()
+        if outgoing is not None:
+            outgoing.wait_for_sends()
+
+        result_queue.put(
+            (
+                rank,
+                {
+                    "completed": completed,
+                    "sent_token_ids": sent_token_ids,
+                    "sent_clocks": sent_clocks,
+                    "saw_credit_exhaustion": saw_credit_exhaustion,
+                    "incoming_max_occupied": incoming.max_occupied if incoming is not None else 0,
+                    "receive_histories": (
+                        [[state.name for state in history] for history in incoming.receive_slot_state_histories]
+                        if incoming is not None
+                        else []
+                    ),
+                    "send_histories": (
+                        [[state.name for state in history] for history in outgoing.send_slot_state_histories]
+                        if outgoing is not None
+                        else []
+                    ),
+                },
+            )
+        )
+        dist.barrier()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_p2p_channel_lane(
+    *,
+    world_size: int,
+    token_count: int,
+    slots_per_edge: int,
+    stage_one_stall_until: int = 0,
+) -> dict[int, dict[str, object]]:
+    mp_context = torch.multiprocessing.get_context("spawn")
+    manager = mp_context.Manager()
+    result_queue = manager.Queue()
+    try:
+        torch.multiprocessing.spawn(
+            _run_p2p_channel_worker,
+            args=(
+                world_size,
+                get_open_port(),
+                token_count,
+                slots_per_edge,
+                stage_one_stall_until,
+                result_queue,
+            ),
+            nprocs=world_size,
+        )
+        return {rank: result for rank, result in (result_queue.get() for _ in range(world_size))}
+    finally:
+        manager.shutdown()
+
+
+class TestPipelineP2PChannel:
+    def test_fixed_header_round_trips_without_object_metadata(self) -> None:
+        encoded = PipelineTransportHeader(
+            token_id=7,
+            step_idx=3,
+            cfg_branch=1,
+            flags=9,
+        ).for_slot(slot_id=2, send_sequence=11)
+        buffer = torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64)
+
+        encoded.encode_into(buffer)
+
+        assert PipelineTransportHeader.decode(buffer) == encoded
+        assert buffer.numel() == PipelineTransportHeader.FIELD_COUNT
+
+    def test_pp2_credit_backpressure_recovers_after_downstream_release(self) -> None:
+        slots_per_edge = 2
+        results = _run_p2p_channel_lane(
+            world_size=2,
+            token_count=5,
+            slots_per_edge=slots_per_edge,
+            stage_one_stall_until=10,
+        )
+
+        source = results[0]
+        destination = results[1]
+        assert source["sent_token_ids"] == [0, 1, 2, 3, 4]
+        assert source["saw_credit_exhaustion"] is True
+        assert source["sent_clocks"][slots_per_edge] >= 10
+        assert destination["incoming_max_occupied"] == slots_per_edge
+        assert [token_id for token_id, _ in destination["completed"]] == [0, 1, 2, 3, 4]
+
+    def test_pp4_preserves_fifo_and_buffer_lifetimes(self) -> None:
+        results = _run_p2p_channel_lane(
+            world_size=4,
+            token_count=8,
+            slots_per_edge=2,
+        )
+
+        completed = results[3]["completed"]
+        assert [token_id for token_id, _ in completed] == list(range(8))
+        assert [value for _, value in completed] == [float(token_id + 3) for token_id in range(8)]
+
+        receive_transitions = {
+            "FREE": {"RECV_POSTED"},
+            "RECV_POSTED": {"READY"},
+            "READY": {"COMPUTING"},
+            "COMPUTING": {"FREE"},
+        }
+        for rank in range(1, 4):
+            for history in results[rank]["receive_histories"]:
+                assert "READY" in history
+                assert all(after in receive_transitions[before] for before, after in zip(history, history[1:]))
+
+        send_transitions = {
+            "FREE": {"SEND_PENDING"},
+            "SEND_PENDING": {"FREE"},
+        }
+        for rank in range(3):
+            for history in results[rank]["send_histories"]:
+                assert all(after in send_transitions[before] for before, after in zip(history, history[1:]))
+            assert any("SEND_PENDING" in history for history in results[rank]["send_histories"])
