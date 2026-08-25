@@ -198,26 +198,24 @@ def _run_p2p_channel_worker(
                         next_token_id += 1
                     elif next_token_id >= slots_per_edge:
                         saw_credit_exhaustion = True
-                continue
+            elif rank != 1 or clock >= stage_one_stall_until:
+                if incoming is not None and incoming.has_ready_message:
+                    if rank == world_size - 1:
+                        message = incoming.begin_compute()
+                        completed.append((message.header.token_id, float(message.payload[0])))
+                        incoming.release_after_compute(message)
+                    elif outgoing is not None and outgoing.can_send:
+                        message = incoming.begin_compute()
+                        # Each intermediate stage mutates a fresh local output
+                        # before releasing its receiver-owned input buffer.
+                        output = message.payload + rank
+                        incoming.release_after_compute(message)
+                        outgoing.send(message.header, output)
 
-            if rank == 1 and clock < stage_one_stall_until:
-                continue
-            if incoming is None or not incoming.has_ready_message:
-                continue
-
-            if rank == world_size - 1:
-                message = incoming.begin_compute()
-                completed.append((message.header.token_id, float(message.payload[0])))
-                incoming.release_after_compute(message)
-                continue
-
-            if outgoing is not None and outgoing.can_send:
-                message = incoming.begin_compute()
-                # Each intermediate stage mutates a fresh local output before
-                # releasing its receiver-owned input buffer.
-                output = message.payload + rank
-                incoming.release_after_compute(message)
-                outgoing.send(message.header, output)
+            # The production tick RPC is a global clock. The barrier makes the
+            # CPU test deterministic and gives every rank a chance to poll
+            # initial credits before rank 0 exhausts its local loop.
+            dist.barrier()
 
         if incoming is not None:
             incoming.wait_for_sends()
