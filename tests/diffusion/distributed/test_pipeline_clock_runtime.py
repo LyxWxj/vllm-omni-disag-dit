@@ -175,7 +175,6 @@ def _run_p2p_channel_worker(
         sent_clocks: list[int] = []
         completed: list[tuple[int, float]] = []
         saw_credit_exhaustion = False
-        shutdown_sent = False
         max_clocks = max(128, token_count * world_size * 12)
 
         for clock in range(max_clocks):
@@ -199,9 +198,6 @@ def _run_p2p_channel_worker(
                         next_token_id += 1
                     elif next_token_id >= slots_per_edge:
                         saw_credit_exhaustion = True
-                if next_token_id == token_count and not shutdown_sent:
-                    outgoing.send_shutdown()
-                    shutdown_sent = True
             elif rank != 1 or clock >= stage_one_stall_until:
                 if incoming is not None and incoming.has_ready_message:
                     if rank == world_size - 1:
@@ -217,13 +213,37 @@ def _run_p2p_channel_worker(
                             output = message.payload + rank
                             outgoing.send(message.header, output)
                         incoming.release_after_compute(message)
-                if incoming is not None and incoming.is_closed and not shutdown_sent:
-                    outgoing.send_shutdown()
-                    shutdown_sent = True
 
             # The production tick RPC is a global clock. The barrier makes the
             # CPU test deterministic and gives every rank a chance to poll
             # initial credits before rank 0 exhausts its local loop.
+            dist.barrier()
+
+        # Data is drained before shutdown starts. Keeping tombstones in a
+        # separate phase prevents one stage from waiting for a downstream
+        # credit while that downstream rank is still at the clock barrier.
+        dist.barrier()
+        shutdown_sent = False
+        for _ in range(world_size + 2):
+            if rank == 0:
+                if not shutdown_sent:
+                    outgoing.send_shutdown()
+                    shutdown_sent = True
+            else:
+                incoming.poll()
+                while incoming.has_ready_message:
+                    if rank != world_size - 1 and not outgoing.can_send:
+                        break
+                    message = incoming.begin_compute()
+                    if not message.header.flags & PipelineTransportHeader.SHUTDOWN_FLAG:
+                        if rank == world_size - 1:
+                            completed.append((message.header.token_id, float(message.payload[0])))
+                        elif outgoing.can_send:
+                            outgoing.send(message.header, message.payload + rank)
+                    incoming.release_after_compute(message)
+                if outgoing is not None and incoming.is_closed and not shutdown_sent:
+                    outgoing.send_shutdown()
+                    shutdown_sent = True
             dist.barrier()
 
         if incoming is not None:
