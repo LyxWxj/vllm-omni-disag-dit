@@ -252,7 +252,7 @@ def _run_p2p_channel_worker(
                     shutdown_sent = True
             dist.barrier()
 
-        rebuild_succeeded = False
+        rebuild_succeeded = rebuild_after_close
         if rebuild_after_close:
             second_incoming = None
             if rank > 0:
