@@ -441,7 +441,7 @@ class PipelineP2PChannel:
         for expected_slot_id, work in enumerate(self._credit_works):
             if not self._works_complete(work):
                 continue
-            work.wait()
+            self._wait_for_works(work)
             credit_slot_id = int(self._credit_buffers[expected_slot_id].item())
             if credit_slot_id != expected_slot_id:
                 raise RuntimeError(
