@@ -45,7 +45,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import RunnerOutput, StepRequestState
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -1124,6 +1124,73 @@ class TestEngine:
 
         assert call_count["n"] == 2
         assert mark_in_flight.call_count == 2
+        assert output.error is None
+        assert torch.equal(output.output, torch.tensor([2.0]))
+
+    def test_pipeline_tick_drains_empty_schedule_in_background(self, mocker: MockerFixture):
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+        engine = _make_engine(scheduler)
+        engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+        engine.od_config.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+        engine.stop_event = threading.Event()
+        engine._rpc_queue = queue.Queue()
+        engine._emit_outputs = mocker.Mock(side_effect=lambda *_: engine.stop_event.set())
+
+        ticks: list[list[str]] = []
+
+        def execute_fn(sched_output):
+            ticks.append(sched_output.scheduled_request_ids)
+            if len(ticks) == 1:
+                return BatchRunnerOutput.from_list([])
+            return BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(
+                        request_id="req-drain",
+                        step_index=1,
+                        finished=True,
+                        result=DiffusionOutput(output=torch.tensor([2.0])),
+                    )
+                ]
+            )
+
+        engine.execute_fn = execute_fn
+        scheduler.add_request(_make_engine_request("req-drain", num_inference_steps=1))
+
+        engine._busy_loop()
+
+        assert ticks == [["req-drain"], []]
+        engine._emit_outputs.assert_called_once()
+
+    def test_pipeline_tick_sync_wait_drains_empty_schedule(self):
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+        engine = _make_engine(scheduler)
+        engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+        engine.od_config.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+
+        ticks: list[list[str]] = []
+
+        def execute_fn(sched_output):
+            ticks.append(sched_output.scheduled_request_ids)
+            if len(ticks) == 1:
+                return BatchRunnerOutput.from_list([])
+            return BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(
+                        request_id="req-sync-drain",
+                        step_index=1,
+                        finished=True,
+                        result=DiffusionOutput(output=torch.tensor([2.0])),
+                    )
+                ]
+            )
+
+        engine.execute_fn = execute_fn
+
+        output = engine.add_req_and_wait_for_response(_make_engine_request("req-sync-drain", num_inference_steps=1))
+
+        assert ticks == [["req-sync-drain"], []]
         assert output.error is None
         assert torch.equal(output.output, torch.tensor([2.0]))
 

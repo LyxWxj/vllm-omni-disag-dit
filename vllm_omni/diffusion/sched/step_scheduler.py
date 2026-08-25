@@ -89,7 +89,11 @@ class StepScheduler(BaseScheduler):
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         completed_request_ids = output.completed_request_ids
         if not completed_request_ids:
-            return set()
+            # An empty pipeline clock is valid while tokens are moving through
+            # downstream PP stages. It can still follow an abort that happened
+            # after schedule(), so preserve terminal notifications recorded by
+            # the scheduler even when this clock has no rank-0 completion.
+            return self._finalize_update_from_output(sched_output, {}, {})
 
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}

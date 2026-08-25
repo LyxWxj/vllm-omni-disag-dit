@@ -378,13 +378,27 @@ class DiffusionEngine:
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
-            pp_size = getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1)
-            if int(pp_size or 1) > 1:
+            if self._uses_pipeline_tick_execution():
                 self.execute_fn = self.executor.execute_pipeline_tick
             else:
                 self.execute_fn = self.executor.execute_step
         else:
             self.execute_fn = self.executor.execute_batch
+
+    def _uses_pipeline_tick_execution(self) -> bool:
+        """Whether this engine submits step work through the PP clock RPC."""
+        if getattr(self, "execution_mode", None) != DiffusionExecutionMode.STEP_BATCH:
+            return False
+        pp_size = getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1)
+        return int(pp_size or 1) > 1
+
+    def _should_drain_pipeline_tick(self) -> bool:
+        """Keep PP clocks advancing after stage 0 has no work to admit."""
+        return (
+            self._uses_pipeline_tick_execution()
+            and isinstance(self.scheduler, StepScheduler)
+            and self.scheduler.num_in_flight_requests > 0
+        )
 
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
@@ -560,7 +574,7 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
                 self._mark_step_requests_in_flight(sched_output)
 
-            if sched_output.is_empty:
+            if sched_output.is_empty and not self._should_drain_pipeline_tick():
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
                 continue
 
@@ -923,11 +937,12 @@ class DiffusionEngine:
                         return self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
+                    if not self._should_drain_pipeline_tick():
+                        continue
 
                 # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
                 # within _dummy_run, only one request will be scheduled
-                request_id = sched_output.scheduled_request_ids[0]
+                request_id = next(iter(sched_output.scheduled_request_ids), target_request_id)
                 try:
                     runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
                 except EngineDeadError:
@@ -945,8 +960,13 @@ class DiffusionEngine:
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
 
-                # sync func should receive one result
-                if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
+                # A PP clock may only advance downstream tokens, yielding no
+                # completion, or finish a request admitted by an earlier tick.
+                if (
+                    not self._uses_pipeline_tick_execution()
+                    and not isinstance(runner_output, RunnerOutput)
+                    and not len(runner_output) == 1
+                ):
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
                     self._remove_diffusion_kv_requests([target_request_id])

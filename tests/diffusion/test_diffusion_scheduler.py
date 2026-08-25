@@ -1593,6 +1593,18 @@ class TestStepScheduler:
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
 
+    def test_empty_tick_surfaces_abort_after_schedule(self) -> None:
+        req_id = self.scheduler.add_request(_make_step_request("abort-empty", num_inference_steps=2))
+
+        sched_output = self.scheduler.schedule()
+        self.scheduler.mark_in_flight(sched_output)
+        self.scheduler.finish_requests(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+        finished = self.scheduler.update_from_output(sched_output, BatchRunnerOutput.from_list([]))
+
+        assert finished == {req_id}
+        assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
+
     def test_batches_compatible_step_requests(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
