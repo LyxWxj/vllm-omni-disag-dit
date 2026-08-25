@@ -901,6 +901,11 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Maximum number of compatible request rows that Wan step execution fuses
+    # into one local PP microbatch. ``max_num_seqs`` remains the total active
+    # request capacity managed by the scheduler.
+    diffusion_pp_microbatch_size: int = 1
+
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 
@@ -1017,6 +1022,8 @@ class OmniDiffusionConfig:
             raise ValueError("max_num_batched_tokens must be positive")
         if self.max_model_len is not None and self.max_model_len != -1 and self.max_model_len <= 0:
             raise ValueError("max_model_len must be positive or -1")
+        if type(self.diffusion_pp_microbatch_size) is not int or self.diffusion_pp_microbatch_size < 1:
+            raise ValueError("diffusion_pp_microbatch_size must be a positive integer")
 
         if self.omni_kv_config is None:
             self.omni_kv_config = {}

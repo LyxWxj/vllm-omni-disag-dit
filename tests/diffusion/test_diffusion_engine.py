@@ -580,6 +580,11 @@ class TestDiffusionCompileConfig:
         with pytest.raises(TypeError, match="diffusion_compile_dynamic"):
             OmniDiffusionConfig(model="test", diffusion_compile_dynamic="false")
 
+    @pytest.mark.parametrize("value", [0, -1, 1.5, False])
+    def test_config_rejects_invalid_pp_microbatch_size(self, value: object) -> None:
+        with pytest.raises(ValueError, match="diffusion_pp_microbatch_size"):
+            OmniDiffusionConfig(model="test", diffusion_pp_microbatch_size=value)  # type: ignore[arg-type]
+
     @pytest.mark.parametrize(
         "kwargs, feature",
         [

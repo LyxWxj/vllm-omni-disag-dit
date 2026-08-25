@@ -9,10 +9,13 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -38,6 +41,10 @@ class _StubScheduler:
 
     def set_timesteps(self, num_steps: int, device: torch.device) -> None:
         self.set_timesteps_calls.append((num_steps, device))
+
+    def step(self, noise_pred, timestep, latents, return_dict=False, **kwargs):
+        del timestep, return_dict, kwargs
+        return (latents - noise_pred,)
 
 
 @contextmanager
@@ -77,7 +84,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.text_encoder = _StubTextEncoder()
     pipeline.transformer_config = SimpleNamespace(patch_size=(1, 2, 2), in_channels=4, out_channels=4)
     pipeline.scheduler = _StubScheduler([9, 5])
-    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
+    pipeline.od_config = SimpleNamespace(flow_shift=5.0, diffusion_pp_microbatch_size=1)
     pipeline._sample_solver = "unipc"
     pipeline._flow_shift = 5.0
     pipeline.vae_scale_factor_temporal = 4
@@ -393,6 +400,121 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         (8.0, 2.0, 522.0),
     ]
     torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def _step_noise_from_latents(*, positive_kwargs, **kwargs):
+    del kwargs
+    latents = positive_kwargs["hidden_states"]
+    timestep = positive_kwargs["timestep"].reshape(latents.shape[0], *([1] * (latents.ndim - 1)))
+    return latents + timestep.to(latents)
+
+
+def _seeded_latents(**kwargs):
+    generator = kwargs["generator"]
+    return torch.randn(
+        (kwargs["batch_size"], kwargs["num_channels_latents"], 1, 8, 8),
+        generator=generator,
+        dtype=kwargs["dtype"],
+        device=kwargs["device"],
+    )
+
+
+def test_step_execution_matches_full_forward_for_fixed_seed(monkeypatch) -> None:
+    full_pipeline = _make_pipeline()
+    step_pipeline = _make_pipeline()
+    full_pipeline.predict_noise_maybe_with_cfg = _step_noise_from_latents  # type: ignore[method-assign]
+    step_pipeline.predict_noise_maybe_with_cfg = _step_noise_from_latents  # type: ignore[method-assign]
+    full_pipeline.prepare_latents = _seeded_latents  # type: ignore[method-assign]
+    step_pipeline.prepare_latents = _seeded_latents  # type: ignore[method-assign]
+    step_pipeline.od_config.diffusion_pp_microbatch_size = 2
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.build_wan_scheduler",
+        lambda sample_solver, flow_shift: _StubScheduler([9, 5]),
+    )
+
+    full_sampling = _make_sampling(generator=torch.Generator(device="cpu").manual_seed(1234))
+    full_request = OmniDiffusionRequest(
+        prompt="fixed seed",
+        request_id="full",
+        sampling_params=full_sampling,
+    )
+    full_output = full_pipeline.forward(DiffusionRequestBatch(requests=[full_request]))[0].output
+
+    state = StepRequestState(
+        request_id="step",
+        prompt="fixed seed",
+        sampling=_make_sampling(generator=torch.Generator(device="cpu").manual_seed(1234)),
+    )
+    step_pipeline.prepare_encode(state)
+    while not state.denoise_completed:
+        input_batch = InputBatch.make_batch([state])
+        noise_pred = step_pipeline.denoise_step(input_batch, states=[state])
+        step_pipeline.step_scheduler(state, noise_pred)
+
+    step_output = step_pipeline.post_decode(state).output
+    assert supports_step_execution(step_pipeline)
+    torch.testing.assert_close(step_output, full_output)
+
+
+def _make_manual_step_state(request_id: str, latent_value: float, timestep: float) -> StepRequestState:
+    state = StepRequestState(
+        request_id=request_id,
+        prompt="prompt",
+        sampling=_make_sampling(),
+        prompt_embeds=torch.zeros((1, 4, 8)),
+        latents=torch.full((1, 4, 1, 8, 8), latent_value),
+        timesteps=torch.tensor([timestep]),
+        scheduler=_StubScheduler([int(timestep)]),
+        txt_seq_lens=[4],
+    )
+    state.extra["wan22"] = {
+        "attention_kwargs": {},
+        "boundary_timestep": 5.0,
+        "first_frame_mask": None,
+        "guidance_high": 1.0,
+        "guidance_low": 1.0,
+        "latent_condition": None,
+        "output_type": "latent",
+    }
+    return state
+
+
+def test_denoise_step_microbatches_by_phase_and_preserves_row_order() -> None:
+    pipeline = _make_pipeline()
+    pipeline.transformer_2 = _StubTransformer()
+    pipeline.od_config.diffusion_pp_microbatch_size = 2
+    model_calls: list[nn.Module] = []
+
+    def fake_noise(*, positive_kwargs, **kwargs):
+        del kwargs
+        model_calls.append(positive_kwargs["current_model"])
+        return _step_noise_from_latents(positive_kwargs=positive_kwargs)
+
+    pipeline.predict_noise_maybe_with_cfg = fake_noise  # type: ignore[method-assign]
+    states = [
+        _make_manual_step_state("a", 1.0, 9.0),
+        _make_manual_step_state("b", 2.0, 9.0),
+        _make_manual_step_state("c", 3.0, 1.0),
+    ]
+    input_batch = InputBatch.make_batch(states)
+
+    microbatches = pipeline.build_microbatches(states)
+    noise_pred = pipeline.denoise_step(input_batch, states=states)
+
+    assert [[state.request_id for state in microbatch] for microbatch in microbatches] == [["a", "b"], ["c"]]
+    assert model_calls == [pipeline.transformer, pipeline.transformer_2]
+    assert noise_pred is not None
+    assert noise_pred[:, 0, 0, 0, 0].tolist() == [10.0, 11.0, 4.0]
+
+
+def test_prepare_encode_rejects_dmd_step_execution() -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    state = StepRequestState(request_id="dmd", prompt="prompt", sampling=_make_sampling())
+
+    with pytest.raises(ValueError, match="DMD step execution"):
+        pipeline.prepare_encode(state)
 
 
 def _make_gate_loading_pipeline():

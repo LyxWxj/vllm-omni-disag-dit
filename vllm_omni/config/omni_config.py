@@ -717,6 +717,7 @@ class _DiffusionConfigProjection:
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
+    diffusion_pp_microbatch_size: int = Field(default=1, ge=1, strict=True)
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
