@@ -400,6 +400,13 @@ class DiffusionEngine:
             and self.scheduler.num_in_flight_requests > 0
         )
 
+    def _execution_error_request_ids(self, sched_output: DiffusionSchedulerOutput) -> list[str]:
+        """Return every request affected when a worker invocation fails."""
+        request_ids = list(sched_output.scheduled_request_ids)
+        if self._uses_pipeline_tick_execution() and isinstance(self.scheduler, StepScheduler):
+            request_ids.extend(self.scheduler.in_flight_request_ids)
+        return list(dict.fromkeys(request_ids))
+
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
             logger.info(
@@ -581,9 +588,8 @@ class DiffusionEngine:
             try:
                 runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
             except Exception as exc:
-                logger.error(
-                    "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
-                )
+                error_request_ids = self._execution_error_request_ids(sched_output)
+                logger.error("Execution failed for diffusion requests %s", error_request_ids, exc_info=True)
                 runner_output = BatchRunnerOutput.from_list(
                     [
                         RunnerOutput(
@@ -592,7 +598,7 @@ class DiffusionEngine:
                             finished=True,
                             result=DiffusionOutput.from_exception(exc),
                         )
-                        for request_id in sched_output.scheduled_request_ids
+                        for request_id in error_request_ids
                     ]
                 )
 
@@ -940,21 +946,26 @@ class DiffusionEngine:
                     if not self._should_drain_pipeline_tick():
                         continue
 
-                # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
-                # within _dummy_run, only one request will be scheduled
-                request_id = next(iter(sched_output.scheduled_request_ids), target_request_id)
                 try:
                     runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
                 except EngineDeadError:
                     raise
                 except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", request_id, exc_info=True)
-                    runner_output = RunnerOutput(
-                        request_id=request_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput.from_exception(exc),
-                    )
+                    error_request_ids = self._execution_error_request_ids(sched_output)
+                    logger.error("Execution failed for diffusion requests %s", error_request_ids, exc_info=True)
+                    error_outputs = [
+                        RunnerOutput(
+                            request_id=error_request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(exc),
+                        )
+                        for error_request_id in error_request_ids
+                    ]
+                    if self._uses_pipeline_tick_execution():
+                        runner_output = BatchRunnerOutput.from_list(error_outputs)
+                    else:
+                        runner_output = error_outputs[0]
 
                 self._process_aborts_queue()
 

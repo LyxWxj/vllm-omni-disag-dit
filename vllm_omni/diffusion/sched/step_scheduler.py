@@ -44,6 +44,11 @@ class StepScheduler(BaseScheduler):
         """Number of step requests submitted to a tick but not yet completed."""
         return len(self._in_flight)
 
+    @property
+    def in_flight_request_ids(self) -> tuple[str, ...]:
+        """Stable snapshot of requests that must be resolved by a PP tick."""
+        return tuple(sorted(self._in_flight))
+
     def mark_in_flight(self, sched_output: DiffusionSchedulerOutput) -> None:
         """Retain submitted work for capacity without scheduling it twice.
 

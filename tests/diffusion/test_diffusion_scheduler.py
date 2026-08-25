@@ -1432,6 +1432,7 @@ class TestStepScheduler:
         scheduler.mark_in_flight(first)
         assert scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.IN_FLIGHT
         assert scheduler.num_in_flight_requests == 1
+        assert scheduler.in_flight_request_ids == (req_id_a,)
 
         req_id_b = scheduler.add_request(_make_step_request("b", num_inference_steps=2))
         second = scheduler.schedule()
@@ -1439,6 +1440,7 @@ class TestStepScheduler:
         assert _cached_ids(second) == []
         scheduler.mark_in_flight(second)
         assert scheduler.num_in_flight_requests == 2
+        assert scheduler.in_flight_request_ids == (req_id_a, req_id_b)
 
         assert scheduler.update_from_output(first, _make_step_output(req_id_a, step_index=1)) == set()
         assert scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.RUNNING
