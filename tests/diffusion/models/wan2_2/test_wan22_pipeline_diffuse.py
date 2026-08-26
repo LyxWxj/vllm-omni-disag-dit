@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import supports_pipeline_tick_execution, supports_step_execution
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -599,6 +599,46 @@ def test_denoise_step_microbatches_by_phase_and_preserves_row_order() -> None:
     assert model_calls == [pipeline.transformer, pipeline.transformer_2]
     assert noise_pred is not None
     assert noise_pred[:, 0, 0, 0, 0].tolist() == [10.0, 11.0, 4.0]
+
+
+def test_interleaved_pp_hooks_use_fixed_transport_and_request_local_scheduler() -> None:
+    pipeline = _make_pipeline()
+    pipeline.transformer_config.num_attention_heads = 2
+    pipeline.transformer_config.attention_head_dim = 3
+    state = _make_manual_step_state("pp", 1.0, 9.0)
+    input_batch = InputBatch.make_batch([state])
+    received: dict[str, object] = {}
+
+    def predict_noise(**kwargs):
+        received.update(kwargs)
+        hidden_states = kwargs.get("intermediate_tensors")
+        if hidden_states is not None:
+            return hidden_states["hidden_states"] + 1
+        return kwargs["hidden_states"] + 1
+
+    pipeline.predict_noise = predict_noise  # type: ignore[method-assign]
+    pipeline.scheduler_step = lambda noise, timestep, latents, **kwargs: latents + noise  # type: ignore[method-assign]
+    spec = pipeline.pipeline_transport_spec([state])
+    intermediate = torch.ones(spec.intermediate_shape, dtype=spec.intermediate_dtype)
+
+    output = pipeline.pipeline_forward_local_stage(
+        input_batch,
+        states=[state],
+        cfg_branch="positive",
+        intermediate_hidden_states=intermediate,
+    )
+    assert pipeline.pipeline_model_phase([state]) == "high"
+    updated_latents = pipeline.pipeline_finish_microbatch(
+        [state], torch.ones_like(state.latents), positive_noise_pred=None
+    )
+
+    assert supports_pipeline_tick_execution(pipeline)
+    assert spec.intermediate_shape == (1, 16, 6)
+    assert spec.feedback_shape == tuple(state.latents.shape)
+    assert torch.equal(output, intermediate + 1)
+    assert received["current_model"] is pipeline.transformer
+    assert torch.equal(updated_latents, torch.full_like(updated_latents, 2.0))
+    assert state.step_index == 1
 
 
 def test_prepare_encode_rejects_dmd_step_execution() -> None:
