@@ -860,7 +860,8 @@ def test_pipeline_tick_drains_after_terminal_empty_schedule() -> None:
 
     def emit_outputs(request_ids, output):
         emitted.append((set(request_ids), output))
-        engine.stop_event.set()
+        if request_ids:
+            engine.stop_event.set()
 
     engine._emit_outputs = emit_outputs
     executed = []
