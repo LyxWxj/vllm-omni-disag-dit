@@ -494,6 +494,22 @@ class PipelineP2PChannel:
             self._credit_works[slot_id] = None
         self._poll_destination()
 
+    def wait_for_shutdown(self) -> None:
+        """Wait for all source-side Work after an explicit shutdown handshake.
+
+        Normal progression must not block on a future credit because an idle
+        edge intentionally has no reposted ``irecv``.  During shutdown every
+        normal payload has either returned its credit or has been superseded
+        by a tombstone on the same slot, so retaining such Work would leak the
+        Gloo waiter thread into the next process-group lifetime.
+        """
+        self._require_source()
+        self.wait_for_sends()
+        for slot_id, work in enumerate(self._credit_works):
+            self._wait_for_works(work)
+            self._credit_works[slot_id] = None
+        self._poll_source()
+
     def _poll_source(self) -> None:
         for slot in self._send_slots:
             if slot.is_send_pending and self._works_complete(slot.header_work, slot.payload_work):
@@ -882,7 +898,10 @@ class PipelineTickRuntime:
             raise RuntimeError("pipeline channel shutdown did not receive every tombstone")
 
         for channel in channels:
-            channel.wait_for_sends()
+            if channel.is_source:
+                channel.wait_for_shutdown()
+            else:
+                channel.wait_for_sends()
             if channel.pending_work_count != 0:
                 raise RuntimeError("pipeline channel retained pending Work after shutdown")
 
