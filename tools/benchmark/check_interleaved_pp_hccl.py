@@ -57,6 +57,31 @@ def main() -> None:
                 dist.isend(sent, dst=destination_rank, group=group, tag=edge_index).wait()
             dist.barrier(group=control_group)
 
+            # HCCL matches P2P receives in posting order, not by torch's tag
+            # argument. The production PP lane therefore keeps one tensor
+            # layout active and uses a single ordered receive ring. The source
+            # deliberately reverses these two sends to assert that behavior.
+            first_tag = 10_000 + edge_index * 2
+            second_tag = first_tag + 1
+            if rank == destination_rank:
+                first = torch.empty(1, dtype=torch.int64, device=device)
+                second = torch.empty(1, dtype=torch.int64, device=device)
+                first_work = dist.irecv(first, src=source_rank, group=group, tag=first_tag)
+                second_work = dist.irecv(second, src=source_rank, group=group, tag=second_tag)
+            dist.barrier(group=control_group)
+
+            if rank == source_rank:
+                second_value = torch.tensor([second_tag], dtype=torch.int64, device=device)
+                first_value = torch.tensor([first_tag], dtype=torch.int64, device=device)
+                dist.isend(second_value, dst=destination_rank, group=group, tag=second_tag).wait()
+                dist.isend(first_value, dst=destination_rank, group=group, tag=first_tag).wait()
+            elif rank == destination_rank:
+                first_work.wait()
+                second_work.wait()
+                assert int(first.item()) == second_tag
+                assert int(second.item()) == first_tag
+            dist.barrier(group=control_group)
+
         if rank == 0:
             print(f"PASS: ordered HCCL PP edge probe completed for {world_size} ranks", flush=True)
     finally:
