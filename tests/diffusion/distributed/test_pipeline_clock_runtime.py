@@ -232,6 +232,7 @@ def _run_p2p_channel_worker(
                 )
 
         release_events: list[_DeferredReleaseEvent] = []
+        credit_return_event_queries: list[int] = []
         if incoming is not None and rank == 1 and deferred_release_queries:
 
             def record_compute_event() -> _DeferredReleaseEvent:
@@ -242,6 +243,13 @@ def _run_p2p_channel_worker(
                 return event
 
             incoming._record_compute_event = record_compute_event
+            original_send_credit = incoming._send_credit
+
+            def send_credit(slot_id: int) -> None:
+                credit_return_event_queries.append(release_events[-1].query_count)
+                original_send_credit(slot_id)
+
+            incoming._send_credit = send_credit
 
         prepare_failure_preserved = not inject_prepare_failure
         if inject_prepare_failure:
@@ -443,6 +451,7 @@ def _run_p2p_channel_worker(
                     "deferred_release_event_queries": (
                         release_events[0].query_count if release_events else 0
                     ),
+                    "credit_return_event_queries": credit_return_event_queries,
                     "transport_buffer_inference_flags": (
                         _transport_buffer_inference_flags(incoming)
                         + _transport_buffer_inference_flags(outgoing)
@@ -582,8 +591,9 @@ class TestPipelineP2PChannel:
         source = results[0]
         destination = results[1]
         assert source["sent_token_ids"] == [0, 1]
-        assert source["sent_clocks"][1] >= deferred_queries
+        assert source["sent_clocks"][1] > source["sent_clocks"][0]
         assert destination["deferred_release_event_queries"] > deferred_queries
+        assert destination["credit_return_event_queries"] == [deferred_queries + 1, 1]
         assert "PENDING_RELEASE" in destination["receive_histories"][0]
         assert destination["incoming_pending_work_count"] == 0
         assert source["outgoing_pending_work_count"] == 0
