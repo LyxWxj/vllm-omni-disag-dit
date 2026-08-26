@@ -718,6 +718,7 @@ class _DiffusionConfigProjection:
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
     diffusion_pp_microbatch_size: int = Field(default=1, ge=1, strict=True)
+    diffusion_pp_schedule: Literal["serial", "interleaved"] = "serial"
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False

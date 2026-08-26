@@ -40,12 +40,14 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRow,
     PreparedDiffusionPagedAttentionBatch,
 )
+from vllm_omni.diffusion.distributed.pipeline_runtime import PipelineTickRuntime
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsPromptUpdate,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
+    supports_pipeline_tick_execution,
     supports_prompt_update,
     supports_step_execution,
 )
@@ -186,6 +188,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
+        # Created lazily after the model is loaded because the transport shape
+        # is pipeline-specific, but retained for the worker lifetime.
+        self._pipeline_tick_runtime: PipelineTickRuntime | None = None
 
         # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -882,6 +887,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
+        *,
+        build_input_batch: bool = True,
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
         prepared_states: list[StepRequestState] = []
@@ -934,7 +941,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     continue
             prepared_states.append(state)
 
-        if not prepared_states:
+        if not prepared_states or not build_input_batch:
             return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
@@ -974,6 +981,149 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             validate_kv_metadata=True,
             record_output_peak_memory=True,
         )
+
+    def execute_pipeline_tick(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Advance one retained-state PP clock instead of one serial PP step."""
+        pp_size = int(getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) or 1)
+        if pp_size <= 1:
+            return self.execute_stepwise(scheduler_output)
+
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        for new_req in scheduler_output.scheduled_new_reqs:
+            validate_new_request_data_identity(new_req)
+            self._validate_diffusion_kv_metadata(
+                request_id=new_req.req.request_id,
+                metadata=new_req.diffusion_kv_metadata,
+            )
+        if not supports_pipeline_tick_execution(self.pipeline):
+            raise ValueError(
+                "Interleaved pipeline parallelism requires a pipeline to explicitly implement "
+                "the stage-local pipeline tick protocol."
+            )
+        if self.od_config.cache_backend not in (None, "none"):
+            raise ValueError("Interleaved PP step runtime does not support cache_backend yet.")
+        vae = getattr(self.pipeline, "vae", None)
+        if vae is not None and callable(getattr(vae, "is_distributed_enabled", None)) and vae.is_distributed_enabled():
+            raise ValueError("Interleaved PP currently requires rank-0 VAE decode; distributed VAE is not supported.")
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and scheduler_output.finished_req_ids
+        ):
+            self.remove_diffusion_kv_requests(list(scheduler_output.finished_req_ids))
+
+        installed_request_ids: list[str] = []
+        try:
+            for new_req in scheduler_output.scheduled_new_reqs:
+                if new_req.diffusion_kv_metadata is not None:
+                    self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
+                    installed_request_ids.append(new_req.request_id)
+            return self._execute_pipeline_tick_core(scheduler_output)
+        except Exception:
+            if installed_request_ids:
+                self.remove_diffusion_kv_requests(installed_request_ids)
+            raise
+
+    def _get_pipeline_tick_runtime(self) -> PipelineTickRuntime:
+        runtime = getattr(self, "_pipeline_tick_runtime", None)
+        if runtime is not None:
+            return runtime
+        assert self.pipeline is not None
+        from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+
+        pp_group = get_pp_group()
+        runtime = PipelineTickRuntime(
+            pipeline=self.pipeline,
+            state_cache=self.state_cache,
+            pp_ranks=pp_group.ranks,
+            global_rank=pp_group.rank,
+            device=self.device,
+            group=pp_group.device_group,
+        )
+        self._pipeline_tick_runtime = runtime
+        return runtime
+
+    def shutdown_pipeline_tick_runtime(self) -> None:
+        """Finish the PP transport handshake before its process group is destroyed."""
+        runtime = getattr(self, "_pipeline_tick_runtime", None)
+        if runtime is None:
+            return
+        runtime.close()
+        self._pipeline_tick_runtime = None
+
+    def _execute_pipeline_tick_core(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Prepare new state, then move every rank forward by one PP clock."""
+        assert self.pipeline is not None
+        runtime = self._get_pipeline_tick_runtime()
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            runtime.cancel(tuple(scheduler_output.finished_req_ids))
+            states, new_request_ids = self._update_states(scheduler_output)
+            states, _, runner_output_list = self._prepare_batch_inputs(
+                states,
+                new_request_ids,
+                build_input_batch=False,
+            )
+            if states:
+                runtime.admit(states)
+
+            with set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=self.od_config,
+                attn_metadata={},
+            ):
+                completions = runtime.progress_one_clock()
+
+            if not runtime.is_first_stage:
+                return BatchRunnerOutput.from_list(runner_output_list)
+
+            for completion in completions:
+                for request_id in completion.request_ids:
+                    state = self.state_cache.get(request_id)
+                    if state is None:
+                        continue
+                    if state.step_index != completion.step_idx + 1:
+                        raise RuntimeError(
+                            f"pipeline feedback advanced {request_id!r} to step {state.step_index}, "
+                            f"expected {completion.step_idx + 1}"
+                        )
+                    try:
+                        if self.od_config.streaming_output:
+                            should_decode = state.chunk_denoise_completed or state.request_denoise_completed
+                        else:
+                            should_decode = state.denoise_completed
+                        result = self.pipeline.post_decode(state) if should_decode else None
+                        if result is not None:
+                            self._attach_stepwise_metrics(state, result)
+                        finished = (
+                            state.request_denoise_completed
+                            if self.od_config.streaming_output
+                            else state.denoise_completed
+                        )
+                        runner_output_list.append(
+                            RunnerOutput(
+                                request_id=request_id,
+                                step_index=state.step_index,
+                                finished=finished,
+                                result=result,
+                            )
+                        )
+                        if finished:
+                            self.state_cache.pop(request_id, None)
+                    except Exception as exc:
+                        self.state_cache.pop(request_id, None)
+                        logger.error("Interleaved PP request error for %s: %s", request_id, exc, exc_info=True)
+                        runner_output_list.append(
+                            RunnerOutput(
+                                request_id=request_id,
+                                step_index=state.step_index,
+                                finished=True,
+                                result=DiffusionOutput.from_exception(exc),
+                            )
+                        )
+            return BatchRunnerOutput.from_list(runner_output_list)
 
     def _execute_stepwise(
         self,

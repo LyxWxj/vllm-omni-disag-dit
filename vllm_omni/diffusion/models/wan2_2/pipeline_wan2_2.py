@@ -23,6 +23,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_runtime import PipelineTensorSpec
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
@@ -330,6 +331,7 @@ class Wan22Pipeline(
 ):
     supports_request_batch = True
     supports_step_execution = True
+    supports_interleaved_pipeline_execution = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -868,11 +870,12 @@ class Wan22Pipeline(
         }
         return state
 
-    def _denoise_microbatch(
+    def _step_forward_kwargs(
         self,
         input_batch: InputBatch,
         states: Sequence[StepRequestState],
-    ) -> torch.Tensor | None:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, bool, float]:
+        """Build one phase-homogeneous Wan stage input without PP transport."""
         _, current_model, guidance_scale = self._step_phase(states[0])
         if any(self._step_microbatch_key(state) != self._step_microbatch_key(states[0]) for state in states[1:]):
             raise ValueError("Wan microbatch must have one phase, CFG policy, and condition layout.")
@@ -906,6 +909,14 @@ class Wan22Pipeline(
                 **positive_kwargs,
                 "encoder_hidden_states": input_batch.negative_prompt_embeds,
             }
+        return positive_kwargs, negative_kwargs, do_true_cfg, guidance_scale
+
+    def _denoise_microbatch(
+        self,
+        input_batch: InputBatch,
+        states: Sequence[StepRequestState],
+    ) -> torch.Tensor | None:
+        positive_kwargs, negative_kwargs, do_true_cfg, guidance_scale = self._step_forward_kwargs(input_batch, states)
         return self.predict_noise_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             true_cfg_scale=guidance_scale,
@@ -913,6 +924,113 @@ class Wan22Pipeline(
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
         )
+
+    def pipeline_transport_spec(self, states: Sequence[StepRequestState]) -> PipelineTensorSpec:
+        """Describe Wan's fixed PP hidden-state and latent feedback tensors."""
+        if not states:
+            raise ValueError("pipeline transport spec requires at least one request state")
+        if self.od_config.parallel_config.sequence_parallel_size not in (None, 1):
+            raise ValueError("Wan interleaved PP currently requires sequence_parallel_size=1")
+
+        reference = states[0].latents
+        if reference is None or reference.ndim != 5:
+            raise RuntimeError("Wan pipeline state must contain 5D latents before PP admission")
+        if any(
+            state.latents is None or tuple(state.latents.shape[1:]) != tuple(reference.shape[1:]) for state in states
+        ):
+            raise ValueError("Wan pipeline microbatch must have one latent layout")
+
+        total_rows = sum(int(state.latents.shape[0]) for state in states if state.latents is not None)
+        patch_t, patch_h, patch_w = self.transformer_config.patch_size
+        _, _, frames, height, width = reference.shape
+        sequence_length = (frames // patch_t) * (height // patch_h) * (width // patch_w)
+        inner_dim = self.transformer_config.num_attention_heads * self.transformer_config.attention_head_dim
+        _, current_model, _ = self._step_phase(states[0])
+        return PipelineTensorSpec(
+            intermediate_shape=(total_rows, sequence_length, inner_dim),
+            intermediate_dtype=current_model.dtype,
+            feedback_shape=(total_rows, *reference.shape[1:]),
+            feedback_dtype=reference.dtype,
+        )
+
+    def pipeline_model_phase(self, states: Sequence[StepRequestState]) -> str:
+        """Return the explicit Wan high/low transformer phase for a token."""
+        phase, current_model, _ = self._step_phase(states[0])
+        if any(
+            self._step_phase(state)[0] != phase or self._step_phase(state)[1] is not current_model
+            for state in states[1:]
+        ):
+            raise ValueError("Wan pipeline microbatch must use one transformer phase")
+        return phase
+
+    def pipeline_forward_local_stage(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState],
+        cfg_branch: str,
+        intermediate_hidden_states: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run only this rank's Wan transformer partition for one CFG branch."""
+        positive_kwargs, negative_kwargs, do_true_cfg, _ = self._step_forward_kwargs(input_batch, states)
+        if cfg_branch == "positive":
+            kwargs = positive_kwargs
+        elif cfg_branch == "negative" and do_true_cfg and negative_kwargs is not None:
+            kwargs = negative_kwargs
+        else:
+            raise ValueError(f"Wan pipeline token has invalid CFG branch {cfg_branch!r}")
+        if intermediate_hidden_states is not None:
+            kwargs = {
+                **kwargs,
+                "intermediate_tensors": IntermediateTensors({"hidden_states": intermediate_hidden_states}),
+            }
+        result = self.predict_noise(**kwargs)
+        if isinstance(result, IntermediateTensors):
+            return result["hidden_states"]
+        if not isinstance(result, torch.Tensor):
+            raise TypeError(f"Wan local PP forward returned {type(result).__name__}, expected Tensor")
+        return result
+
+    def pipeline_finish_microbatch(
+        self,
+        states: Sequence[StepRequestState],
+        noise_pred: torch.Tensor,
+        *,
+        positive_noise_pred: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run sequential CFG combine and request-local scheduling on the last PP rank."""
+        outputs: list[torch.Tensor] = []
+        offset = 0
+        for state in states:
+            if state.latents is None or state.current_timestep is None or state.scheduler is None:
+                raise RuntimeError(f"Wan step state {state.request_id} is not initialized.")
+            row_count = int(state.latents.shape[0])
+            next_offset = offset + row_count
+            local_noise = noise_pred[offset:next_offset]
+            _, _, guidance_scale = self._step_phase(state)
+            do_true_cfg = guidance_scale > 1.0 and state.negative_prompt_embeds is not None
+            if do_true_cfg:
+                if positive_noise_pred is None:
+                    raise RuntimeError("Wan CFG scheduler step is missing the positive branch prediction")
+                local_noise = self.combine_cfg_noise(
+                    positive_noise_pred[offset:next_offset],
+                    local_noise,
+                    guidance_scale,
+                    cfg_normalize=False,
+                )
+            state.latents = self.scheduler_step(
+                local_noise,
+                state.current_timestep,
+                state.latents,
+                per_request_scheduler=state.scheduler,
+                generator=state.sampling.generator,
+            )
+            state.step_index += 1
+            outputs.append(state.latents)
+            offset = next_offset
+        if offset != noise_pred.shape[0]:
+            raise ValueError("Wan pipeline noise rows do not match the microbatch request states")
+        return torch.cat(outputs, dim=0)
 
     def denoise_step(
         self,

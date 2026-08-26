@@ -292,7 +292,13 @@ class DiffusionEngine:
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
+        pp_schedule = getattr(od_config, "diffusion_pp_schedule", "serial")
+        if pp_schedule not in {"serial", "interleaved"}:
+            raise ValueError("diffusion_pp_schedule must be 'serial' or 'interleaved'")
+        self.step_execution = bool(getattr(od_config, "step_execution", False) or pp_schedule == "interleaved")
+        if pp_schedule == "interleaved" and not getattr(od_config, "step_execution", False):
+            logger.info("Interleaved PP enables internal step execution with final-only output policy.")
+            od_config.step_execution = True
         if od_config.streaming_output and not self.step_execution:
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             od_config.step_execution = True
@@ -390,7 +396,7 @@ class DiffusionEngine:
         if getattr(self, "execution_mode", None) != DiffusionExecutionMode.STEP_BATCH:
             return False
         pp_size = getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1)
-        return int(pp_size or 1) > 1
+        return int(pp_size or 1) > 1 and getattr(self.od_config, "diffusion_pp_schedule", "serial") == "interleaved"
 
     def _should_drain_pipeline_tick(self) -> bool:
         """Keep PP clocks advancing after stage 0 has no work to admit."""

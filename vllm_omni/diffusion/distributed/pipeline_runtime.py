@@ -13,7 +13,7 @@ order.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Hashable
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from threading import Event, Thread
@@ -661,6 +661,571 @@ class PipelineP2PChannel:
     def _require_destination(self) -> None:
         if self._is_source:
             raise RuntimeError("operation is only valid on the destination rank of a PipelineP2PChannel")
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineTensorSpec:
+    """Fixed tensor layouts for one homogeneous PP microbatch."""
+
+    intermediate_shape: tuple[int, ...]
+    intermediate_dtype: Any
+    feedback_shape: tuple[int, ...]
+    feedback_dtype: Any
+
+    def __post_init__(self) -> None:
+        for field_name, shape in (
+            ("intermediate_shape", self.intermediate_shape),
+            ("feedback_shape", self.feedback_shape),
+        ):
+            normalized = tuple(shape)
+            if not normalized or any(not isinstance(dim, int) or dim < 1 for dim in normalized):
+                raise ValueError(f"PipelineTensorSpec.{field_name} must contain positive integer dimensions")
+            object.__setattr__(self, field_name, normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineTickCompletion:
+    """One request-local scheduler result received by stage 0 in a tick."""
+
+    request_ids: tuple[str, ...]
+    step_idx: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PipelineMicrobatch:
+    """Static metadata shared by all PP ranks for one admitted microbatch."""
+
+    token_id_by_branch: Mapping[int, int]
+    request_ids: tuple[str, ...]
+    row_counts: tuple[int, ...]
+    step_idx: int
+    microbatch_id: int
+    spec: PipelineTensorSpec
+    model_phase: str
+    do_true_cfg: bool
+
+    @property
+    def row_map(self) -> tuple[int, ...]:
+        return tuple(range(len(self.request_ids)))
+
+
+class PipelineTickRuntime:
+    """Persistent one-clock PP runtime used by ``execute_pipeline_tick``.
+
+    Request-local state stays on each rank. Only fixed tensor payloads cross
+    the data path, so headers can be resolved from token metadata registered
+    during the collective scheduler admission RPC.
+    """
+
+    _BRANCH_POSITIVE = 0
+    _BRANCH_NEGATIVE = 1
+    _BRANCH_FEEDBACK = 2
+    _TAG_BASE = 10_000
+    _MODEL_PHASE_SHIFT = 8
+
+    def __init__(
+        self,
+        *,
+        pipeline: Any,
+        state_cache: dict[str, Any],
+        pp_ranks: Sequence[int],
+        global_rank: int,
+        device: Any,
+        group: Any,
+        slots_per_edge: int = 2,
+    ) -> None:
+        if len(pp_ranks) < 2:
+            raise ValueError("PipelineTickRuntime requires at least two PP ranks")
+        if global_rank not in pp_ranks:
+            raise ValueError("global_rank must belong to pp_ranks")
+        if slots_per_edge < 1:
+            raise ValueError("slots_per_edge must be positive")
+        required = (
+            "build_microbatches",
+            "pipeline_transport_spec",
+            "pipeline_model_phase",
+            "pipeline_forward_local_stage",
+            "pipeline_finish_microbatch",
+        )
+        missing = [name for name in required if not callable(getattr(pipeline, name, None))]
+        if missing:
+            raise ValueError(f"{type(pipeline).__name__} does not implement interleaved PP hooks: {', '.join(missing)}")
+
+        self.pipeline = pipeline
+        self.state_cache = state_cache
+        self.pp_ranks = tuple(pp_ranks)
+        self.global_rank = global_rank
+        self.stage = self.pp_ranks.index(global_rank)
+        self.world_size = len(self.pp_ranks)
+        self.device = device
+        self.group = group
+        self.slots_per_edge = slots_per_edge
+        self.clock = 0
+
+        self._next_token_id = 1
+        self._next_microbatch_id = 0
+        self._waiting: deque[int] = deque()
+        self._microbatches: dict[int, _PipelineMicrobatch] = {}
+        self._tokens: dict[int, PipelineToken] = {}
+        self._cancelled_request_ids: set[str] = set()
+        self._positive_noise: dict[int, Any] = {}
+        self._model_phase_ids: dict[str, int] = {}
+        self._spec_ids: dict[PipelineTensorSpec, int] = {}
+        self._forward_channels: dict[tuple[int, PipelineTensorSpec], PipelineP2PChannel] = {}
+        self._feedback_channels: dict[PipelineTensorSpec, PipelineP2PChannel] = {}
+
+    @property
+    def is_first_stage(self) -> bool:
+        return self.stage == 0
+
+    @property
+    def is_last_stage(self) -> bool:
+        return self.stage == self.world_size - 1
+
+    def cancel(self, request_ids: Sequence[str]) -> None:
+        """Mark cancelled work for discard after any physical transfer drains."""
+        self._cancelled_request_ids.update(request_ids)
+        for token_id, plan in tuple(self._microbatches.items()):
+            if self._is_cancelled(plan):
+                self._positive_noise.pop(token_id, None)
+
+    def admit(self, states: Sequence[Any]) -> None:
+        """Register scheduler-admitted state and queue stage-0 branches.
+
+        Every PP rank calls this for the same scheduler RPC. Only stage 0 owns
+        the injection queue, but all ranks retain the token registry needed to
+        decode a later fixed-size P2P header without an object collective.
+        """
+        for microbatch_states in self.pipeline.build_microbatches(states):
+            if not microbatch_states:
+                continue
+            spec = self.pipeline.pipeline_transport_spec(microbatch_states)
+            if not isinstance(spec, PipelineTensorSpec):
+                raise TypeError("pipeline_transport_spec() must return PipelineTensorSpec")
+            self._ensure_channels(spec)
+
+            step_idx = self._step_index(microbatch_states)
+            model_phase = self.pipeline.pipeline_model_phase(microbatch_states)
+            if not isinstance(model_phase, str) or not model_phase:
+                raise ValueError("pipeline_model_phase() must return a non-empty string")
+            self._register_model_phase(model_phase)
+            do_true_cfg = bool(getattr(microbatch_states[0], "do_true_cfg", False))
+            if any(bool(getattr(state, "do_true_cfg", False)) != do_true_cfg for state in microbatch_states[1:]):
+                raise ValueError("one pipeline microbatch must have one CFG policy")
+
+            branches = (self._BRANCH_POSITIVE, self._BRANCH_NEGATIVE) if do_true_cfg else (self._BRANCH_POSITIVE,)
+            token_id_by_branch = {branch: self._allocate_token_id() for branch in branches}
+            plan = _PipelineMicrobatch(
+                token_id_by_branch=token_id_by_branch,
+                request_ids=tuple(state.request_id for state in microbatch_states),
+                row_counts=tuple(self._state_row_count(state) for state in microbatch_states),
+                step_idx=step_idx,
+                microbatch_id=self._next_microbatch_id,
+                spec=spec,
+                model_phase=model_phase,
+                do_true_cfg=do_true_cfg,
+            )
+            self._next_microbatch_id += 1
+            for branch, token_id in token_id_by_branch.items():
+                token = PipelineToken(
+                    request_ids=plan.request_ids,
+                    row_map=plan.row_map,
+                    step_idx=step_idx,
+                    cfg_branch=self._branch_name(branch),
+                    microbatch_id=plan.microbatch_id,
+                    token_id=str(token_id),
+                    slot_id=None,
+                    compatibility_key=spec,
+                    model_phase=model_phase,
+                )
+                self._tokens[token_id] = token
+                self._microbatches[token_id] = plan
+                if self.is_first_stage:
+                    self._waiting.append(token_id)
+
+    def progress_one_clock(self) -> tuple[PipelineTickCompletion, ...]:
+        """Advance at most one local DiT stage and consume ready feedback."""
+        self._poll_channels()
+        completions = self._consume_feedback() if self.is_first_stage else []
+        self._run_one_local_stage()
+        self.clock += 1
+        return tuple(completions)
+
+    def close(self) -> None:
+        """Close an already-drained lane without retaining P2P Work handles.
+
+        Worker shutdown invokes this only after the engine has stopped issuing
+        clocks.  Every PP worker executes the method, so each source endpoint
+        can emit its per-slot tombstones while each destination polls and
+        releases them.  It intentionally refuses to close stage-0 queued work
+        or an unmatched positive CFG branch: those are runtime bugs, not safe
+        teardown states.
+        """
+        if self._waiting or self._positive_noise:
+            raise RuntimeError("cannot close PipelineTickRuntime with queued or partial CFG tokens")
+
+        channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
+        for channel in channels:
+            if channel.is_source:
+                channel.send_shutdown()
+
+        destinations = [channel for channel in channels if channel.is_destination]
+        for _ in range(256):
+            for channel in destinations:
+                channel.poll()
+                while channel.has_ready_message:
+                    message = channel.begin_compute()
+                    channel.release_after_compute(message)
+            if all(channel.is_closed for channel in destinations):
+                break
+        else:
+            raise RuntimeError("pipeline channel shutdown did not receive every tombstone")
+
+        for channel in channels:
+            channel.wait_for_sends()
+            if channel.pending_work_count != 0:
+                raise RuntimeError("pipeline channel retained pending Work after shutdown")
+
+    def _all_channels(self) -> Sequence[PipelineP2PChannel]:
+        return (*self._forward_channels.values(), *self._feedback_channels.values())
+
+    def _run_one_local_stage(self) -> None:
+        token_id: int | None = None
+        incoming: PipelineP2PChannel | None = None
+        message: PipelineTransportMessage | None = None
+
+        if self.is_first_stage:
+            if not self._waiting:
+                return
+            token_id = self._waiting[0]
+            plan = self._microbatches[token_id]
+            if not self._forward_channel(self.stage, plan.spec).can_send:
+                return
+            self._waiting.popleft()
+        else:
+            candidate = self._next_ready_input()
+            if candidate is None:
+                return
+            incoming, spec = candidate
+            if not self.is_last_stage and not self._forward_channel(self.stage, spec).can_send:
+                return
+            if self.is_last_stage and not self._feedback_channel(spec).can_send:
+                return
+            message = incoming.begin_compute()
+            token_id = message.header.token_id
+            self._validate_received_header(message.header, spec)
+
+        assert token_id is not None
+        plan = self._microbatches[token_id]
+        token = self._tokens[token_id]
+        try:
+            if self._is_cancelled(plan):
+                self._retire_token(token_id)
+                return
+            states = self._states_for(plan)
+            self._set_state_step(states, token.step_idx)
+            input_batch = self._make_input_batch(states)
+            result = self.pipeline.pipeline_forward_local_stage(
+                input_batch,
+                states=states,
+                cfg_branch=token.cfg_branch,
+                intermediate_hidden_states=None if message is None else message.payload,
+            )
+
+            if not self.is_last_stage:
+                payload = self._extract_tensor(result, "pipeline_forward_local_stage")
+                self._validate_tensor(
+                    payload, plan.spec.intermediate_shape, plan.spec.intermediate_dtype, "intermediate"
+                )
+                self._forward_channel(self.stage, plan.spec).send(self._header_for(token_id, token), payload)
+                if not self.is_first_stage:
+                    self._advance_nonfirst_state(states, token.step_idx)
+                    self._retire_token(token_id)
+                elif plan.do_true_cfg and self._branch_code(token.cfg_branch) == self._BRANCH_POSITIVE:
+                    # Only the negative branch produces the feedback token.
+                    # Stage 0 no longer needs the positive branch after send.
+                    self._retire_token(token_id)
+                return
+
+            self._finish_last_stage(token_id, token, plan, states, result)
+        finally:
+            if message is not None and incoming is not None:
+                incoming.release_after_compute(message)
+
+    def _finish_last_stage(
+        self,
+        token_id: int,
+        token: PipelineToken,
+        plan: _PipelineMicrobatch,
+        states: Sequence[Any],
+        result: Any,
+    ) -> None:
+        noise_pred = self._extract_tensor(result, "pipeline_forward_local_stage")
+        branch = self._branch_code(token.cfg_branch)
+        if plan.do_true_cfg and branch == self._BRANCH_POSITIVE:
+            self._positive_noise[token_id] = noise_pred
+            self._advance_nonfirst_state(states, token.step_idx)
+            self._retire_token(token_id, retain_positive_noise=True)
+            return
+
+        positive_noise = None
+        if plan.do_true_cfg:
+            positive_token_id = plan.token_id_by_branch[self._BRANCH_POSITIVE]
+            positive_noise = self._positive_noise.pop(positive_token_id, None)
+            if positive_noise is None:
+                raise RuntimeError("negative CFG token reached the last stage before its positive token")
+
+        latents = self._extract_tensor(
+            self.pipeline.pipeline_finish_microbatch(states, noise_pred, positive_noise_pred=positive_noise),
+            "pipeline_finish_microbatch",
+        )
+        self._validate_tensor(latents, plan.spec.feedback_shape, plan.spec.feedback_dtype, "feedback")
+        self._feedback_channel(plan.spec).send(
+            PipelineTransportHeader(
+                token_id=token_id,
+                step_idx=token.step_idx,
+                cfg_branch=self._BRANCH_FEEDBACK,
+                flags=self._model_phase_flags(token.model_phase),
+            ),
+            latents,
+        )
+        self._advance_nonfirst_state(states, token.step_idx)
+        self._retire_token(token_id)
+
+    def _consume_feedback(self) -> list[PipelineTickCompletion]:
+        completions: list[PipelineTickCompletion] = []
+        for spec, channel in self._feedback_channels.items():
+            channel.poll()
+            while channel.has_ready_message:
+                message = channel.begin_compute()
+                try:
+                    header = message.header
+                    if header.cfg_branch != self._BRANCH_FEEDBACK:
+                        raise RuntimeError("feedback edge received a non-feedback token")
+                    plan = self._microbatches.get(header.token_id)
+                    token = self._tokens.get(header.token_id)
+                    if plan is None or token is None:
+                        raise RuntimeError(f"feedback for unknown pipeline token {header.token_id}")
+                    if (
+                        plan.spec != spec
+                        or header.step_idx != token.step_idx
+                        or header.flags != self._model_phase_flags(token.model_phase)
+                    ):
+                        raise RuntimeError("feedback header does not match its registered token")
+                    if self._is_cancelled(plan):
+                        self._retire_feedback_plan(header.token_id, plan)
+                        continue
+                    self._validate_tensor(message.payload, spec.feedback_shape, spec.feedback_dtype, "feedback")
+                    states = self._states_for(plan)
+                    self._apply_feedback(states, message.payload, header.step_idx)
+                    completions.append(PipelineTickCompletion(plan.request_ids, header.step_idx))
+                    self._retire_feedback_plan(header.token_id, plan)
+                finally:
+                    channel.release_after_compute(message)
+        return completions
+
+    def _retire_feedback_plan(self, token_id: int, plan: _PipelineMicrobatch) -> None:
+        """Drop rank-0 metadata once a feedback message has been consumed."""
+        self._retire_token(token_id)
+        if plan.do_true_cfg:
+            self._retire_token(plan.token_id_by_branch[self._BRANCH_POSITIVE])
+
+    def _retire_token(self, token_id: int, *, retain_positive_noise: bool = False) -> None:
+        """Release local metadata once this rank will not see the token again."""
+        self._tokens.pop(token_id, None)
+        self._microbatches.pop(token_id, None)
+        if not retain_positive_noise:
+            self._positive_noise.pop(token_id, None)
+        active_request_ids = {request_id for plan in self._microbatches.values() for request_id in plan.request_ids}
+        self._cancelled_request_ids.intersection_update(active_request_ids)
+
+    def _apply_feedback(self, states: Sequence[Any], latents: Any, step_idx: int) -> None:
+        offset = 0
+        for state, row_count in zip(states, (self._state_row_count(state) for state in states), strict=True):
+            next_offset = offset + row_count
+            state.latents = latents[offset:next_offset].clone()
+            state.step_index = step_idx + 1
+            offset = next_offset
+        if offset != latents.shape[0]:
+            raise RuntimeError("feedback row count does not match its request state")
+
+    def _next_ready_input(self) -> tuple[PipelineP2PChannel, PipelineTensorSpec] | None:
+        candidates: list[tuple[int, PipelineP2PChannel, PipelineTensorSpec]] = []
+        for spec, spec_id in self._spec_ids.items():
+            channel = self._forward_channel(self.stage - 1, spec)
+            channel.poll()
+            if channel.has_ready_message:
+                candidates.append((spec_id, channel, spec))
+        if not candidates:
+            return None
+        _, channel, spec = min(candidates, key=lambda candidate: candidate[0])
+        return channel, spec
+
+    def _ensure_channels(self, spec: PipelineTensorSpec) -> None:
+        if spec in self._spec_ids:
+            return
+        spec_id = len(self._spec_ids)
+        self._spec_ids[spec] = spec_id
+        tag_stride = (self.world_size + 1) * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT
+        tag_base = self._TAG_BASE + spec_id * tag_stride
+        for edge in range(self.world_size - 1):
+            if self.stage not in (edge, edge + 1):
+                continue
+            self._forward_channels[(edge, spec)] = PipelineP2PChannel(
+                source_rank=self.pp_ranks[edge],
+                destination_rank=self.pp_ranks[edge + 1],
+                tensor_shape=spec.intermediate_shape,
+                tensor_dtype=spec.intermediate_dtype,
+                device=self.device,
+                slots_per_edge=self.slots_per_edge,
+                tag_base=tag_base + edge * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
+                group=self.group,
+            )
+        if self.stage in (0, self.world_size - 1):
+            self._feedback_channels[spec] = PipelineP2PChannel(
+                source_rank=self.pp_ranks[-1],
+                destination_rank=self.pp_ranks[0],
+                tensor_shape=spec.feedback_shape,
+                tensor_dtype=spec.feedback_dtype,
+                device=self.device,
+                slots_per_edge=self.slots_per_edge,
+                tag_base=tag_base + (self.world_size - 1) * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
+                group=self.group,
+            )
+
+    def _poll_channels(self) -> None:
+        for channel in self._forward_channels.values():
+            channel.poll()
+        for channel in self._feedback_channels.values():
+            channel.poll()
+
+    def _forward_channel(self, edge: int, spec: PipelineTensorSpec) -> PipelineP2PChannel:
+        try:
+            return self._forward_channels[(edge, spec)]
+        except KeyError as exc:
+            raise RuntimeError(f"missing local pipeline edge {edge} for tensor spec") from exc
+
+    def _feedback_channel(self, spec: PipelineTensorSpec) -> PipelineP2PChannel:
+        try:
+            return self._feedback_channels[spec]
+        except KeyError as exc:
+            raise RuntimeError("missing local pipeline feedback edge") from exc
+
+    def _states_for(self, plan: _PipelineMicrobatch) -> tuple[Any, ...]:
+        states: list[Any] = []
+        for request_id in plan.request_ids:
+            state = self.state_cache.get(request_id)
+            if state is None:
+                raise RuntimeError(f"pipeline token references unknown request state {request_id!r}")
+            states.append(state)
+        return tuple(states)
+
+    def _is_cancelled(self, plan: _PipelineMicrobatch) -> bool:
+        return any(request_id in self._cancelled_request_ids for request_id in plan.request_ids)
+
+    @staticmethod
+    def _make_input_batch(states: Sequence[Any]) -> Any:
+        from vllm_omni.diffusion.worker.input_batch import InputBatch
+
+        return InputBatch.make_batch(states)
+
+    @staticmethod
+    def _state_row_count(state: Any) -> int:
+        latents = getattr(state, "latents", None)
+        if latents is None:
+            raise RuntimeError(f"pipeline request state {state.request_id!r} has no latents")
+        return int(latents.shape[0])
+
+    @staticmethod
+    def _step_index(states: Sequence[Any]) -> int:
+        step_idx = int(states[0].step_index)
+        if any(int(state.step_index) != step_idx for state in states[1:]):
+            raise ValueError("one pipeline microbatch must have one step index")
+        return step_idx
+
+    @staticmethod
+    def _set_state_step(states: Sequence[Any], step_idx: int) -> None:
+        for state in states:
+            state.step_index = step_idx
+
+    @staticmethod
+    def _advance_nonfirst_state(states: Sequence[Any], step_idx: int) -> None:
+        for state in states:
+            state.step_index = step_idx + 1
+
+    @staticmethod
+    def _extract_tensor(value: Any, operation: str) -> Any:
+        if isinstance(value, tuple):
+            if len(value) != 1:
+                raise TypeError(f"{operation} returned {len(value)} tensors; interleaved PP currently needs one tensor")
+            value = value[0]
+        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            raise TypeError(f"{operation} must return one tensor, got {type(value).__name__}")
+        return value
+
+    @staticmethod
+    def _validate_tensor(value: Any, shape: tuple[int, ...], dtype: Any, label: str) -> None:
+        if tuple(value.shape) != shape or value.dtype != dtype:
+            raise ValueError(
+                f"pipeline {label} payload expected shape={shape}, dtype={dtype}; "
+                f"got shape={tuple(value.shape)}, dtype={value.dtype}"
+            )
+
+    def _validate_received_header(self, header: PipelineTransportHeader, spec: PipelineTensorSpec) -> None:
+        token = self._tokens.get(header.token_id)
+        plan = self._microbatches.get(header.token_id)
+        if token is None or plan is None:
+            raise RuntimeError(f"received unknown pipeline token {header.token_id}")
+        if plan.spec != spec:
+            raise RuntimeError("received token on an edge with the wrong tensor spec")
+        if header.step_idx != token.step_idx or header.cfg_branch != self._branch_code(token.cfg_branch):
+            raise RuntimeError("received pipeline header does not match registered token metadata")
+        if header.flags != self._model_phase_flags(token.model_phase):
+            raise RuntimeError("received pipeline header does not match registered model phase")
+
+    def _header_for(self, token_id: int, token: PipelineToken) -> PipelineTransportHeader:
+        return PipelineTransportHeader(
+            token_id=token_id,
+            step_idx=token.step_idx,
+            cfg_branch=self._branch_code(token.cfg_branch),
+            flags=self._model_phase_flags(token.model_phase),
+        )
+
+    def _register_model_phase(self, model_phase: str) -> None:
+        if model_phase in self._model_phase_ids:
+            return
+        phase_id = len(self._model_phase_ids)
+        max_phase_id = PipelineTransportHeader.INT64_MAX >> self._MODEL_PHASE_SHIFT
+        if phase_id > max_phase_id:
+            raise ValueError("too many pipeline model phases for the fixed transport header")
+        self._model_phase_ids[model_phase] = phase_id
+
+    def _model_phase_flags(self, model_phase: str) -> int:
+        try:
+            return self._model_phase_ids[model_phase] << self._MODEL_PHASE_SHIFT
+        except KeyError as exc:
+            raise RuntimeError(f"pipeline token references unknown model phase {model_phase!r}") from exc
+
+    def _allocate_token_id(self) -> int:
+        token_id = self._next_token_id
+        self._next_token_id += 1
+        return token_id
+
+    @classmethod
+    def _branch_name(cls, branch: int) -> str:
+        if branch == cls._BRANCH_POSITIVE:
+            return "positive"
+        if branch == cls._BRANCH_NEGATIVE:
+            return "negative"
+        raise ValueError(f"unsupported pipeline branch {branch}")
+
+    @classmethod
+    def _branch_code(cls, branch: str) -> int:
+        if branch == "positive":
+            return cls._BRANCH_POSITIVE
+        if branch == "negative":
+            return cls._BRANCH_NEGATIVE
+        raise ValueError(f"unsupported pipeline branch {branch!r}")
 
 
 class PipelineDeadlockError(RuntimeError):

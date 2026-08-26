@@ -552,6 +552,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     # Wan interleaved PP: maximum compatible request rows per local clock.
     diffusion_pp_microbatch_size: int = 1
+    diffusion_pp_schedule: str = "serial"
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True

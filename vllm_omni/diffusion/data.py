@@ -905,6 +905,10 @@ class OmniDiffusionConfig:
     # into one local PP microbatch. ``max_num_seqs`` remains the total active
     # request capacity managed by the scheduler.
     diffusion_pp_microbatch_size: int = 1
+    # ``serial`` preserves the historical whole-batch PP path. ``interleaved``
+    # selects the retained-state one-clock runtime and internally uses step
+    # execution even when callers request final-only output.
+    diffusion_pp_schedule: str = "serial"
 
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
@@ -1024,6 +1028,8 @@ class OmniDiffusionConfig:
             raise ValueError("max_model_len must be positive or -1")
         if type(self.diffusion_pp_microbatch_size) is not int or self.diffusion_pp_microbatch_size < 1:
             raise ValueError("diffusion_pp_microbatch_size must be a positive integer")
+        if self.diffusion_pp_schedule not in {"serial", "interleaved"}:
+            raise ValueError("diffusion_pp_schedule must be 'serial' or 'interleaved'")
 
         if self.omni_kv_config is None:
             self.omni_kv_config = {}

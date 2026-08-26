@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,9 +16,12 @@ from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineClockSimulator,
     PipelineP2PChannel,
     PipelineSlotState,
+    PipelineTensorSpec,
+    PipelineTickRuntime,
     PipelineToken,
     PipelineTransportHeader,
 )
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -486,3 +490,163 @@ class TestPipelineP2PChannel:
             assert any("SEND_PENDING" in history for history in results[rank]["send_histories"])
         assert all(results[rank]["incoming_pending_work_count"] == 0 for rank in range(1, 4))
         assert all(results[rank]["outgoing_pending_work_count"] == 0 for rank in range(3))
+
+
+class _TickPipeline:
+    """Small stage-local pipeline used to exercise the production clock."""
+
+    supports_step_execution = True
+    supports_interleaved_pipeline_execution = True
+
+    def __init__(self, stage: int, active_stages: list[tuple[int, int]]) -> None:
+        self.stage = stage
+        self.clock = 0
+        self.active_stages = active_stages
+
+    @staticmethod
+    def build_microbatches(states):
+        return [tuple(states)]
+
+    @staticmethod
+    def pipeline_transport_spec(states):
+        rows = sum(int(state.latents.shape[0]) for state in states)
+        return PipelineTensorSpec(
+            intermediate_shape=(rows, 1),
+            intermediate_dtype=torch.float32,
+            feedback_shape=(rows, 1),
+            feedback_dtype=torch.float32,
+        )
+
+    @staticmethod
+    def pipeline_model_phase(states):
+        del states
+        return "main"
+
+    def pipeline_forward_local_stage(self, input_batch, *, states, cfg_branch, intermediate_hidden_states):
+        del states, cfg_branch
+        self.active_stages.append((self.clock, self.stage))
+        source = input_batch.latents if intermediate_hidden_states is None else intermediate_hidden_states
+        return source + float(self.stage + 1)
+
+    @staticmethod
+    def pipeline_finish_microbatch(states, noise_pred, *, positive_noise_pred):
+        if positive_noise_pred is not None:
+            noise_pred = positive_noise_pred + noise_pred
+        offset = 0
+        outputs = []
+        for state in states:
+            rows = int(state.latents.shape[0])
+            state.latents = noise_pred[offset : offset + rows].clone()
+            state.step_index += 1
+            outputs.append(state.latents)
+            offset += rows
+        return torch.cat(outputs, dim=0)
+
+
+def _make_tick_state(request_id: str, value: float, *, cfg: bool) -> StepRequestState:
+    state = StepRequestState(request_id=request_id, sampling=SimpleNamespace(generator=None), prompt=None)
+    state.latents = torch.tensor([[value]], dtype=torch.float32)
+    state.timesteps = torch.tensor([1.0, 0.0], dtype=torch.float32)
+    state.prompt_embeds = torch.zeros((1, 1, 1), dtype=torch.float32)
+    state.negative_prompt_embeds = torch.zeros((1, 1, 1), dtype=torch.float32) if cfg else None
+    state.do_true_cfg = cfg
+    return state
+
+
+def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, master_port: int, result_queue) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{master_port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        state_cache = {
+            "A": _make_tick_state("A", 0.0, cfg=True),
+            "B": _make_tick_state("B", 10.0, cfg=True),
+        }
+        active_stages: list[tuple[int, int]] = []
+        pipeline = _TickPipeline(rank, active_stages)
+        runtime = PipelineTickRuntime(
+            pipeline=pipeline,
+            state_cache=state_cache,
+            pp_ranks=tuple(range(world_size)),
+            global_rank=rank,
+            device="cpu",
+            group=dist.group.WORLD,
+        )
+
+        pending_admissions = ["A"]
+        completed: list[tuple[str, int, float]] = []
+        for clock in range(48):
+            if clock == 1:
+                pending_admissions.append("B")
+            if pending_admissions:
+                runtime.admit([state_cache[request_id] for request_id in pending_admissions])
+                pending_admissions = []
+
+            pipeline.clock = clock
+            local_completions = runtime.progress_one_clock()
+            serialized = [
+                (request_id, completion.step_idx)
+                for completion in local_completions
+                for request_id in completion.request_ids
+            ]
+            gathered: list[list[tuple[str, int]]] = [[] for _ in range(world_size)]
+            dist.all_gather_object(gathered, serialized)
+            rank_zero_completions = gathered[0]
+            if rank == 0:
+                completed.extend(
+                    (request_id, step_idx, float(state_cache[request_id].latents.item()))
+                    for request_id, step_idx in rank_zero_completions
+                )
+            for request_id, step_idx in rank_zero_completions:
+                if step_idx + 1 < state_cache[request_id].total_steps:
+                    pending_admissions.append(request_id)
+            dist.barrier()
+
+            done = [len(completed) == 4 if rank == 0 else False]
+            dist.broadcast_object_list(done, src=0)
+            if done[0]:
+                break
+        dist.barrier()
+        runtime.close()
+        dist.barrier()
+        result_queue.put((rank, completed, active_stages))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+class TestPipelineTickRuntime:
+    def test_pp4_overlaps_dynamic_admission_and_returns_feedback(self) -> None:
+        world_size = 4
+        mp_context = torch.multiprocessing.get_context("spawn")
+        manager = mp_context.Manager()
+        result_queue = manager.Queue()
+        try:
+            torch.multiprocessing.spawn(
+                _run_pipeline_tick_runtime_worker,
+                args=(world_size, get_open_port(), result_queue),
+                nprocs=world_size,
+            )
+            results = {
+                rank: (completed, active_stages)
+                for rank, completed, active_stages in (result_queue.get() for _ in range(world_size))
+            }
+        finally:
+            manager.shutdown()
+
+        assert results[0][0] == [
+            ("A", 0, 20.0),
+            ("B", 0, 40.0),
+            ("A", 1, 60.0),
+            ("B", 1, 100.0),
+        ]
+        assert all(results[rank][0] == [] for rank in range(1, world_size))
+        stages_by_clock: dict[int, set[int]] = {}
+        for _, active_stages in results.values():
+            for clock, stage in active_stages:
+                stages_by_clock.setdefault(clock, set()).add(stage)
+        assert any(len(stages) >= 2 for stages in stages_by_clock.values())

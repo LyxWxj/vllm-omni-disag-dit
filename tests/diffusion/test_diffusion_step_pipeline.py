@@ -906,7 +906,10 @@ def _make_step_worker(lora_manager=None, *, expected_output=None):
     worker.lora_manager = lora_manager
     worker._step_lora_state = {}
     output = expected_output if expected_output is not None else RunnerOutput(request_id="req-1")
-    worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: output)
+    worker.model_runner = SimpleNamespace(
+        execute_stepwise=lambda arg: output,
+        execute_pipeline_tick=lambda arg: output,
+    )
     return worker
 
 
@@ -923,16 +926,16 @@ class TestWorker:
 
         assert output is expected
 
-    def test_execute_pipeline_tick_delegates_to_stepwise(self, mocker: MockerFixture):
+    def test_execute_pipeline_tick_delegates_to_retained_runtime(self, mocker: MockerFixture):
         worker = _make_step_worker()
         scheduler_output = _make_scheduler_output(_make_engine_request("req-tick"), request_id="req-tick")
         expected = RunnerOutput(request_id="req-tick", step_index=1, finished=False, result=None)
-        execute_stepwise = mocker.patch.object(DiffusionWorker, "execute_stepwise", return_value=expected)
+        worker.model_runner.execute_pipeline_tick = mocker.Mock(return_value=expected)
 
         output = DiffusionWorker.execute_pipeline_tick(worker, scheduler_output)
 
         assert output is expected
-        execute_stepwise.assert_called_once_with(scheduler_output)
+        worker.model_runner.execute_pipeline_tick.assert_called_once_with(scheduler_output)
 
     def test_deactivates_lora_when_request_has_no_adapter(self):
         manager = _RecordingLoRAManager()

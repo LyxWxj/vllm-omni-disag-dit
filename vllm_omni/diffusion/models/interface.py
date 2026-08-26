@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.distributed.pipeline_runtime import PipelineTensorSpec
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -77,6 +78,46 @@ class SupportsStepExecution(Protocol):
 
 
 @runtime_checkable
+class SupportsPipelineTickExecution(Protocol):
+    """Explicit stage-local protocol required by interleaved PP clocks."""
+
+    supports_interleaved_pipeline_execution: ClassVar[bool] = True
+
+    def build_microbatches(self, states: Sequence[StepRequestState]) -> list[tuple[StepRequestState, ...]]:
+        """Build ordered homogeneous stage-0 microbatches."""
+        ...
+
+    def pipeline_transport_spec(self, states: Sequence[StepRequestState]) -> PipelineTensorSpec:
+        """Describe fixed intermediate and feedback tensor buffers."""
+        ...
+
+    def pipeline_model_phase(self, states: Sequence[StepRequestState]) -> str:
+        """Return explicit model phase metadata for a pipeline token."""
+        ...
+
+    def pipeline_forward_local_stage(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState],
+        cfg_branch: str,
+        intermediate_hidden_states: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run one local PP transformer partition."""
+        ...
+
+    def pipeline_finish_microbatch(
+        self,
+        states: Sequence[StepRequestState],
+        noise_pred: torch.Tensor,
+        *,
+        positive_noise_pred: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run last-stage CFG and scheduler work."""
+        ...
+
+
+@runtime_checkable
 class SupportsComponentDiscovery(Protocol):
     """Declares which submodules serve as pipeline components.
 
@@ -109,6 +150,16 @@ def supports_step_execution(pipeline: object) -> bool:
     # state for this runtime.  Subclasses may explicitly disable inherited
     # implementations (for example Wan VACE) with ``False``.
     return getattr(pipeline, "supports_step_execution", False) is True and isinstance(pipeline, SupportsStepExecution)
+
+
+def supports_pipeline_tick_execution(pipeline: object) -> bool:
+    """Return whether a step pipeline explicitly supports interleaved PP."""
+
+    return (
+        supports_step_execution(pipeline)
+        and getattr(pipeline, "supports_interleaved_pipeline_execution", False) is True
+        and isinstance(pipeline, SupportsPipelineTickExecution)
+    )
 
 
 @runtime_checkable

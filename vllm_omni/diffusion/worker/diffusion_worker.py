@@ -645,8 +645,16 @@ class DiffusionWorker:
         return output
 
     def execute_pipeline_tick(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Advance the PP control plane until the stateful runtime is installed."""
-        return self.execute_stepwise(scheduler_output)
+        """Advance one retained-state interleaved PP clock."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self._activate_step_lora(scheduler_output)
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_pipeline_tick") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_pipeline_tick(scheduler_output)
+        if profiler:
+            profiler.step()
+        return output
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
@@ -668,6 +676,12 @@ class DiffusionWorker:
             )
 
         if self.lora_manager is None:
+            return
+
+        # A drain tick can advance an older token while stage 0 has no new
+        # scheduler admission. Keep the currently active homogeneous adapter
+        # instead of clearing it merely because this RPC has no request ids.
+        if not scheduler_output.scheduled_request_ids:
             return
 
         lora_request: LoRARequest | None = None
@@ -902,6 +916,9 @@ class DiffusionWorker:
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
         if self.model_runner is not None:
+            shutdown_pipeline_tick_runtime = getattr(self.model_runner, "shutdown_pipeline_tick_runtime", None)
+            if callable(shutdown_pipeline_tick_runtime):
+                shutdown_pipeline_tick_runtime()
             mgr = getattr(self.model_runner, "kv_transfer_manager", None)
             if mgr is not None:
                 mgr.shutdown_prefetch()

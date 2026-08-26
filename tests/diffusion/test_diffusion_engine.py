@@ -481,6 +481,7 @@ class TestRequestBatchCapability:
             custom_pipeline_args=None,
             streaming_output=False,
             step_execution=True,
+            diffusion_pp_schedule="interleaved",
             max_num_seqs=2,
             parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=2),
         )
