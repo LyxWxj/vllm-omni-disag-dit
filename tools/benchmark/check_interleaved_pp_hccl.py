@@ -7,8 +7,8 @@ Run on one Ascend node with one process per PP rank:
         tools/benchmark/check_interleaved_pp_hccl.py
 
 The probe creates the same directed edge groups as ``PipelineTickRuntime``.
-It deliberately orders each edge's communicator bootstrap through a Gloo
-barrier before testing the reverse bootstrap P2P and the forward payload P2P.
+It deliberately orders each edge's collective and payload P2P bootstrap
+through a Gloo barrier before testing the forward payload direction.
 """
 
 from __future__ import annotations
@@ -48,22 +48,13 @@ def main() -> None:
                 dist.all_reduce(bootstrap, group=group)
             dist.barrier(group=control_group)
 
-            if rank == source_rank:
-                received = torch.empty(1, dtype=torch.int64, device=device)
-                dist.irecv(received, src=destination_rank, group=group, tag=edge_index * 2).wait()
-                assert int(received.item()) == destination_rank
-            elif rank == destination_rank:
-                sent = torch.tensor([rank], dtype=torch.int64, device=device)
-                dist.isend(sent, dst=source_rank, group=group, tag=edge_index * 2).wait()
-            dist.barrier(group=control_group)
-
             if rank == destination_rank:
                 received = torch.empty(1, dtype=torch.int64, device=device)
-                dist.irecv(received, src=source_rank, group=group, tag=edge_index * 2 + 1).wait()
+                dist.irecv(received, src=source_rank, group=group, tag=edge_index).wait()
                 assert int(received.item()) == source_rank
             elif rank == source_rank:
                 sent = torch.tensor([rank], dtype=torch.int64, device=device)
-                dist.isend(sent, dst=destination_rank, group=group, tag=edge_index * 2 + 1).wait()
+                dist.isend(sent, dst=destination_rank, group=group, tag=edge_index).wait()
             dist.barrier(group=control_group)
 
         if rank == 0:
