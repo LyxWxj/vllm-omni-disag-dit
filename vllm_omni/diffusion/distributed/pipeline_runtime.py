@@ -300,6 +300,14 @@ class PipelineP2PChannel:
         self._shutdown_slot_ids: set[int] = set()
         self._closed = False
 
+        # ProcessGroupHCCL creates its communicator lazily on the first
+        # operation. A receiver pre-posts the payload irecv, while its source
+        # cannot send until it has received a reverse credit. Establish the
+        # payload communicator symmetrically before either half starts that
+        # dependency chain. This is a one-time channel setup collective, not
+        # part of the pipeline clock data path.
+        self._warm_up_payload_group()
+
         if self._is_source:
             self._send_slots = [
                 _P2PSendSlot(
@@ -652,6 +660,10 @@ class PipelineP2PChannel:
 
     def _credit_tag(self, slot_id: int) -> int:
         return self._header_tag(slot_id) + 2
+
+    def _warm_up_payload_group(self) -> None:
+        warmup = self._torch.zeros(1, dtype=self._torch.float32, device=self.device)
+        self._dist.all_reduce(warmup, group=self._group)
 
     def _start_work(self, work: Any, *, requires_wait_thread: bool | None = None) -> Any:
         if not (self._requires_wait_thread if requires_wait_thread is None else requires_wait_thread):
