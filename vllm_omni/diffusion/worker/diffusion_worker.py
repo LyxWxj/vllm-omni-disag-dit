@@ -915,14 +915,16 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
-        if self.model_runner is not None:
-            shutdown_pipeline_tick_runtime = getattr(self.model_runner, "shutdown_pipeline_tick_runtime", None)
-            if callable(shutdown_pipeline_tick_runtime):
-                shutdown_pipeline_tick_runtime()
-            mgr = getattr(self.model_runner, "kv_transfer_manager", None)
-            if mgr is not None:
-                mgr.shutdown_prefetch()
-        destroy_distributed_env()
+        try:
+            if self.model_runner is not None:
+                shutdown_pipeline_tick_runtime = getattr(self.model_runner, "shutdown_pipeline_tick_runtime", None)
+                if callable(shutdown_pipeline_tick_runtime):
+                    shutdown_pipeline_tick_runtime()
+                mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+                if mgr is not None:
+                    mgr.shutdown_prefetch()
+        finally:
+            destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:

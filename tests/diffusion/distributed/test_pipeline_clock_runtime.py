@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -25,6 +26,39 @@ from vllm_omni.diffusion.distributed.pipeline_runtime import (
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+class _DeferredReleaseEvent:
+    """Device-event stand-in that keeps one receive slot unavailable."""
+
+    def __init__(self, pending_queries: int) -> None:
+        self.pending_queries = pending_queries
+        self.query_count = 0
+
+    def query(self) -> bool:
+        self.query_count += 1
+        if self.pending_queries > 0:
+            self.pending_queries -= 1
+            return False
+        return True
+
+
+def _transport_buffer_inference_flags(channel: PipelineP2PChannel | None) -> list[bool]:
+    if channel is None:
+        return []
+    if channel.is_source:
+        buffers = [
+            *[slot.header_buffer for slot in channel._send_slots],
+            *[slot.payload_buffer for slot in channel._send_slots],
+            *channel._credit_buffers,
+        ]
+    else:
+        buffers = [
+            *[slot.header_buffer for slot in channel._receive_slots],
+            *[slot.payload_buffer for slot in channel._receive_slots],
+            *channel._credit_buffers,
+        ]
+    return [buffer.is_inference() for buffer in buffers]
 
 
 def _token(token_id: str, microbatch_id: int, *, compatibility_key: tuple[str, int] = ("wan22", 2)) -> PipelineToken:
@@ -148,6 +182,8 @@ def _run_p2p_channel_worker(
     stage_one_stall_until: int,
     rebuild_after_close: bool,
     inject_prepare_failure: bool,
+    deferred_release_queries: int,
+    construct_inside_inference_mode: bool,
     result_queue,
 ) -> None:
     """Run one rank of a tensor-only PP lane without loading a model."""
@@ -165,33 +201,47 @@ def _run_p2p_channel_worker(
         credit_edge_groups = [
             dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for edge_rank in range(world_size - 1)
         ]
-        incoming = None
-        if rank > 0:
-            incoming = PipelineP2PChannel(
-                source_rank=rank - 1,
-                destination_rank=rank,
-                tensor_shape=(2,),
-                tensor_dtype=torch.float32,
-                device="cpu",
-                slots_per_edge=slots_per_edge,
-                tag_base=(rank - 1) * 100,
-                group=edge_groups[rank - 1],
-                credit_group=credit_edge_groups[rank - 1],
-            )
+        channel_context = torch.inference_mode() if construct_inside_inference_mode else nullcontext()
+        with channel_context:
+            incoming = None
+            if rank > 0:
+                incoming = PipelineP2PChannel(
+                    source_rank=rank - 1,
+                    destination_rank=rank,
+                    tensor_shape=(2,),
+                    tensor_dtype=torch.float32,
+                    device="cpu",
+                    slots_per_edge=slots_per_edge,
+                    tag_base=(rank - 1) * 100,
+                    group=edge_groups[rank - 1],
+                    credit_group=credit_edge_groups[rank - 1],
+                )
 
-        outgoing = None
-        if rank < world_size - 1:
-            outgoing = PipelineP2PChannel(
-                source_rank=rank,
-                destination_rank=rank + 1,
-                tensor_shape=(2,),
-                tensor_dtype=torch.float32,
-                device="cpu",
-                slots_per_edge=slots_per_edge,
-                tag_base=rank * 100,
-                group=edge_groups[rank],
-                credit_group=credit_edge_groups[rank],
-            )
+            outgoing = None
+            if rank < world_size - 1:
+                outgoing = PipelineP2PChannel(
+                    source_rank=rank,
+                    destination_rank=rank + 1,
+                    tensor_shape=(2,),
+                    tensor_dtype=torch.float32,
+                    device="cpu",
+                    slots_per_edge=slots_per_edge,
+                    tag_base=rank * 100,
+                    group=edge_groups[rank],
+                    credit_group=credit_edge_groups[rank],
+                )
+
+        release_events: list[_DeferredReleaseEvent] = []
+        if incoming is not None and rank == 1 and deferred_release_queries:
+
+            def record_compute_event() -> _DeferredReleaseEvent:
+                event = _DeferredReleaseEvent(
+                    deferred_release_queries if not release_events else 0
+                )
+                release_events.append(event)
+                return event
+
+            incoming._record_compute_event = record_compute_event
 
         prepare_failure_preserved = not inject_prepare_failure
         if inject_prepare_failure:
@@ -390,6 +440,13 @@ def _run_p2p_channel_worker(
                     "outgoing_pending_work_count": outgoing.pending_work_count if outgoing is not None else 0,
                     "rebuild_succeeded": rebuild_succeeded,
                     "prepare_failure_preserved": prepare_failure_preserved,
+                    "deferred_release_event_queries": (
+                        release_events[0].query_count if release_events else 0
+                    ),
+                    "transport_buffer_inference_flags": (
+                        _transport_buffer_inference_flags(incoming)
+                        + _transport_buffer_inference_flags(outgoing)
+                    ),
                 },
             )
         )
@@ -407,6 +464,8 @@ def _run_p2p_channel_lane(
     stage_one_stall_until: int = 0,
     rebuild_after_close: bool = False,
     inject_prepare_failure: bool = False,
+    deferred_release_queries: int = 0,
+    construct_inside_inference_mode: bool = False,
 ) -> dict[int, dict[str, object]]:
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
@@ -422,6 +481,8 @@ def _run_p2p_channel_lane(
                 stage_one_stall_until,
                 rebuild_after_close,
                 inject_prepare_failure,
+                deferred_release_queries,
+                construct_inside_inference_mode,
                 result_queue,
             ),
             nprocs=world_size,
@@ -490,7 +551,8 @@ class TestPipelineP2PChannel:
             "FREE": {"RECV_POSTED"},
             "RECV_POSTED": {"READY"},
             "READY": {"COMPUTING"},
-            "COMPUTING": {"FREE"},
+            "COMPUTING": {"PENDING_RELEASE"},
+            "PENDING_RELEASE": {"FREE"},
         }
         for rank in range(1, 4):
             for history in results[rank]["receive_histories"]:
@@ -507,6 +569,41 @@ class TestPipelineP2PChannel:
             assert any("SEND_PENDING" in history for history in results[rank]["send_histories"])
         assert all(results[rank]["incoming_pending_work_count"] == 0 for rank in range(1, 4))
         assert all(results[rank]["outgoing_pending_work_count"] == 0 for rank in range(3))
+
+    def test_pp2_defers_credit_until_the_compute_event_completes(self) -> None:
+        deferred_queries = 8
+        results = _run_p2p_channel_lane(
+            world_size=2,
+            token_count=2,
+            slots_per_edge=1,
+            deferred_release_queries=deferred_queries,
+        )
+
+        source = results[0]
+        destination = results[1]
+        assert source["sent_token_ids"] == [0, 1]
+        assert source["sent_clocks"][1] >= deferred_queries
+        assert destination["deferred_release_event_queries"] > deferred_queries
+        assert "PENDING_RELEASE" in destination["receive_histories"][0]
+        assert destination["incoming_pending_work_count"] == 0
+        assert source["outgoing_pending_work_count"] == 0
+
+    def test_pp2_transport_buffers_are_mutable_after_inference_mode_construction(self) -> None:
+        results = _run_p2p_channel_lane(
+            world_size=2,
+            token_count=2,
+            slots_per_edge=1,
+            construct_inside_inference_mode=True,
+        )
+
+        assert results[1]["completed"] == [(0, 0.0), (1, 1.0)]
+        assert all(
+            not is_inference
+            for result in results.values()
+            for is_inference in result["transport_buffer_inference_flags"]
+        )
+        assert results[1]["incoming_pending_work_count"] == 0
+        assert results[0]["outgoing_pending_work_count"] == 0
 
 
 class _TickPipeline:

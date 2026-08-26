@@ -71,6 +71,7 @@ class PipelineSlotState(Enum):
     RECV_POSTED = auto()
     READY = auto()
     COMPUTING = auto()
+    PENDING_RELEASE = auto()
     SEND_PENDING = auto()
 
 
@@ -205,6 +206,7 @@ class _P2PReceiveSlot:
         self.header_work: Any | None = None
         self.payload_work: Any | None = None
         self.header: PipelineTransportHeader | None = None
+        self.release_event: Any | None = None
         self.state = PipelineSlotState.FREE
         self.history = [self.state]
 
@@ -231,10 +233,11 @@ class PipelineP2PChannel:
 
     The destination owns the receive ring. It pre-posts one header and tensor
     receive per physical slot, then returns a slot credit only after
-    :meth:`release_after_compute`. The source can send only after it has
-    received that credit, and copies each payload into its own per-slot output
-    buffer before starting ``isend``. This gives bounded memory and protects
-    both input and output buffer lifetimes without a blocking metadata path.
+    :meth:`release_after_compute` observes that the local compute stream has
+    consumed the input buffer. The source can send only after it has received
+    that credit, and copies each payload into its own per-slot output buffer
+    before starting ``isend``. This gives bounded memory and protects both
+    input and output buffer lifetimes without a blocking metadata path.
     """
 
     _TAGS_PER_SLOT = 3
@@ -300,35 +303,43 @@ class PipelineP2PChannel:
         self._shutdown_slot_ids: set[int] = set()
         self._closed = False
 
+        # This constructor is reached from the model runner's inference-mode
+        # execution context. Transport buffers outlive one model invocation
+        # and are mutated during shutdown, so they must remain ordinary
+        # writable tensors instead of inference tensors.
+        with torch.inference_mode(False):
+            if self._is_source:
+                self._send_slots = [
+                    _P2PSendSlot(
+                        slot_id,
+                        torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64, device=self.device),
+                        torch.empty(self.tensor_shape, dtype=tensor_dtype, device=self.device),
+                    )
+                    for slot_id in range(slots_per_edge)
+                ]
+                self._credit_buffers = [
+                    torch.empty(1, dtype=torch.int64, device=self._credit_device) for _ in range(slots_per_edge)
+                ]
+            else:
+                self._receive_slots = [
+                    _P2PReceiveSlot(
+                        slot_id,
+                        torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64, device=self.device),
+                        torch.empty(self.tensor_shape, dtype=tensor_dtype, device=self.device),
+                    )
+                    for slot_id in range(slots_per_edge)
+                ]
+                self._credit_buffers = [
+                    torch.empty(1, dtype=torch.int64, device=self._credit_device) for _ in range(slots_per_edge)
+                ]
+
         if self._is_source:
-            self._send_slots = [
-                _P2PSendSlot(
-                    slot_id,
-                    torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64, device=self.device),
-                    torch.empty(self.tensor_shape, dtype=tensor_dtype, device=self.device),
-                )
-                for slot_id in range(slots_per_edge)
-            ]
-            self._credit_buffers = [
-                torch.empty(1, dtype=torch.int64, device=self._credit_device) for _ in range(slots_per_edge)
-            ]
             self._credit_works: list[Any | None] = [None] * slots_per_edge
             self._credit_slot_ids: deque[int] = deque()
             self._credit_slot_id_set: set[int] = set()
             for slot_id in range(slots_per_edge):
                 self._post_credit_receive(slot_id)
         else:
-            self._receive_slots = [
-                _P2PReceiveSlot(
-                    slot_id,
-                    torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64, device=self.device),
-                    torch.empty(self.tensor_shape, dtype=tensor_dtype, device=self.device),
-                )
-                for slot_id in range(slots_per_edge)
-            ]
-            self._credit_buffers = [
-                torch.empty(1, dtype=torch.int64, device=self._credit_device) for _ in range(slots_per_edge)
-            ]
             self._credit_works = [None] * slots_per_edge
             for slot in self._receive_slots:
                 self._post_receive(slot)
@@ -470,14 +481,9 @@ class PipelineP2PChannel:
         slot = self._receive_slots[slot_id]
         if slot.state is not PipelineSlotState.COMPUTING or slot.header != message.header:
             raise RuntimeError("attempted to release a message that is not currently computing")
-        slot.transition(PipelineSlotState.COMPUTING, PipelineSlotState.FREE)
-        slot.header = None
-        if message.header.flags & PipelineTransportHeader.SHUTDOWN_FLAG:
-            self._shutdown_slot_ids.add(slot_id)
-            self._closed = len(self._shutdown_slot_ids) == self.slots_per_edge
-            return
-        self._post_receive(slot)
-        self._send_credit(slot_id)
+        slot.transition(PipelineSlotState.COMPUTING, PipelineSlotState.PENDING_RELEASE)
+        slot.release_event = self._record_compute_event()
+        self._reclaim_completed_receive_slots()
 
     def send_shutdown(self) -> None:
         """Send one tombstone per physical slot and finish the edge cleanly."""
@@ -552,6 +558,7 @@ class PipelineP2PChannel:
             self._credit_slot_id_set.add(credit_slot_id)
 
     def _poll_destination(self) -> None:
+        self._reclaim_completed_receive_slots()
         for slot in self._receive_slots:
             if slot.state is not PipelineSlotState.RECV_POSTED or slot.header is not None:
                 continue
@@ -579,6 +586,44 @@ class PipelineP2PChannel:
             slot.transition(PipelineSlotState.RECV_POSTED, PipelineSlotState.READY)
             self._ready_slot_ids.append(slot.slot_id)
             self._next_receive_sequence += 1
+
+    def _record_compute_event(self) -> Any | None:
+        """Record completion of this slot's consumer without a global sync."""
+        if self.device.type == "cpu":
+            return None
+
+        device_api = getattr(self._torch, self.device.type, None)
+        event_type = getattr(device_api, "Event", None)
+        current_stream = getattr(device_api, "current_stream", None)
+        if event_type is None or current_stream is None:
+            raise RuntimeError(
+                f"PipelineP2PChannel cannot safely reuse {self.device.type} receive buffers without device events"
+            )
+
+        event = event_type(enable_timing=False)
+        event.record(current_stream(self.device))
+        return event
+
+    def _reclaim_completed_receive_slots(self) -> None:
+        """Return credits only after the local compute stream releases a slot."""
+        for slot in self._receive_slots:
+            if slot.state is not PipelineSlotState.PENDING_RELEASE:
+                continue
+            if slot.release_event is not None and not slot.release_event.query():
+                continue
+
+            header = slot.header
+            if header is None:
+                raise RuntimeError(f"receive slot {slot.slot_id} lost its header before release")
+            slot.release_event = None
+            slot.transition(PipelineSlotState.PENDING_RELEASE, PipelineSlotState.FREE)
+            slot.header = None
+            if header.flags & PipelineTransportHeader.SHUTDOWN_FLAG:
+                self._shutdown_slot_ids.add(slot.slot_id)
+                self._closed = len(self._shutdown_slot_ids) == self.slots_per_edge
+                continue
+            self._post_receive(slot)
+            self._send_credit(slot.slot_id)
 
     def _post_credit_receive(self, slot_id: int) -> None:
         self._credit_works[slot_id] = self._start_work(

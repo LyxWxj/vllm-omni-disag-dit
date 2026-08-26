@@ -12,6 +12,7 @@ This module tests the WorkerWrapperBase implementation:
 - Dynamic worker class extension
 """
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -216,6 +217,24 @@ class TestWorkerWrapperBaseDelegation:
         result = wrapper.shutdown()
         wrapper.worker.shutdown.assert_called_once()
         assert result is None
+
+
+class TestDiffusionWorkerShutdown:
+    def test_shutdown_destroys_distributed_environment_after_runtime_close_error(self, mocker: MockerFixture) -> None:
+        worker = object.__new__(DiffusionWorker)
+        close_error = RuntimeError("pipeline close failed")
+        close_runtime = mocker.Mock(side_effect=close_error)
+        worker.model_runner = SimpleNamespace(
+            shutdown_pipeline_tick_runtime=close_runtime,
+            kv_transfer_manager=None,
+        )
+        destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+
+        with pytest.raises(RuntimeError, match="pipeline close failed"):
+            worker.shutdown()
+
+        close_runtime.assert_called_once_with()
+        destroy.assert_called_once_with()
 
 
 # -------------------------------------------------------------------------
