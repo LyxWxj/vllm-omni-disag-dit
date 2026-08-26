@@ -340,6 +340,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
+        if self._uses_interleaved_pipeline_tick_runtime():
+            self._validate_interleaved_pipeline_tick_configuration()
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(
@@ -839,6 +841,39 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _pipeline_parallel_size(self) -> int:
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        return int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+
+    def _uses_interleaved_pipeline_tick_runtime(self) -> bool:
+        return (
+            self._pipeline_parallel_size() > 1
+            and getattr(self.od_config, "diffusion_pp_schedule", "serial") == "interleaved"
+        )
+
+    def _validate_interleaved_pipeline_tick_configuration(self) -> None:
+        """Reject unsupported stage-local PP combinations before serving requests."""
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not supports_pipeline_tick_execution(self.pipeline):
+            raise ValueError(
+                "Interleaved pipeline parallelism requires a pipeline to explicitly implement "
+                "the stage-local pipeline tick protocol."
+            )
+
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        cfg_parallel_size = int(getattr(parallel_config, "cfg_parallel_size", 1) or 1)
+        if cfg_parallel_size != 1:
+            raise ValueError(
+                "Interleaved PP currently supports sequential CFG only; "
+                f"cfg_parallel_size must be 1, got {cfg_parallel_size}."
+            )
+        if self.od_config.cache_backend not in (None, "none"):
+            raise ValueError("Interleaved PP step runtime does not support cache_backend yet.")
+
+        vae = getattr(self.pipeline, "vae", None)
+        if vae is not None and callable(getattr(vae, "is_distributed_enabled", None)) and vae.is_distributed_enabled():
+            raise ValueError("Interleaved PP currently requires rank-0 VAE decode; distributed VAE is not supported.")
+
     def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for request_id in scheduler_output.finished_req_ids:
@@ -984,7 +1019,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def execute_pipeline_tick(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Advance one retained-state PP clock instead of one serial PP step."""
-        pp_size = int(getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) or 1)
+        pp_size = self._pipeline_parallel_size()
         if pp_size <= 1:
             return self.execute_stepwise(scheduler_output)
 
@@ -995,22 +1030,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 request_id=new_req.req.request_id,
                 metadata=new_req.diffusion_kv_metadata,
             )
-        if not supports_pipeline_tick_execution(self.pipeline):
-            raise ValueError(
-                "Interleaved pipeline parallelism requires a pipeline to explicitly implement "
-                "the stage-local pipeline tick protocol."
-            )
-        cfg_parallel_size = int(getattr(self.od_config.parallel_config, "cfg_parallel_size", 1) or 1)
-        if cfg_parallel_size != 1:
-            raise ValueError(
-                "Interleaved PP currently supports sequential CFG only; "
-                f"cfg_parallel_size must be 1, got {cfg_parallel_size}."
-            )
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Interleaved PP step runtime does not support cache_backend yet.")
-        vae = getattr(self.pipeline, "vae", None)
-        if vae is not None and callable(getattr(vae, "is_distributed_enabled", None)) and vae.is_distributed_enabled():
-            raise ValueError("Interleaved PP currently requires rank-0 VAE decode; distributed VAE is not supported.")
+        self._validate_interleaved_pipeline_tick_configuration()
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)

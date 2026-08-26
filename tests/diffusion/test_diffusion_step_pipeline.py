@@ -103,6 +103,32 @@ class _StepPipeline:
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
+class _InterleavedStepPipeline(_StepPipeline):
+    """Step pipeline stub that declares the complete interleaved PP contract."""
+
+    supports_interleaved_pipeline_execution = True
+
+    def build_microbatches(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("pipeline tick hook should not run during model loading")
+
+    def pipeline_transport_spec(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("pipeline tick hook should not run during model loading")
+
+    def pipeline_model_phase(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("pipeline tick hook should not run during model loading")
+
+    def pipeline_forward_local_stage(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("pipeline tick hook should not run during model loading")
+
+    def pipeline_finish_microbatch(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("pipeline tick hook should not run during model loading")
+
+
 class _PerRequestErrorStepPipeline(_StepPipeline):
     def prepare_encode(self, state, **kwargs):
         if state.prompt == "fail-prepare":
@@ -890,6 +916,118 @@ class TestRunner:
 
         with pytest.raises(ValueError, match="RequestOnlyPipeline"):
             DiffusionModelRunner.load_model(runner)
+
+    @pytest.mark.parametrize(
+        ("pipeline_factory", "cfg_parallel_size", "cache_backend", "distributed_vae", "error"),
+        [
+            pytest.param(
+                _StepPipeline,
+                1,
+                None,
+                False,
+                "stage-local pipeline tick protocol",
+                id="unsupported-pipeline-hook",
+            ),
+            pytest.param(
+                _InterleavedStepPipeline,
+                2,
+                None,
+                False,
+                "cfg_parallel_size must be 1",
+                id="cfg-parallel",
+            ),
+            pytest.param(
+                _InterleavedStepPipeline,
+                1,
+                "cache_dit",
+                False,
+                "does not support cache_backend",
+                id="cache-backend",
+            ),
+            pytest.param(
+                _InterleavedStepPipeline,
+                1,
+                None,
+                True,
+                "distributed VAE is not supported",
+                id="distributed-vae",
+            ),
+        ],
+    )
+    def test_load_model_rejects_incompatible_interleaved_pp_before_runtime_setup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        pipeline_factory,
+        cfg_parallel_size: int,
+        cache_backend: str | None,
+        distributed_vae: bool,
+        error: str,
+    ):
+        pipeline = pipeline_factory()
+        if distributed_vae:
+            pipeline.vae = SimpleNamespace(is_distributed_enabled=lambda: True)
+
+        class _FakeLoader:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+
+            def load_model(self, **kwargs):
+                del kwargs
+                return pipeline
+
+        class _FakeProfiler:
+            consumed_memory = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+        runner = object.__new__(DiffusionModelRunner)
+        runner.vllm_config = _make_vllm_config()
+        runner.od_config = SimpleNamespace(
+            enable_cpu_offload=False,
+            enable_layerwise_offload=False,
+            enforce_eager=True,
+            cache_backend=cache_backend,
+            cache_config=None,
+            max_num_seqs=4,
+            step_execution=True,
+            model_class_name=type(pipeline).__name__,
+            parallel_config=SimpleNamespace(
+                use_hsdp=False,
+                pipeline_parallel_size=2,
+                cfg_parallel_size=cfg_parallel_size,
+            ),
+            diffusion_pp_schedule="interleaved",
+            streaming_output=False,
+        )
+        runner.device = torch.device("cpu")
+        runner.pipeline = None
+        runner.cache_backend = None
+        runner.offload_backend = None
+        runner.state_cache = {}
+        runner.kv_transfer_manager = SimpleNamespace()
+
+        setup_offload = mocker.patch.object(model_runner_module, "get_offload_backend")
+        setup_cache = mocker.patch.object(model_runner_module, "get_cache_backend")
+        monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeLoader)
+        monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeProfiler)
+        monkeypatch.setattr(
+            current_omni_platform,
+            "init_diffusion_model_runner_runtime",
+            lambda *args, **kwargs: None,
+        )
+
+        with pytest.raises(ValueError, match=error):
+            DiffusionModelRunner.load_model(runner)
+
+        assert runner.pipeline is pipeline
+        setup_offload.assert_not_called()
+        setup_cache.assert_not_called()
 
 
 class _RecordingLoRAManager:
