@@ -566,7 +566,7 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, master_port: i
             "A": _make_tick_state("A", 0.0, cfg=True),
             "B": _make_tick_state("B", 10.0, cfg=True),
         }
-        edge_pairs = [*zip(range(world_size), range(1, world_size), strict=True), (world_size - 1, 0)]
+        edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
         edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
         active_stages: list[tuple[int, int]] = []
         pipeline = _TickPipeline(rank, active_stages)

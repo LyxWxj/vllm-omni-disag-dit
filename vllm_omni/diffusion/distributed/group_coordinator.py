@@ -716,7 +716,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         for ranks in group_ranks:
             if len(ranks) < 2:
                 continue
-            edge_pairs = [*zip(ranks, ranks[1:], strict=True), (ranks[-1], ranks[0])]
+            edge_pairs = [*zip(ranks, ranks[1:]), (ranks[-1], ranks[0])]
             for source_rank, destination_rank in edge_pairs:
                 edge_group = torch.distributed.new_group(
                     [source_rank, destination_rank], backend=torch_distributed_backend
