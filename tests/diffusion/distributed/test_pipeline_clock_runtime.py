@@ -598,6 +598,7 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: s
             edge_credit_groups={
                 edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
             },
+            bootstrap_group=dist.group.WORLD,
         )
 
         pending_admissions = ["A"]
@@ -667,6 +668,7 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
             edge_credit_groups={
                 edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
             },
+            bootstrap_group=dist.group.WORLD,
         )
 
         runtime.admit([state_cache["A"]])

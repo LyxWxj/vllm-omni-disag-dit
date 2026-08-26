@@ -237,7 +237,7 @@ class PipelineP2PChannel:
     both input and output buffer lifetimes without a blocking metadata path.
     """
 
-    _TAGS_PER_SLOT = 4
+    _TAGS_PER_SLOT = 3
 
     def __init__(
         self,
@@ -299,13 +299,6 @@ class PipelineP2PChannel:
         self._shutdown_requested = False
         self._shutdown_slot_ids: set[int] = set()
         self._closed = False
-
-        # HCCL lazily forms its P2P communicator on the first operation. A
-        # destination normally posts a payload receive before its source has
-        # a credit to send, which leaves that first HCCL operation unmatched.
-        # Bootstrap the pair once in the reverse direction, then use Gloo for
-        # all logical credits and HCCL only for payloads.
-        self._bootstrap_payload_group()
 
         if self._is_source:
             self._send_slots = [
@@ -660,29 +653,6 @@ class PipelineP2PChannel:
     def _credit_tag(self, slot_id: int) -> int:
         return self._header_tag(slot_id) + 2
 
-    def _bootstrap_tag(self) -> int:
-        return self.tag_base + self._TAGS_PER_SLOT - 1
-
-    def _bootstrap_payload_group(self) -> None:
-        if self._requires_wait_thread:
-            return
-        buffer = self._torch.zeros(1, dtype=self._torch.int64, device=self.device)
-        if self._is_source:
-            work = self._dist.irecv(
-                buffer,
-                src=self._peer_rank,
-                group=self._group,
-                tag=self._bootstrap_tag(),
-            )
-        else:
-            work = self._dist.isend(
-                buffer,
-                dst=self._peer_rank,
-                group=self._group,
-                tag=self._bootstrap_tag(),
-            )
-        work.wait()
-
     def _start_work(self, work: Any, *, requires_wait_thread: bool | None = None) -> Any:
         if not (self._requires_wait_thread if requires_wait_thread is None else requires_wait_thread):
             return work
@@ -801,6 +771,7 @@ class PipelineTickRuntime:
         device: Any,
         edge_groups: Mapping[tuple[int, int], Any],
         edge_credit_groups: Mapping[tuple[int, int], Any] | None = None,
+        bootstrap_group: Any = None,
         slots_per_edge: int = 2,
     ) -> None:
         if len(pp_ranks) < 2:
@@ -829,6 +800,7 @@ class PipelineTickRuntime:
         self.device = device
         self.edge_groups = edge_groups
         self.edge_credit_groups = edge_groups if edge_credit_groups is None else edge_credit_groups
+        self.bootstrap_group = bootstrap_group
         self.slots_per_edge = slots_per_edge
         self.clock = 0
 
@@ -1296,8 +1268,10 @@ class PipelineTickRuntime:
             return
         spec_id = len(self._spec_ids)
         self._spec_ids[spec] = spec_id
-        tag_stride = (self.world_size + 1) * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT
+        channel_tag_span = self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT + 1
+        tag_stride = (self.world_size + 1) * channel_tag_span
         tag_base = self._TAG_BASE + spec_id * tag_stride
+        self._bootstrap_payload_edges(tag_base, channel_tag_span)
         for edge in range(self.world_size - 1):
             if self.stage not in (edge, edge + 1):
                 continue
@@ -1308,7 +1282,7 @@ class PipelineTickRuntime:
                 tensor_dtype=spec.intermediate_dtype,
                 device=self.device,
                 slots_per_edge=self.slots_per_edge,
-                tag_base=tag_base + edge * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
+                tag_base=tag_base + edge * channel_tag_span,
                 group=self._edge_group(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
                 credit_group=self._edge_credit_group(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
             )
@@ -1320,10 +1294,42 @@ class PipelineTickRuntime:
                 tensor_dtype=spec.feedback_dtype,
                 device=self.device,
                 slots_per_edge=self.slots_per_edge,
-                tag_base=tag_base + (self.world_size - 1) * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
+                tag_base=tag_base + (self.world_size - 1) * channel_tag_span,
                 group=self._edge_group(self.pp_ranks[-1], self.pp_ranks[0]),
                 credit_group=self._edge_credit_group(self.pp_ranks[-1], self.pp_ranks[0]),
             )
+
+    def _bootstrap_payload_edges(self, tag_base: int, channel_tag_span: int) -> None:
+        """Create HCCL edge communicators in one globally ordered wave."""
+        import torch
+        import torch.distributed as dist
+
+        if not self.edge_groups or all(dist.get_backend(group) == "gloo" for group in self.edge_groups.values()):
+            return
+        if self.bootstrap_group is None:
+            raise RuntimeError("HCCL PP transport requires a bootstrap process group")
+
+        for edge_index, (source_rank, destination_rank) in enumerate(pipeline_edge_pairs(self.pp_ranks)):
+            bootstrap_tag = tag_base + edge_index * channel_tag_span + channel_tag_span - 1
+            if self.global_rank == source_rank:
+                buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
+                work = dist.irecv(
+                    buffer,
+                    src=destination_rank,
+                    group=self._edge_group(source_rank, destination_rank),
+                    tag=bootstrap_tag,
+                )
+                work.wait()
+            elif self.global_rank == destination_rank:
+                buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
+                work = dist.isend(
+                    buffer,
+                    dst=source_rank,
+                    group=self._edge_group(source_rank, destination_rank),
+                    tag=bootstrap_tag,
+                )
+                work.wait()
+            dist.barrier(group=self.bootstrap_group)
 
     def _poll_channels(self) -> None:
         for channel in self._forward_channels.values():

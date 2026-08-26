@@ -1077,6 +1077,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 for source_rank, destination_rank in pipeline_edge_pairs(pp_group.ranks)
                 if pp_group.rank in (source_rank, destination_rank)
             },
+            bootstrap_group=pp_group.cpu_group,
         )
         self._pipeline_tick_runtime = runtime
         return runtime
