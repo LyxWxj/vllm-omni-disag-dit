@@ -711,8 +711,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         # Retained-state PP clocks exchange independent point-to-point streams
         # on each forward edge and on the last-to-first feedback edge. Keep
         # those streams off the PP collective group so a control collective
-        # cannot race an outstanding edge transfer.
+        # cannot race an outstanding edge transfer. HCCL also requires the
+        # payload and reverse-credit P2P directions to use distinct groups.
         self._pipeline_edge_groups: dict[tuple[int, int], ProcessGroup] = {}
+        self._pipeline_edge_credit_groups: dict[tuple[int, int], ProcessGroup] = {}
         for ranks in group_ranks:
             if len(ranks) < 2:
                 continue
@@ -721,13 +723,26 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 edge_group = torch.distributed.new_group(
                     [source_rank, destination_rank], backend=torch_distributed_backend
                 )
+                credit_group = torch.distributed.new_group(
+                    [source_rank, destination_rank], backend=torch_distributed_backend
+                )
                 if self.rank in (source_rank, destination_rank):
                     self._pipeline_edge_groups[(source_rank, destination_rank)] = edge_group
+                    self._pipeline_edge_credit_groups[(source_rank, destination_rank)] = credit_group
 
     def pipeline_edge_group(self, source_rank: int, destination_rank: int) -> ProcessGroup:
         """Return the dedicated device group for one directed PP edge."""
         try:
             return self._pipeline_edge_groups[(source_rank, destination_rank)]
+        except KeyError as exc:
+            raise ValueError(
+                f"rank {self.rank} is not an endpoint of pipeline edge {source_rank}->{destination_rank}"
+            ) from exc
+
+    def pipeline_edge_credit_group(self, source_rank: int, destination_rank: int) -> ProcessGroup:
+        """Return the reverse-credit group for one directed PP edge."""
+        try:
+            return self._pipeline_edge_credit_groups[(source_rank, destination_rank)]
         except KeyError as exc:
             raise ValueError(
                 f"rank {self.rank} is not an endpoint of pipeline edge {source_rank}->{destination_rank}"
@@ -1022,6 +1037,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
             *self.cpu_groups,
             self.skip_device_group,
             *self._pipeline_edge_groups.values(),
+            *self._pipeline_edge_credit_groups.values(),
         ]
         seen = {id(self.device_group), id(self.cpu_group)}
         for group in groups:
@@ -1032,6 +1048,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.cpu_groups = []
         self.skip_device_group = None
         self._pipeline_edge_groups = {}
+        self._pipeline_edge_credit_groups = {}
         super().destroy()
 
 

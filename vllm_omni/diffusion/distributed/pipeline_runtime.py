@@ -250,6 +250,7 @@ class PipelineP2PChannel:
         slots_per_edge: int = 2,
         tag_base: int = 0,
         group: Any = None,
+        credit_group: Any = None,
     ) -> None:
         if source_rank < 0 or destination_rank < 0 or source_rank == destination_rank:
             raise ValueError("source_rank and destination_rank must be distinct non-negative ranks")
@@ -269,6 +270,10 @@ class PipelineP2PChannel:
         self._torch = torch
         self._dist = dist
         self._group = group
+        # HCCL requires matching P2P ordering within one process group. The
+        # payload lane is source->destination while credits move in the
+        # opposite direction, so they must use separate pair groups there.
+        self._credit_group = group if credit_group is None else credit_group
         self._requires_wait_thread = dist.get_backend(group) == "gloo"
         self.source_rank = source_rank
         self.destination_rank = destination_rank
@@ -577,7 +582,7 @@ class PipelineP2PChannel:
             self._dist.irecv(
                 self._credit_buffers[slot_id],
                 src=self._peer_rank,
-                group=self._group,
+                group=self._credit_group,
                 tag=self._credit_tag(slot_id),
             )
         )
@@ -609,7 +614,7 @@ class PipelineP2PChannel:
             self._dist.isend(
                 self._credit_buffers[slot_id],
                 dst=self._peer_rank,
-                group=self._group,
+                group=self._credit_group,
                 tag=self._credit_tag(slot_id),
             )
         )
@@ -760,6 +765,7 @@ class PipelineTickRuntime:
         global_rank: int,
         device: Any,
         edge_groups: Mapping[tuple[int, int], Any],
+        edge_credit_groups: Mapping[tuple[int, int], Any] | None = None,
         slots_per_edge: int = 2,
     ) -> None:
         if len(pp_ranks) < 2:
@@ -787,6 +793,7 @@ class PipelineTickRuntime:
         self.world_size = len(self.pp_ranks)
         self.device = device
         self.edge_groups = edge_groups
+        self.edge_credit_groups = edge_groups if edge_credit_groups is None else edge_credit_groups
         self.slots_per_edge = slots_per_edge
         self.clock = 0
 
@@ -1268,6 +1275,7 @@ class PipelineTickRuntime:
                 slots_per_edge=self.slots_per_edge,
                 tag_base=tag_base + edge * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
                 group=self._edge_group(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
+                credit_group=self._edge_credit_group(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
             )
         if self.stage in (0, self.world_size - 1):
             self._feedback_channels[spec] = PipelineP2PChannel(
@@ -1279,6 +1287,7 @@ class PipelineTickRuntime:
                 slots_per_edge=self.slots_per_edge,
                 tag_base=tag_base + (self.world_size - 1) * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
                 group=self._edge_group(self.pp_ranks[-1], self.pp_ranks[0]),
+                credit_group=self._edge_credit_group(self.pp_ranks[-1], self.pp_ranks[0]),
             )
 
     def _poll_channels(self) -> None:
@@ -1304,6 +1313,14 @@ class PipelineTickRuntime:
             return self.edge_groups[(source_rank, destination_rank)]
         except KeyError as exc:
             raise RuntimeError(f"missing process group for pipeline edge {source_rank}->{destination_rank}") from exc
+
+    def _edge_credit_group(self, source_rank: int, destination_rank: int) -> Any:
+        try:
+            return self.edge_credit_groups[(source_rank, destination_rank)]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"missing credit process group for pipeline edge {source_rank}->{destination_rank}"
+            ) from exc
 
     def _states_for(self, plan: _PipelineMicrobatch) -> tuple[Any, ...]:
         states: list[Any] = []

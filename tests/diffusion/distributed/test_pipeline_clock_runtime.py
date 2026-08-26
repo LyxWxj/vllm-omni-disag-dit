@@ -162,6 +162,9 @@ def _run_p2p_channel_worker(
         edge_groups = [
             dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for edge_rank in range(world_size - 1)
         ]
+        credit_edge_groups = [
+            dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for edge_rank in range(world_size - 1)
+        ]
         incoming = None
         if rank > 0:
             incoming = PipelineP2PChannel(
@@ -173,6 +176,7 @@ def _run_p2p_channel_worker(
                 slots_per_edge=slots_per_edge,
                 tag_base=(rank - 1) * 100,
                 group=edge_groups[rank - 1],
+                credit_group=credit_edge_groups[rank - 1],
             )
 
         outgoing = None
@@ -186,6 +190,7 @@ def _run_p2p_channel_worker(
                 slots_per_edge=slots_per_edge,
                 tag_base=rank * 100,
                 group=edge_groups[rank],
+                credit_group=credit_edge_groups[rank],
             )
 
         prepare_failure_preserved = not inject_prepare_failure
@@ -296,6 +301,9 @@ def _run_p2p_channel_worker(
         rebuild_succeeded = rebuild_after_close
         if rebuild_after_close:
             second_incoming = None
+            second_credit_edge_groups = [
+                dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for edge_rank in range(world_size - 1)
+            ]
             if rank > 0:
                 second_incoming = PipelineP2PChannel(
                     source_rank=rank - 1,
@@ -306,6 +314,7 @@ def _run_p2p_channel_worker(
                     slots_per_edge=1,
                     tag_base=(rank - 1) * 100,
                     group=edge_groups[rank - 1],
+                    credit_group=second_credit_edge_groups[rank - 1],
                 )
             second_outgoing = None
             if rank < world_size - 1:
@@ -318,6 +327,7 @@ def _run_p2p_channel_worker(
                     slots_per_edge=1,
                     tag_base=rank * 100,
                     group=edge_groups[rank],
+                    credit_group=second_credit_edge_groups[rank],
                 )
 
             if rank == 0:
@@ -575,6 +585,7 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: s
         }
         edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
         edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
+        credit_edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
         active_stages: list[tuple[int, int]] = []
         pipeline = _TickPipeline(rank, active_stages)
         runtime = PipelineTickRuntime(
@@ -584,6 +595,9 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: s
             global_rank=rank,
             device="cpu",
             edge_groups={edge_pair: edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair},
+            edge_credit_groups={
+                edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
+            },
         )
 
         pending_admissions = ["A"]
@@ -640,6 +654,7 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
         state_cache = {"A": _make_tick_state("A", 0.0, cfg=True)}
         edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
         edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
+        credit_edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
         active_stages: list[tuple[int, int]] = []
         pipeline = _TickPipeline(rank, active_stages)
         runtime = PipelineTickRuntime(
@@ -649,6 +664,9 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
             global_rank=rank,
             device="cpu",
             edge_groups={edge_pair: edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair},
+            edge_credit_groups={
+                edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
+            },
         )
 
         runtime.admit([state_cache["A"]])
