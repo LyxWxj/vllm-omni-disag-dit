@@ -90,6 +90,7 @@ class PipelineTransportHeader:
 
     FIELD_COUNT: ClassVar[int] = 6
     SHUTDOWN_FLAG: ClassVar[int] = 1
+    CANCELLED_FLAG: ClassVar[int] = 2
     INT64_MAX: ClassVar[int] = 2**63 - 1
 
     def __post_init__(self) -> None:
@@ -798,11 +799,23 @@ class PipelineTickRuntime:
     def is_last_stage(self) -> bool:
         return self.stage == self.world_size - 1
 
+    @property
+    def has_in_flight_work(self) -> bool:
+        """Whether rank 0 still owns a token that must reach feedback.
+
+        A terminal scheduler status does not imply physical PP work is gone:
+        a cancelled token must still drain its receiver-owned slots.  Every
+        non-cancelled microbatch is retained here until rank 0 consumes its
+        feedback, while a cancelled one is retained until its fixed-shape
+        feedback tombstone arrives.
+        """
+        return bool(self._waiting or self._microbatches)
+
     def cancel(self, request_ids: Sequence[str]) -> None:
         """Mark cancelled work for discard after any physical transfer drains."""
         self._cancelled_request_ids.update(request_ids)
         for token_id, plan in tuple(self._microbatches.items()):
-            if self._is_cancelled(plan):
+            if self._is_fully_cancelled(plan):
                 self._positive_noise.pop(token_id, None)
 
     def admit(self, states: Sequence[Any]) -> None:
@@ -938,8 +951,11 @@ class PipelineTickRuntime:
         plan = self._microbatches[token_id]
         token = self._tokens[token_id]
         try:
-            if self._is_cancelled(plan):
-                self._retire_token(token_id)
+            cancelled = self._is_fully_cancelled(plan) or (
+                message is not None and bool(message.header.flags & PipelineTransportHeader.CANCELLED_FLAG)
+            )
+            if cancelled:
+                self._forward_cancelled_token(token_id, token, plan)
                 return
             states = self._states_for(plan)
             self._set_state_step(states, token.step_idx)
@@ -959,17 +975,73 @@ class PipelineTickRuntime:
                 self._forward_channel(self.stage, plan.spec).send(self._header_for(token_id, token), payload)
                 if not self.is_first_stage:
                     self._advance_nonfirst_state(states, token.step_idx)
+                    if self._is_feedback_token(plan, token_id):
+                        self._discard_cancelled_states(plan)
                     self._retire_token(token_id)
                 elif plan.do_true_cfg and self._branch_code(token.cfg_branch) == self._BRANCH_POSITIVE:
                     # Only the negative branch produces the feedback token.
                     # Stage 0 no longer needs the positive branch after send.
                     self._retire_token(token_id)
+                elif self._is_feedback_token(plan, token_id):
+                    self._discard_cancelled_states(plan)
                 return
 
             self._finish_last_stage(token_id, token, plan, states, result)
         finally:
             if message is not None and incoming is not None:
                 incoming.release_after_compute(message)
+
+    def _forward_cancelled_token(
+        self,
+        token_id: int,
+        token: PipelineToken,
+        plan: _PipelineMicrobatch,
+    ) -> None:
+        """Drain a fully cancelled token without reusing its model buffers.
+
+        Stage 0 injects a fixed-shape tombstone for queued work; middle
+        stages relay it; the last stage returns one feedback tombstone for the
+        canonical branch.  This preserves P2P order and releases every credit
+        before rank 0 reports the lane idle.
+        """
+        feedback_token_id = self._feedback_token_id(plan)
+        if self.is_last_stage:
+            if token_id == feedback_token_id:
+                import torch
+
+                payload = torch.zeros(
+                    plan.spec.feedback_shape,
+                    dtype=plan.spec.feedback_dtype,
+                    device=self.device,
+                )
+                self._feedback_channel(plan.spec).send(
+                    PipelineTransportHeader(
+                        token_id=feedback_token_id,
+                        step_idx=token.step_idx,
+                        cfg_branch=self._BRANCH_FEEDBACK,
+                        flags=self._model_phase_flags(token.model_phase) | PipelineTransportHeader.CANCELLED_FLAG,
+                    ),
+                    payload,
+                )
+                self._discard_cancelled_states(plan)
+            self._retire_token(token_id)
+            return
+
+        import torch
+
+        payload = torch.zeros(
+            plan.spec.intermediate_shape,
+            dtype=plan.spec.intermediate_dtype,
+            device=self.device,
+        )
+        self._forward_channel(self.stage, plan.spec).send(
+            self._header_for(token_id, token, cancelled=True),
+            payload,
+        )
+        if not self.is_first_stage or token_id != feedback_token_id:
+            self._retire_token(token_id)
+        if token_id == feedback_token_id:
+            self._discard_cancelled_states(plan)
 
     def _finish_last_stage(
         self,
@@ -1009,6 +1081,7 @@ class PipelineTickRuntime:
             latents,
         )
         self._advance_nonfirst_state(states, token.step_idx)
+        self._discard_cancelled_states(plan)
         self._retire_token(token_id)
 
     def _consume_feedback(self) -> list[PipelineTickCompletion]:
@@ -1028,16 +1101,20 @@ class PipelineTickRuntime:
                     if (
                         plan.spec != spec
                         or header.step_idx != token.step_idx
-                        or header.flags != self._model_phase_flags(token.model_phase)
+                        or (header.flags & ~PipelineTransportHeader.CANCELLED_FLAG)
+                        != self._model_phase_flags(token.model_phase)
                     ):
                         raise RuntimeError("feedback header does not match its registered token")
-                    if self._is_cancelled(plan):
+                    if header.flags & PipelineTransportHeader.CANCELLED_FLAG:
+                        if not self._is_fully_cancelled(plan):
+                            raise RuntimeError("received a cancellation tombstone for a live pipeline token")
                         self._retire_feedback_plan(header.token_id, plan)
                         continue
                     self._validate_tensor(message.payload, spec.feedback_shape, spec.feedback_dtype, "feedback")
-                    states = self._states_for(plan)
-                    self._apply_feedback(states, message.payload, header.step_idx)
-                    completions.append(PipelineTickCompletion(plan.request_ids, header.step_idx))
+                    self._apply_feedback(plan, message.payload, header.step_idx)
+                    active_request_ids = self._active_request_ids(plan)
+                    if active_request_ids:
+                        completions.append(PipelineTickCompletion(active_request_ids, header.step_idx))
                     self._retire_feedback_plan(header.token_id, plan)
                 finally:
                     channel.release_after_compute(message)
@@ -1045,6 +1122,7 @@ class PipelineTickRuntime:
 
     def _retire_feedback_plan(self, token_id: int, plan: _PipelineMicrobatch) -> None:
         """Drop rank-0 metadata once a feedback message has been consumed."""
+        self._discard_cancelled_states(plan)
         self._retire_token(token_id)
         if plan.do_true_cfg:
             self._retire_token(plan.token_id_by_branch[self._BRANCH_POSITIVE])
@@ -1058,10 +1136,16 @@ class PipelineTickRuntime:
         active_request_ids = {request_id for plan in self._microbatches.values() for request_id in plan.request_ids}
         self._cancelled_request_ids.intersection_update(active_request_ids)
 
-    def _apply_feedback(self, states: Sequence[Any], latents: Any, step_idx: int) -> None:
+    def _apply_feedback(self, plan: _PipelineMicrobatch, latents: Any, step_idx: int) -> None:
         offset = 0
-        for state, row_count in zip(states, (self._state_row_count(state) for state in states), strict=True):
+        for request_id, row_count in zip(plan.request_ids, plan.row_counts, strict=True):
             next_offset = offset + row_count
+            state = self.state_cache.get(request_id)
+            if state is None:
+                if request_id not in self._cancelled_request_ids:
+                    raise RuntimeError(f"pipeline feedback references unknown request state {request_id!r}")
+                offset = next_offset
+                continue
             state.latents = latents[offset:next_offset].clone()
             state.step_index = step_idx + 1
             offset = next_offset
@@ -1145,8 +1229,23 @@ class PipelineTickRuntime:
             states.append(state)
         return tuple(states)
 
-    def _is_cancelled(self, plan: _PipelineMicrobatch) -> bool:
-        return any(request_id in self._cancelled_request_ids for request_id in plan.request_ids)
+    def _is_fully_cancelled(self, plan: _PipelineMicrobatch) -> bool:
+        return all(request_id in self._cancelled_request_ids for request_id in plan.request_ids)
+
+    def _active_request_ids(self, plan: _PipelineMicrobatch) -> tuple[str, ...]:
+        return tuple(request_id for request_id in plan.request_ids if request_id not in self._cancelled_request_ids)
+
+    def _feedback_token_id(self, plan: _PipelineMicrobatch) -> int:
+        branch = self._BRANCH_NEGATIVE if plan.do_true_cfg else self._BRANCH_POSITIVE
+        return plan.token_id_by_branch[branch]
+
+    def _is_feedback_token(self, plan: _PipelineMicrobatch, token_id: int) -> bool:
+        return token_id == self._feedback_token_id(plan)
+
+    def _discard_cancelled_states(self, plan: _PipelineMicrobatch) -> None:
+        for request_id in plan.request_ids:
+            if request_id in self._cancelled_request_ids:
+                self.state_cache.pop(request_id, None)
 
     @staticmethod
     def _make_input_batch(states: Sequence[Any]) -> Any:
@@ -1205,15 +1304,24 @@ class PipelineTickRuntime:
             raise RuntimeError("received token on an edge with the wrong tensor spec")
         if header.step_idx != token.step_idx or header.cfg_branch != self._branch_code(token.cfg_branch):
             raise RuntimeError("received pipeline header does not match registered token metadata")
-        if header.flags != self._model_phase_flags(token.model_phase):
+        if (header.flags & ~PipelineTransportHeader.CANCELLED_FLAG) != self._model_phase_flags(token.model_phase):
             raise RuntimeError("received pipeline header does not match registered model phase")
 
-    def _header_for(self, token_id: int, token: PipelineToken) -> PipelineTransportHeader:
+    def _header_for(
+        self,
+        token_id: int,
+        token: PipelineToken,
+        *,
+        cancelled: bool = False,
+    ) -> PipelineTransportHeader:
         return PipelineTransportHeader(
             token_id=token_id,
             step_idx=token.step_idx,
             cfg_branch=self._branch_code(token.cfg_branch),
-            flags=self._model_phase_flags(token.model_phase),
+            flags=(
+                self._model_phase_flags(token.model_phase)
+                | (PipelineTransportHeader.CANCELLED_FLAG if cancelled else 0)
+            ),
         )
 
     def _register_model_phase(self, model_phase: str) -> None:

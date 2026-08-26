@@ -620,6 +620,51 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: s
             dist.destroy_process_group()
 
 
+def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
+    """Cancel after injection and prove the tombstone drains every PP edge."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        state_cache = {"A": _make_tick_state("A", 0.0, cfg=True)}
+        edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
+        edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
+        active_stages: list[tuple[int, int]] = []
+        pipeline = _TickPipeline(rank, active_stages)
+        runtime = PipelineTickRuntime(
+            pipeline=pipeline,
+            state_cache=state_cache,
+            pp_ranks=tuple(range(world_size)),
+            global_rank=rank,
+            device="cpu",
+            edge_groups={edge_pair: edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair},
+        )
+
+        runtime.admit([state_cache["A"]])
+        for clock in range(32):
+            if clock == 1:
+                runtime.cancel(("A",))
+            pipeline.clock = clock
+            assert runtime.progress_one_clock() == ()
+            done = [not runtime.has_in_flight_work if rank == 0 else False]
+            dist.broadcast_object_list(done, src=0)
+            if done[0]:
+                break
+        else:
+            raise RuntimeError("cancelled pipeline token did not drain")
+
+        dist.barrier()
+        runtime.close()
+        result_queue.put((rank, active_stages, tuple(state_cache)))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 class TestPipelineTickRuntime:
     def test_pp4_overlaps_dynamic_admission_and_returns_feedback(self) -> None:
         world_size = 4
@@ -651,3 +696,25 @@ class TestPipelineTickRuntime:
             for clock, stage in active_stages:
                 stages_by_clock.setdefault(clock, set()).add(stage)
         assert any(len(stages) >= 2 for stages in stages_by_clock.values())
+
+    def test_pp4_abort_drains_tombstones_without_more_forwards(self) -> None:
+        world_size = 4
+        mp_context = torch.multiprocessing.get_context("spawn")
+        manager = mp_context.Manager()
+        result_queue = manager.Queue()
+        try:
+            torch.multiprocessing.spawn(
+                _run_pipeline_tick_abort_worker,
+                args=(world_size, get_distributed_init_method(), result_queue),
+                nprocs=world_size,
+            )
+            results = {
+                rank: (active_stages, state_cache_keys)
+                for rank, active_stages, state_cache_keys in (result_queue.get() for _ in range(world_size))
+            }
+        finally:
+            manager.shutdown()
+
+        assert results[0][0] == [(0, 0)]
+        assert all(results[rank][0] == [] for rank in range(1, world_size))
+        assert all(results[rank][1] == () for rank in range(world_size))

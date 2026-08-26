@@ -213,6 +213,11 @@ class RunnerOutput(BaseRunnerOutput):
 @dataclass
 class BatchRunnerOutput(BaseRunnerOutput):
     runner_outputs: list[RunnerOutput]
+    # Rank 0 reports whether a retained PP lane still owns physical tokens.
+    # This is intentionally separate from request completions: an abort can
+    # become terminal for the client before its tombstone has crossed every
+    # PP edge.
+    pipeline_has_in_flight_work: bool = False
     _id_to_idx: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -238,5 +243,13 @@ class BatchRunnerOutput(BaseRunnerOutput):
         return len(self.runner_outputs)
 
     @classmethod
-    def from_list(cls, runner_output_list: list[RunnerOutput]) -> BatchRunnerOutput:
-        return cls(runner_outputs=runner_output_list)
+    def from_list(
+        cls,
+        runner_output_list: list[RunnerOutput],
+        *,
+        pipeline_has_in_flight_work: bool = False,
+    ) -> BatchRunnerOutput:
+        return cls(
+            runner_outputs=runner_output_list,
+            pipeline_has_in_flight_work=pipeline_has_in_flight_work,
+        )

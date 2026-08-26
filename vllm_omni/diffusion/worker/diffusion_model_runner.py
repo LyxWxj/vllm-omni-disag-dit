@@ -1000,6 +1000,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "Interleaved pipeline parallelism requires a pipeline to explicitly implement "
                 "the stage-local pipeline tick protocol."
             )
+        cfg_parallel_size = int(getattr(self.od_config.parallel_config, "cfg_parallel_size", 1) or 1)
+        if cfg_parallel_size != 1:
+            raise ValueError(
+                "Interleaved PP currently supports sequential CFG only; "
+                f"cfg_parallel_size must be 1, got {cfg_parallel_size}."
+            )
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Interleaved PP step runtime does not support cache_backend yet.")
         vae = getattr(self.pipeline, "vae", None)
@@ -1130,7 +1136,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 result=DiffusionOutput.from_exception(exc),
                             )
                         )
-            return BatchRunnerOutput.from_list(runner_output_list)
+            return BatchRunnerOutput.from_list(
+                runner_output_list,
+                pipeline_has_in_flight_work=runtime.has_in_flight_work,
+            )
 
     def _execute_stepwise(
         self,

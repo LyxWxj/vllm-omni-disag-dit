@@ -379,6 +379,10 @@ class DiffusionEngine:
         self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
         self._closed = False
         self._shutdown_complete = False
+        # A terminal request can leave physical PP tombstones in flight.  The
+        # rank-0 runner updates this after every clock so the engine keeps
+        # submitting empty drain ticks even after the StepScheduler is empty.
+        self._pipeline_tick_has_in_flight_work = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
 
@@ -400,11 +404,15 @@ class DiffusionEngine:
 
     def _should_drain_pipeline_tick(self) -> bool:
         """Keep PP clocks advancing after stage 0 has no work to admit."""
-        return (
-            self._uses_pipeline_tick_execution()
-            and isinstance(self.scheduler, StepScheduler)
-            and self.scheduler.num_in_flight_requests > 0
+        return self._uses_pipeline_tick_execution() and (
+            (isinstance(self.scheduler, StepScheduler) and self.scheduler.num_in_flight_requests > 0)
+            or bool(getattr(self, "_pipeline_tick_has_in_flight_work", False))
         )
+
+    def _record_pipeline_tick_state(self, runner_output: BaseRunnerOutput) -> None:
+        """Retain rank-0 PP drain state independently of scheduler status."""
+        if self._uses_pipeline_tick_execution():
+            self._pipeline_tick_has_in_flight_work = bool(getattr(runner_output, "pipeline_has_in_flight_work", False))
 
     def _execution_error_request_ids(self, sched_output: DiffusionSchedulerOutput) -> list[str]:
         """Return every request affected when a worker invocation fails."""
@@ -569,6 +577,7 @@ class DiffusionEngine:
             with self._cv:
                 while (
                     not self.scheduler.has_requests()
+                    and not self._should_drain_pipeline_tick()
                     and self._rpc_queue.empty()
                     and self.abort_queue.empty()
                     and not self.stop_event.is_set()
@@ -578,7 +587,7 @@ class DiffusionEngine:
                 if self.stop_event.is_set():
                     break
 
-                if not self.scheduler.has_requests():
+                if not self.scheduler.has_requests() and not self._should_drain_pipeline_tick():
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
@@ -608,6 +617,7 @@ class DiffusionEngine:
                     ]
                 )
 
+            self._record_pipeline_tick_state(runner_output)
             self._process_aborts_queue()
             self._process_rpc_queue()
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
@@ -937,6 +947,8 @@ class DiffusionEngine:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             target_request_id = self.scheduler.add_request(request)
+            target_finished = False
+            target_runner_output: RunnerOutput | None = None
 
             # keep scheduling and executing until the target request is finished
             while True:
@@ -944,10 +956,17 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
                 self._mark_step_requests_in_flight(sched_output)
                 if sched_output.is_empty:
-                    if target_request_id in sched_output.finished_req_ids:
+                    if target_request_id in sched_output.finished_req_ids and not self._should_drain_pipeline_tick():
                         self._remove_diffusion_kv_requests([target_request_id])
                         return self._finalize_finished_request(target_request_id)
-                    if not self.scheduler.has_requests():
+                    if not self.scheduler.has_requests() and not self._should_drain_pipeline_tick():
+                        if target_finished:
+                            self._remove_diffusion_kv_requests([target_request_id])
+                            return self._finalize_finished_request(
+                                target_request_id,
+                                runner_output=target_runner_output,
+                                missing_result_error="Diffusion execution finished without a final output.",
+                            )
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     if not self._should_drain_pipeline_tick():
                         continue
@@ -973,6 +992,7 @@ class DiffusionEngine:
                     else:
                         runner_output = error_outputs[0]
 
+                self._record_pipeline_tick_state(runner_output)
                 self._process_aborts_queue()
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
@@ -986,11 +1006,13 @@ class DiffusionEngine:
                 ):
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
+                    target_finished = True
+                    target_runner_output = runner_output.get_request_output(target_request_id)
+                if target_finished and not self._should_drain_pipeline_tick():
                     self._remove_diffusion_kv_requests([target_request_id])
-                    req_output = runner_output.get_request_output(target_request_id)
                     output = self._finalize_finished_request(
                         target_request_id,
-                        runner_output=req_output,
+                        runner_output=target_runner_output,
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
                     if output.async_output_id:

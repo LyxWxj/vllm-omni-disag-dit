@@ -452,6 +452,25 @@ def test_execute_pipeline_tick_admits_state_and_returns_feedback_completion(monk
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_pipeline_tick_rejects_cfg_parallel(monkeypatch):
+    """The retained PP runtime only implements sequential CFG branches."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.parallel_config.pipeline_parallel_size = 2
+    runner.od_config.parallel_config.cfg_parallel_size = 2
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    monkeypatch.setattr(model_runner_module, "supports_pipeline_tick_execution", lambda pipeline: True)
+
+    with pytest.raises(ValueError, match="sequential CFG only"):
+        DiffusionModelRunner.execute_pipeline_tick(runner, scheduler_output)
+
+
+@pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypatch):
     """Guard cache diagnostics with runtime backend state to avoid stale-config crashes."""
