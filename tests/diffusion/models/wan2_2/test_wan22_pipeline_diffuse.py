@@ -605,6 +605,7 @@ def test_interleaved_pp_hooks_use_fixed_transport_and_request_local_scheduler() 
     pipeline = _make_pipeline()
     pipeline.transformer_config.num_attention_heads = 2
     pipeline.transformer_config.attention_head_dim = 3
+    pipeline.od_config.parallel_config = SimpleNamespace(sequence_parallel_size=1)
     state = _make_manual_step_state("pp", 1.0, 9.0)
     input_batch = InputBatch.make_batch([state])
     received: dict[str, object] = {}
