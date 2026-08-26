@@ -30,6 +30,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -809,6 +810,76 @@ def test_engine_admission_preprocesses_request_once(entrypoint: str) -> None:
 
     assert preprocess_calls == [raw_request]
     assert engine.scheduler._waiting_queue == [prepared_request]
+
+
+@pytest.mark.cpu
+def test_pipeline_tick_drains_after_terminal_empty_schedule() -> None:
+    """A terminal PP request still receives an empty clock for slot drain."""
+
+    class _DrainScheduler:
+        def __init__(self) -> None:
+            self.phase = 0
+
+        def has_requests(self) -> bool:
+            return self.phase == 0
+
+        def schedule(self):
+            if self.phase == 0:
+                self.phase = 1
+                return DiffusionSchedulerOutput(
+                    step_id=0,
+                    scheduled_new_reqs=[SimpleNamespace(request_id="A")],
+                )
+            if self.phase == 1:
+                self.phase = 2
+                return DiffusionSchedulerOutput(step_id=1, finished_req_ids={"A"})
+            return DiffusionSchedulerOutput(step_id=2)
+
+        def update_from_output(self, sched_output, runner_output):
+            del runner_output
+            return {"A"} if sched_output.finished_req_ids else set()
+
+    engine = object.__new__(DiffusionEngine)
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    engine.od_config = SimpleNamespace(
+        diffusion_pp_schedule="interleaved",
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    engine.scheduler = _DrainScheduler()
+    engine._pipeline_tick_has_in_flight_work = False
+    engine.stop_event = threading.Event()
+    engine.abort_queue = queue.Queue()
+    engine._rpc_queue = queue.Queue()
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._process_aborts_queue = lambda: None
+    engine._process_rpc_queue = lambda: None
+    engine._wait_for_admission_if_needed_locked = lambda: None
+    engine._emit_finished_outputs = lambda request_ids, output: None
+    emitted = []
+
+    def emit_outputs(request_ids, output):
+        emitted.append((set(request_ids), output))
+        engine.stop_event.set()
+
+    engine._emit_outputs = emit_outputs
+    executed = []
+
+    def execute_pipeline_tick(sched_output):
+        executed.append(tuple(sched_output.scheduled_request_ids))
+        return BatchRunnerOutput.from_list(
+            [],
+            pipeline_has_in_flight_work=len(executed) == 1,
+        )
+
+    engine.execute_fn = execute_pipeline_tick
+
+    engine._busy_loop()
+
+    assert executed == [("A",), ()]
+    assert len(emitted) == 1
+    assert emitted[0][0] == {"A"}
+    assert engine._pipeline_tick_has_in_flight_work is False
 
 
 @pytest.mark.cpu
