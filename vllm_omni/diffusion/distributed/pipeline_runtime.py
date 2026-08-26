@@ -20,6 +20,8 @@ from enum import Enum, auto
 from threading import Event, Thread
 from typing import Any, ClassVar
 
+from vllm_omni.diffusion.distributed import pp_trace
+
 
 @dataclass(frozen=True, slots=True)
 class PipelineToken:
@@ -872,6 +874,18 @@ class PipelineTickRuntime:
                 self._microbatches[token_id] = plan
                 if self.is_first_stage:
                     self._waiting.append(token_id)
+                pp_trace.event(
+                    "token_registered",
+                    pp_rank=self.stage,
+                    pp_size=self.world_size,
+                    clock=self.clock,
+                    token_id=token_id,
+                    request_ids=plan.request_ids,
+                    microbatch_id=plan.microbatch_id,
+                    step_idx=plan.step_idx,
+                    cfg_branch=self._branch_name(branch),
+                    model_phase=plan.model_phase,
+                )
 
     def progress_one_clock(self) -> tuple[PipelineTickCompletion, ...]:
         """Advance at most one local DiT stage and consume ready feedback."""
@@ -937,6 +951,19 @@ class PipelineTickRuntime:
             token_id = self._waiting[0]
             plan = self._microbatches[token_id]
             if not self._forward_channel(self.stage, plan.spec).can_send:
+                pp_trace.event(
+                    "credit_wait",
+                    pp_rank=self.stage,
+                    pp_size=self.world_size,
+                    clock=self.clock,
+                    token_id=self._tokens[token_id].token_id,
+                    request_ids=plan.request_ids,
+                    microbatch_id=plan.microbatch_id,
+                    step_idx=plan.step_idx,
+                    cfg_branch=self._tokens[token_id].cfg_branch,
+                    model_phase=plan.model_phase,
+                    slot_id=None,
+                )
                 return
             self._waiting.popleft()
         else:
@@ -945,8 +972,34 @@ class PipelineTickRuntime:
                 return
             incoming, spec = candidate
             if not self.is_last_stage and not self._forward_channel(self.stage, spec).can_send:
+                pp_trace.event(
+                    "credit_wait",
+                    pp_rank=self.stage,
+                    pp_size=self.world_size,
+                    clock=self.clock,
+                    token_id=None,
+                    request_ids=(),
+                    microbatch_id=None,
+                    step_idx=None,
+                    cfg_branch=None,
+                    model_phase=None,
+                    slot_id=None,
+                )
                 return
             if self.is_last_stage and not self._feedback_channel(spec).can_send:
+                pp_trace.event(
+                    "credit_wait",
+                    pp_rank=self.stage,
+                    pp_size=self.world_size,
+                    clock=self.clock,
+                    token_id=None,
+                    request_ids=(),
+                    microbatch_id=None,
+                    step_idx=None,
+                    cfg_branch=None,
+                    model_phase=None,
+                    slot_id=None,
+                )
                 return
             message = incoming.begin_compute()
             token_id = message.header.token_id
@@ -955,6 +1008,18 @@ class PipelineTickRuntime:
         assert token_id is not None
         plan = self._microbatches[token_id]
         token = self._tokens[token_id]
+        trace_fields = {
+            "clock": self.clock,
+            "token_id": token_id,
+            "request_ids": plan.request_ids,
+            "microbatch_id": plan.microbatch_id,
+            "step_idx": token.step_idx,
+            "cfg_branch": token.cfg_branch,
+            "model_phase": token.model_phase,
+            "slot_id": token.slot_id if token.slot_id is not None else (message.header.slot_id if message else None),
+        }
+        if message is not None:
+            pp_trace.event("recv_ready", pp_rank=self.stage, pp_size=self.world_size, **trace_fields)
         try:
             cancelled = self._is_fully_cancelled(plan) or (
                 message is not None and bool(message.header.flags & PipelineTransportHeader.CANCELLED_FLAG)
@@ -965,12 +1030,19 @@ class PipelineTickRuntime:
             states = self._states_for(plan)
             self._set_state_step(states, token.step_idx)
             input_batch = self._make_input_batch(states)
-            result = self.pipeline.pipeline_forward_local_stage(
-                input_batch,
-                states=states,
-                cfg_branch=token.cfg_branch,
-                intermediate_hidden_states=None if message is None else message.payload,
-            )
+            with pp_trace.span(
+                "stage_forward",
+                pp_rank=self.stage,
+                pp_size=self.world_size,
+                device=self.device,
+                **trace_fields,
+            ):
+                result = self.pipeline.pipeline_forward_local_stage(
+                    input_batch,
+                    states=states,
+                    cfg_branch=token.cfg_branch,
+                    intermediate_hidden_states=None if message is None else message.payload,
+                )
 
             if not self.is_last_stage:
                 payload = self._extract_tensor(result, "pipeline_forward_local_stage")
