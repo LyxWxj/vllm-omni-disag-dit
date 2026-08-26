@@ -1138,7 +1138,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         )
             return BatchRunnerOutput.from_list(
                 runner_output_list,
-                pipeline_has_in_flight_work=runtime.has_in_flight_work,
+                pipeline_has_in_flight_work=bool(getattr(runtime, "has_in_flight_work", False)),
             )
 
     def _execute_stepwise(

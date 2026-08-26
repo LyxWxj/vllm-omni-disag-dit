@@ -12,6 +12,7 @@ order.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -899,7 +900,8 @@ class PipelineTickRuntime:
                 channel.send_shutdown()
 
         destinations = [channel for channel in channels if channel.is_destination]
-        for _ in range(256):
+        shutdown_deadline = time.monotonic() + 10.0
+        while True:
             for channel in destinations:
                 channel.poll()
                 while channel.has_ready_message:
@@ -907,8 +909,11 @@ class PipelineTickRuntime:
                     channel.release_after_compute(message)
             if all(channel.is_closed for channel in destinations):
                 break
-        else:
-            raise RuntimeError("pipeline channel shutdown did not receive every tombstone")
+            if time.monotonic() >= shutdown_deadline:
+                raise RuntimeError("pipeline channel shutdown did not receive every tombstone")
+            # Gloo's background Work waiters need an opportunity to publish
+            # their completion between non-blocking polling rounds.
+            time.sleep(0.001)
 
         for channel in channels:
             if channel.is_source:
