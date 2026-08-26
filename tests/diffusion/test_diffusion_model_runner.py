@@ -420,6 +420,7 @@ def test_execute_pipeline_tick_admits_state_and_returns_feedback_completion(monk
 
         def progress_one_clock(self):
             state = self.admitted[-1][0]
+            state.latents = torch.ones_like(state.latents)
             state.step_index += 1
             return (PipelineTickCompletion((state.request_id,), step_idx=0),)
 
