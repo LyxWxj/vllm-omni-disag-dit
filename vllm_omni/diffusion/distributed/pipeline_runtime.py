@@ -272,9 +272,11 @@ class PipelineP2PChannel:
         self._group = group
         # HCCL requires matching P2P ordering within one process group. The
         # payload lane is source->destination while credits move in the
-        # opposite direction, so they must use separate pair groups there.
+        # opposite direction, so HCCL payload and Gloo credit lanes are kept
+        # separate by PipelineGroupCoordinator.
         self._credit_group = group if credit_group is None else credit_group
         self._requires_wait_thread = dist.get_backend(group) == "gloo"
+        self._credit_requires_wait_thread = dist.get_backend(self._credit_group) == "gloo"
         self.source_rank = source_rank
         self.destination_rank = destination_rank
         self.slots_per_edge = slots_per_edge
@@ -282,6 +284,7 @@ class PipelineP2PChannel:
         self.tensor_shape = tuple(tensor_shape)
         self.tensor_dtype = tensor_dtype
         self.device = torch.device(device)
+        self._credit_device = torch.device("cpu") if self._credit_requires_wait_thread else self.device
         self.rank = dist.get_rank()
         if self.rank not in (source_rank, destination_rank):
             raise ValueError(f"rank {self.rank} is not an endpoint of channel {source_rank}->{destination_rank}")
@@ -307,7 +310,7 @@ class PipelineP2PChannel:
                 for slot_id in range(slots_per_edge)
             ]
             self._credit_buffers = [
-                torch.empty(1, dtype=torch.int64, device=self.device) for _ in range(slots_per_edge)
+                torch.empty(1, dtype=torch.int64, device=self._credit_device) for _ in range(slots_per_edge)
             ]
             self._credit_works: list[Any | None] = [None] * slots_per_edge
             self._credit_slot_ids: deque[int] = deque()
@@ -324,7 +327,7 @@ class PipelineP2PChannel:
                 for slot_id in range(slots_per_edge)
             ]
             self._credit_buffers = [
-                torch.empty(1, dtype=torch.int64, device=self.device) for _ in range(slots_per_edge)
+                torch.empty(1, dtype=torch.int64, device=self._credit_device) for _ in range(slots_per_edge)
             ]
             self._credit_works = [None] * slots_per_edge
             for slot in self._receive_slots:
@@ -584,7 +587,8 @@ class PipelineP2PChannel:
                 src=self._peer_rank,
                 group=self._credit_group,
                 tag=self._credit_tag(slot_id),
-            )
+            ),
+            requires_wait_thread=self._credit_requires_wait_thread,
         )
 
     def _post_receive(self, slot: _P2PReceiveSlot) -> None:
@@ -616,7 +620,8 @@ class PipelineP2PChannel:
                 dst=self._peer_rank,
                 group=self._credit_group,
                 tag=self._credit_tag(slot_id),
-            )
+            ),
+            requires_wait_thread=self._credit_requires_wait_thread,
         )
 
     def _peek_send_credit(self) -> int:
@@ -648,8 +653,8 @@ class PipelineP2PChannel:
     def _credit_tag(self, slot_id: int) -> int:
         return self._header_tag(slot_id) + 2
 
-    def _start_work(self, work: Any) -> Any:
-        if not self._requires_wait_thread:
+    def _start_work(self, work: Any, *, requires_wait_thread: bool | None = None) -> Any:
+        if not (self._requires_wait_thread if requires_wait_thread is None else requires_wait_thread):
             return work
 
         tracked_work = _TrackedWork(work)

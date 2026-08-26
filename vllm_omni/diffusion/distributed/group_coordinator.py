@@ -711,8 +711,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
         # Retained-state PP clocks exchange independent point-to-point streams
         # on each forward edge and on the last-to-first feedback edge. Keep
         # those streams off the PP collective group so a control collective
-        # cannot race an outstanding edge transfer. HCCL also requires the
-        # payload and reverse-credit P2P directions to use distinct groups.
+        # cannot race an outstanding edge transfer. The device lane remains
+        # unidirectional HCCL; scalar reverse credits use a dedicated Gloo
+        # pair group so HCCL never observes cross-direction P2P ordering.
         self._pipeline_edge_groups: dict[tuple[int, int], ProcessGroup] = {}
         self._pipeline_edge_credit_groups: dict[tuple[int, int], ProcessGroup] = {}
         for ranks in group_ranks:
@@ -723,9 +724,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 edge_group = torch.distributed.new_group(
                     [source_rank, destination_rank], backend=torch_distributed_backend
                 )
-                credit_group = torch.distributed.new_group(
-                    [source_rank, destination_rank], backend=torch_distributed_backend
-                )
+                credit_group = torch.distributed.new_group([source_rank, destination_rank], backend="gloo")
                 if self.rank in (source_rank, destination_rank):
                     self._pipeline_edge_groups[(source_rank, destination_rank)] = edge_group
                     self._pipeline_edge_credit_groups[(source_rank, destination_rank)] = credit_group
