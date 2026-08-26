@@ -658,12 +658,6 @@ class OmniServeCommand(CLISubcommand):
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
         omni_config_group.add_argument(
-            "--diffusion-pp-microbatch-size",
-            type=int,
-            default=1,
-            help="Maximum number of compatible diffusion request rows admitted per interleaved PP clock.",
-        )
-        omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=_nonneg_finite_float,
             default=0.0,

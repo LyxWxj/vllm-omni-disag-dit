@@ -927,6 +927,7 @@ class TestRunner:
     @pytest.mark.parametrize(
         (
             "pipeline_factory",
+            "microbatch_size",
             "cfg_parallel_size",
             "cache_backend",
             "distributed_vae",
@@ -938,6 +939,7 @@ class TestRunner:
             pytest.param(
                 _StepPipeline,
                 1,
+                1,
                 None,
                 False,
                 False,
@@ -947,6 +949,7 @@ class TestRunner:
             ),
             pytest.param(
                 _InterleavedStepPipeline,
+                1,
                 2,
                 None,
                 False,
@@ -957,6 +960,18 @@ class TestRunner:
             ),
             pytest.param(
                 _InterleavedStepPipeline,
+                2,
+                1,
+                None,
+                False,
+                False,
+                1,
+                "diffusion_pp_microbatch_size=1",
+                id="multi-request-microbatch",
+            ),
+            pytest.param(
+                _InterleavedStepPipeline,
+                1,
                 1,
                 "cache_dit",
                 False,
@@ -968,6 +983,7 @@ class TestRunner:
             pytest.param(
                 _InterleavedStepPipeline,
                 1,
+                1,
                 None,
                 True,
                 False,
@@ -978,6 +994,7 @@ class TestRunner:
             pytest.param(
                 _InterleavedStepPipeline,
                 1,
+                1,
                 None,
                 False,
                 True,
@@ -987,6 +1004,7 @@ class TestRunner:
             ),
             pytest.param(
                 _InterleavedStepPipeline,
+                1,
                 1,
                 None,
                 False,
@@ -1002,6 +1020,7 @@ class TestRunner:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
         pipeline_factory,
+        microbatch_size: int,
         cfg_parallel_size: int,
         cache_backend: str | None,
         distributed_vae: bool,
@@ -1043,6 +1062,7 @@ class TestRunner:
             max_num_seqs=4,
             step_execution=True,
             model_class_name=type(pipeline).__name__,
+            diffusion_pp_microbatch_size=microbatch_size,
             parallel_config=SimpleNamespace(
                 use_hsdp=False,
                 pipeline_parallel_size=2,

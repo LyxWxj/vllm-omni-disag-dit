@@ -860,6 +860,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "Interleaved pipeline parallelism requires a pipeline to explicitly implement "
                 "the stage-local pipeline tick protocol."
             )
+        microbatch_size = int(getattr(self.od_config, "diffusion_pp_microbatch_size", 1))
+        if microbatch_size != 1:
+            raise ValueError(
+                "Interleaved PP currently requires diffusion_pp_microbatch_size=1; "
+                "multi-request microbatches are disabled until request-isolated numerical parity is validated."
+            )
         validate_pipeline_tick_configuration(self.pipeline)
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
