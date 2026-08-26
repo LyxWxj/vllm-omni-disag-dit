@@ -614,7 +614,6 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: s
                 break
         dist.barrier()
         runtime.close()
-        dist.barrier()
         result_queue.put((rank, completed, active_stages))
     finally:
         if dist.is_initialized():
