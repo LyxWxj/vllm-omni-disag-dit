@@ -236,9 +236,7 @@ def _run_p2p_channel_worker(
         if incoming is not None and rank == 1 and deferred_release_queries:
 
             def record_compute_event() -> _DeferredReleaseEvent:
-                event = _DeferredReleaseEvent(
-                    deferred_release_queries if not release_events else 0
-                )
+                event = _DeferredReleaseEvent(deferred_release_queries if not release_events else 0)
                 release_events.append(event)
                 return event
 
@@ -281,8 +279,10 @@ def _run_p2p_channel_worker(
         next_token_id = 0
         sent_token_ids: list[int] = []
         sent_sequences: list[int] = []
+        sent_slot_ids: list[int] = []
         sent_clocks: list[int] = []
         completed: list[tuple[int, float]] = []
+        received_slot_ids: list[int] = []
         saw_credit_exhaustion = False
         max_clocks = max(128, token_count * world_size * 12)
 
@@ -304,6 +304,7 @@ def _run_p2p_channel_worker(
                         sent_header = outgoing.send(header, payload)
                         sent_token_ids.append(next_token_id)
                         sent_sequences.append(sent_header.send_sequence)
+                        sent_slot_ids.append(sent_header.slot_id)
                         sent_clocks.append(clock)
                         next_token_id += 1
                     elif next_token_id >= slots_per_edge:
@@ -312,11 +313,13 @@ def _run_p2p_channel_worker(
                 if incoming is not None and incoming.has_ready_message:
                     if rank == world_size - 1:
                         message = incoming.begin_compute()
+                        received_slot_ids.append(message.header.slot_id)
                         if not message.header.flags & PipelineTransportHeader.SHUTDOWN_FLAG:
                             completed.append((message.header.token_id, float(message.payload[0])))
                         incoming.release_after_compute(message)
                     elif outgoing is not None and outgoing.can_send:
                         message = incoming.begin_compute()
+                        received_slot_ids.append(message.header.slot_id)
                         if not message.header.flags & PipelineTransportHeader.SHUTDOWN_FLAG:
                             # Each intermediate stage mutates a fresh local
                             # output before releasing its receiver-owned input.
@@ -431,7 +434,9 @@ def _run_p2p_channel_worker(
                     "completed": completed,
                     "sent_token_ids": sent_token_ids,
                     "sent_sequences": sent_sequences,
+                    "sent_slot_ids": sent_slot_ids,
                     "sent_clocks": sent_clocks,
+                    "received_slot_ids": received_slot_ids,
                     "saw_credit_exhaustion": saw_credit_exhaustion,
                     "incoming_max_occupied": incoming.max_occupied if incoming is not None else 0,
                     "incoming_pending_work_count": incoming.pending_work_count if incoming is not None else 0,
@@ -448,13 +453,10 @@ def _run_p2p_channel_worker(
                     "outgoing_pending_work_count": outgoing.pending_work_count if outgoing is not None else 0,
                     "rebuild_succeeded": rebuild_succeeded,
                     "prepare_failure_preserved": prepare_failure_preserved,
-                    "deferred_release_event_queries": (
-                        release_events[0].query_count if release_events else 0
-                    ),
+                    "deferred_release_event_queries": (release_events[0].query_count if release_events else 0),
                     "credit_return_event_queries": credit_return_event_queries,
                     "transport_buffer_inference_flags": (
-                        _transport_buffer_inference_flags(incoming)
-                        + _transport_buffer_inference_flags(outgoing)
+                        _transport_buffer_inference_flags(incoming) + _transport_buffer_inference_flags(outgoing)
                     ),
                 },
             )
@@ -535,6 +537,8 @@ class TestPipelineP2PChannel:
         destination = results[1]
         assert source["sent_token_ids"] == [0, 1, 2, 3, 4]
         assert source["sent_sequences"] == [0, 1, 2, 3, 4]
+        assert source["sent_slot_ids"] == [0, 1, 0, 1, 0]
+        assert destination["received_slot_ids"][:5] == [0, 1, 0, 1, 0]
         assert source["saw_credit_exhaustion"] is True
         assert source["sent_clocks"][slots_per_edge] >= 10
         assert destination["incoming_max_occupied"] == slots_per_edge

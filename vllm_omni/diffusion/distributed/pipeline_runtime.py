@@ -5,9 +5,8 @@
 ``PipelineClockSimulator`` is the CPU-only reference for the retained-state
 clock. ``PipelineP2PChannel`` applies the same bounded-slot contract to one
 real ``torch.distributed`` PP edge: receive buffers belong to the downstream
-stage, credits return only after local consumption, and an explicit send
-sequence restores FIFO delivery when distinct physical slots complete out of
-order.
+stage, credits return only after local consumption, and a fixed physical-slot
+ring preserves P2P ordering even on backends that ignore transport tags.
 """
 
 from __future__ import annotations
@@ -234,10 +233,12 @@ class PipelineP2PChannel:
     The destination owns the receive ring. It pre-posts one header and tensor
     receive per physical slot, then returns a slot credit only after
     :meth:`release_after_compute` observes that the local compute stream has
-    consumed the input buffer. The source can send only after it has received
-    that credit, and copies each payload into its own per-slot output buffer
-    before starting ``isend``. This gives bounded memory and protects both
-    input and output buffer lifetimes without a blocking metadata path.
+    consumed the input buffer. Both endpoints use slots in a fixed cyclic
+    order. A credit therefore proves capacity for the next physical slot, but
+    can never reorder HCCL's tag-less P2P calls. The source copies each payload
+    into its own per-slot output buffer before starting ``isend``. This gives
+    bounded memory and protects both input and output buffer lifetimes without
+    a blocking metadata path.
     """
 
     _TAGS_PER_SLOT = 3
@@ -295,7 +296,9 @@ class PipelineP2PChannel:
         self._is_source = self.rank == source_rank
         self._peer_rank = destination_rank if self._is_source else source_rank
         self._next_send_sequence = 0
+        self._next_send_slot_id = 0
         self._next_receive_sequence = 0
+        self._next_repost_slot_id = 0
         self._ready_slot_ids: deque[int] = deque()
         self._received_by_sequence: dict[int, _P2PReceiveSlot] = {}
         self._max_occupied = 0
@@ -369,7 +372,7 @@ class PipelineP2PChannel:
         """Whether the source can begin one new payload transfer now."""
         self._require_source()
         self.poll()
-        return any(self._send_slots[slot_id].state is PipelineSlotState.FREE for slot_id in self._credit_slot_ids)
+        return self._has_credit_for_next_send_slot()
 
     @property
     def has_ready_message(self) -> bool:
@@ -441,6 +444,7 @@ class PipelineP2PChannel:
         self._consume_send_credit(slot_id)
         slot.begin_send()
         self._next_send_sequence += 1
+        self._next_send_slot_id = self._next_slot_id(slot_id)
         if not self._shutdown_requested:
             self._post_credit_receive(slot_id)
         slot.header_work = self._start_work(
@@ -605,12 +609,20 @@ class PipelineP2PChannel:
         return event
 
     def _reclaim_completed_receive_slots(self) -> None:
-        """Return credits only after the local compute stream releases a slot."""
-        for slot in self._receive_slots:
+        """Return credits in physical lane order after stream completion.
+
+        HCCL matches P2P calls by their posting order rather than by the tag
+        supplied to ``isend``/``irecv``. Reposting a later slot merely because
+        its device event completed first would let it consume the next send
+        for an earlier slot. The fixed ring makes slot ownership and the P2P
+        posting sequence the same invariant on every backend.
+        """
+        while True:
+            slot = self._receive_slots[self._next_repost_slot_id]
             if slot.state is not PipelineSlotState.PENDING_RELEASE:
-                continue
+                return
             if slot.release_event is not None and not slot.release_event.query():
-                continue
+                return
 
             header = slot.header
             if header is None:
@@ -621,9 +633,10 @@ class PipelineP2PChannel:
             if header.flags & PipelineTransportHeader.SHUTDOWN_FLAG:
                 self._shutdown_slot_ids.add(slot.slot_id)
                 self._closed = len(self._shutdown_slot_ids) == self.slots_per_edge
-                continue
-            self._post_receive(slot)
-            self._send_credit(slot.slot_id)
+            else:
+                self._post_receive(slot)
+                self._send_credit(slot.slot_id)
+            self._next_repost_slot_id = self._next_slot_id(slot.slot_id)
 
     def _post_credit_receive(self, slot_id: int) -> None:
         self._credit_works[slot_id] = self._start_work(
@@ -670,10 +683,17 @@ class PipelineP2PChannel:
         )
 
     def _peek_send_credit(self) -> int:
-        for slot_id in self._credit_slot_ids:
-            if self._send_slots[slot_id].state is PipelineSlotState.FREE:
-                return slot_id
+        slot_id = self._next_send_slot_id
+        if slot_id in self._credit_slot_id_set and self._send_slots[slot_id].state is PipelineSlotState.FREE:
+            return slot_id
         raise RuntimeError("attempted to send without a downstream credit")
+
+    def _has_credit_for_next_send_slot(self) -> bool:
+        slot_id = self._next_send_slot_id
+        return slot_id in self._credit_slot_id_set and self._send_slots[slot_id].state is PipelineSlotState.FREE
+
+    def _next_slot_id(self, slot_id: int) -> int:
+        return (slot_id + 1) % self.slots_per_edge
 
     def _consume_send_credit(self, slot_id: int) -> None:
         if slot_id not in self._credit_slot_id_set:
@@ -1505,7 +1525,9 @@ class PipelineTickRuntime:
         if payload.shape[0] != active_rows:
             raise ValueError(f"{name} rows {payload.shape[0]} do not match microbatch rows {active_rows}")
         if active_rows > transport_shape[0] or tuple(payload.shape[1:]) != transport_shape[1:]:
-            raise ValueError(f"{name} shape {tuple(payload.shape)} does not fit fixed transport shape {transport_shape}")
+            raise ValueError(
+                f"{name} shape {tuple(payload.shape)} does not fit fixed transport shape {transport_shape}"
+            )
 
     def _is_fully_cancelled(self, plan: _PipelineMicrobatch) -> bool:
         return all(request_id in self._cancelled_request_ids for request_id in plan.request_ids)
