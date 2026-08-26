@@ -1043,10 +1043,10 @@ class PipelineTickRuntime:
             self._header_for(token_id, token, cancelled=True),
             payload,
         )
-        if not self.is_first_stage or token_id != feedback_token_id:
-            self._retire_token(token_id)
         if token_id == feedback_token_id:
             self._discard_cancelled_states(plan)
+        if not self.is_first_stage or token_id != feedback_token_id:
+            self._retire_token(token_id)
 
     def _finish_last_stage(
         self,
