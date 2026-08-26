@@ -108,6 +108,13 @@ class _InterleavedStepPipeline(_StepPipeline):
 
     supports_interleaved_pipeline_execution = True
 
+    def validate_interleaved_pipeline_configuration(self):
+        if getattr(self, "is_dmd", False):
+            raise ValueError("Wan interleaved PP does not support DMD models")
+        sequence_parallel_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", None)
+        if sequence_parallel_size not in (None, 1):
+            raise ValueError("Wan interleaved PP currently requires sequence_parallel_size=1")
+
     def build_microbatches(self, *args, **kwargs):
         del args, kwargs
         raise AssertionError("pipeline tick hook should not run during model loading")
@@ -918,13 +925,23 @@ class TestRunner:
             DiffusionModelRunner.load_model(runner)
 
     @pytest.mark.parametrize(
-        ("pipeline_factory", "cfg_parallel_size", "cache_backend", "distributed_vae", "error"),
+        (
+            "pipeline_factory",
+            "cfg_parallel_size",
+            "cache_backend",
+            "distributed_vae",
+            "is_dmd",
+            "sequence_parallel_size",
+            "error",
+        ),
         [
             pytest.param(
                 _StepPipeline,
                 1,
                 None,
                 False,
+                False,
+                1,
                 "stage-local pipeline tick protocol",
                 id="unsupported-pipeline-hook",
             ),
@@ -933,6 +950,8 @@ class TestRunner:
                 2,
                 None,
                 False,
+                False,
+                1,
                 "cfg_parallel_size must be 1",
                 id="cfg-parallel",
             ),
@@ -941,6 +960,8 @@ class TestRunner:
                 1,
                 "cache_dit",
                 False,
+                False,
+                1,
                 "does not support cache_backend",
                 id="cache-backend",
             ),
@@ -949,8 +970,30 @@ class TestRunner:
                 1,
                 None,
                 True,
+                False,
+                1,
                 "distributed VAE is not supported",
                 id="distributed-vae",
+            ),
+            pytest.param(
+                _InterleavedStepPipeline,
+                1,
+                None,
+                False,
+                True,
+                1,
+                "DMD models",
+                id="wan-dmd",
+            ),
+            pytest.param(
+                _InterleavedStepPipeline,
+                1,
+                None,
+                False,
+                False,
+                2,
+                "sequence_parallel_size=1",
+                id="wan-sequence-parallel",
             ),
         ],
     )
@@ -962,9 +1005,12 @@ class TestRunner:
         cfg_parallel_size: int,
         cache_backend: str | None,
         distributed_vae: bool,
+        is_dmd: bool,
+        sequence_parallel_size: int,
         error: str,
     ):
         pipeline = pipeline_factory()
+        pipeline.is_dmd = is_dmd
         if distributed_vae:
             pipeline.vae = SimpleNamespace(is_distributed_enabled=lambda: True)
 
@@ -1001,10 +1047,12 @@ class TestRunner:
                 use_hsdp=False,
                 pipeline_parallel_size=2,
                 cfg_parallel_size=cfg_parallel_size,
+                sequence_parallel_size=sequence_parallel_size,
             ),
             diffusion_pp_schedule="interleaved",
             streaming_output=False,
         )
+        pipeline.od_config = runner.od_config
         runner.device = torch.device("cpu")
         runner.pipeline = None
         runner.cache_backend = None

@@ -50,6 +50,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_pipeline_tick_execution,
     supports_prompt_update,
     supports_step_execution,
+    validate_pipeline_tick_configuration,
 )
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
@@ -859,6 +860,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "Interleaved pipeline parallelism requires a pipeline to explicitly implement "
                 "the stage-local pipeline tick protocol."
             )
+        validate_pipeline_tick_configuration(self.pipeline)
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
         cfg_parallel_size = int(getattr(parallel_config, "cfg_parallel_size", 1) or 1)

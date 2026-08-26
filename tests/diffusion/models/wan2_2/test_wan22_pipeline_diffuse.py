@@ -651,6 +651,26 @@ def test_prepare_encode_rejects_dmd_step_execution() -> None:
         pipeline.prepare_encode(state)
 
 
+@pytest.mark.parametrize(
+    ("is_dmd", "sequence_parallel_size", "error"),
+    [
+        (True, 1, "DMD models"),
+        (False, 2, "sequence_parallel_size=1"),
+    ],
+)
+def test_interleaved_configuration_rejects_wan_unsupported_modes(
+    is_dmd: bool,
+    sequence_parallel_size: int,
+    error: str,
+) -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = is_dmd
+    pipeline.od_config.parallel_config = SimpleNamespace(sequence_parallel_size=sequence_parallel_size)
+
+    with pytest.raises(ValueError, match=error):
+        pipeline.validate_interleaved_pipeline_configuration()
+
+
 def _make_gate_loading_pipeline():
     pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)

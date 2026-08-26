@@ -118,6 +118,22 @@ class SupportsPipelineTickExecution(Protocol):
 
 
 @runtime_checkable
+class SupportsPipelineTickConfiguration(Protocol):
+    """Optional model-specific validation for interleaved PP startup."""
+
+    def validate_interleaved_pipeline_configuration(self) -> None:
+        """Reject model/configuration combinations unsupported by pipeline ticks."""
+        ...
+
+
+def validate_pipeline_tick_configuration(pipeline: object) -> None:
+    """Run an optional model-specific interleaved PP configuration check."""
+
+    if isinstance(pipeline, SupportsPipelineTickConfiguration):
+        pipeline.validate_interleaved_pipeline_configuration()
+
+
+@runtime_checkable
 class SupportsComponentDiscovery(Protocol):
     """Declares which submodules serve as pipeline components.
 

@@ -717,6 +717,16 @@ class Wan22Pipeline(
             raise ValueError(f"Cannot microbatch Wan requests with a mix of present and missing {field_name}.")
         return torch.cat(values, dim=0)
 
+    def validate_interleaved_pipeline_configuration(self) -> None:
+        """Reject Wan modes that are not implemented by the retained-state PP path."""
+        if self.is_dmd:
+            raise ValueError(
+                "Wan interleaved PP does not support DMD models because DMD step execution is not supported yet."
+            )
+        sequence_parallel_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", None)
+        if sequence_parallel_size not in (None, 1):
+            raise ValueError("Wan interleaved PP currently requires sequence_parallel_size=1")
+
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         """Initialize all Wan request-local state required by step execution."""
         del kwargs
