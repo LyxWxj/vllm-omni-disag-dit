@@ -878,8 +878,7 @@ def test_pipeline_tick_drains_after_terminal_empty_schedule() -> None:
     engine._busy_loop()
 
     assert executed == [("A",), ()]
-    assert len(emitted) == 1
-    assert emitted[0][0] == {"A"}
+    assert [request_ids for request_ids, _ in emitted] == [set(), {"A"}]
     assert engine._pipeline_tick_has_in_flight_work is False
 
 
