@@ -708,6 +708,31 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
 
+        # Retained-state PP clocks exchange independent point-to-point streams
+        # on each forward edge and on the last-to-first feedback edge. Keep
+        # those streams off the PP collective group so a control collective
+        # cannot race an outstanding edge transfer.
+        self._pipeline_edge_groups: dict[tuple[int, int], ProcessGroup] = {}
+        for ranks in group_ranks:
+            if len(ranks) < 2:
+                continue
+            edge_pairs = [*zip(ranks, ranks[1:], strict=True), (ranks[-1], ranks[0])]
+            for source_rank, destination_rank in edge_pairs:
+                edge_group = torch.distributed.new_group(
+                    [source_rank, destination_rank], backend=torch_distributed_backend
+                )
+                if self.rank in (source_rank, destination_rank):
+                    self._pipeline_edge_groups[(source_rank, destination_rank)] = edge_group
+
+    def pipeline_edge_group(self, source_rank: int, destination_rank: int) -> ProcessGroup:
+        """Return the dedicated device group for one directed PP edge."""
+        try:
+            return self._pipeline_edge_groups[(source_rank, destination_rank)]
+        except KeyError as exc:
+            raise ValueError(
+                f"rank {self.rank} is not an endpoint of pipeline edge {source_rank}->{destination_rank}"
+            ) from exc
+
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         if dst is None:
             dst = self.group_next_rank
@@ -992,7 +1017,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
         return torch.distributed.isend(tensor, dst=self.skip_rank, group=self.skip_device_group)
 
     def destroy(self):
-        groups = [*self.device_groups, *self.cpu_groups, self.skip_device_group]
+        groups = [
+            *self.device_groups,
+            *self.cpu_groups,
+            self.skip_device_group,
+            *self._pipeline_edge_groups.values(),
+        ]
         seen = {id(self.device_group), id(self.cpu_group)}
         for group in groups:
             if group is not None and id(group) not in seen:
@@ -1001,6 +1031,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.device_groups = []
         self.cpu_groups = []
         self.skip_device_group = None
+        self._pipeline_edge_groups = {}
         super().destroy()
 
 

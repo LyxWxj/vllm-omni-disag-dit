@@ -747,7 +747,7 @@ class PipelineTickRuntime:
         pp_ranks: Sequence[int],
         global_rank: int,
         device: Any,
-        group: Any,
+        edge_groups: Mapping[tuple[int, int], Any],
         slots_per_edge: int = 2,
     ) -> None:
         if len(pp_ranks) < 2:
@@ -774,7 +774,7 @@ class PipelineTickRuntime:
         self.stage = self.pp_ranks.index(global_rank)
         self.world_size = len(self.pp_ranks)
         self.device = device
-        self.group = group
+        self.edge_groups = edge_groups
         self.slots_per_edge = slots_per_edge
         self.clock = 0
 
@@ -1098,7 +1098,7 @@ class PipelineTickRuntime:
                 device=self.device,
                 slots_per_edge=self.slots_per_edge,
                 tag_base=tag_base + edge * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
-                group=self.group,
+                group=self._edge_group(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
             )
         if self.stage in (0, self.world_size - 1):
             self._feedback_channels[spec] = PipelineP2PChannel(
@@ -1109,7 +1109,7 @@ class PipelineTickRuntime:
                 device=self.device,
                 slots_per_edge=self.slots_per_edge,
                 tag_base=tag_base + (self.world_size - 1) * self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT,
-                group=self.group,
+                group=self._edge_group(self.pp_ranks[-1], self.pp_ranks[0]),
             )
 
     def _poll_channels(self) -> None:
@@ -1129,6 +1129,12 @@ class PipelineTickRuntime:
             return self._feedback_channels[spec]
         except KeyError as exc:
             raise RuntimeError("missing local pipeline feedback edge") from exc
+
+    def _edge_group(self, source_rank: int, destination_rank: int) -> Any:
+        try:
+            return self.edge_groups[(source_rank, destination_rank)]
+        except KeyError as exc:
+            raise RuntimeError(f"missing process group for pipeline edge {source_rank}->{destination_rank}") from exc
 
     def _states_for(self, plan: _PipelineMicrobatch) -> tuple[Any, ...]:
         states: list[Any] = []

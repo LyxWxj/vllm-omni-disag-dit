@@ -1039,7 +1039,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pp_ranks=pp_group.ranks,
             global_rank=pp_group.rank,
             device=self.device,
-            group=pp_group.device_group,
+            edge_groups={
+                (source_rank, destination_rank): pp_group.pipeline_edge_group(source_rank, destination_rank)
+                for source_rank, destination_rank in (
+                    *zip(pp_group.ranks, pp_group.ranks[1:], strict=True),
+                    (pp_group.ranks[-1], pp_group.ranks[0]),
+                )
+                if pp_group.rank in (source_rank, destination_rank)
+            },
         )
         self._pipeline_tick_runtime = runtime
         return runtime
