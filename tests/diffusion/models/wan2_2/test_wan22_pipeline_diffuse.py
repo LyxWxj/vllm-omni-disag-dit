@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.interface import supports_pipeline_tick_execution, supports_step_execution
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, get_wan22_pre_process_func
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -640,6 +640,40 @@ def test_interleaved_pp_hooks_use_fixed_transport_and_request_local_scheduler() 
     assert received["current_model"] is pipeline.transformer
     assert torch.equal(updated_latents, torch.full_like(updated_latents, 2.0))
     assert state.step_index == 1
+
+
+def test_interleaved_pp_transport_reserves_tail_microbatch_capacity() -> None:
+    pipeline = _make_pipeline()
+    pipeline.transformer_config.num_attention_heads = 2
+    pipeline.transformer_config.attention_head_dim = 3
+    pipeline.od_config.parallel_config = SimpleNamespace(sequence_parallel_size=1)
+    pipeline.od_config.diffusion_pp_microbatch_size = 2
+    state = _make_manual_step_state("tail", 1.0, 9.0)
+
+    tail_spec = pipeline.pipeline_transport_spec([state])
+    full_spec = pipeline.pipeline_transport_spec([state, _make_manual_step_state("full", 2.0, 9.0)])
+
+    assert tail_spec == full_spec
+    assert tail_spec.intermediate_shape == (2, 16, 6)
+    assert tail_spec.feedback_shape == (2, *state.latents.shape[1:])
+
+
+def test_wan_preprocess_compatibility_key_includes_effective_transport_layout() -> None:
+    preprocess = get_wan22_pre_process_func(SimpleNamespace())
+    request = OmniDiffusionRequest(
+        request_id="layout",
+        prompt={"prompt": "a prompt"},
+        sampling_params=OmniDiffusionSamplingParams(
+            height=579,
+            width=323,
+            num_frames=18,
+            num_outputs_per_prompt=2,
+        ),
+    )
+
+    result = preprocess(request)
+
+    assert result.batch_compatibility_key == ("wan22_condition_layout", False, 576, 320, 17, 2)
 
 
 def test_prepare_encode_rejects_dmd_step_execution() -> None:

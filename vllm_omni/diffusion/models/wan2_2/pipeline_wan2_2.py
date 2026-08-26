@@ -273,13 +273,30 @@ def get_wan22_pre_process_func(
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
         has_image = raw_image is not None and (not isinstance(raw_image, list) or bool(raw_image))
-        request.batch_compatibility_key = ("wan22_image_condition", has_image)
+
+        def set_batch_compatibility_key() -> None:
+            sampling = request.sampling_params
+            height = (sampling.height or 480) // 16 * 16
+            width = (sampling.width or 832) // 16 * 16
+            num_frames = sampling.num_frames or 81
+            if num_frames % 4 != 1:
+                num_frames = num_frames // 4 * 4 + 1
+            request.batch_compatibility_key = (
+                "wan22_condition_layout",
+                has_image,
+                height,
+                width,
+                num_frames,
+                sampling.num_outputs_per_prompt or 1,
+            )
+
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
 
         if raw_image is None:
+            set_batch_compatibility_key()
             request.prompt = prompt
             return request
 
@@ -313,6 +330,7 @@ def get_wan22_pre_process_func(
         )
         prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
 
+        set_batch_compatibility_key()
         request.prompt = prompt
         return request
 
@@ -950,16 +968,22 @@ class Wan22Pipeline(
         ):
             raise ValueError("Wan pipeline microbatch must have one latent layout")
 
-        total_rows = sum(int(state.latents.shape[0]) for state in states if state.latents is not None)
+        rows_per_request = int(reference.shape[0])
+        if any(state.latents is not None and int(state.latents.shape[0]) != rows_per_request for state in states):
+            raise ValueError("Wan pipeline microbatch must have one row count per request")
+        microbatch_size = int(getattr(self.od_config, "diffusion_pp_microbatch_size", 1))
+        if microbatch_size < 1:
+            raise ValueError("diffusion_pp_microbatch_size must be a positive integer")
+        transport_rows = rows_per_request * microbatch_size
         patch_t, patch_h, patch_w = self.transformer_config.patch_size
         _, _, frames, height, width = reference.shape
         sequence_length = (frames // patch_t) * (height // patch_h) * (width // patch_w)
         inner_dim = self.transformer_config.num_attention_heads * self.transformer_config.attention_head_dim
         _, current_model, _ = self._step_phase(states[0])
         return PipelineTensorSpec(
-            intermediate_shape=(total_rows, sequence_length, inner_dim),
+            intermediate_shape=(transport_rows, sequence_length, inner_dim),
             intermediate_dtype=current_model.dtype,
-            feedback_shape=(total_rows, *reference.shape[1:]),
+            feedback_shape=(transport_rows, *reference.shape[1:]),
             feedback_dtype=reference.dtype,
         )
 

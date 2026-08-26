@@ -527,10 +527,11 @@ class _TickPipeline:
     @staticmethod
     def pipeline_transport_spec(states):
         rows = sum(int(state.latents.shape[0]) for state in states)
+        width = int(states[0].latents.shape[1])
         return PipelineTensorSpec(
-            intermediate_shape=(rows, 1),
+            intermediate_shape=(max(2, rows), width),
             intermediate_dtype=torch.float32,
-            feedback_shape=(rows, 1),
+            feedback_shape=(max(2, rows), width),
             feedback_dtype=torch.float32,
         )
 
@@ -560,9 +561,9 @@ class _TickPipeline:
         return torch.cat(outputs, dim=0)
 
 
-def _make_tick_state(request_id: str, value: float, *, cfg: bool) -> StepRequestState:
+def _make_tick_state(request_id: str, value: float, *, cfg: bool, width: int = 1) -> StepRequestState:
     state = StepRequestState(request_id=request_id, sampling=SimpleNamespace(generator=None), prompt=None)
-    state.latents = torch.tensor([[value]], dtype=torch.float32)
+    state.latents = torch.full((1, width), value, dtype=torch.float32)
     state.timesteps = torch.tensor([1.0, 0.0], dtype=torch.float32)
     state.prompt_embeds = torch.zeros((1, 1, 1), dtype=torch.float32)
     state.negative_prompt_embeds = torch.zeros((1, 1, 1), dtype=torch.float32) if cfg else None
@@ -692,6 +693,67 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
             dist.destroy_process_group()
 
 
+def _run_pipeline_tick_reconfigure_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
+    """Rebuild an idle fixed-shape lane before admitting a new tensor layout."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        state_cache = {
+            "A": _make_tick_state("A", 0.0, cfg=False, width=1),
+            "C": _make_tick_state("C", 10.0, cfg=False, width=2),
+        }
+        edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
+        edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
+        credit_edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
+        active_stages: list[tuple[int, int]] = []
+        pipeline = _TickPipeline(rank, active_stages)
+        runtime = PipelineTickRuntime(
+            pipeline=pipeline,
+            state_cache=state_cache,
+            pp_ranks=tuple(range(world_size)),
+            global_rank=rank,
+            device="cpu",
+            edge_groups={edge_pair: edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair},
+            edge_credit_groups={
+                edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
+            },
+            bootstrap_group=dist.group.WORLD,
+        )
+
+        completed: list[str] = []
+        for request_id in ("A", "C"):
+            runtime.admit([state_cache[request_id]])
+            for clock in range(16):
+                pipeline.clock = clock
+                completions = runtime.progress_one_clock()
+                if rank == 0:
+                    completed.extend(
+                        completed_request_id
+                        for completion in completions
+                        for completed_request_id in completion.request_ids
+                    )
+                done = [request_id in completed if rank == 0 else False]
+                dist.broadcast_object_list(done, src=0)
+                dist.barrier()
+                if done[0]:
+                    break
+            else:
+                raise RuntimeError(f"{request_id} did not complete")
+            assert not runtime.has_in_flight_work
+
+        final_specs = tuple(runtime._spec_ids)  # noqa: SLF001 - verifies lane replacement.
+        runtime.close()
+        result_queue.put((rank, completed, final_specs, active_stages))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 class TestPipelineTickRuntime:
     def test_pp4_overlaps_dynamic_admission_and_returns_feedback(self) -> None:
         world_size = 4
@@ -745,3 +807,26 @@ class TestPipelineTickRuntime:
         assert results[0][0] == [(0, 0)]
         assert all(results[rank][0] == [] for rank in range(1, world_size))
         assert all(results[rank][1] == () for rank in range(world_size)), results
+
+    def test_pp2_rebuilds_idle_lane_before_new_tensor_layout(self) -> None:
+        world_size = 2
+        mp_context = torch.multiprocessing.get_context("spawn")
+        manager = mp_context.Manager()
+        result_queue = manager.Queue()
+        try:
+            torch.multiprocessing.spawn(
+                _run_pipeline_tick_reconfigure_worker,
+                args=(world_size, get_distributed_init_method(), result_queue),
+                nprocs=world_size,
+            )
+            results = {
+                rank: (completed, specs, active_stages)
+                for rank, completed, specs, active_stages in (result_queue.get() for _ in range(world_size))
+            }
+        finally:
+            manager.shutdown()
+
+        assert results[0][0] == ["A", "C"]
+        assert all(results[rank][0] == [] for rank in range(1, world_size))
+        assert all(specs[0].intermediate_shape == (2, 2) for _, specs, _ in results.values())
+        assert all(active_stages for _, _, active_stages in results.values())

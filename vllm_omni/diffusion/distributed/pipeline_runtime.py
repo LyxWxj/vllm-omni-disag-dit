@@ -812,6 +812,9 @@ class PipelineTickRuntime:
         self._cancelled_request_ids: set[str] = set()
         self._positive_noise: dict[int, Any] = {}
         self._model_phase_ids: dict[str, int] = {}
+        # HCCL does not use the P2P ``tag`` argument when matching already
+        # posted receives. Keep exactly one physical tensor layout live on a
+        # PP lane and explicitly drain it before changing layouts.
         self._spec_ids: dict[PipelineTensorSpec, int] = {}
         self._forward_channels: dict[tuple[int, PipelineTensorSpec], PipelineP2PChannel] = {}
         self._feedback_channels: dict[PipelineTensorSpec, PipelineP2PChannel] = {}
@@ -930,7 +933,13 @@ class PipelineTickRuntime:
         if self._waiting or self._positive_noise:
             raise RuntimeError("cannot close PipelineTickRuntime with queued or partial CFG tokens")
 
+        self._shutdown_channels()
+
+    def _shutdown_channels(self) -> None:
+        """Drain and close every current transport channel without retiring state."""
         channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
+        if not channels:
+            return
         for channel in channels:
             if channel.is_source:
                 channel.send_shutdown()
@@ -1063,13 +1072,19 @@ class PipelineTickRuntime:
                     input_batch,
                     states=states,
                     cfg_branch=token.cfg_branch,
-                    intermediate_hidden_states=None if message is None else message.payload,
+                    intermediate_hidden_states=(
+                        None if message is None else self._active_payload(plan, message.payload, "intermediate")
+                    ),
                 )
 
             if not self.is_last_stage:
                 payload = self._extract_tensor(result, "pipeline_forward_local_stage")
-                self._validate_tensor(
-                    payload, plan.spec.intermediate_shape, plan.spec.intermediate_dtype, "intermediate"
+                payload = self._pack_payload(
+                    plan,
+                    payload,
+                    plan.spec.intermediate_shape,
+                    plan.spec.intermediate_dtype,
+                    "intermediate",
                 )
                 self._forward_channel(self.stage, plan.spec).send(self._header_for(token_id, token), payload)
                 if not self.is_first_stage:
@@ -1169,7 +1184,13 @@ class PipelineTickRuntime:
             self.pipeline.pipeline_finish_microbatch(states, noise_pred, positive_noise_pred=positive_noise),
             "pipeline_finish_microbatch",
         )
-        self._validate_tensor(latents, plan.spec.feedback_shape, plan.spec.feedback_dtype, "feedback")
+        latents = self._pack_payload(
+            plan,
+            latents,
+            plan.spec.feedback_shape,
+            plan.spec.feedback_dtype,
+            "feedback",
+        )
         self._feedback_channel(plan.spec).send(
             PipelineTransportHeader(
                 token_id=token_id,
@@ -1209,8 +1230,7 @@ class PipelineTickRuntime:
                             raise RuntimeError("received a cancellation tombstone for a live pipeline token")
                         self._retire_feedback_plan(header.token_id, plan)
                         continue
-                    self._validate_tensor(message.payload, spec.feedback_shape, spec.feedback_dtype, "feedback")
-                    self._apply_feedback(plan, message.payload, header.step_idx)
+                    self._apply_feedback(plan, self._active_payload(plan, message.payload, "feedback"), header.step_idx)
                     active_request_ids = self._active_request_ids(plan)
                     if active_request_ids:
                         completions.append(PipelineTickCompletion(active_request_ids, header.step_idx))
@@ -1266,7 +1286,18 @@ class PipelineTickRuntime:
     def _ensure_channels(self, spec: PipelineTensorSpec) -> None:
         if spec in self._spec_ids:
             return
-        spec_id = len(self._spec_ids)
+        if self._spec_ids:
+            if self._waiting or self._microbatches or self._positive_noise:
+                raise RuntimeError(
+                    "interleaved PP cannot change tensor layout while a pipeline token is in flight; "
+                    "wait for the homogeneous cohort to drain first"
+                )
+            self._shutdown_channels()
+            self._forward_channels.clear()
+            self._feedback_channels.clear()
+            self._spec_ids.clear()
+
+        spec_id = 0
         self._spec_ids[spec] = spec_id
         channel_tag_span = self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT + 1
         tag_stride = (self.world_size + 1) * channel_tag_span
@@ -1379,6 +1410,57 @@ class PipelineTickRuntime:
                 raise RuntimeError(f"pipeline token references unknown request state {request_id!r}")
             states.append(state)
         return tuple(states)
+
+    @staticmethod
+    def _active_rows(plan: _PipelineMicrobatch) -> int:
+        return sum(plan.row_counts)
+
+    def _pack_payload(
+        self,
+        plan: _PipelineMicrobatch,
+        payload: Any,
+        transport_shape: tuple[int, ...],
+        transport_dtype: Any,
+        name: str,
+    ) -> Any:
+        """Pad one variable-size microbatch into its fixed edge buffer."""
+        active_rows = self._active_rows(plan)
+        self._validate_active_tensor(payload, active_rows, transport_shape, transport_dtype, name)
+        if payload.shape[0] == transport_shape[0]:
+            return payload
+
+        import torch
+
+        packed = torch.zeros(transport_shape, dtype=transport_dtype, device=payload.device)
+        packed[:active_rows].copy_(payload)
+        return packed
+
+    def _active_payload(self, plan: _PipelineMicrobatch, payload: Any, name: str) -> Any:
+        """Validate a received edge buffer and expose only its live rows."""
+        shape, dtype = (
+            (plan.spec.intermediate_shape, plan.spec.intermediate_dtype)
+            if name == "intermediate"
+            else (plan.spec.feedback_shape, plan.spec.feedback_dtype)
+        )
+        self._validate_tensor(payload, shape, dtype, name)
+        return payload[: self._active_rows(plan)]
+
+    @staticmethod
+    def _validate_active_tensor(
+        payload: Any,
+        active_rows: int,
+        transport_shape: tuple[int, ...],
+        transport_dtype: Any,
+        name: str,
+    ) -> None:
+        if payload.dtype != transport_dtype:
+            raise ValueError(f"{name} dtype {payload.dtype} does not match transport dtype {transport_dtype}")
+        if payload.ndim != len(transport_shape):
+            raise ValueError(f"{name} rank {payload.ndim} does not match transport rank {len(transport_shape)}")
+        if payload.shape[0] != active_rows:
+            raise ValueError(f"{name} rows {payload.shape[0]} do not match microbatch rows {active_rows}")
+        if active_rows > transport_shape[0] or tuple(payload.shape[1:]) != transport_shape[1:]:
+            raise ValueError(f"{name} shape {tuple(payload.shape)} does not fit fixed transport shape {transport_shape}")
 
     def _is_fully_cancelled(self, plan: _PipelineMicrobatch) -> bool:
         return all(request_id in self._cancelled_request_ids for request_id in plan.request_ids)
