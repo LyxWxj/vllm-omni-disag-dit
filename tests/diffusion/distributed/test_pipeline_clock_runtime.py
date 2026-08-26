@@ -717,4 +717,4 @@ class TestPipelineTickRuntime:
 
         assert results[0][0] == [(0, 0)]
         assert all(results[rank][0] == [] for rank in range(1, world_size))
-        assert all(results[rank][1] == () for rank in range(world_size))
+        assert all(results[rank][1] == () for rank in range(world_size)), results
