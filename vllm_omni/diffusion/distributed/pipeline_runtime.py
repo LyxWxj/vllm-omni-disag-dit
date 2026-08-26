@@ -1268,10 +1268,10 @@ class PipelineTickRuntime:
             return
         spec_id = len(self._spec_ids)
         self._spec_ids[spec] = spec_id
-        channel_tag_span = self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT + 1
+        channel_tag_span = self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT
         tag_stride = (self.world_size + 1) * channel_tag_span
         tag_base = self._TAG_BASE + spec_id * tag_stride
-        self._bootstrap_payload_edges(tag_base, channel_tag_span)
+        self._bootstrap_payload_edges()
         for edge in range(self.world_size - 1):
             if self.stage not in (edge, edge + 1):
                 continue
@@ -1299,7 +1299,7 @@ class PipelineTickRuntime:
                 credit_group=self._edge_credit_group(self.pp_ranks[-1], self.pp_ranks[0]),
             )
 
-    def _bootstrap_payload_edges(self, tag_base: int, channel_tag_span: int) -> None:
+    def _bootstrap_payload_edges(self) -> None:
         """Create HCCL edge communicators in one globally ordered wave."""
         import torch
         import torch.distributed as dist
@@ -1309,26 +1309,13 @@ class PipelineTickRuntime:
         if self.bootstrap_group is None:
             raise RuntimeError("HCCL PP transport requires a bootstrap process group")
 
-        for edge_index, (source_rank, destination_rank) in enumerate(pipeline_edge_pairs(self.pp_ranks)):
-            bootstrap_tag = tag_base + edge_index * channel_tag_span + channel_tag_span - 1
-            if self.global_rank == source_rank:
+        for source_rank, destination_rank in pipeline_edge_pairs(self.pp_ranks):
+            if self.global_rank in (source_rank, destination_rank):
                 buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
-                work = dist.irecv(
+                dist.all_reduce(
                     buffer,
-                    src=destination_rank,
                     group=self._edge_group(source_rank, destination_rank),
-                    tag=bootstrap_tag,
                 )
-                work.wait()
-            elif self.global_rank == destination_rank:
-                buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
-                work = dist.isend(
-                    buffer,
-                    dst=source_rank,
-                    group=self._edge_group(source_rank, destination_rank),
-                    tag=bootstrap_tag,
-                )
-                work.wait()
             dist.barrier(group=self.bootstrap_group)
 
     def _poll_channels(self) -> None:
