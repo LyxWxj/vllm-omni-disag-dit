@@ -20,6 +20,7 @@ from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineTickRuntime,
     PipelineToken,
     PipelineTransportHeader,
+    pipeline_edge_pairs,
 )
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -41,6 +42,12 @@ def _token(token_id: str, microbatch_id: int, *, compatibility_key: tuple[str, i
 
 
 class TestPipelineClockSimulator:
+    def test_pp_edges_include_the_feedback_lane(self) -> None:
+        assert pipeline_edge_pairs((4, 7, 9, 11)) == ((4, 7), (7, 9), (9, 11), (11, 4))
+
+        with pytest.raises(ValueError, match="at least two ranks"):
+            pipeline_edge_pairs((4,))
+
     def test_pp4_fills_all_stages_and_completes_every_token_once(self) -> None:
         runtime = PipelineClockSimulator(num_stages=4, slots_per_edge=2)
         for index, token_id in enumerate(("A", "B", "C", "D")):

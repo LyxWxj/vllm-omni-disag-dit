@@ -74,6 +74,14 @@ class PipelineSlotState(Enum):
     SEND_PENDING = auto()
 
 
+def pipeline_edge_pairs(pp_ranks: Sequence[int]) -> tuple[tuple[int, int], ...]:
+    """Return adjacent forward edges plus the last-to-first feedback edge."""
+    ranks = tuple(pp_ranks)
+    if len(ranks) < 2:
+        raise ValueError("interleaved pipeline parallelism requires at least two ranks")
+    return (*zip(ranks[:-1], ranks[1:], strict=True), (ranks[-1], ranks[0]))
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineTransportHeader:
     """Fixed-size control header carried with one PP tensor payload.

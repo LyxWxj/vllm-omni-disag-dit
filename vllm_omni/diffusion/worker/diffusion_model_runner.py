@@ -40,7 +40,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRow,
     PreparedDiffusionPagedAttentionBatch,
 )
-from vllm_omni.diffusion.distributed.pipeline_runtime import PipelineTickRuntime
+from vllm_omni.diffusion.distributed.pipeline_runtime import PipelineTickRuntime, pipeline_edge_pairs
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -1069,10 +1069,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             device=self.device,
             edge_groups={
                 (source_rank, destination_rank): pp_group.pipeline_edge_group(source_rank, destination_rank)
-                for source_rank, destination_rank in (
-                    *zip(pp_group.ranks, pp_group.ranks[1:], strict=True),
-                    (pp_group.ranks[-1], pp_group.ranks[0]),
-                )
+                for source_rank, destination_rank in pipeline_edge_pairs(pp_group.ranks)
                 if pp_group.rank in (source_rank, destination_rank)
             },
         )
