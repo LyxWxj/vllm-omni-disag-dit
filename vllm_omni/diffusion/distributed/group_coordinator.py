@@ -708,29 +708,33 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
 
-        # Retained-state PP clocks use the established PP device group for
-        # payload P2P. HCCL pair groups create their communicator lazily, and
-        # a receiver-first credit protocol cannot safely initialize a pair
-        # group before its source has work to send. Reverse slot credits use
-        # dedicated Gloo pair groups, so the device group sees payload traffic
-        # in one direction only.
+        # Retained-state PP clocks exchange independent point-to-point streams
+        # on each forward edge and on the last-to-first feedback edge. The
+        # device lane remains unidirectional HCCL after a one-time channel
+        # bootstrap; scalar reverse credits use a dedicated Gloo pair group.
+        self._pipeline_edge_groups: dict[tuple[int, int], ProcessGroup] = {}
         self._pipeline_edge_credit_groups: dict[tuple[int, int], ProcessGroup] = {}
         for ranks in group_ranks:
             if len(ranks) < 2:
                 continue
             edge_pairs = [*zip(ranks, ranks[1:]), (ranks[-1], ranks[0])]
             for source_rank, destination_rank in edge_pairs:
+                edge_group = torch.distributed.new_group(
+                    [source_rank, destination_rank], backend=torch_distributed_backend
+                )
                 credit_group = torch.distributed.new_group([source_rank, destination_rank], backend="gloo")
                 if self.rank in (source_rank, destination_rank):
+                    self._pipeline_edge_groups[(source_rank, destination_rank)] = edge_group
                     self._pipeline_edge_credit_groups[(source_rank, destination_rank)] = credit_group
 
     def pipeline_edge_group(self, source_rank: int, destination_rank: int) -> ProcessGroup:
-        """Return the established PP device group for one directed payload edge."""
-        if self.rank not in (source_rank, destination_rank):
-            raise ValueError(f"rank {self.rank} is not an endpoint of pipeline edge {source_rank}->{destination_rank}")
-        if self.world_size == 2:
-            return self.device_groups[self.ranks.index(source_rank)]
-        return self.device_group
+        """Return the dedicated device group for one directed PP edge."""
+        try:
+            return self._pipeline_edge_groups[(source_rank, destination_rank)]
+        except KeyError as exc:
+            raise ValueError(
+                f"rank {self.rank} is not an endpoint of pipeline edge {source_rank}->{destination_rank}"
+            ) from exc
 
     def pipeline_edge_credit_group(self, source_rank: int, destination_rank: int) -> ProcessGroup:
         """Return the reverse-credit group for one directed PP edge."""
@@ -1029,6 +1033,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
             *self.device_groups,
             *self.cpu_groups,
             self.skip_device_group,
+            *self._pipeline_edge_groups.values(),
             *self._pipeline_edge_credit_groups.values(),
         ]
         seen = {id(self.device_group), id(self.cpu_group)}
@@ -1039,6 +1044,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.device_groups = []
         self.cpu_groups = []
         self.skip_device_group = None
+        self._pipeline_edge_groups = {}
         self._pipeline_edge_credit_groups = {}
         super().destroy()
 

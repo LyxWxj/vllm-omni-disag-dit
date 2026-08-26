@@ -584,7 +584,7 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: s
             "B": _make_tick_state("B", 10.0, cfg=True),
         }
         edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
-        payload_group = dist.new_group(list(range(world_size)), backend="gloo")
+        edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
         credit_edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
         active_stages: list[tuple[int, int]] = []
         pipeline = _TickPipeline(rank, active_stages)
@@ -594,7 +594,7 @@ def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: s
             pp_ranks=tuple(range(world_size)),
             global_rank=rank,
             device="cpu",
-            edge_groups={edge_pair: payload_group for edge_pair in edge_pairs if rank in edge_pair},
+            edge_groups={edge_pair: edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair},
             edge_credit_groups={
                 edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
             },
@@ -653,7 +653,7 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
     try:
         state_cache = {"A": _make_tick_state("A", 0.0, cfg=True)}
         edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
-        payload_group = dist.new_group(list(range(world_size)), backend="gloo")
+        edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
         credit_edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
         active_stages: list[tuple[int, int]] = []
         pipeline = _TickPipeline(rank, active_stages)
@@ -663,7 +663,7 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
             pp_ranks=tuple(range(world_size)),
             global_rank=rank,
             device="cpu",
-            edge_groups={edge_pair: payload_group for edge_pair in edge_pairs if rank in edge_pair},
+            edge_groups={edge_pair: edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair},
             edge_credit_groups={
                 edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
             },

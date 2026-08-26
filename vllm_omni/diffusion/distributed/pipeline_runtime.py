@@ -237,7 +237,7 @@ class PipelineP2PChannel:
     both input and output buffer lifetimes without a blocking metadata path.
     """
 
-    _TAGS_PER_SLOT = 3
+    _TAGS_PER_SLOT = 4
 
     def __init__(
         self,
@@ -299,6 +299,13 @@ class PipelineP2PChannel:
         self._shutdown_requested = False
         self._shutdown_slot_ids: set[int] = set()
         self._closed = False
+
+        # HCCL lazily forms its P2P communicator on the first operation. A
+        # destination normally posts a payload receive before its source has
+        # a credit to send, which leaves that first HCCL operation unmatched.
+        # Bootstrap the pair once in the reverse direction, then use Gloo for
+        # all logical credits and HCCL only for payloads.
+        self._bootstrap_payload_group()
 
         if self._is_source:
             self._send_slots = [
@@ -652,6 +659,29 @@ class PipelineP2PChannel:
 
     def _credit_tag(self, slot_id: int) -> int:
         return self._header_tag(slot_id) + 2
+
+    def _bootstrap_tag(self) -> int:
+        return self.tag_base + self._TAGS_PER_SLOT - 1
+
+    def _bootstrap_payload_group(self) -> None:
+        if self._requires_wait_thread:
+            return
+        buffer = self._torch.zeros(1, dtype=self._torch.int64, device=self.device)
+        if self._is_source:
+            work = self._dist.irecv(
+                buffer,
+                src=self._peer_rank,
+                group=self._group,
+                tag=self._bootstrap_tag(),
+            )
+        else:
+            work = self._dist.isend(
+                buffer,
+                dst=self._peer_rank,
+                group=self._group,
+                tag=self._bootstrap_tag(),
+            )
+        work.wait()
 
     def _start_work(self, work: Any, *, requires_wait_thread: bool | None = None) -> Any:
         if not (self._requires_wait_thread if requires_wait_thread is None else requires_wait_thread):
