@@ -12,6 +12,7 @@ import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.distributed.pipeline_runtime import PipelineTickCompletion
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
@@ -394,6 +395,56 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
 
     output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")
 
+    assert output.finished is True
+    assert output.result is not None
+    assert torch.equal(output.result.output, torch.ones(1, 1))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_pipeline_tick_admits_state_and_returns_feedback_completion(monkeypatch):
+    """The runner keeps a request in flight until the PP feedback tick arrives."""
+
+    class _FakePipelineRuntime:
+        is_first_stage = True
+
+        def __init__(self) -> None:
+            self.cancelled: tuple[str, ...] = ()
+            self.admitted: list[tuple] = []
+
+        def cancel(self, request_ids) -> None:
+            self.cancelled = tuple(request_ids)
+
+        def admit(self, states) -> None:
+            self.admitted.append(tuple(states))
+
+        def progress_one_clock(self):
+            state = self.admitted[-1][0]
+            state.step_index += 1
+            return (PipelineTickCompletion((state.request_id,), step_idx=0),)
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.parallel_config.pipeline_parallel_size = 2
+    runtime = _FakePipelineRuntime()
+    runner._pipeline_tick_runtime = runtime
+    runner._attach_stepwise_metrics = Mock()
+    req = _make_request()
+    req.request_id = "req"
+    req.sampling_params.num_inference_steps = 1
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "supports_pipeline_tick_execution", lambda pipeline: True)
+
+    output = DiffusionModelRunner.execute_pipeline_tick(runner, scheduler_output).get_request_output("req")
+
+    assert runtime.cancelled == ()
+    assert [[state.request_id for state in batch] for batch in runtime.admitted] == [["req"]]
     assert output.finished is True
     assert output.result is not None
     assert torch.equal(output.result.output, torch.ones(1, 1))
