@@ -471,16 +471,18 @@ class TestRequestBatchCapability:
         fake_executor.execute_batch.assert_called_once()
         fake_executor.execute_request.assert_not_called()
 
+    @pytest.mark.parametrize("step_execution", [False, True])
     def test_pp_step_engine_dispatches_pipeline_tick(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
+        step_execution: bool,
     ) -> None:
         od_config = SimpleNamespace(
             model_class_name="StepPipeline",
             custom_pipeline_args=None,
             streaming_output=False,
-            step_execution=True,
+            step_execution=step_execution,
             diffusion_pp_schedule="interleaved",
             max_num_seqs=2,
             parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=2),
@@ -510,6 +512,7 @@ class TestRequestBatchCapability:
         output = engine.execute_fn(_make_request_mode_sched_output("req-a"))
 
         assert engine.execution_mode == DiffusionExecutionMode.STEP_BATCH
+        assert od_config.step_execution is True
         assert output == "pipeline-tick"
         fake_executor.execute_pipeline_tick.assert_called_once()
         fake_executor.execute_step.assert_not_called()

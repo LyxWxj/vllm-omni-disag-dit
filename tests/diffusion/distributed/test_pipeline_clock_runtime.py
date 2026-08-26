@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from tests.helpers.runtime import get_open_port
+from tests.helpers.runtime import get_distributed_init_method, get_open_port
 from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineClockSimulator,
     PipelineP2PChannel,
@@ -553,10 +553,10 @@ def _make_tick_state(request_id: str, value: float, *, cfg: bool) -> StepRequest
     return state
 
 
-def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, master_port: int, result_queue) -> None:
+def _run_pipeline_tick_runtime_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
     dist.init_process_group(
         backend="gloo",
-        init_method=f"tcp://127.0.0.1:{master_port}",
+        init_method=init_method,
         rank=rank,
         world_size=world_size,
         timeout=timedelta(seconds=30),
@@ -630,7 +630,7 @@ class TestPipelineTickRuntime:
         try:
             torch.multiprocessing.spawn(
                 _run_pipeline_tick_runtime_worker,
-                args=(world_size, get_open_port(), result_queue),
+                args=(world_size, get_distributed_init_method(), result_queue),
                 nprocs=world_size,
             )
             results = {
