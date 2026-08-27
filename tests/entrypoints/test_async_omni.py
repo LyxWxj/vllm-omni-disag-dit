@@ -176,7 +176,9 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
             assert re.fullmatch(rf"{re.escape(cancel_prefix)}-[0-9a-f]+", rid)
         assert len(aborted_ids) == expected_cancel_count
         assert len(set(aborted_ids)) == expected_cancel_count
-        assert len(omni.request_states) == len(req_ids) - expected_cancel_count
+        # Public abort retains frontend state until each generate() consumer
+        # observes its terminal output.
+        assert len(omni.request_states) == len(req_ids)
 
         for t in tasks:
             t.cancel()
@@ -186,7 +188,7 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
 
 
 @pytest.mark.cpu
-def test_abort_pops_request_states_only_after_ack():
+def test_abort_retains_request_states_after_ack_for_result_consumer():
     async def run():
         release = asyncio.Event()
         seen_during_wait: list[int] = []
@@ -211,7 +213,7 @@ def test_abort_pops_request_states_only_after_ack():
 
         release.set()
         await task
-        assert "req-1-aaaa" not in omni.request_states
+        assert "req-1-aaaa" in omni.request_states
 
     asyncio.run(run())
 
@@ -263,6 +265,49 @@ def test_abort_delivers_terminal_output_to_active_generate_stream():
         assert outputs[0].finished
         assert outputs[0].aborted
         assert outputs[0].abort_message == "Request abort-me aborted."
+        assert not omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_before_request_admission_delivers_terminal_output():
+    async def run():
+        admission_started = asyncio.Event()
+        release_admission = asyncio.Event()
+
+        async def blocked_add_request(**kwargs):
+            del kwargs
+            admission_started.set()
+            await release_admission.wait()
+
+        omni = get_async_omni_instance(fake_add_request=blocked_add_request)
+        del omni._process_orchestrator_results
+        outputs = []
+
+        async def collect():
+            async for output in omni.generate(
+                prompt={"prompt": "test"},
+                request_id="abort-before-admission",
+                sampling_params_list=[SimpleNamespace()],
+            ):
+                outputs.append(output)
+
+        task = asyncio.create_task(collect())
+        await admission_started.wait()
+        assert len(omni.request_states) == 1
+
+        await omni.abort("abort-before-admission")
+        assert len(omni.request_states) == 1
+        assert not task.done()
+
+        release_admission.set()
+        await task
+
+        assert len(outputs) == 1
+        assert outputs[0].finished
+        assert outputs[0].aborted
+        assert outputs[0].abort_message == "Request abort-before-admission aborted."
         assert not omni.request_states
 
     asyncio.run(run())

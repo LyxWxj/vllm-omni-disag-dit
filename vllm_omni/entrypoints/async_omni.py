@@ -1111,17 +1111,22 @@ class AsyncOmni(EngineClient, OmniBase):
         # Request IDs are already internal, so we just need to get the matching states.
         internal_req_ids = [rid for rid in request_ids if rid in self.request_states]
         await self._abort(internal_req_ids)
+        # This path is used when generate() itself is being cancelled or has
+        # failed, so there is no result consumer left to retire the state.
+        for rid in internal_req_ids:
+            self.request_states.pop(rid, None)
 
     async def _abort(self, request_ids: list[str]) -> None:
-        """Abort request IDs via the engine and clean frontend state after ack.
+        """Abort request IDs and enqueue their terminal frontend outputs.
 
-        Waits for orchestrator abort acknowledgment before popping
-        ``request_states`` so generate() cleanup stays consistent with
-        backend binding/request teardown. Orchestrator abort errors propagate.
+        The state must remain registered until generate() consumes the queued
+        terminal result. In particular, abort may race with add_request_async()
+        before generate() starts its result consumer. Orchestrator abort errors
+        propagate without changing frontend state.
         """
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
-            state = self.request_states.pop(rid, None)
+            state = self.request_states.get(rid)
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
