@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.benchmark.analyze_diffusion_pp_trace import summarize
 from vllm_omni.diffusion.distributed import pp_trace
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_trace_writes_request_and_clock_metadata(tmp_path: Path, monkeypatch) -> None:
@@ -63,6 +67,24 @@ def test_trace_summary_reports_multi_stage_overlap(tmp_path: Path, monkeypatch) 
         "pp_rank_1.jsonl": [
             {
                 "event": "begin",
+                "name": "scheduler_step",
+                "pp_rank": 1,
+                "pp_size": 2,
+                "ts_ns": 0,
+                "token_id": 1,
+                "clock": 0,
+            },
+            {
+                "event": "end",
+                "name": "scheduler_step",
+                "pp_rank": 1,
+                "pp_size": 2,
+                "ts_ns": 5,
+                "token_id": 1,
+                "clock": 0,
+            },
+            {
+                "event": "begin",
                 "name": "stage_forward",
                 "pp_rank": 1,
                 "pp_size": 2,
@@ -86,5 +108,14 @@ def test_trace_summary_reports_multi_stage_overlap(tmp_path: Path, monkeypatch) 
 
     summary = summarize(tmp_path)
     assert summary["stage_forward_intervals"] == 2
+    assert summary["active_stage_ms"] == 0.000015
     assert summary["multi_stage_overlap_ms"] == 0.000005
     assert summary["overlap_ratio"] == 1 / 3
+    assert summary["per_rank"] == {
+        "0": {"interval_count": 1, "active_ms": 0.00001},
+        "1": {"interval_count": 1, "active_ms": 0.00001},
+    }
+    assert summary["all_span_active_ms"] == 0.000015
+    assert summary["all_span_overlap_ms"] == 0.00001
+    assert summary["all_span_overlap_ratio"] == 2 / 3
+    assert summary["all_span_per_rank"]["1"] == {"interval_count": 2, "active_ms": 0.000015}

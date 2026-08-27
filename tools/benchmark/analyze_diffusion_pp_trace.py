@@ -64,24 +64,31 @@ def _load_intervals(trace_dir: Path) -> list[dict[str, Any]]:
     return intervals
 
 
-def _union_ns(intervals: list[dict[str, Any]]) -> int:
-    total = 0
-    end = -1
+def _merged_intervals(intervals: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
     for interval in sorted(intervals, key=lambda item: (item["start_ns"], item["end_ns"])):
         start, stop = interval["start_ns"], interval["end_ns"]
-        if start > end:
-            total += stop - start
-        elif stop > end:
-            total += stop - end
-        end = max(end, stop)
-    return total
+        if not merged or start > merged[-1][1]:
+            merged.append((start, stop))
+        elif stop > merged[-1][1]:
+            merged[-1] = (merged[-1][0], stop)
+    return merged
+
+
+def _union_ns(intervals: list[dict[str, Any]]) -> int:
+    return sum(stop - start for start, stop in _merged_intervals(intervals))
 
 
 def _overlap_ns(intervals: list[dict[str, Any]]) -> int:
-    boundaries: list[tuple[int, int]] = []
+    by_rank: dict[Any, list[dict[str, Any]]] = defaultdict(list)
     for interval in intervals:
-        boundaries.append((interval["start_ns"], 1))
-        boundaries.append((interval["end_ns"], -1))
+        by_rank[interval["pp_rank"]].append(interval)
+
+    boundaries: list[tuple[int, int]] = []
+    for rank_intervals in by_rank.values():
+        for start, stop in _merged_intervals(rank_intervals):
+            boundaries.append((start, 1))
+            boundaries.append((stop, -1))
     active = 0
     overlap = 0
     previous = None
@@ -95,16 +102,22 @@ def _overlap_ns(intervals: list[dict[str, Any]]) -> int:
 
 def summarize(trace_dir: Path) -> dict[str, Any]:
     intervals = _load_intervals(trace_dir)
-    by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    stage_intervals = [interval for interval in intervals if interval["name"] == "stage_forward"]
+    stage_by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    all_by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for interval in intervals:
-        by_rank[str(interval["pp_rank"])].append(interval)
-    active_ns = _union_ns(intervals)
-    overlap_ns = _overlap_ns(intervals)
+        all_by_rank[str(interval["pp_rank"])].append(interval)
+    for interval in stage_intervals:
+        stage_by_rank[str(interval["pp_rank"])].append(interval)
+    active_ns = _union_ns(stage_intervals)
+    overlap_ns = _overlap_ns(stage_intervals)
+    all_span_active_ns = _union_ns(intervals)
+    all_span_overlap_ns = _overlap_ns(intervals)
     return {
         "trace_dir": str(trace_dir),
         "interval_count": len(intervals),
-        "ranks": sorted(by_rank),
-        "stage_forward_intervals": len([item for item in intervals if item["name"] == "stage_forward"]),
+        "ranks": sorted(all_by_rank),
+        "stage_forward_intervals": len(stage_intervals),
         "active_stage_ms": active_ns / 1e6,
         "multi_stage_overlap_ms": overlap_ns / 1e6,
         "overlap_ratio": overlap_ns / active_ns if active_ns else 0.0,
@@ -113,7 +126,17 @@ def summarize(trace_dir: Path) -> dict[str, Any]:
                 "interval_count": len(items),
                 "active_ms": _union_ns(items) / 1e6,
             }
-            for rank, items in sorted(by_rank.items())
+            for rank, items in sorted(stage_by_rank.items())
+        },
+        "all_span_active_ms": all_span_active_ns / 1e6,
+        "all_span_overlap_ms": all_span_overlap_ns / 1e6,
+        "all_span_overlap_ratio": all_span_overlap_ns / all_span_active_ns if all_span_active_ns else 0.0,
+        "all_span_per_rank": {
+            rank: {
+                "interval_count": len(items),
+                "active_ms": _union_ns(items) / 1e6,
+            }
+            for rank, items in sorted(all_by_rank.items())
         },
         "intervals": intervals,
     }
