@@ -1023,7 +1023,11 @@ class PipelineTickRuntime:
         self._terminal_error: str | None = None
         # HCCL does not use the P2P ``tag`` argument when matching already
         # posted receives. Keep exactly one physical tensor layout live on a
-        # PP lane and explicitly drain it before changing layouts.
+        # PP lane and explicitly drain it before changing layouts. The edge
+        # communicators themselves are bootstrapped only once: repeating the
+        # bootstrap collectives after real P2P traffic is not a valid channel
+        # reconfiguration protocol on NCCL/HCCL.
+        self._transport_bootstrapped = False
         self._spec_ids: dict[PipelineTensorSpec, int] = {}
         self._forward_channels: dict[tuple[int, PipelineTensorSpec], PipelineP2PChannel] = {}
         self._feedback_channels: dict[PipelineTensorSpec, PipelineP2PChannel] = {}
@@ -1692,7 +1696,9 @@ class PipelineTickRuntime:
         channel_tag_span = self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT + 1
         tag_stride = (self.world_size + 1) * channel_tag_span
         tag_base = self._TAG_BASE + spec_id * tag_stride
-        self._bootstrap_transport_edges(tag_base, channel_tag_span)
+        if not self._transport_bootstrapped:
+            self._bootstrap_transport_edges(tag_base, channel_tag_span)
+            self._transport_bootstrapped = True
         for edge in range(self.world_size - 1):
             if self.stage not in (edge, edge + 1):
                 continue

@@ -875,6 +875,16 @@ def _run_pipeline_tick_reconfigure_worker(rank: int, world_size: int, init_metho
             bootstrap_group=dist.group.WORLD,
         )
 
+        bootstrap_calls = 0
+        bootstrap_transport_edges = runtime._bootstrap_transport_edges  # noqa: SLF001
+
+        def count_bootstrap(tag_base: int, channel_tag_span: int) -> None:
+            nonlocal bootstrap_calls
+            bootstrap_calls += 1
+            bootstrap_transport_edges(tag_base, channel_tag_span)
+
+        runtime._bootstrap_transport_edges = count_bootstrap  # noqa: SLF001
+
         completed: list[str] = []
         for request_id in ("A", "C"):
             runtime.admit([state_cache[request_id]])
@@ -898,7 +908,7 @@ def _run_pipeline_tick_reconfigure_worker(rank: int, world_size: int, init_metho
 
         final_specs = tuple(runtime._spec_ids)  # noqa: SLF001 - verifies lane replacement.
         runtime.close()
-        result_queue.put((rank, completed, final_specs, active_stages))
+        result_queue.put((rank, completed, final_specs, active_stages, bootstrap_calls))
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -1123,16 +1133,19 @@ class TestPipelineTickRuntime:
                 nprocs=world_size,
             )
             results = {
-                rank: (completed, specs, active_stages)
-                for rank, completed, specs, active_stages in (result_queue.get() for _ in range(world_size))
+                rank: (completed, specs, active_stages, bootstrap_calls)
+                for rank, completed, specs, active_stages, bootstrap_calls in (
+                    result_queue.get() for _ in range(world_size)
+                )
             }
         finally:
             manager.shutdown()
 
         assert results[0][0] == ["A", "C"]
         assert all(results[rank][0] == [] for rank in range(1, world_size))
-        assert all(specs[0].intermediate_shape == (2, 2) for _, specs, _ in results.values())
-        assert all(active_stages for _, _, active_stages in results.values())
+        assert all(specs[0].intermediate_shape == (2, 2) for _, specs, _, _ in results.values())
+        assert all(active_stages for _, _, active_stages, _ in results.values())
+        assert all(bootstrap_calls == 1 for _, _, _, bootstrap_calls in results.values())
 
     def test_pp4_device_bootstrap_only_resolves_endpoint_groups(self) -> None:
         world_size = 4
