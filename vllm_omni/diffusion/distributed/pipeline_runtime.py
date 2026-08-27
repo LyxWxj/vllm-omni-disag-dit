@@ -173,10 +173,6 @@ class _P2PSendSlot:
         self.payload_buffer = payload_buffer
         self.header_work: Any | None = None
         self.payload_work: Any | None = None
-        # Device P2P can run on a communication stream that does not
-        # automatically depend on the default stream producing this buffer.
-        self.producer_event: Any | None = None
-        self.transfer_event: Any | None = None
         self.state = PipelineSlotState.FREE
         self.history = [self.state]
 
@@ -195,8 +191,6 @@ class _P2PSendSlot:
             raise RuntimeError(f"send slot {self.slot_id} has no pending transfer")
         self.header_work = None
         self.payload_work = None
-        self.producer_event = None
-        self.transfer_event = None
         self.state = PipelineSlotState.FREE
         self.history.append(self.state)
 
@@ -210,7 +204,6 @@ class _P2PReceiveSlot:
         self.payload_buffer = payload_buffer
         self.header_work: Any | None = None
         self.payload_work: Any | None = None
-        self.transfer_event: Any | None = None
         self.header: PipelineTransportHeader | None = None
         self.release_event: Any | None = None
         self.state = PipelineSlotState.FREE
@@ -316,14 +309,6 @@ class PipelineP2PChannel:
         self.tensor_shape = tuple(tensor_shape)
         self.tensor_dtype = tensor_dtype
         self.device = torch.device(device)
-        self._device_api = getattr(torch, self.device.type, None)
-        self._p2p_stream = None
-        if self._requires_coordinated_device_transfers:
-            stream_type = getattr(self._device_api, "Stream", None)
-            stream_context = getattr(self._device_api, "stream", None)
-            if stream_type is None or stream_context is None:
-                raise RuntimeError(f"{self.device.type} PP transport requires device stream support")
-            self._p2p_stream = stream_type(device=self.device)
         self._credit_device = torch.device("cpu") if self._credit_requires_wait_thread else self.device
         self.rank = dist.get_rank()
         if self.rank not in (source_rank, destination_rank):
@@ -488,7 +473,6 @@ class PipelineP2PChannel:
 
         slot.begin_send()
         if self._requires_coordinated_device_transfers:
-            slot.producer_event = self._record_producer_event()
             return transport_header
         self._commit_prepared_send(slot)
         return transport_header
@@ -624,11 +608,7 @@ class PipelineP2PChannel:
 
     def _poll_source(self) -> None:
         for slot in self._send_slots:
-            if slot.is_send_pending and self._slot_transfer_complete(
-                slot.transfer_event,
-                slot.header_work,
-                slot.payload_work,
-            ):
+            if slot.is_send_pending and self._works_complete(slot.header_work, slot.payload_work):
                 self._wait_for_works(slot.header_work, slot.payload_work)
                 slot.finish_send()
 
@@ -652,12 +632,11 @@ class PipelineP2PChannel:
         for slot in self._receive_slots:
             if slot.state is not PipelineSlotState.RECV_POSTED or slot.header is not None:
                 continue
-            if not self._slot_transfer_complete(slot.transfer_event, slot.header_work, slot.payload_work):
+            if not self._works_complete(slot.header_work, slot.payload_work):
                 continue
             self._wait_for_works(slot.header_work, slot.payload_work)
             slot.header_work = None
             slot.payload_work = None
-            slot.transfer_event = None
             header = PipelineTransportHeader.decode(slot.header_buffer)
             if header.slot_id != slot.slot_id:
                 raise RuntimeError(f"header for receive slot {slot.slot_id} carries mismatched slot {header.slot_id}")
@@ -683,8 +662,9 @@ class PipelineP2PChannel:
         if self.device.type == "cpu":
             return None
 
-        event_type = getattr(self._device_api, "Event", None)
-        current_stream = getattr(self._device_api, "current_stream", None)
+        device_api = getattr(self._torch, self.device.type, None)
+        event_type = getattr(device_api, "Event", None)
+        current_stream = getattr(device_api, "current_stream", None)
         if event_type is None or current_stream is None:
             raise RuntimeError(
                 f"PipelineP2PChannel cannot safely reuse {self.device.type} receive buffers without device events"
@@ -693,45 +673,6 @@ class PipelineP2PChannel:
         event = event_type(enable_timing=False)
         event.record(current_stream(self.device))
         return event
-
-    def _record_producer_event(self) -> Any | None:
-        """Record completion of the default-stream copy into a send slot."""
-        return self._record_compute_event()
-
-    def _slot_transfer_complete(self, transfer_event: Any | None, *works: Any | None) -> bool:
-        if transfer_event is not None:
-            return bool(transfer_event.query())
-        return self._works_complete(*works)
-
-    def _start_device_transfer(
-        self,
-        ops: Sequence[Any],
-        *,
-        producer_event: Any | None = None,
-    ) -> tuple[_BatchedWork, Any]:
-        """Submit P2P after its producer and expose true device completion.
-
-        ``Work.is_completed()`` is not a device-buffer lifetime guarantee on
-        NCCL/HCCL.  Waiting on the Work from a side stream inserts the device
-        dependency without blocking the host; the event recorded afterwards
-        is the point at which the fixed slot can be consumed or reused.
-        """
-        if self._p2p_stream is None:
-            raise RuntimeError("device PP transport has no P2P stream")
-        if producer_event is not None:
-            self._p2p_stream.wait_event(producer_event)
-        with self._device_api.stream(self._p2p_stream):
-            batch_work = self._start_batched_work(
-                self._dist.batch_isend_irecv(ops),
-                requires_wait_thread=False,
-            )
-            self._wait_for_works(batch_work)
-            event_type = getattr(self._device_api, "Event", None)
-            if event_type is None:
-                raise RuntimeError(f"{self.device.type} PP transport requires device events")
-            transfer_event = event_type(enable_timing=False)
-            transfer_event.record(self._p2p_stream)
-        return batch_work, transfer_event
 
     def _reclaim_completed_receive_slots(self) -> None:
         """Return credits in physical lane order after stream completion.
@@ -778,61 +719,53 @@ class PipelineP2PChannel:
     def _post_receive(self, slot: _P2PReceiveSlot) -> None:
         slot.transition(PipelineSlotState.FREE, PipelineSlotState.RECV_POSTED)
         slot_group = self._slot_groups[slot.slot_id]
-        ops = [
-            self._dist.P2POp(
-                self._dist.irecv,
-                slot.header_buffer,
-                self._peer_rank,
-                slot_group,
-                self._header_tag(slot.slot_id),
+        batch_work = self._start_batched_work(
+            self._dist.batch_isend_irecv(
+                [
+                    self._dist.P2POp(
+                        self._dist.irecv,
+                        slot.header_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._header_tag(slot.slot_id),
+                    ),
+                    self._dist.P2POp(
+                        self._dist.irecv,
+                        slot.payload_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._payload_tag(slot.slot_id),
+                    ),
+                ]
             ),
-            self._dist.P2POp(
-                self._dist.irecv,
-                slot.payload_buffer,
-                self._peer_rank,
-                slot_group,
-                self._payload_tag(slot.slot_id),
-            ),
-        ]
-        if self._requires_coordinated_device_transfers:
-            batch_work, slot.transfer_event = self._start_device_transfer(ops)
-        else:
-            batch_work = self._start_batched_work(
-                self._dist.batch_isend_irecv(ops),
-                requires_wait_thread=self._slot_requires_wait_thread[slot.slot_id],
-            )
+            requires_wait_thread=self._slot_requires_wait_thread[slot.slot_id],
+        )
         slot.header_work = batch_work
         slot.payload_work = batch_work
 
     def _post_payload_send(self, slot: _P2PSendSlot) -> None:
         slot_group = self._slot_groups[slot.slot_id]
-        ops = [
-            self._dist.P2POp(
-                self._dist.isend,
-                slot.header_buffer,
-                self._peer_rank,
-                slot_group,
-                self._header_tag(slot.slot_id),
+        batch_work = self._start_batched_work(
+            self._dist.batch_isend_irecv(
+                [
+                    self._dist.P2POp(
+                        self._dist.isend,
+                        slot.header_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._header_tag(slot.slot_id),
+                    ),
+                    self._dist.P2POp(
+                        self._dist.isend,
+                        slot.payload_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._payload_tag(slot.slot_id),
+                    ),
+                ]
             ),
-            self._dist.P2POp(
-                self._dist.isend,
-                slot.payload_buffer,
-                self._peer_rank,
-                slot_group,
-                self._payload_tag(slot.slot_id),
-            ),
-        ]
-        if self._requires_coordinated_device_transfers:
-            batch_work, slot.transfer_event = self._start_device_transfer(
-                ops,
-                producer_event=slot.producer_event,
-            )
-            slot.producer_event = None
-        else:
-            batch_work = self._start_batched_work(
-                self._dist.batch_isend_irecv(ops),
-                requires_wait_thread=self._slot_requires_wait_thread[slot.slot_id],
-            )
+            requires_wait_thread=self._slot_requires_wait_thread[slot.slot_id],
+        )
         slot.header_work = batch_work
         slot.payload_work = batch_work
 

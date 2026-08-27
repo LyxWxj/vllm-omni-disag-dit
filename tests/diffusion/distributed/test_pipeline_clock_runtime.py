@@ -43,63 +43,6 @@ class _DeferredReleaseEvent:
         return True
 
 
-class _DeviceWork:
-    def __init__(self, events: list[str], name: str) -> None:
-        self.events = events
-        self.name = name
-
-    def wait(self) -> None:
-        self.events.append(f"wait:{self.name}")
-
-
-class _DeviceStream:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    def wait_event(self, event: object) -> None:
-        self.events.append("producer_wait")
-
-
-class _DeviceStreamContext:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    def __enter__(self) -> None:
-        self.events.append("stream_enter")
-
-    def __exit__(self, *_args: object) -> None:
-        self.events.append("stream_exit")
-
-
-class _DeviceTransferEvent:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    def record(self, stream: _DeviceStream) -> None:
-        self.events.append("completion_record")
-
-
-class _DeviceAPI:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    def stream(self, stream: _DeviceStream) -> _DeviceStreamContext:
-        return _DeviceStreamContext(self.events)
-
-    def Event(self, *, enable_timing: bool) -> _DeviceTransferEvent:  # noqa: N802 - mirrors torch API.
-        assert enable_timing is False
-        return _DeviceTransferEvent(self.events)
-
-
-class _DeviceDist:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    def batch_isend_irecv(self, ops: object) -> list[_DeviceWork]:
-        self.events.append("p2p_submit")
-        return [_DeviceWork(self.events, "header"), _DeviceWork(self.events, "payload")]
-
-
 def _transport_buffer_inference_flags(channel: PipelineP2PChannel | None) -> list[bool]:
     if channel is None:
         return []
@@ -580,38 +523,6 @@ def _run_p2p_channel_lane(
 
 
 class TestPipelineP2PChannel:
-    def test_device_transfer_orders_p2p_after_producer_without_host_sync(self) -> None:
-        events: list[str] = []
-        channel = object.__new__(PipelineP2PChannel)
-        channel._p2p_stream = _DeviceStream(events)  # noqa: SLF001 - isolate stream ordering.
-        channel._device_api = _DeviceAPI(events)  # noqa: SLF001
-        channel._dist = _DeviceDist(events)  # noqa: SLF001
-
-        batch_work, transfer_event = channel._start_device_transfer(  # noqa: SLF001
-            ("header", "payload"),
-            producer_event=object(),
-        )
-
-        assert len(batch_work.works) == 2
-        assert isinstance(transfer_event, _DeviceTransferEvent)
-        assert events == [
-            "producer_wait",
-            "stream_enter",
-            "p2p_submit",
-            "wait:header",
-            "wait:payload",
-            "completion_record",
-            "stream_exit",
-        ]
-
-    def test_device_slot_lifetime_uses_transfer_event_completion(self) -> None:
-        channel = object.__new__(PipelineP2PChannel)
-        transfer_event = _DeferredReleaseEvent(pending_queries=1)
-
-        assert channel._slot_transfer_complete(transfer_event, None, None) is False  # noqa: SLF001
-        assert channel._slot_transfer_complete(transfer_event, None, None) is True  # noqa: SLF001
-        assert transfer_event.query_count == 2
-
     def test_header_rejects_values_that_do_not_fit_int64(self) -> None:
         with pytest.raises(ValueError, match="signed int64"):
             PipelineTransportHeader(token_id=2**63, step_idx=0, cfg_branch=0)
