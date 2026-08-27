@@ -74,7 +74,12 @@ def _parse_args() -> argparse.Namespace:
         "--abort-delay-ms",
         type=float,
         default=100.0,
-        help="Delay before aborting --abort-request-index after the request wave starts.",
+        help="Delay before aborting --abort-request-index; after --abort-after-stage-forward when enabled.",
+    )
+    parser.add_argument(
+        "--abort-after-stage-forward",
+        action="store_true",
+        help="Wait for a rank-0 stage-forward trace event for the target request before aborting.",
     )
     parser.add_argument(
         "--trace-dir",
@@ -110,6 +115,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--abort-request-index must identify a submitted request")
     if args.abort_delay_ms < 0:
         parser.error("--abort-delay-ms must be non-negative")
+    if args.abort_after_stage_forward and args.abort_request_index is None:
+        parser.error("--abort-after-stage-forward requires --abort-request-index")
+    if args.abort_after_stage_forward and args.trace_dir is None:
+        parser.error("--abort-after-stage-forward requires --trace-dir")
     if args.mode == "ti2v":
         if args.image is None:
             parser.error("--image is required for --mode ti2v")
@@ -291,6 +300,26 @@ def _filter_startup_trace(trace_dir: Path, output_dir: Path) -> Path:
     return filtered_dir
 
 
+async def _wait_for_stage_forward_begin(trace_dir: Path, request_id: str, timeout_s: float = 60.0) -> None:
+    """Wait until the target request has a rank-0 forward span in the PP trace."""
+    trace_path = trace_dir / "pp_rank_0.jsonl"
+    request_prefix = f"{request_id}-"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if trace_path.is_file():
+            for line in trace_path.read_text(encoding="utf-8").splitlines():
+                record = json.loads(line)
+                request_ids = record.get("request_ids") or ()
+                if (
+                    record.get("event") == "begin"
+                    and record.get("name") == "stage_forward"
+                    and any(str(candidate).startswith(request_prefix) for candidate in request_ids)
+                ):
+                    return
+        await asyncio.sleep(0.02)
+    raise TimeoutError(f"Timed out waiting for stage-0 forward of request {request_id!r}")
+
+
 def _trace_summary(trace_dir: Path, output_dir: Path) -> dict[str, Any] | None:
     analyzer = Path(__file__).with_name("analyze_diffusion_pp_trace.py")
     if not list(trace_dir.glob("pp_rank_*.jsonl")):
@@ -365,6 +394,7 @@ async def _run(args: argparse.Namespace) -> int:
             "num_requests": args.num_requests,
             "seed": args.seed,
             "trace_sync": 0 if trace_dir is not None else None,
+            "abort_after_stage_forward": args.abort_after_stage_forward,
         },
         "trace_dir": str(trace_dir) if trace_dir is not None else None,
         "requests": [],
@@ -395,8 +425,12 @@ async def _run(args: argparse.Namespace) -> int:
             for index, request_id in enumerate(request_ids)
         ]
         if args.abort_request_index is not None:
+            abort_request_id = request_ids[args.abort_request_index]
+            if args.abort_after_stage_forward:
+                assert trace_dir is not None
+                await _wait_for_stage_forward_begin(trace_dir, abort_request_id)
             await asyncio.sleep(args.abort_delay_ms / 1000)
-            await omni.abort(request_ids[args.abort_request_index])
+            await omni.abort(abort_request_id)
         results = await asyncio.gather(*tasks)
         if args.abort_request_index is not None:
             aborted = results[args.abort_request_index]
