@@ -840,6 +840,11 @@ class AsyncOmni(EngineClient, OmniBase):
                 continue
 
             stage_id = result.stage_id
+            if result.engine_outputs.aborted:
+                output_to_yield = result.engine_outputs
+                output_to_yield.request_id = req_state.external_request_id or output_to_yield.request_id
+                yield output_to_yield
+                break
 
             self._check_engine_output_error(result, request_id, stage_id)
 
@@ -1120,6 +1125,21 @@ class AsyncOmni(EngineClient, OmniBase):
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
+            if state is not None and hasattr(state, "queue"):
+                external_request_id = getattr(state, "external_request_id", None) or rid
+                await state.queue.put(
+                    OutputMessage(
+                        request_id=rid,
+                        stage_id=getattr(state, "stage_id", None) or 0,
+                        engine_outputs=OmniRequestOutput(
+                            request_id=rid,
+                            finished=True,
+                            aborted=True,
+                            abort_message=f"Request {external_request_id} aborted.",
+                        ),
+                        finished=True,
+                    )
+                )
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
