@@ -1027,6 +1027,11 @@ class PipelineTickRuntime:
         """
         return bool(self._waiting or self._microbatches)
 
+    @property
+    def is_terminal(self) -> bool:
+        """Whether a clock failure has retired this runtime permanently."""
+        return self._terminal_error is not None
+
     def cancel(self, request_ids: Sequence[str]) -> None:
         """Mark cancelled work for discard after any physical transfer drains."""
         self._cancelled_request_ids.update(request_ids)

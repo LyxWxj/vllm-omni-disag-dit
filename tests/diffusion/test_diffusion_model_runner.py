@@ -453,6 +453,103 @@ def test_execute_pipeline_tick_admits_state_and_returns_feedback_completion(monk
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_execute_pipeline_tick_retires_terminal_runtime_before_next_request(monkeypatch):
+    """A clock failure closes its lane so a later request creates a fresh one."""
+
+    class _FailingRuntime:
+        is_first_stage = True
+
+        def __init__(self, state_cache) -> None:
+            self.state_cache = state_cache
+            self.is_terminal = False
+            self.close_calls = 0
+            self.admitted: list[tuple] = []
+
+        def cancel(self, request_ids) -> None:
+            del request_ids
+
+        def admit(self, states) -> None:
+            self.admitted.append(tuple(states))
+
+        def progress_one_clock(self):
+            self.is_terminal = True
+            for state in self.admitted[-1]:
+                self.state_cache.pop(state.request_id, None)
+            raise RuntimeError("interleaved PP clock failed on pipeline rank(s) 1")
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class _HealthyRuntime:
+        is_first_stage = True
+        is_terminal = False
+
+        def __init__(self) -> None:
+            self.admitted: list[tuple] = []
+
+        def cancel(self, request_ids) -> None:
+            del request_ids
+
+        def admit(self, states) -> None:
+            self.admitted.append(tuple(states))
+
+        def progress_one_clock(self):
+            state = self.admitted[-1][0]
+            state.latents = torch.ones_like(state.latents)
+            state.step_index += 1
+            return (PipelineTickCompletion((state.request_id,), step_idx=0),)
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.parallel_config.pipeline_parallel_size = 2
+    failed_runtime = _FailingRuntime(runner.state_cache)
+    healthy_runtime = _HealthyRuntime()
+    runner._pipeline_tick_runtime = failed_runtime
+
+    def get_runtime():
+        runtime = getattr(runner, "_pipeline_tick_runtime", None)
+        if runtime is None:
+            runner._pipeline_tick_runtime = healthy_runtime
+        return runner._pipeline_tick_runtime
+
+    runner._get_pipeline_tick_runtime = get_runtime
+    runner._attach_stepwise_metrics = lambda state, result: None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "supports_pipeline_tick_execution", lambda pipeline: True)
+
+    failed_request = _make_request()
+    failed_request.request_id = "failed"
+    failed_request.sampling_params.num_inference_steps = 1
+    failed_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="failed", req=failed_request, diffusion_kv_metadata=None)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    with pytest.raises(RuntimeError, match="pipeline rank\\(s\\) 1"):
+        DiffusionModelRunner.execute_pipeline_tick(runner, failed_output)
+
+    assert failed_runtime.close_calls == 1
+    assert runner._pipeline_tick_runtime is None
+    assert "failed" not in runner.state_cache
+
+    healthy_request = _make_request()
+    healthy_request.request_id = "healthy"
+    healthy_request.sampling_params.num_inference_steps = 1
+    healthy_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="healthy", req=healthy_request, diffusion_kv_metadata=None)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    output = DiffusionModelRunner.execute_pipeline_tick(runner, healthy_output).get_request_output("healthy")
+
+    assert [[state.request_id for state in states] for states in healthy_runtime.admitted] == [["healthy"]]
+    assert runner._pipeline_tick_runtime is healthy_runtime
+    assert output.finished is True
+    assert output.result is not None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_execute_pipeline_tick_rejects_cfg_parallel(monkeypatch):
     """The retained PP runtime only implements sequential CFG branches."""
     runner = _make_runner(cache_backend=None, cache_backend_name=None)

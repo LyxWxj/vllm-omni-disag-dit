@@ -1102,10 +1102,27 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         runtime.close()
         self._pipeline_tick_runtime = None
 
+    def _retire_terminal_pipeline_tick_runtime(self, runtime: PipelineTickRuntime) -> None:
+        """Close and discard a lane retired by a synchronized clock failure."""
+        if not getattr(runtime, "is_terminal", False):
+            return
+        try:
+            runtime.close()
+        finally:
+            if getattr(self, "_pipeline_tick_runtime", None) is runtime:
+                self._pipeline_tick_runtime = None
+
     def _execute_pipeline_tick_core(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Prepare new state, then move every rank forward by one PP clock."""
         assert self.pipeline is not None
         runtime = self._get_pipeline_tick_runtime()
+        # A previous failed tick may have reached the runner while its engine
+        # exception path was still unwinding. Retire it before registering a
+        # later request, otherwise admission would poison fresh state with the
+        # old terminal error.
+        if getattr(runtime, "is_terminal", False):
+            self._retire_terminal_pipeline_tick_runtime(runtime)
+            runtime = self._get_pipeline_tick_runtime()
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
@@ -1124,7 +1141,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata={},
             ):
-                completions = runtime.progress_one_clock()
+                try:
+                    completions = runtime.progress_one_clock()
+                except Exception:
+                    # ``progress_one_clock`` has already converged this error
+                    # on every PP rank. Complete the common tombstone
+                    # handshake before propagating it to the engine, so the
+                    # next request gets a fresh retained-state runtime.
+                    self._retire_terminal_pipeline_tick_runtime(runtime)
+                    raise
 
             if not runtime.is_first_stage:
                 return BatchRunnerOutput.from_list(runner_output_list)
