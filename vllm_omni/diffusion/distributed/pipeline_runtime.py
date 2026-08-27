@@ -171,6 +171,8 @@ class _P2PSendSlot:
         self.slot_id = slot_id
         self.header_buffer = header_buffer
         self.payload_buffer = payload_buffer
+        self.payload_owner: Any | None = None
+        self.awaits_credit = False
         self.header_work: Any | None = None
         self.payload_work: Any | None = None
         self.state = PipelineSlotState.FREE
@@ -180,9 +182,10 @@ class _P2PSendSlot:
     def is_send_pending(self) -> bool:
         return self.state is PipelineSlotState.SEND_PENDING
 
-    def begin_send(self) -> None:
+    def begin_send(self, *, awaits_credit: bool) -> None:
         if self.state is not PipelineSlotState.FREE:
             raise RuntimeError(f"send slot {self.slot_id} is not free")
+        self.awaits_credit = awaits_credit
         self.state = PipelineSlotState.SEND_PENDING
         self.history.append(self.state)
 
@@ -193,6 +196,11 @@ class _P2PSendSlot:
         self.payload_work = None
         self.state = PipelineSlotState.FREE
         self.history.append(self.state)
+
+    def release_payload(self) -> None:
+        """Drop the producer only after its receiver-owned slot is released."""
+        self.payload_owner = None
+        self.awaits_credit = False
 
 
 class _P2PReceiveSlot:
@@ -465,11 +473,21 @@ class PipelineP2PChannel:
         if slot.is_send_pending:
             raise RuntimeError(f"slot {slot_id} credit returned before its previous send completed")
 
+        if slot.payload_owner is not None:
+            raise RuntimeError(f"send slot {slot_id} retained a producer after its credit returned")
+
         transport_header = header.for_slot(slot_id, self._next_send_sequence)
         transport_header.encode_into(slot.header_buffer)
-        slot.payload_buffer.copy_(payload)
+        if self._requires_coordinated_device_transfers:
+            # Keep the actual producer tensor alive through the downstream
+            # compute lifetime. Copying an asynchronously-produced tensor into
+            # another fixed buffer before HCCL/NCCL submission does not create
+            # a portable cross-stream readiness guarantee.
+            slot.payload_owner = payload.contiguous()
+        else:
+            slot.payload_buffer.copy_(payload)
 
-        slot.begin_send()
+        slot.begin_send(awaits_credit=not self._shutdown_requested)
         if self._requires_coordinated_device_transfers:
             return transport_header
         self._commit_prepared_send(slot)
@@ -507,6 +525,7 @@ class PipelineP2PChannel:
         for slot in self._send_slots:
             if slot.is_send_pending and slot.header_work is None and slot.payload_work is None:
                 slot.finish_send()
+                slot.release_payload()
 
     def post_coordinated_receive(self, slot_id: int) -> None:
         """Submit one clock-planned device receive paired with its source send."""
@@ -609,6 +628,8 @@ class PipelineP2PChannel:
             if slot.is_send_pending and self._works_complete(slot.header_work, slot.payload_work):
                 self._wait_for_works(slot.header_work, slot.payload_work)
                 slot.finish_send()
+                if not slot.awaits_credit:
+                    slot.release_payload()
 
         for expected_slot_id, work in enumerate(self._credit_works):
             if not self._works_complete(work):
@@ -624,6 +645,7 @@ class PipelineP2PChannel:
                 raise RuntimeError(f"received duplicate credit for slot {credit_slot_id}")
             self._credit_slot_ids.append(credit_slot_id)
             self._credit_slot_id_set.add(credit_slot_id)
+            self._send_slots[credit_slot_id].release_payload()
 
     def _poll_destination(self) -> None:
         self._reclaim_completed_receive_slots()
@@ -743,6 +765,7 @@ class PipelineP2PChannel:
 
     def _post_payload_send(self, slot: _P2PSendSlot) -> None:
         slot_group = self._slot_groups[slot.slot_id]
+        payload = slot.payload_owner if slot.payload_owner is not None else slot.payload_buffer
         batch_work = self._start_batched_work(
             self._dist.batch_isend_irecv(
                 [
@@ -755,7 +778,7 @@ class PipelineP2PChannel:
                     ),
                     self._dist.P2POp(
                         self._dist.isend,
-                        slot.payload_buffer,
+                        payload,
                         self._peer_rank,
                         slot_group,
                         self._payload_tag(slot.slot_id),

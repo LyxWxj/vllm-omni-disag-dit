@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from tests.helpers.runtime import get_distributed_init_method, get_open_port
+from vllm_omni.diffusion.distributed import pipeline_runtime as pipeline_runtime_module
 from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineClockSimulator,
     PipelineP2PChannel,
@@ -523,6 +524,25 @@ def _run_p2p_channel_lane(
 
 
 class TestPipelineP2PChannel:
+    def test_device_send_slot_retains_producer_until_downstream_credit(self) -> None:
+        producer = torch.ones(2)
+        slot = pipeline_runtime_module._P2PSendSlot(  # noqa: SLF001 - verify the channel's slot lifetime contract.
+            0,
+            torch.empty(PipelineTransportHeader.FIELD_COUNT, dtype=torch.int64),
+            torch.empty(2),
+        )
+
+        slot.payload_owner = producer
+        slot.begin_send(awaits_credit=True)
+        slot.finish_send()
+
+        assert slot.payload_owner is producer
+        assert slot.awaits_credit is True
+
+        slot.release_payload()
+        assert slot.payload_owner is None
+        assert slot.awaits_credit is False
+
     def test_header_rejects_values_that_do_not_fit_int64(self) -> None:
         with pytest.raises(ValueError, match="signed int64"):
             PipelineTransportHeader(token_id=2**63, step_idx=0, cfg_branch=0)
