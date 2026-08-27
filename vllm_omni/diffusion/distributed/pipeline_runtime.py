@@ -1184,9 +1184,14 @@ class PipelineTickRuntime:
                 while channel.has_ready_message:
                     message = channel.begin_compute()
                     channel.release_after_compute(message)
-            if all(source_shutdown_complete) and all(channel.is_closed for channel in destinations):
+            local_complete = all(source_shutdown_complete) and all(channel.is_closed for channel in destinations)
+            globally_complete, any_timed_out = self._converge_channel_shutdown(
+                local_complete=local_complete,
+                timed_out=time.monotonic() >= shutdown_deadline,
+            )
+            if globally_complete:
                 break
-            if time.monotonic() >= shutdown_deadline:
+            if any_timed_out:
                 raise RuntimeError("pipeline channel shutdown did not receive every tombstone")
             # Gloo's background Work waiters need an opportunity to publish
             # their completion between non-blocking polling rounds.
@@ -1199,6 +1204,22 @@ class PipelineTickRuntime:
                 channel.wait_for_sends()
             if channel.pending_work_count != 0:
                 raise RuntimeError("pipeline channel retained pending Work after shutdown")
+        # Every rank has retired the same number of control rounds above. Keep
+        # the process groups alive until peers also finish their local Work
+        # cleanup, so the next tensor layout cannot reuse a mismatched round.
+        self._converge_channel_shutdown(local_complete=True, timed_out=False)
+
+    def _converge_channel_shutdown(self, *, local_complete: bool, timed_out: bool) -> tuple[bool, bool]:
+        """Make channel shutdown loop completion a PP-lane decision."""
+        if self.bootstrap_group is None:
+            return local_complete, timed_out
+
+        import torch
+        import torch.distributed as dist
+
+        state = torch.tensor((int(local_complete), int(timed_out)), dtype=torch.int64, device="cpu")
+        dist.all_reduce(state, group=self.bootstrap_group)
+        return int(state[0].item()) == dist.get_world_size(self.bootstrap_group), bool(state[1].item())
 
     def _all_channels(self) -> Sequence[PipelineP2PChannel]:
         return (*self._forward_channels.values(), *self._feedback_channels.values())
