@@ -119,3 +119,54 @@ def test_trace_summary_reports_multi_stage_overlap(tmp_path: Path, monkeypatch) 
     assert summary["all_span_overlap_ms"] == 0.00001
     assert summary["all_span_overlap_ratio"] == 2 / 3
     assert summary["all_span_per_rank"]["1"] == {"interval_count": 2, "active_ms": 0.000015}
+
+
+def test_trace_summary_does_not_count_nested_spans_on_one_rank_as_overlap(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(pp_trace, "_TRACE_DIR", None)
+    records = [
+        {
+            "event": "begin",
+            "name": "stage_forward",
+            "pp_rank": 0,
+            "pp_size": 1,
+            "ts_ns": 0,
+            "token_id": 1,
+            "clock": 0,
+        },
+        {
+            "event": "begin",
+            "name": "scheduler_step",
+            "pp_rank": 0,
+            "pp_size": 1,
+            "ts_ns": 2,
+            "token_id": 1,
+            "clock": 0,
+        },
+        {
+            "event": "end",
+            "name": "scheduler_step",
+            "pp_rank": 0,
+            "pp_size": 1,
+            "ts_ns": 8,
+            "token_id": 1,
+            "clock": 0,
+        },
+        {
+            "event": "end",
+            "name": "stage_forward",
+            "pp_rank": 0,
+            "pp_size": 1,
+            "ts_ns": 10,
+            "token_id": 1,
+            "clock": 0,
+        },
+    ]
+    (tmp_path / "pp_rank_0.jsonl").write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    summary = summarize(tmp_path)
+    assert summary["active_stage_ms"] == 0.00001
+    assert summary["multi_stage_overlap_ms"] == 0.0
+    assert summary["all_span_active_ms"] == 0.00001
+    assert summary["all_span_overlap_ms"] == 0.0
+    assert summary["all_span_overlap_ratio"] == 0.0
+    assert summary["all_span_per_rank"] == {"0": {"interval_count": 2, "active_ms": 0.00001}}
