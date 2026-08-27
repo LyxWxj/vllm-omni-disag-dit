@@ -18,6 +18,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from multiprocessing import util as multiprocessing_util
 from typing import Any
 
 import torch
@@ -1457,10 +1458,12 @@ class WorkerProc:
                 # where distributed env is initialized but worker_proc is still None
                 destroy_distributed_env()
 
-        logger.info("Worker %d: Shutdown complete.", rank)
         # All owned resources have been explicitly released above.  Bypass
         # interpreter and accelerator finalizers, which can otherwise retain a
-        # fully-cleaned multiprocessing worker until the parent timeout.
+        # fully-cleaned worker until the parent timeout.  Run multiprocessing's
+        # registry first so direct exit does not leak tracked IPC resources.
+        multiprocessing_util._run_finalizers()
+        logger.info("Worker %d: Shutdown complete.", rank)
         os._exit(0)
 
 

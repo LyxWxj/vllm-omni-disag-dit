@@ -337,6 +337,9 @@ class TestWorkerProcShutdown:
         mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.signal.signal")
         mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.set_death_signal")
         mocker.patch("vllm_omni.plugins.load_omni_general_plugins")
+        run_finalizers = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.multiprocessing_util._run_finalizers"
+        )
         exit_process = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.os._exit")
         pipe_writer = MagicMock()
 
@@ -351,6 +354,7 @@ class TestWorkerProcShutdown:
         worker_cls.assert_called_once()
         worker_proc.shutdown.assert_called_once_with()
         worker_proc.context.term.assert_called_once_with()
+        run_finalizers.assert_called_once_with()
         exit_process.assert_called_once_with(0)
 
     def test_shutdown_stops_async_thread_and_releases_queues(self):
