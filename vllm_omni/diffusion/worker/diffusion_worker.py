@@ -1458,6 +1458,10 @@ class WorkerProc:
                 destroy_distributed_env()
 
         logger.info("Worker %d: Shutdown complete.", rank)
+        # All owned resources have been explicitly released above.  Bypass
+        # interpreter and accelerator finalizers, which can otherwise retain a
+        # fully-cleaned multiprocessing worker until the parent timeout.
+        os._exit(0)
 
 
 class WorkerWrapperBase:

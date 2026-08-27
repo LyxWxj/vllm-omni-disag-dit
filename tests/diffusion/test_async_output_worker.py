@@ -326,6 +326,33 @@ class TestDrainAsyncOutputs:
 
 
 class TestWorkerProcShutdown:
+    def test_worker_main_exits_directly_after_clean_shutdown(self, mocker):
+        worker_proc = MagicMock()
+        worker_proc.result_mq_handle = "result-handle"
+        worker_proc._worker_busy_loop.return_value = None
+        worker_cls = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.WorkerProc",
+            return_value=worker_proc,
+        )
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.signal.signal")
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.set_death_signal")
+        mocker.patch("vllm_omni.plugins.load_omni_general_plugins")
+        exit_process = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.os._exit")
+        pipe_writer = MagicMock()
+
+        WorkerProc.worker_main(
+            0,
+            MagicMock(),
+            pipe_writer,
+            MagicMock(),
+            MagicMock(),
+        )
+
+        worker_cls.assert_called_once()
+        worker_proc.shutdown.assert_called_once_with()
+        worker_proc.context.term.assert_called_once_with()
+        exit_process.assert_called_once_with(0)
+
     def test_shutdown_stops_async_thread_and_releases_queues(self):
         import threading
 

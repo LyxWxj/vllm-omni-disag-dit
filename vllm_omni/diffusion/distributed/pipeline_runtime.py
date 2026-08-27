@@ -1164,9 +1164,9 @@ class PipelineTickRuntime:
         if self._waiting or self._positive_noise:
             raise RuntimeError("cannot close PipelineTickRuntime with queued or partial CFG tokens")
 
-        self._shutdown_channels(synchronize=True)
+        self._shutdown_channels()
 
-    def _shutdown_channels(self, *, synchronize: bool = False) -> None:
+    def _shutdown_channels(self) -> None:
         """Drain and close every current transport channel without retiring state."""
         channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
         if not channels:
@@ -1199,15 +1199,6 @@ class PipelineTickRuntime:
                 channel.wait_for_sends()
             if channel.pending_work_count != 0:
                 raise RuntimeError("pipeline channel retained pending Work after shutdown")
-
-        # Local closure is not a global completion guarantee: one rank may
-        # otherwise destroy the shared Gloo/HCCL groups while a peer is still
-        # retiring another edge.  The bootstrap group already spans exactly
-        # the PP lane and remains valid until worker teardown.
-        if synchronize and self.bootstrap_group is not None:
-            import torch.distributed as dist
-
-            dist.barrier(group=self.bootstrap_group)
 
     def _all_channels(self) -> Sequence[PipelineP2PChannel]:
         return (*self._forward_channels.values(), *self._feedback_channels.values())
