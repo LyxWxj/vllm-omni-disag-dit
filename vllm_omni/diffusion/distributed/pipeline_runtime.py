@@ -1140,6 +1140,14 @@ class PipelineTickRuntime:
             raise RuntimeError("cannot close PipelineTickRuntime with queued or partial CFG tokens")
 
         self._shutdown_channels()
+        # Worker shutdown destroys each rank's process groups independently.
+        # Wait until every PP endpoint has drained its local channel Work so an
+        # early rank cannot close Gloo while a peer is still finishing teardown.
+        if self.bootstrap_group is not None:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.barrier(group=self.bootstrap_group)
 
     def _shutdown_channels(self) -> None:
         """Drain and close every current transport channel without retiring state."""
