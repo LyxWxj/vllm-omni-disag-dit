@@ -1252,10 +1252,43 @@ class PipelineTickRuntime:
             for slot_id in range(self.slots_per_edge):
                 if not int(plan[edge_index * self.slots_per_edge + slot_id].item()):
                     continue
+                role = "send" if self.global_rank == source_rank else "receive"
+                pp_trace.event(
+                    "p2p_post_begin",
+                    pp_rank=self.stage,
+                    pp_size=self.world_size,
+                    clock=self.clock,
+                    token_id=None,
+                    request_ids=(),
+                    microbatch_id=None,
+                    step_idx=None,
+                    cfg_branch=None,
+                    model_phase=None,
+                    slot_id=slot_id,
+                    source_rank=source_rank,
+                    destination_rank=destination_rank,
+                    role=role,
+                )
                 if self.global_rank == source_rank:
                     channel.post_coordinated_send(slot_id)
                 else:
                     channel.post_coordinated_receive(slot_id)
+                pp_trace.event(
+                    "p2p_post_end",
+                    pp_rank=self.stage,
+                    pp_size=self.world_size,
+                    clock=self.clock,
+                    token_id=None,
+                    request_ids=(),
+                    microbatch_id=None,
+                    step_idx=None,
+                    cfg_branch=None,
+                    model_phase=None,
+                    slot_id=slot_id,
+                    source_rank=source_rank,
+                    destination_rank=destination_rank,
+                    role=role,
+                )
 
     def _abort_failed_clock(self, message: str) -> None:
         """Discard uncommitted P2P sends and retire an unrecoverable lane."""
