@@ -1421,7 +1421,7 @@ class PipelineTickRuntime:
                     self._discard_cancelled_states(plan)
                 return
 
-            self._finish_last_stage(token_id, token, plan, states, result)
+            self._finish_last_stage(token_id, token, plan, states, result, trace_fields)
         finally:
             if message is not None and incoming is not None:
                 incoming.release_after_compute(message)
@@ -1485,6 +1485,7 @@ class PipelineTickRuntime:
         plan: _PipelineMicrobatch,
         states: Sequence[Any],
         result: Any,
+        trace_fields: Mapping[str, Any],
     ) -> None:
         noise_pred = self._extract_tensor(result, "pipeline_forward_local_stage")
         branch = self._branch_code(token.cfg_branch)
@@ -1501,10 +1502,17 @@ class PipelineTickRuntime:
             if positive_noise is None:
                 raise RuntimeError("negative CFG token reached the last stage before its positive token")
 
-        latents = self._extract_tensor(
-            self.pipeline.pipeline_finish_microbatch(states, noise_pred, positive_noise_pred=positive_noise),
-            "pipeline_finish_microbatch",
-        )
+        with pp_trace.span(
+            "scheduler_step",
+            pp_rank=self.stage,
+            pp_size=self.world_size,
+            device=self.device,
+            **trace_fields,
+        ):
+            latents = self._extract_tensor(
+                self.pipeline.pipeline_finish_microbatch(states, noise_pred, positive_noise_pred=positive_noise),
+                "pipeline_finish_microbatch",
+            )
         latents = self._pack_payload(
             plan,
             latents,
@@ -1512,7 +1520,7 @@ class PipelineTickRuntime:
             plan.spec.feedback_dtype,
             "feedback",
         )
-        self._feedback_channel(plan.spec).send(
+        feedback_header = self._feedback_channel(plan.spec).send(
             PipelineTransportHeader(
                 token_id=token_id,
                 step_idx=token.step_idx,
@@ -1520,6 +1528,13 @@ class PipelineTickRuntime:
                 flags=self._model_phase_flags(token.model_phase),
             ),
             latents,
+        )
+        pp_trace.event(
+            "feedback_ready",
+            pp_rank=self.stage,
+            pp_size=self.world_size,
+            device=self.device,
+            **{**trace_fields, "slot_id": feedback_header.slot_id},
         )
         self._advance_nonfirst_state(states, token.step_idx)
         self._discard_cancelled_states(plan)
