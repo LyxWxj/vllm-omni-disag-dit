@@ -21,7 +21,6 @@ from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineTickRuntime,
     PipelineToken,
     PipelineTransportHeader,
-    _P2PSendSlot,
     pipeline_edge_pairs,
 )
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -44,11 +43,61 @@ class _DeferredReleaseEvent:
         return True
 
 
-class _DeferredProducerEvent(_DeferredReleaseEvent):
-    """Device-event stand-in for a not-yet-safe send buffer."""
+class _DeviceWork:
+    def __init__(self, events: list[str], name: str) -> None:
+        self.events = events
+        self.name = name
 
-    def synchronize(self) -> None:
-        raise AssertionError("coordinated send must not block on a producer event")
+    def wait(self) -> None:
+        self.events.append(f"wait:{self.name}")
+
+
+class _DeviceStream:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def wait_event(self, event: object) -> None:
+        self.events.append("producer_wait")
+
+
+class _DeviceStreamContext:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def __enter__(self) -> None:
+        self.events.append("stream_enter")
+
+    def __exit__(self, *_args: object) -> None:
+        self.events.append("stream_exit")
+
+
+class _DeviceTransferEvent:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def record(self, stream: _DeviceStream) -> None:
+        self.events.append("completion_record")
+
+
+class _DeviceAPI:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def stream(self, stream: _DeviceStream) -> _DeviceStreamContext:
+        return _DeviceStreamContext(self.events)
+
+    def Event(self, *, enable_timing: bool) -> _DeviceTransferEvent:  # noqa: N802 - mirrors torch API.
+        assert enable_timing is False
+        return _DeviceTransferEvent(self.events)
+
+
+class _DeviceDist:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def batch_isend_irecv(self, ops: object) -> list[_DeviceWork]:
+        self.events.append("p2p_submit")
+        return [_DeviceWork(self.events, "header"), _DeviceWork(self.events, "payload")]
 
 
 def _transport_buffer_inference_flags(channel: PipelineP2PChannel | None) -> list[bool]:
@@ -531,40 +580,37 @@ def _run_p2p_channel_lane(
 
 
 class TestPipelineP2PChannel:
-    def test_coordinated_send_defers_until_its_producer_event_is_ready(self) -> None:
+    def test_device_transfer_orders_p2p_after_producer_without_host_sync(self) -> None:
+        events: list[str] = []
         channel = object.__new__(PipelineP2PChannel)
-        channel._is_source = True  # noqa: SLF001 - isolate device transfer planning.
-        channel._requires_coordinated_device_transfers = True  # noqa: SLF001
-        slot = _P2PSendSlot(0, header_buffer=None, payload_buffer=None)
-        slot.begin_send()
-        event = _DeferredProducerEvent(pending_queries=1)
-        slot.producer_event = event
-        channel._send_slots = [slot]  # noqa: SLF001
+        channel._p2p_stream = _DeviceStream(events)  # noqa: SLF001 - isolate stream ordering.
+        channel._device_api = _DeviceAPI(events)  # noqa: SLF001
+        channel._dist = _DeviceDist(events)  # noqa: SLF001
 
-        assert channel.coordinated_send_slot_ids() == ()
-        assert channel.coordinated_send_slot_ids() == (0,)
-        assert event.query_count == 2
+        batch_work, transfer_event = channel._start_device_transfer(  # noqa: SLF001
+            ("header", "payload"),
+            producer_event=object(),
+        )
 
-    def test_coordinated_send_does_not_commit_before_its_producer_is_ready(self) -> None:
+        assert len(batch_work.works) == 2
+        assert isinstance(transfer_event, _DeviceTransferEvent)
+        assert events == [
+            "producer_wait",
+            "stream_enter",
+            "p2p_submit",
+            "wait:header",
+            "wait:payload",
+            "completion_record",
+            "stream_exit",
+        ]
+
+    def test_device_slot_lifetime_uses_transfer_event_completion(self) -> None:
         channel = object.__new__(PipelineP2PChannel)
-        channel._credit_slot_ids = [0]  # noqa: SLF001 - assert transaction state.
-        channel._credit_slot_id_set = {0}  # noqa: SLF001
-        channel._next_send_sequence = 7  # noqa: SLF001
-        channel._next_send_slot_id = 0  # noqa: SLF001
-        slot = _P2PSendSlot(0, header_buffer=None, payload_buffer=None)
-        slot.begin_send()
-        event = _DeferredProducerEvent(pending_queries=1)
-        slot.producer_event = event
+        transfer_event = _DeferredReleaseEvent(pending_queries=1)
 
-        with pytest.raises(RuntimeError, match="producer is not ready"):
-            channel._commit_prepared_send(slot)  # noqa: SLF001 - isolated commit guard.
-
-        assert slot.is_send_pending
-        assert slot.producer_event is event
-        assert channel._credit_slot_ids == [0]  # noqa: SLF001
-        assert channel._credit_slot_id_set == {0}  # noqa: SLF001
-        assert channel._next_send_sequence == 7  # noqa: SLF001
-        assert channel._next_send_slot_id == 0  # noqa: SLF001
+        assert channel._slot_transfer_complete(transfer_event, None, None) is False  # noqa: SLF001
+        assert channel._slot_transfer_complete(transfer_event, None, None) is True  # noqa: SLF001
+        assert transfer_event.query_count == 2
 
     def test_header_rejects_values_that_do_not_fit_int64(self) -> None:
         with pytest.raises(ValueError, match="signed int64"):
