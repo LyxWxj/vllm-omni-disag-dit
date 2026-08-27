@@ -196,7 +196,8 @@ def _run_p2p_channel_worker(
     )
     try:
         edge_groups = [
-            dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for edge_rank in range(world_size - 1)
+            tuple(dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for _ in range(slots_per_edge))
+            for edge_rank in range(world_size - 1)
         ]
         credit_edge_groups = [
             dist.new_group([edge_rank, edge_rank + 1], backend="gloo") for edge_rank in range(world_size - 1)
@@ -213,7 +214,8 @@ def _run_p2p_channel_worker(
                     device="cpu",
                     slots_per_edge=slots_per_edge,
                     tag_base=(rank - 1) * 100,
-                    group=edge_groups[rank - 1],
+                    group=edge_groups[rank - 1][0],
+                    slot_groups=edge_groups[rank - 1],
                     credit_group=credit_edge_groups[rank - 1],
                 )
 
@@ -227,7 +229,8 @@ def _run_p2p_channel_worker(
                     device="cpu",
                     slots_per_edge=slots_per_edge,
                     tag_base=rank * 100,
-                    group=edge_groups[rank],
+                    group=edge_groups[rank][0],
+                    slot_groups=edge_groups[rank],
                     credit_group=credit_edge_groups[rank],
                 )
 
@@ -336,12 +339,13 @@ def _run_p2p_channel_worker(
         # separate phase prevents one stage from waiting for a downstream
         # credit while that downstream rank is still at the clock barrier.
         dist.barrier()
-        shutdown_sent = False
-        for _ in range(world_size + 2):
+        shutdown_started = False
+        for _ in range((world_size + 2) * slots_per_edge + 4):
             if rank == 0:
-                if not shutdown_sent:
-                    outgoing.send_shutdown()
-                    shutdown_sent = True
+                if not shutdown_started:
+                    outgoing.begin_shutdown()
+                    shutdown_started = True
+                outgoing.progress_shutdown()
             else:
                 incoming.poll()
                 while incoming.has_ready_message:
@@ -354,9 +358,12 @@ def _run_p2p_channel_worker(
                         elif outgoing.can_send:
                             outgoing.send(message.header, message.payload + rank)
                     incoming.release_after_compute(message)
-                if outgoing is not None and incoming.is_closed and not shutdown_sent:
-                    outgoing.send_shutdown()
-                    shutdown_sent = True
+                if outgoing is not None:
+                    if incoming.is_closed and not shutdown_started:
+                        outgoing.begin_shutdown()
+                        shutdown_started = True
+                    if shutdown_started:
+                        outgoing.progress_shutdown()
             dist.barrier()
 
         rebuild_succeeded = rebuild_after_close
@@ -374,7 +381,8 @@ def _run_p2p_channel_worker(
                     device="cpu",
                     slots_per_edge=1,
                     tag_base=(rank - 1) * 100,
-                    group=edge_groups[rank - 1],
+                    group=edge_groups[rank - 1][0],
+                    slot_groups=(edge_groups[rank - 1][0],),
                     credit_group=second_credit_edge_groups[rank - 1],
                 )
             second_outgoing = None
@@ -387,34 +395,45 @@ def _run_p2p_channel_worker(
                     device="cpu",
                     slots_per_edge=1,
                     tag_base=rank * 100,
-                    group=edge_groups[rank],
+                    group=edge_groups[rank][0],
+                    slot_groups=(edge_groups[rank][0],),
                     credit_group=second_credit_edge_groups[rank],
                 )
 
-            if rank == 0:
-                while not second_outgoing.can_send:
+            second_message_sent = False
+            second_message_received = False
+            for _ in range(8):
+                if rank == 0:
                     second_outgoing.poll()
-                second_outgoing.send(
-                    PipelineTransportHeader(token_id=99, step_idx=0, cfg_branch=0),
-                    torch.full((2,), 99.0, dtype=torch.float32),
-                )
-            dist.barrier()
-            if rank == world_size - 1:
-                while not second_incoming.has_ready_message:
+                    if not second_message_sent and second_outgoing.can_send:
+                        second_outgoing.send(
+                            PipelineTransportHeader(token_id=99, step_idx=0, cfg_branch=0),
+                            torch.full((2,), 99.0, dtype=torch.float32),
+                        )
+                        second_message_sent = True
+                if rank == world_size - 1:
                     second_incoming.poll()
-                message = second_incoming.begin_compute()
-                rebuild_succeeded = message.header.token_id == 99
-                second_incoming.release_after_compute(message)
-            dist.barrier()
-            if rank == 0:
-                second_outgoing.send_shutdown()
-            dist.barrier()
+                    if not second_message_received and second_incoming.has_ready_message:
+                        message = second_incoming.begin_compute()
+                        rebuild_succeeded = message.header.token_id == 99
+                        second_incoming.release_after_compute(message)
+                        second_message_received = True
+                dist.barrier()
             if rank == world_size - 1:
-                while not second_incoming.has_ready_message:
+                rebuild_succeeded = rebuild_succeeded and second_message_received
+            second_shutdown_started = False
+            for _ in range((world_size + 2) * 2 + 4):
+                if rank == 0:
+                    if not second_shutdown_started:
+                        second_outgoing.begin_shutdown()
+                        second_shutdown_started = True
+                    second_outgoing.progress_shutdown()
+                if rank == world_size - 1:
                     second_incoming.poll()
-                message = second_incoming.begin_compute()
-                second_incoming.release_after_compute(message)
-            dist.barrier()
+                    while second_incoming.has_ready_message:
+                        message = second_incoming.begin_compute()
+                        second_incoming.release_after_compute(message)
+                dist.barrier()
             if second_incoming is not None:
                 second_incoming.wait_for_sends()
                 rebuild_succeeded = rebuild_succeeded and second_incoming.pending_work_count == 0

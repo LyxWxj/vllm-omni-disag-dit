@@ -227,11 +227,22 @@ class _TrackedWork:
         self.error: BaseException | None = None
 
 
+class _BatchedWork:
+    """One logical header/payload transfer backed by one or more Work items."""
+
+    def __init__(self, works: Sequence[Any]) -> None:
+        if not works:
+            raise RuntimeError("batch_isend_irecv returned no Work handles")
+        self.works = tuple(works)
+
+
 class PipelineP2PChannel:
     """Retained-state P2P runtime for one directed, fixed-shape PP edge.
 
-    The destination owns the receive ring. It pre-posts one header and tensor
-    receive per physical slot, then returns a slot credit only after
+    The destination owns the receive ring. Gloo edges keep one fixed-size
+    header and tensor receive posted per physical slot; NCCL/HCCL edges defer
+    both halves until the runtime's fixed clock round pairs the source and
+    destination. The destination returns a slot credit only after
     :meth:`release_after_compute` observes that the local compute stream has
     consumed the input buffer. Both endpoints use slots in a fixed cyclic
     order. A credit therefore proves capacity for the next physical slot, but
@@ -254,6 +265,7 @@ class PipelineP2PChannel:
         slots_per_edge: int = 2,
         tag_base: int = 0,
         group: Any = None,
+        slot_groups: Sequence[Any] | None = None,
         credit_group: Any = None,
     ) -> None:
         if source_rank < 0 or destination_rank < 0 or source_rank == destination_rank:
@@ -274,12 +286,21 @@ class PipelineP2PChannel:
         self._torch = torch
         self._dist = dist
         self._group = group
-        # HCCL requires matching P2P ordering within one process group. The
-        # payload lane is source->destination while credits move in the
-        # opposite direction, so HCCL payload and Gloo credit lanes are kept
-        # separate by PipelineGroupCoordinator.
+        # NCCL and HCCL match P2P calls by call order instead of the optional
+        # tag. A pre-posted receive for slot N must therefore not share a
+        # device group with slot N - 1, whose next payload may still be in
+        # flight. Header and payload are issued together through
+        # ``batch_isend_irecv`` on that slot group, which is required for
+        # unbatched NCCL P2P work to make progress reliably. Gloo carries
+        # reverse credits without interfering with device traffic.
+        self._slot_groups = (group,) * slots_per_edge if slot_groups is None else tuple(slot_groups)
+        if len(self._slot_groups) != slots_per_edge:
+            raise ValueError("slot_groups must contain exactly one group per physical slot")
         self._credit_group = group if credit_group is None else credit_group
-        self._requires_wait_thread = dist.get_backend(group) == "gloo"
+        self._slot_requires_wait_thread = tuple(
+            dist.get_backend(slot_group) == "gloo" for slot_group in self._slot_groups
+        )
+        self._requires_coordinated_device_transfers = not all(self._slot_requires_wait_thread)
         self._credit_requires_wait_thread = dist.get_backend(self._credit_group) == "gloo"
         self.source_rank = source_rank
         self.destination_rank = destination_rank
@@ -303,6 +324,8 @@ class PipelineP2PChannel:
         self._received_by_sequence: dict[int, _P2PReceiveSlot] = {}
         self._max_occupied = 0
         self._shutdown_requested = False
+        self._shutdown_slots_sent = 0
+        self._shutdown_payload: Any | None = None
         self._shutdown_slot_ids: set[int] = set()
         self._closed = False
 
@@ -345,7 +368,8 @@ class PipelineP2PChannel:
         else:
             self._credit_works = [None] * slots_per_edge
             for slot in self._receive_slots:
-                self._post_receive(slot)
+                if not self._requires_coordinated_device_transfers:
+                    self._post_receive(slot)
                 self._send_credit(slot.slot_id)
 
     @property
@@ -447,23 +471,38 @@ class PipelineP2PChannel:
         self._next_send_slot_id = self._next_slot_id(slot_id)
         if not self._shutdown_requested:
             self._post_credit_receive(slot_id)
-        slot.header_work = self._start_work(
-            self._dist.isend(
-                slot.header_buffer,
-                dst=self._peer_rank,
-                group=self._group,
-                tag=self._header_tag(slot_id),
-            )
-        )
-        slot.payload_work = self._start_work(
-            self._dist.isend(
-                slot.payload_buffer,
-                dst=self._peer_rank,
-                group=self._group,
-                tag=self._payload_tag(slot_id),
-            )
-        )
+        if self._requires_coordinated_device_transfers:
+            return transport_header
+        self._post_payload_send(slot)
         return transport_header
+
+    def coordinated_send_slot_ids(self) -> tuple[int, ...]:
+        """Return device-transfer slots prepared by this source this clock."""
+        self._require_source()
+        if not self._requires_coordinated_device_transfers:
+            return ()
+        return tuple(
+            slot.slot_id
+            for slot in self._send_slots
+            if slot.is_send_pending and slot.header_work is None and slot.payload_work is None
+        )
+
+    def post_coordinated_send(self, slot_id: int) -> None:
+        """Submit one clock-planned device send after its peer posts receive."""
+        self._require_source()
+        if not self._requires_coordinated_device_transfers:
+            raise RuntimeError("coordinated sends are only used for NCCL/HCCL PP transport")
+        slot = self._send_slots[slot_id]
+        if not slot.is_send_pending or slot.header_work is not None or slot.payload_work is not None:
+            raise RuntimeError(f"slot {slot_id} has no prepared coordinated send")
+        self._post_payload_send(slot)
+
+    def post_coordinated_receive(self, slot_id: int) -> None:
+        """Submit one clock-planned device receive paired with its source send."""
+        self._require_destination()
+        if not self._requires_coordinated_device_transfers:
+            raise RuntimeError("coordinated receives are only used for NCCL/HCCL PP transport")
+        self._post_receive(self._receive_slots[slot_id])
 
     def begin_compute(self) -> PipelineTransportMessage:
         """Reserve the oldest FIFO-ready input buffer for local stage compute."""
@@ -489,17 +528,28 @@ class PipelineP2PChannel:
         slot.release_event = self._record_compute_event()
         self._reclaim_completed_receive_slots()
 
-    def send_shutdown(self) -> None:
-        """Send one tombstone per physical slot and finish the edge cleanly."""
+    def send_shutdown(self) -> bool:
+        """Start shutdown and post every tombstone currently backed by credit."""
+        self._require_source()
+        self.begin_shutdown()
+        return self.progress_shutdown()
+
+    def begin_shutdown(self) -> None:
+        """Start asynchronous tombstone delivery for this source endpoint."""
         self._require_source()
         if self._shutdown_requested:
             return
         self._shutdown_requested = True
-        self.wait_for_sends()
-        payload = self._torch.zeros(self.tensor_shape, dtype=self.tensor_dtype, device=self.device)
-        for _ in range(self.slots_per_edge):
-            while not self.can_send:
-                self.poll()
+        self._shutdown_payload = self._torch.zeros(self.tensor_shape, dtype=self.tensor_dtype, device=self.device)
+
+    def progress_shutdown(self) -> bool:
+        """Post available tombstones without blocking on a destination poll."""
+        self._require_source()
+        if not self._shutdown_requested:
+            raise RuntimeError("pipeline channel shutdown has not been started")
+        self.poll()
+        while self._shutdown_slots_sent < self.slots_per_edge and self.can_send:
+            assert self._shutdown_payload is not None
             self.send(
                 PipelineTransportHeader(
                     token_id=0,
@@ -507,10 +557,13 @@ class PipelineP2PChannel:
                     cfg_branch=0,
                     flags=PipelineTransportHeader.SHUTDOWN_FLAG,
                 ),
-                payload,
+                self._shutdown_payload,
             )
-        self.wait_for_sends()
-        self._closed = True
+            self._shutdown_slots_sent += 1
+        self.poll()
+        return self._shutdown_slots_sent == self.slots_per_edge and not any(
+            slot.is_send_pending for slot in self._send_slots
+        )
 
     def wait_for_sends(self) -> None:
         """Wait for locally-issued sends; receive work remains non-blocking."""
@@ -634,7 +687,8 @@ class PipelineP2PChannel:
                 self._shutdown_slot_ids.add(slot.slot_id)
                 self._closed = len(self._shutdown_slot_ids) == self.slots_per_edge
             else:
-                self._post_receive(slot)
+                if not self._requires_coordinated_device_transfers:
+                    self._post_receive(slot)
                 self._send_credit(slot.slot_id)
             self._next_repost_slot_id = self._next_slot_id(slot.slot_id)
 
@@ -651,22 +705,56 @@ class PipelineP2PChannel:
 
     def _post_receive(self, slot: _P2PReceiveSlot) -> None:
         slot.transition(PipelineSlotState.FREE, PipelineSlotState.RECV_POSTED)
-        slot.header_work = self._start_work(
-            self._dist.irecv(
-                slot.header_buffer,
-                src=self._peer_rank,
-                group=self._group,
-                tag=self._header_tag(slot.slot_id),
-            )
+        slot_group = self._slot_groups[slot.slot_id]
+        batch_work = self._start_batched_work(
+            self._dist.batch_isend_irecv(
+                [
+                    self._dist.P2POp(
+                        self._dist.irecv,
+                        slot.header_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._header_tag(slot.slot_id),
+                    ),
+                    self._dist.P2POp(
+                        self._dist.irecv,
+                        slot.payload_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._payload_tag(slot.slot_id),
+                    ),
+                ]
+            ),
+            requires_wait_thread=self._slot_requires_wait_thread[slot.slot_id],
         )
-        slot.payload_work = self._start_work(
-            self._dist.irecv(
-                slot.payload_buffer,
-                src=self._peer_rank,
-                group=self._group,
-                tag=self._payload_tag(slot.slot_id),
-            )
+        slot.header_work = batch_work
+        slot.payload_work = batch_work
+
+    def _post_payload_send(self, slot: _P2PSendSlot) -> None:
+        slot_group = self._slot_groups[slot.slot_id]
+        batch_work = self._start_batched_work(
+            self._dist.batch_isend_irecv(
+                [
+                    self._dist.P2POp(
+                        self._dist.isend,
+                        slot.header_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._header_tag(slot.slot_id),
+                    ),
+                    self._dist.P2POp(
+                        self._dist.isend,
+                        slot.payload_buffer,
+                        self._peer_rank,
+                        slot_group,
+                        self._payload_tag(slot.slot_id),
+                    ),
+                ]
+            ),
+            requires_wait_thread=self._slot_requires_wait_thread[slot.slot_id],
         )
+        slot.header_work = batch_work
+        slot.payload_work = batch_work
 
     def _send_credit(self, slot_id: int) -> None:
         previous_work = self._credit_works[slot_id]
@@ -718,8 +806,8 @@ class PipelineP2PChannel:
     def _credit_tag(self, slot_id: int) -> int:
         return self._header_tag(slot_id) + 2
 
-    def _start_work(self, work: Any, *, requires_wait_thread: bool | None = None) -> Any:
-        if not (self._requires_wait_thread if requires_wait_thread is None else requires_wait_thread):
+    def _start_work(self, work: Any, *, requires_wait_thread: bool) -> Any:
+        if not requires_wait_thread:
             return work
 
         tracked_work = _TrackedWork(work)
@@ -735,11 +823,17 @@ class PipelineP2PChannel:
         Thread(target=wait_for_gloo_work, daemon=True).start()
         return tracked_work
 
+    def _start_batched_work(self, works: Sequence[Any], *, requires_wait_thread: bool) -> _BatchedWork:
+        return _BatchedWork(tuple(self._start_work(work, requires_wait_thread=requires_wait_thread) for work in works))
+
     def _works_complete(self, *works: Any | None) -> bool:
         for work in works:
             if work is None:
                 return False
-            if isinstance(work, _TrackedWork):
+            if isinstance(work, _BatchedWork):
+                if not self._works_complete(*work.works):
+                    return False
+            elif isinstance(work, _TrackedWork):
                 if not work.completed.is_set():
                     return False
             elif not work.is_completed():
@@ -750,7 +844,9 @@ class PipelineP2PChannel:
         for work in works:
             if work is None:
                 continue
-            if isinstance(work, _TrackedWork):
+            if isinstance(work, _BatchedWork):
+                self._wait_for_works(*work.works)
+            elif isinstance(work, _TrackedWork):
                 work.completed.wait()
                 if work.error is not None:
                     raise work.error
@@ -835,6 +931,7 @@ class PipelineTickRuntime:
         global_rank: int,
         device: Any,
         edge_groups: Mapping[tuple[int, int], Any],
+        edge_slot_groups: Mapping[tuple[int, int], Sequence[Any]] | None = None,
         edge_credit_groups: Mapping[tuple[int, int], Any] | None = None,
         bootstrap_group: Any = None,
         slots_per_edge: int = 2,
@@ -864,6 +961,7 @@ class PipelineTickRuntime:
         self.world_size = len(self.pp_ranks)
         self.device = device
         self.edge_groups = edge_groups
+        self.edge_slot_groups = {} if edge_slot_groups is None else edge_slot_groups
         self.edge_credit_groups = edge_groups if edge_credit_groups is None else edge_credit_groups
         self.bootstrap_group = bootstrap_group
         self.slots_per_edge = slots_per_edge
@@ -982,6 +1080,7 @@ class PipelineTickRuntime:
         self._poll_channels()
         completions = self._consume_feedback() if self.is_first_stage else []
         self._run_one_local_stage()
+        self._coordinate_device_transfers()
         self.clock += 1
         return tuple(completions)
 
@@ -1005,19 +1104,20 @@ class PipelineTickRuntime:
         channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
         if not channels:
             return
-        for channel in channels:
-            if channel.is_source:
-                channel.send_shutdown()
-
+        sources = [channel for channel in channels if channel.is_source]
         destinations = [channel for channel in channels if channel.is_destination]
+        for channel in sources:
+            channel.begin_shutdown()
         shutdown_deadline = time.monotonic() + 10.0
         while True:
+            source_shutdown_complete = [channel.progress_shutdown() for channel in sources]
+            self._coordinate_device_transfers()
             for channel in destinations:
                 channel.poll()
                 while channel.has_ready_message:
                     message = channel.begin_compute()
                     channel.release_after_compute(message)
-            if all(channel.is_closed for channel in destinations):
+            if all(source_shutdown_complete) and all(channel.is_closed for channel in destinations):
                 break
             if time.monotonic() >= shutdown_deadline:
                 raise RuntimeError("pipeline channel shutdown did not receive every tombstone")
@@ -1035,6 +1135,78 @@ class PipelineTickRuntime:
 
     def _all_channels(self) -> Sequence[PipelineP2PChannel]:
         return (*self._forward_channels.values(), *self._feedback_channels.values())
+
+    def _coordinate_device_transfers(self) -> None:
+        """Submit this clock's NCCL/HCCL pairs in one fixed edge order.
+
+        Device P2P calls can block while their peer enters the matching call.
+        A worker that has no local compute would otherwise return from the RPC
+        before an upstream stage has produced its tensor.  The small Gloo
+        bitmap makes each edge's source and destination enter the paired
+        ``batch_isend_irecv`` in the same clock, while all local DiT forwards
+        have already been queued and can overlap.
+        """
+        if not self._all_channels():
+            return
+
+        import torch
+        import torch.distributed as dist
+
+        local_edge_groups = tuple(self.edge_groups.values())
+        if not local_edge_groups or all(dist.get_backend(group) == "gloo" for group in local_edge_groups):
+            return
+        if self.bootstrap_group is None:
+            raise RuntimeError("NCCL/HCCL PP transport requires a Gloo control group")
+
+        edge_pairs = pipeline_edge_pairs(self.pp_ranks)
+        plan = torch.zeros(
+            len(edge_pairs) * self.slots_per_edge,
+            dtype=torch.int64,
+            device="cpu",
+        )
+        for edge_index, (source_rank, destination_rank) in enumerate(edge_pairs):
+            if self.global_rank != source_rank:
+                continue
+            channel = self._local_channel_for_edge(source_rank, destination_rank)
+            if channel is None:
+                raise RuntimeError(f"missing source pipeline channel for {source_rank}->{destination_rank}")
+            for slot_id in channel.coordinated_send_slot_ids():
+                plan[edge_index * self.slots_per_edge + slot_id] = 1
+
+        dist.all_reduce(plan, group=self.bootstrap_group)
+        if bool((plan > 1).any()):
+            raise RuntimeError("more than one rank scheduled the same PP transport slot")
+
+        for edge_index, (source_rank, destination_rank) in enumerate(edge_pairs):
+            if self.global_rank not in (source_rank, destination_rank):
+                continue
+            channel = self._local_channel_for_edge(source_rank, destination_rank)
+            if channel is None:
+                raise RuntimeError(f"missing local pipeline channel for {source_rank}->{destination_rank}")
+            for slot_id in range(self.slots_per_edge):
+                if not int(plan[edge_index * self.slots_per_edge + slot_id].item()):
+                    continue
+                if self.global_rank == source_rank:
+                    channel.post_coordinated_send(slot_id)
+                else:
+                    channel.post_coordinated_receive(slot_id)
+
+    def _local_channel_for_edge(
+        self,
+        source_rank: int,
+        destination_rank: int,
+    ) -> PipelineP2PChannel | None:
+        if source_rank == self.pp_ranks[-1] and destination_rank == self.pp_ranks[0]:
+            return next(iter(self._feedback_channels.values()), None)
+        try:
+            edge = self.pp_ranks.index(source_rank)
+        except ValueError:
+            return None
+        for spec in self._spec_ids:
+            channel = self._forward_channels.get((edge, spec))
+            if channel is not None:
+                return channel
+        return None
 
     def _run_one_local_stage(self) -> None:
         token_id: int | None = None
@@ -1367,7 +1539,7 @@ class PipelineTickRuntime:
         channel_tag_span = self.slots_per_edge * PipelineP2PChannel._TAGS_PER_SLOT + 1
         tag_stride = (self.world_size + 1) * channel_tag_span
         tag_base = self._TAG_BASE + spec_id * tag_stride
-        self._bootstrap_payload_edges(tag_base, channel_tag_span)
+        self._bootstrap_transport_edges(tag_base, channel_tag_span)
         for edge in range(self.world_size - 1):
             if self.stage not in (edge, edge + 1):
                 continue
@@ -1380,6 +1552,7 @@ class PipelineTickRuntime:
                 slots_per_edge=self.slots_per_edge,
                 tag_base=tag_base + edge * channel_tag_span,
                 group=self._edge_group(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
+                slot_groups=self._edge_slot_groups(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
                 credit_group=self._edge_credit_group(self.pp_ranks[edge], self.pp_ranks[edge + 1]),
             )
         if self.stage in (0, self.world_size - 1):
@@ -1392,11 +1565,12 @@ class PipelineTickRuntime:
                 slots_per_edge=self.slots_per_edge,
                 tag_base=tag_base + (self.world_size - 1) * channel_tag_span,
                 group=self._edge_group(self.pp_ranks[-1], self.pp_ranks[0]),
+                slot_groups=self._edge_slot_groups(self.pp_ranks[-1], self.pp_ranks[0]),
                 credit_group=self._edge_credit_group(self.pp_ranks[-1], self.pp_ranks[0]),
             )
 
-    def _bootstrap_payload_edges(self, tag_base: int, channel_tag_span: int) -> None:
-        """Create HCCL edge communicators in one globally ordered wave."""
+    def _bootstrap_transport_edges(self, tag_base: int, channel_tag_span: int) -> None:
+        """Create one P2P communicator per physical receive slot."""
         import torch
         import torch.distributed as dist
 
@@ -1406,34 +1580,37 @@ class PipelineTickRuntime:
             raise RuntimeError("HCCL PP transport requires a bootstrap process group")
 
         for edge_index, (source_rank, destination_rank) in enumerate(pipeline_edge_pairs(self.pp_ranks)):
-            if self.global_rank in (source_rank, destination_rank):
-                buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
-                dist.all_reduce(
-                    buffer,
-                    group=self._edge_group(source_rank, destination_rank),
+            slot_groups = self._edge_slot_groups(source_rank, destination_rank)
+            if len({id(edge_group) for edge_group in slot_groups}) != len(slot_groups):
+                raise RuntimeError(
+                    "NCCL/HCCL PP transport requires distinct device groups for every physical receive slot"
                 )
-            dist.barrier(group=self.bootstrap_group)
+            for slot_id, edge_group in enumerate(slot_groups):
+                if self.global_rank in (source_rank, destination_rank):
+                    buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
+                    dist.all_reduce(buffer, group=edge_group)
+                dist.barrier(group=self.bootstrap_group)
 
-            bootstrap_tag = tag_base + edge_index * channel_tag_span + channel_tag_span - 1
-            if self.global_rank == source_rank:
-                buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
-                work = dist.isend(
-                    buffer,
-                    dst=destination_rank,
-                    group=self._edge_group(source_rank, destination_rank),
-                    tag=bootstrap_tag,
-                )
-                work.wait()
-            elif self.global_rank == destination_rank:
-                buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
-                work = dist.irecv(
-                    buffer,
-                    src=source_rank,
-                    group=self._edge_group(source_rank, destination_rank),
-                    tag=bootstrap_tag,
-                )
-                work.wait()
-            dist.barrier(group=self.bootstrap_group)
+                bootstrap_tag = tag_base + edge_index * channel_tag_span + channel_tag_span - 1 - slot_id
+                if self.global_rank == source_rank:
+                    buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
+                    work = dist.isend(
+                        buffer,
+                        dst=destination_rank,
+                        group=edge_group,
+                        tag=bootstrap_tag,
+                    )
+                    work.wait()
+                elif self.global_rank == destination_rank:
+                    buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
+                    work = dist.irecv(
+                        buffer,
+                        src=source_rank,
+                        group=edge_group,
+                        tag=bootstrap_tag,
+                    )
+                    work.wait()
+                dist.barrier(group=self.bootstrap_group)
 
     def _poll_channels(self) -> None:
         for channel in self._forward_channels.values():
@@ -1466,6 +1643,18 @@ class PipelineTickRuntime:
             raise RuntimeError(
                 f"missing credit process group for pipeline edge {source_rank}->{destination_rank}"
             ) from exc
+
+    def _edge_slot_groups(self, source_rank: int, destination_rank: int) -> tuple[Any, ...]:
+        try:
+            slot_groups = self.edge_slot_groups[(source_rank, destination_rank)]
+        except KeyError:
+            slot_groups = (self._edge_group(source_rank, destination_rank),) * self.slots_per_edge
+        if len(slot_groups) != self.slots_per_edge:
+            raise RuntimeError(
+                f"pipeline edge {source_rank}->{destination_rank} has {len(slot_groups)} slot groups, "
+                f"expected {self.slots_per_edge}"
+            )
+        return tuple(slot_groups)
 
     def _states_for(self, plan: _PipelineMicrobatch) -> tuple[Any, ...]:
         states: list[Any] = []

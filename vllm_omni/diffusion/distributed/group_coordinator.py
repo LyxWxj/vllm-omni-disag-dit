@@ -709,22 +709,29 @@ class PipelineGroupCoordinator(GroupCoordinator):
         assert self.skip_device_group is not None
 
         # Retained-state PP clocks exchange independent point-to-point streams
-        # on each forward edge and on the last-to-first feedback edge. The
-        # device lane remains unidirectional HCCL after a one-time channel
-        # bootstrap; scalar reverse credits use a dedicated Gloo pair group.
+        # on each forward edge and on the last-to-first feedback edge. NCCL
+        # and HCCL match P2P calls by order rather than tag, so every physical
+        # receive slot requires its own device group. This keeps an unmatched
+        # receive for slot N from blocking traffic on slot N - 1. Header and
+        # payload are posted together through one NCCL/HCCL batch on that
+        # group. Scalar reverse credits use a dedicated Gloo pair group.
+        self._pipeline_transport_slots_per_edge = 2
         self._pipeline_edge_groups: dict[tuple[int, int], ProcessGroup] = {}
+        self._pipeline_edge_slot_groups: dict[tuple[int, int], tuple[ProcessGroup, ...]] = {}
         self._pipeline_edge_credit_groups: dict[tuple[int, int], ProcessGroup] = {}
         for ranks in group_ranks:
             if len(ranks) < 2:
                 continue
             edge_pairs = [*zip(ranks, ranks[1:]), (ranks[-1], ranks[0])]
             for source_rank, destination_rank in edge_pairs:
-                edge_group = torch.distributed.new_group(
-                    [source_rank, destination_rank], backend=torch_distributed_backend
+                slot_groups = tuple(
+                    torch.distributed.new_group([source_rank, destination_rank], backend=torch_distributed_backend)
+                    for _ in range(self._pipeline_transport_slots_per_edge)
                 )
                 credit_group = torch.distributed.new_group([source_rank, destination_rank], backend="gloo")
                 if self.rank in (source_rank, destination_rank):
-                    self._pipeline_edge_groups[(source_rank, destination_rank)] = edge_group
+                    self._pipeline_edge_groups[(source_rank, destination_rank)] = slot_groups[0]
+                    self._pipeline_edge_slot_groups[(source_rank, destination_rank)] = slot_groups
                     self._pipeline_edge_credit_groups[(source_rank, destination_rank)] = credit_group
 
     def pipeline_edge_group(self, source_rank: int, destination_rank: int) -> ProcessGroup:
@@ -740,6 +747,19 @@ class PipelineGroupCoordinator(GroupCoordinator):
         """Return the reverse-credit group for one directed PP edge."""
         try:
             return self._pipeline_edge_credit_groups[(source_rank, destination_rank)]
+        except KeyError as exc:
+            raise ValueError(
+                f"rank {self.rank} is not an endpoint of pipeline edge {source_rank}->{destination_rank}"
+            ) from exc
+
+    @property
+    def pipeline_transport_slots_per_edge(self) -> int:
+        return self._pipeline_transport_slots_per_edge
+
+    def pipeline_edge_slot_groups(self, source_rank: int, destination_rank: int) -> tuple[ProcessGroup, ...]:
+        """Return independent P2P groups for one directed PP edge's slots."""
+        try:
+            return self._pipeline_edge_slot_groups[(source_rank, destination_rank)]
         except KeyError as exc:
             raise ValueError(
                 f"rank {self.rank} is not an endpoint of pipeline edge {source_rank}->{destination_rank}"
@@ -1034,6 +1054,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
             *self.cpu_groups,
             self.skip_device_group,
             *self._pipeline_edge_groups.values(),
+            *(group for groups in self._pipeline_edge_slot_groups.values() for group in groups),
             *self._pipeline_edge_credit_groups.values(),
         ]
         seen = {id(self.device_group), id(self.cpu_group)}
@@ -1045,6 +1066,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.cpu_groups = []
         self.skip_device_group = None
         self._pipeline_edge_groups = {}
+        self._pipeline_edge_slot_groups = {}
         self._pipeline_edge_credit_groups = {}
         super().destroy()
 
