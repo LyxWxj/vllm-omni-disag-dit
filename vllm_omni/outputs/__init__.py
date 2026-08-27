@@ -101,6 +101,8 @@ _OMNI_CONTENT_ATTRS = (
     "trajectory_decoded",
     "_multimodal_output",
     "_custom_output",
+    "aborted",
+    "abort_message",
 )
 
 
@@ -178,6 +180,8 @@ class OmniRequestOutput(RequestOutput):
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
+    aborted: bool = False
+    abort_message: str | None = None
 
     def _copy_content_from(self, source: RequestOutput) -> None:
         """Copy generation content from a stage output into this object.

@@ -238,6 +238,37 @@ def test_abort_propagates_engine_errors_without_popping_state():
 
 
 @pytest.mark.cpu
+def test_abort_delivers_terminal_output_to_active_generate_stream():
+    async def run():
+        omni = get_async_omni_instance()
+        del omni._process_orchestrator_results
+        outputs = []
+
+        async def collect():
+            async for output in omni.generate(
+                prompt={"prompt": "test"},
+                request_id="abort-me",
+                sampling_params_list=[SimpleNamespace()],
+            ):
+                outputs.append(output)
+
+        task = asyncio.create_task(collect())
+        while not omni.request_states:
+            await asyncio.sleep(0)
+
+        await omni.abort("abort-me")
+        await task
+
+        assert len(outputs) == 1
+        assert outputs[0].finished
+        assert outputs[0].aborted
+        assert outputs[0].abort_message == "Request abort-me aborted."
+        assert not omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_accepts_request_after_repeated_cancellations():
     async def run_test():
         submitted_request_ids = []
