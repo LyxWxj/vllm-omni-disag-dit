@@ -21,6 +21,7 @@ from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineTickRuntime,
     PipelineToken,
     PipelineTransportHeader,
+    _P2PSendSlot,
     pipeline_edge_pairs,
 )
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -41,6 +42,16 @@ class _DeferredReleaseEvent:
             self.pending_queries -= 1
             return False
         return True
+
+
+class _ProducerEvent:
+    """Device-event stand-in used to assert coordinated send ordering."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def synchronize(self) -> None:
+        self.events.append("producer_ready")
 
 
 def _transport_buffer_inference_flags(channel: PipelineP2PChannel | None) -> list[bool]:
@@ -523,6 +534,27 @@ def _run_p2p_channel_lane(
 
 
 class TestPipelineP2PChannel:
+    def test_coordinated_send_waits_for_its_producer_event_before_p2p(self) -> None:
+        events: list[str] = []
+        channel = object.__new__(PipelineP2PChannel)
+        channel._shutdown_requested = False  # noqa: SLF001 - isolate the commit protocol.
+        channel._next_send_sequence = 7  # noqa: SLF001 - isolate the commit protocol.
+        channel._next_send_slot_id = 0  # noqa: SLF001 - isolate the commit protocol.
+        channel.slots_per_edge = 2
+        channel._consume_send_credit = lambda slot_id: events.append(f"credit:{slot_id}")  # type: ignore[attr-defined]
+        channel._post_credit_receive = lambda slot_id: events.append(f"credit_recv:{slot_id}")  # type: ignore[attr-defined]
+        channel._post_payload_send = lambda slot: events.append(f"p2p:{slot.slot_id}")  # type: ignore[attr-defined]
+        slot = _P2PSendSlot(1, header_buffer=None, payload_buffer=None)
+        slot.begin_send()
+        slot.producer_event = _ProducerEvent(events)
+
+        channel._commit_prepared_send(slot)  # noqa: SLF001 - exercise the P2P commit ordering.
+
+        assert events == ["producer_ready", "credit:1", "credit_recv:1", "p2p:1"]
+        assert slot.producer_event is None
+        assert channel._next_send_sequence == 8  # noqa: SLF001 - commit remains transactional after the fence.
+        assert channel._next_send_slot_id == 0  # noqa: SLF001 - next physical slot follows the ring order.
+
     def test_header_rejects_values_that_do_not_fit_int64(self) -> None:
         with pytest.raises(ValueError, match="signed int64"):
             PipelineTransportHeader(token_id=2**63, step_idx=0, cfg_branch=0)
