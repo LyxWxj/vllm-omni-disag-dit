@@ -450,7 +450,13 @@ class PipelineP2PChannel:
             self._poll_destination()
 
     def send(self, header: PipelineTransportHeader, payload: Any) -> PipelineTransportHeader:
-        """Copy and send one payload after reserving a downstream receive credit."""
+        """Prepare one payload, committing it immediately only on Gloo edges.
+
+        Device P2P pairs are committed by the clock control round.  Until
+        that round confirms every rank is healthy, the source retains its
+        credit and sequence number so a peer failure can discard this local
+        preparation without leaving a dead slot behind.
+        """
         self._require_source()
         self.poll()
         self._validate_payload(payload)
@@ -465,15 +471,10 @@ class PipelineP2PChannel:
         transport_header.encode_into(slot.header_buffer)
         slot.payload_buffer.copy_(payload)
 
-        self._consume_send_credit(slot_id)
         slot.begin_send()
-        self._next_send_sequence += 1
-        self._next_send_slot_id = self._next_slot_id(slot_id)
-        if not self._shutdown_requested:
-            self._post_credit_receive(slot_id)
         if self._requires_coordinated_device_transfers:
             return transport_header
-        self._post_payload_send(slot)
+        self._commit_prepared_send(slot)
         return transport_header
 
     def coordinated_send_slot_ids(self) -> tuple[int, ...]:
@@ -495,7 +496,19 @@ class PipelineP2PChannel:
         slot = self._send_slots[slot_id]
         if not slot.is_send_pending or slot.header_work is not None or slot.payload_work is not None:
             raise RuntimeError(f"slot {slot_id} has no prepared coordinated send")
-        self._post_payload_send(slot)
+        self._commit_prepared_send(slot)
+
+    def discard_prepared_sends(self) -> None:
+        """Rollback local device sends that have not entered P2P yet.
+
+        This is valid only before :meth:`post_coordinated_send`; no receiver
+        can observe the payload at that point, and the source still owns the
+        credit and the sequence number.
+        """
+        self._require_source()
+        for slot in self._send_slots:
+            if slot.is_send_pending and slot.header_work is None and slot.payload_work is None:
+                slot.finish_send()
 
     def post_coordinated_receive(self, slot_id: int) -> None:
         """Submit one clock-planned device receive paired with its source send."""
@@ -756,6 +769,17 @@ class PipelineP2PChannel:
         slot.header_work = batch_work
         slot.payload_work = batch_work
 
+    def _commit_prepared_send(self, slot: _P2PSendSlot) -> None:
+        """Consume one credit and submit a fully prepared source slot."""
+        if not slot.is_send_pending or slot.header_work is not None or slot.payload_work is not None:
+            raise RuntimeError(f"slot {slot.slot_id} has no prepared send to commit")
+        self._consume_send_credit(slot.slot_id)
+        self._next_send_sequence += 1
+        self._next_send_slot_id = self._next_slot_id(slot.slot_id)
+        if not self._shutdown_requested:
+            self._post_credit_receive(slot.slot_id)
+        self._post_payload_send(slot)
+
     def _send_credit(self, slot_id: int) -> None:
         previous_work = self._credit_works[slot_id]
         self._wait_for_works(previous_work)
@@ -975,6 +999,7 @@ class PipelineTickRuntime:
         self._cancelled_request_ids: set[str] = set()
         self._positive_noise: dict[int, Any] = {}
         self._model_phase_ids: dict[str, int] = {}
+        self._terminal_error: str | None = None
         # HCCL does not use the P2P ``tag`` argument when matching already
         # posted receives. Keep exactly one physical tensor layout live on a
         # PP lane and explicitly drain it before changing layouts.
@@ -1016,6 +1041,8 @@ class PipelineTickRuntime:
         the injection queue, but all ranks retain the token registry needed to
         decode a later fixed-size P2P header without an object collective.
         """
+        if self._terminal_error is not None:
+            raise RuntimeError(self._terminal_error)
         for microbatch_states in self.pipeline.build_microbatches(states):
             if not microbatch_states:
                 continue
@@ -1077,6 +1104,8 @@ class PipelineTickRuntime:
 
     def progress_one_clock(self) -> tuple[PipelineTickCompletion, ...]:
         """Advance at most one local DiT stage and consume ready feedback."""
+        if self._terminal_error is not None:
+            raise RuntimeError(self._terminal_error)
         completions: list[PipelineTickCompletion] = []
         local_error: Exception | None = None
         try:
@@ -1204,6 +1233,7 @@ class PipelineTickRuntime:
         )
         if failed_ranks:
             message = "interleaved PP clock failed on pipeline rank(s) " + ", ".join(map(str, failed_ranks))
+            self._abort_failed_clock(message)
             if local_error is not None:
                 raise RuntimeError(message) from local_error
             raise RuntimeError(message)
@@ -1223,6 +1253,22 @@ class PipelineTickRuntime:
                     channel.post_coordinated_send(slot_id)
                 else:
                     channel.post_coordinated_receive(slot_id)
+
+    def _abort_failed_clock(self, message: str) -> None:
+        """Discard uncommitted P2P sends and retire an unrecoverable lane."""
+        for channel in {id(channel): channel for channel in self._all_channels()}.values():
+            if channel.is_source:
+                channel.discard_prepared_sends()
+
+        failed_request_ids = {request_id for plan in self._microbatches.values() for request_id in plan.request_ids}
+        self._waiting.clear()
+        self._microbatches.clear()
+        self._tokens.clear()
+        self._positive_noise.clear()
+        self._cancelled_request_ids.clear()
+        for request_id in failed_request_ids:
+            self.state_cache.pop(request_id, None)
+        self._terminal_error = message
 
     def _local_channel_for_edge(
         self,

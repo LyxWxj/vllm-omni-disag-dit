@@ -928,7 +928,7 @@ def _run_pp4_device_bootstrap_worker(rank: int, world_size: int, init_method: st
 
 
 def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
-    """Inject one local failure and verify every rank leaves the control round."""
+    """Fail one rank after a device send is prepared, then rebuild the lane."""
     dist.init_process_group(
         backend="gloo",
         init_method=init_method,
@@ -940,10 +940,15 @@ def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str,
     try:
         edge_pairs = pipeline_edge_pairs(tuple(range(world_size)))
         endpoint_groups: dict[tuple[int, int], object] = {}
+        endpoint_slot_groups: dict[tuple[int, int], tuple[object, ...]] = {}
+        endpoint_credit_groups: dict[tuple[int, int], object] = {}
         for edge_pair in edge_pairs:
-            group = dist.new_group(list(edge_pair), backend="gloo")
+            slot_groups = (dist.new_group(list(edge_pair), backend="gloo"),)
+            credit_group = dist.new_group(list(edge_pair), backend="gloo")
             if rank in edge_pair:
-                endpoint_groups[edge_pair] = group
+                endpoint_groups[edge_pair] = slot_groups[0]
+                endpoint_slot_groups[edge_pair] = slot_groups
+                endpoint_credit_groups[edge_pair] = credit_group
 
         device_group_ids = {id(group) for group in endpoint_groups.values()}
 
@@ -953,37 +958,77 @@ def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str,
             return original_get_backend(group)
 
         dist.get_backend = get_backend
-        runtime = object.__new__(PipelineTickRuntime)
-        runtime.pp_ranks = tuple(range(world_size))
-        runtime.global_rank = rank
-        runtime.stage = rank
-        runtime.world_size = world_size
-        runtime.edge_groups = endpoint_groups
-        runtime.bootstrap_group = dist.group.WORLD
-        runtime.slots_per_edge = 1
-        runtime.clock = 0
-        runtime._all_channels = lambda: (object(),)  # noqa: SLF001
 
-        class EmptyChannel:
-            def coordinated_send_slot_ids(self):
-                return ()
+        def make_runtime(state_cache, active_stages):
+            return PipelineTickRuntime(
+                pipeline=_TickPipeline(rank, active_stages),
+                state_cache=state_cache,
+                pp_ranks=tuple(range(world_size)),
+                global_rank=rank,
+                device="cpu",
+                edge_groups=endpoint_groups,
+                edge_slot_groups=endpoint_slot_groups,
+                edge_credit_groups=endpoint_credit_groups,
+                bootstrap_group=dist.group.WORLD,
+                slots_per_edge=1,
+            )
 
-        runtime._local_channel_for_edge = lambda *_args: EmptyChannel()  # noqa: SLF001
+        state_cache = {"A": _make_tick_state("A", 0.0, cfg=False)}
+        runtime = make_runtime(state_cache, [])
+        runtime.admit([state_cache["A"]])
+        for channel in runtime._all_channels():  # noqa: SLF001 - device control on top of Gloo transport.
+            channel._slot_requires_wait_thread = (True,)  # noqa: SLF001
+        for _ in range(16):
+            runtime._poll_channels()  # noqa: SLF001 - await initial source credit.
+            dist.barrier()
+        if rank == 0:
+            spec = next(iter(runtime._spec_ids))  # noqa: SLF001 - inspect the admitted edge.
+            assert runtime._forward_channel(0, spec).can_send  # noqa: SLF001
+
+        original_poll_channels = runtime._poll_channels  # noqa: SLF001
 
         def poll_channels() -> None:
+            original_poll_channels()
             if rank == 1:
                 raise ValueError("injected stage-local failure")
 
         runtime._poll_channels = poll_channels  # noqa: SLF001
-        runtime._consume_feedback = lambda: []  # noqa: SLF001
-        runtime._run_one_local_stage = lambda: None  # noqa: SLF001
 
         try:
             runtime.progress_one_clock()
         except RuntimeError as exc:
-            result_queue.put((rank, str(exc), runtime.clock))
+            error_message = str(exc)
         else:
-            result_queue.put((rank, "", runtime.clock))
+            error_message = ""
+        assert not runtime.has_in_flight_work
+        assert not state_cache
+        runtime.close()
+        failed_runtime_pending_work = [channel.pending_work_count for channel in runtime._all_channels()]  # noqa: SLF001
+
+        recovered_state_cache = {"B": _make_tick_state("B", 10.0, cfg=False)}
+        recovered_active_stages: list[tuple[int, int]] = []
+        recovered = make_runtime(recovered_state_cache, recovered_active_stages)
+        recovered.admit([recovered_state_cache["B"]])
+        for channel in recovered._all_channels():  # noqa: SLF001 - device control on top of Gloo transport.
+            channel._slot_requires_wait_thread = (True,)  # noqa: SLF001
+        completions: list[str] = []
+        for _ in range(8):
+            for completion in recovered.progress_one_clock():
+                completions.extend(completion.request_ids)
+            dist.barrier()
+        assert not recovered.has_in_flight_work
+        recovered.close()
+        recovered_pending_work = [channel.pending_work_count for channel in recovered._all_channels()]  # noqa: SLF001
+        result_queue.put(
+            (
+                rank,
+                error_message,
+                runtime.clock,
+                failed_runtime_pending_work,
+                recovered_pending_work,
+                completions,
+            )
+        )
         dist.barrier()
     finally:
         dist.get_backend = original_get_backend
@@ -1096,11 +1141,18 @@ class TestPipelineTickRuntime:
                 args=(world_size, get_distributed_init_method(), result_queue),
                 nprocs=world_size,
             )
-            results = dict(
-                (rank, (message, clock)) for rank, message, clock in (result_queue.get() for _ in range(world_size))
-            )
+            results = {
+                rank: (message, clock, failed_pending_work, recovered_pending_work, completions)
+                for rank, message, clock, failed_pending_work, recovered_pending_work, completions in (
+                    result_queue.get() for _ in range(world_size)
+                )
+            }
         finally:
             manager.shutdown()
 
-        assert all(message == "interleaved PP clock failed on pipeline rank(s) 1" for message, _ in results.values())
-        assert all(clock == 0 for _, clock in results.values())
+        assert all(message == "interleaved PP clock failed on pipeline rank(s) 1" for message, *_ in results.values())
+        assert all(clock == 0 for _, clock, *_ in results.values())
+        assert all(not any(failed_pending_work) for _, _, failed_pending_work, _, _ in results.values())
+        assert all(not any(recovered_pending_work) for _, _, _, recovered_pending_work, _ in results.values())
+        assert results[0][-1] == ["B"]
+        assert results[1][-1] == []
