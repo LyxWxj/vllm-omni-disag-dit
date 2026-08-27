@@ -65,6 +65,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-shift", type=float, default=None)
     parser.add_argument("--request-id-prefix", default="evidence")
     parser.add_argument(
+        "--abort-request-index",
+        type=int,
+        default=None,
+        help="Abort this request after --abort-delay-ms; use for PP drain evidence.",
+    )
+    parser.add_argument(
+        "--abort-delay-ms",
+        type=float,
+        default=100.0,
+        help="Delay before aborting --abort-request-index after the request wave starts.",
+    )
+    parser.add_argument(
         "--trace-dir",
         type=Path,
         default=None,
@@ -94,6 +106,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--height and --width must be positive multiples of 16")
     if args.num_frames <= 0 or args.num_inference_steps <= 0:
         parser.error("--num-frames and --num-inference-steps must be positive")
+    if args.abort_request_index is not None and not 0 <= args.abort_request_index < args.num_requests:
+        parser.error("--abort-request-index must identify a submitted request")
+    if args.abort_delay_ms < 0:
+        parser.error("--abort-delay-ms must be non-negative")
     if args.mode == "ti2v":
         if args.image is None:
             parser.error("--image is required for --mode ti2v")
@@ -132,10 +148,13 @@ class RequestEvidence:
     request_id: str
     seed: int
     latency_ms: float
-    latent_file: str
-    latent_sha256: str
-    latent_shape: list[int]
-    latent_dtype: str
+    status: str
+    aborted: bool
+    abort_message: str | None
+    latent_file: str | None
+    latent_sha256: str | None
+    latent_shape: list[int] | None
+    latent_dtype: str | None
     peak_memory_mb: float
     stage_durations: dict[str, float]
 
@@ -213,6 +232,21 @@ async def _collect_one(
     elapsed_ms = (time.perf_counter() - started) * 1000
     if final_output is None:
         raise RuntimeError(f"{request_id} completed without a terminal output")
+    if final_output.aborted:
+        return RequestEvidence(
+            request_id=request_id,
+            seed=seed,
+            latency_ms=elapsed_ms,
+            status="aborted",
+            aborted=True,
+            abort_message=final_output.abort_message,
+            latent_file=None,
+            latent_sha256=None,
+            latent_shape=None,
+            latent_dtype=None,
+            peak_memory_mb=float(final_output.peak_memory_mb or 0.0),
+            stage_durations={str(key): float(value) for key, value in (final_output.stage_durations or {}).items()},
+        )
     latent = _output_latent(final_output)
     if latent is None:
         raise RuntimeError(
@@ -230,6 +264,9 @@ async def _collect_one(
         request_id=request_id,
         seed=seed,
         latency_ms=elapsed_ms,
+        status="completed",
+        aborted=False,
+        abort_message=None,
         latent_file=str(latent_path.relative_to(output_dir)),
         latent_sha256=_tensor_digest(latent),
         latent_shape=list(latent.shape),
@@ -343,19 +380,30 @@ async def _run(args: argparse.Namespace) -> int:
             profile_started = True
 
         wave_started = time.perf_counter()
-        results = await asyncio.gather(
-            *(
+        request_ids = [f"{args.request_id_prefix}-{index}" for index in range(args.num_requests)]
+        tasks = [
+            asyncio.create_task(
                 _collect_one(
                     omni,
                     args,
-                    request_id=f"{args.request_id_prefix}-{index}",
+                    request_id=request_id,
                     seed=args.seed + index,
                     image=image,
                     output_dir=output_dir,
                 )
-                for index in range(args.num_requests)
             )
-        )
+            for index, request_id in enumerate(request_ids)
+        ]
+        if args.abort_request_index is not None:
+            await asyncio.sleep(args.abort_delay_ms / 1000)
+            await omni.abort(request_ids[args.abort_request_index])
+        results = await asyncio.gather(*tasks)
+        if args.abort_request_index is not None:
+            aborted = results[args.abort_request_index]
+            if not aborted.aborted:
+                raise RuntimeError(f"{aborted.request_id} did not receive an aborted terminal output")
+            if any(result.aborted for index, result in enumerate(results) if index != args.abort_request_index):
+                raise RuntimeError("A non-target request was aborted while draining the PP runtime")
         manifest["wave_latency_ms"] = (time.perf_counter() - wave_started) * 1000
         manifest["requests"] = [asdict(result) for result in results]
         manifest["status"] = "completed"
