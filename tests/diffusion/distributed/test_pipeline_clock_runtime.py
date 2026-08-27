@@ -21,6 +21,7 @@ from vllm_omni.diffusion.distributed.pipeline_runtime import (
     PipelineTickRuntime,
     PipelineToken,
     PipelineTransportHeader,
+    _P2PSendSlot,
     pipeline_edge_pairs,
 )
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -41,6 +42,13 @@ class _DeferredReleaseEvent:
             self.pending_queries -= 1
             return False
         return True
+
+
+class _DeferredProducerEvent(_DeferredReleaseEvent):
+    """Device-event stand-in for a not-yet-safe send buffer."""
+
+    def synchronize(self) -> None:
+        raise AssertionError("coordinated send must not block on a producer event")
 
 
 def _transport_buffer_inference_flags(channel: PipelineP2PChannel | None) -> list[bool]:
@@ -523,6 +531,41 @@ def _run_p2p_channel_lane(
 
 
 class TestPipelineP2PChannel:
+    def test_coordinated_send_defers_until_its_producer_event_is_ready(self) -> None:
+        channel = object.__new__(PipelineP2PChannel)
+        channel._is_source = True  # noqa: SLF001 - isolate device transfer planning.
+        channel._requires_coordinated_device_transfers = True  # noqa: SLF001
+        slot = _P2PSendSlot(0, header_buffer=None, payload_buffer=None)
+        slot.begin_send()
+        event = _DeferredProducerEvent(pending_queries=1)
+        slot.producer_event = event
+        channel._send_slots = [slot]  # noqa: SLF001
+
+        assert channel.coordinated_send_slot_ids() == ()
+        assert channel.coordinated_send_slot_ids() == (0,)
+        assert event.query_count == 2
+
+    def test_coordinated_send_does_not_commit_before_its_producer_is_ready(self) -> None:
+        channel = object.__new__(PipelineP2PChannel)
+        channel._credit_slot_ids = [0]  # noqa: SLF001 - assert transaction state.
+        channel._credit_slot_id_set = {0}  # noqa: SLF001
+        channel._next_send_sequence = 7  # noqa: SLF001
+        channel._next_send_slot_id = 0  # noqa: SLF001
+        slot = _P2PSendSlot(0, header_buffer=None, payload_buffer=None)
+        slot.begin_send()
+        event = _DeferredProducerEvent(pending_queries=1)
+        slot.producer_event = event
+
+        with pytest.raises(RuntimeError, match="producer is not ready"):
+            channel._commit_prepared_send(slot)  # noqa: SLF001 - isolated commit guard.
+
+        assert slot.is_send_pending
+        assert slot.producer_event is event
+        assert channel._credit_slot_ids == [0]  # noqa: SLF001
+        assert channel._credit_slot_id_set == {0}  # noqa: SLF001
+        assert channel._next_send_sequence == 7  # noqa: SLF001
+        assert channel._next_send_slot_id == 0  # noqa: SLF001
+
     def test_header_rejects_values_that_do_not_fit_int64(self) -> None:
         with pytest.raises(ValueError, match="signed int64"):
             PipelineTransportHeader(token_id=2**63, step_idx=0, cfg_branch=0)

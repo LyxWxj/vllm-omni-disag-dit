@@ -173,6 +173,9 @@ class _P2PSendSlot:
         self.payload_buffer = payload_buffer
         self.header_work: Any | None = None
         self.payload_work: Any | None = None
+        # Device P2P can run on a communication stream that does not
+        # automatically depend on the default stream producing this buffer.
+        self.producer_event: Any | None = None
         self.state = PipelineSlotState.FREE
         self.history = [self.state]
 
@@ -191,6 +194,7 @@ class _P2PSendSlot:
             raise RuntimeError(f"send slot {self.slot_id} has no pending transfer")
         self.header_work = None
         self.payload_work = None
+        self.producer_event = None
         self.state = PipelineSlotState.FREE
         self.history.append(self.state)
 
@@ -473,6 +477,7 @@ class PipelineP2PChannel:
 
         slot.begin_send()
         if self._requires_coordinated_device_transfers:
+            slot.producer_event = self._record_producer_event()
             return transport_header
         self._commit_prepared_send(slot)
         return transport_header
@@ -485,7 +490,12 @@ class PipelineP2PChannel:
         return tuple(
             slot.slot_id
             for slot in self._send_slots
-            if slot.is_send_pending and slot.header_work is None and slot.payload_work is None
+            if (
+                slot.is_send_pending
+                and slot.header_work is None
+                and slot.payload_work is None
+                and self._producer_ready(slot)
+            )
         )
 
     def post_coordinated_send(self, slot_id: int) -> None:
@@ -674,6 +684,15 @@ class PipelineP2PChannel:
         event.record(current_stream(self.device))
         return event
 
+    def _record_producer_event(self) -> Any | None:
+        """Record completion of the default-stream copy into a send slot."""
+        return self._record_compute_event()
+
+    @staticmethod
+    def _producer_ready(slot: _P2PSendSlot) -> bool:
+        """Whether a coordinated send buffer is safe for its P2P DMA."""
+        return slot.producer_event is None or bool(slot.producer_event.query())
+
     def _reclaim_completed_receive_slots(self) -> None:
         """Return credits in physical lane order after stream completion.
 
@@ -773,6 +792,9 @@ class PipelineP2PChannel:
         """Consume one credit and submit a fully prepared source slot."""
         if not slot.is_send_pending or slot.header_work is not None or slot.payload_work is not None:
             raise RuntimeError(f"slot {slot.slot_id} has no prepared send to commit")
+        if not self._producer_ready(slot):
+            raise RuntimeError(f"slot {slot.slot_id} producer is not ready for device P2P")
+        slot.producer_event = None
         self._consume_send_credit(slot.slot_id)
         self._next_send_sequence += 1
         self._next_send_slot_id = self._next_slot_id(slot.slot_id)
