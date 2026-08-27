@@ -1077,10 +1077,18 @@ class PipelineTickRuntime:
 
     def progress_one_clock(self) -> tuple[PipelineTickCompletion, ...]:
         """Advance at most one local DiT stage and consume ready feedback."""
-        self._poll_channels()
-        completions = self._consume_feedback() if self.is_first_stage else []
-        self._run_one_local_stage()
-        self._coordinate_device_transfers()
+        completions: list[PipelineTickCompletion] = []
+        local_error: Exception | None = None
+        try:
+            self._poll_channels()
+            completions = self._consume_feedback() if self.is_first_stage else []
+            self._run_one_local_stage()
+        except Exception as exc:
+            # Every PP rank must reach the control collective below.  Raising
+            # here would strand the peer ranks in their matching all-reduce.
+            local_error = exc
+
+        self._coordinate_device_transfers(local_error=local_error)
         self.clock += 1
         return tuple(completions)
 
@@ -1136,7 +1144,7 @@ class PipelineTickRuntime:
     def _all_channels(self) -> Sequence[PipelineP2PChannel]:
         return (*self._forward_channels.values(), *self._feedback_channels.values())
 
-    def _coordinate_device_transfers(self) -> None:
+    def _coordinate_device_transfers(self, *, local_error: Exception | None = None) -> None:
         """Submit this clock's NCCL/HCCL pairs in one fixed edge order.
 
         Device P2P calls can block while their peer enters the matching call.
@@ -1147,6 +1155,8 @@ class PipelineTickRuntime:
         have already been queued and can overlap.
         """
         if not self._all_channels():
+            if local_error is not None:
+                raise local_error
             return
 
         import torch
@@ -1154,26 +1164,49 @@ class PipelineTickRuntime:
 
         local_edge_groups = tuple(self.edge_groups.values())
         if not local_edge_groups or all(dist.get_backend(group) == "gloo" for group in local_edge_groups):
+            if local_error is not None:
+                raise local_error
             return
         if self.bootstrap_group is None:
-            raise RuntimeError("NCCL/HCCL PP transport requires a Gloo control group")
+            error = RuntimeError("NCCL/HCCL PP transport requires a Gloo control group")
+            if local_error is not None:
+                raise error from local_error
+            raise error
 
         edge_pairs = pipeline_edge_pairs(self.pp_ranks)
         plan = torch.zeros(
-            len(edge_pairs) * self.slots_per_edge,
+            len(edge_pairs) * self.slots_per_edge + self.world_size,
             dtype=torch.int64,
             device="cpu",
         )
-        for edge_index, (source_rank, destination_rank) in enumerate(edge_pairs):
-            if self.global_rank != source_rank:
-                continue
-            channel = self._local_channel_for_edge(source_rank, destination_rank)
-            if channel is None:
-                raise RuntimeError(f"missing source pipeline channel for {source_rank}->{destination_rank}")
-            for slot_id in channel.coordinated_send_slot_ids():
-                plan[edge_index * self.slots_per_edge + slot_id] = 1
+        transfer_plan_size = len(edge_pairs) * self.slots_per_edge
+        if local_error is None:
+            try:
+                for edge_index, (source_rank, destination_rank) in enumerate(edge_pairs):
+                    if self.global_rank != source_rank:
+                        continue
+                    channel = self._local_channel_for_edge(source_rank, destination_rank)
+                    if channel is None:
+                        raise RuntimeError(f"missing source pipeline channel for {source_rank}->{destination_rank}")
+                    for slot_id in channel.coordinated_send_slot_ids():
+                        plan[edge_index * self.slots_per_edge + slot_id] = 1
+            except Exception as exc:
+                local_error = exc
+        else:
+            plan[transfer_plan_size + self.stage] = 1
+        if local_error is not None:
+            plan[:transfer_plan_size].zero_()
+            plan[transfer_plan_size + self.stage] = 1
 
         dist.all_reduce(plan, group=self.bootstrap_group)
+        failed_ranks = tuple(
+            rank for stage, rank in enumerate(self.pp_ranks) if int(plan[transfer_plan_size + stage].item())
+        )
+        if failed_ranks:
+            message = "interleaved PP clock failed on pipeline rank(s) " + ", ".join(map(str, failed_ranks))
+            if local_error is not None:
+                raise RuntimeError(message) from local_error
+            raise RuntimeError(message)
         if bool((plan > 1).any()):
             raise RuntimeError("more than one rank scheduled the same PP transport slot")
 
@@ -1580,13 +1613,15 @@ class PipelineTickRuntime:
             raise RuntimeError("HCCL PP transport requires a bootstrap process group")
 
         for edge_index, (source_rank, destination_rank) in enumerate(pipeline_edge_pairs(self.pp_ranks)):
-            slot_groups = self._edge_slot_groups(source_rank, destination_rank)
-            if len({id(edge_group) for edge_group in slot_groups}) != len(slot_groups):
+            is_endpoint = self.global_rank in (source_rank, destination_rank)
+            slot_groups = self._edge_slot_groups(source_rank, destination_rank) if is_endpoint else ()
+            if is_endpoint and len({id(edge_group) for edge_group in slot_groups}) != len(slot_groups):
                 raise RuntimeError(
                     "NCCL/HCCL PP transport requires distinct device groups for every physical receive slot"
                 )
-            for slot_id, edge_group in enumerate(slot_groups):
-                if self.global_rank in (source_rank, destination_rank):
+            for slot_id in range(self.slots_per_edge):
+                if is_endpoint:
+                    edge_group = slot_groups[slot_id]
                     buffer = torch.zeros(1, dtype=torch.int64, device=self.device)
                     dist.all_reduce(buffer, group=edge_group)
                 dist.barrier(group=self.bootstrap_group)

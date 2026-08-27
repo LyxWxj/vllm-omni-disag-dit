@@ -884,6 +884,113 @@ def _run_pipeline_tick_reconfigure_worker(rank: int, world_size: int, init_metho
             dist.destroy_process_group()
 
 
+def _run_pp4_device_bootstrap_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
+    """Exercise the device bootstrap path with endpoint-only group maps."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    original_get_backend = dist.get_backend
+    try:
+        edge_pairs = pipeline_edge_pairs(tuple(range(world_size)))
+        endpoint_slot_groups: dict[tuple[int, int], tuple[object, ...]] = {}
+        for edge_pair in edge_pairs:
+            slot_groups = tuple(dist.new_group(list(edge_pair), backend="gloo") for _ in range(2))
+            if rank in edge_pair:
+                endpoint_slot_groups[edge_pair] = slot_groups
+
+        device_group_ids = {id(group) for groups in endpoint_slot_groups.values() for group in groups}
+
+        def get_backend(group):
+            if id(group) in device_group_ids:
+                return "nccl"
+            return original_get_backend(group)
+
+        dist.get_backend = get_backend
+        runtime = object.__new__(PipelineTickRuntime)
+        runtime.edge_groups = {edge_pair: groups[0] for edge_pair, groups in endpoint_slot_groups.items()}
+        runtime.edge_slot_groups = endpoint_slot_groups
+        runtime.bootstrap_group = dist.group.WORLD
+        runtime.pp_ranks = tuple(range(world_size))
+        runtime.global_rank = rank
+        runtime.slots_per_edge = 2
+        runtime.device = "cpu"
+        runtime._bootstrap_transport_edges(tag_base=40_000, channel_tag_span=16)  # noqa: SLF001
+        result_queue.put((rank, True))
+        dist.barrier()
+    finally:
+        dist.get_backend = original_get_backend
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
+    """Inject one local failure and verify every rank leaves the control round."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    original_get_backend = dist.get_backend
+    try:
+        edge_pairs = pipeline_edge_pairs(tuple(range(world_size)))
+        endpoint_groups: dict[tuple[int, int], object] = {}
+        for edge_pair in edge_pairs:
+            group = dist.new_group(list(edge_pair), backend="gloo")
+            if rank in edge_pair:
+                endpoint_groups[edge_pair] = group
+
+        device_group_ids = {id(group) for group in endpoint_groups.values()}
+
+        def get_backend(group):
+            if id(group) in device_group_ids:
+                return "nccl"
+            return original_get_backend(group)
+
+        dist.get_backend = get_backend
+        runtime = object.__new__(PipelineTickRuntime)
+        runtime.pp_ranks = tuple(range(world_size))
+        runtime.global_rank = rank
+        runtime.stage = rank
+        runtime.world_size = world_size
+        runtime.edge_groups = endpoint_groups
+        runtime.bootstrap_group = dist.group.WORLD
+        runtime.slots_per_edge = 1
+        runtime.clock = 0
+        runtime._all_channels = lambda: (object(),)  # noqa: SLF001
+
+        class EmptyChannel:
+            def coordinated_send_slot_ids(self):
+                return ()
+
+        runtime._local_channel_for_edge = lambda *_args: EmptyChannel()  # noqa: SLF001
+
+        def poll_channels() -> None:
+            if rank == 1:
+                raise ValueError("injected stage-local failure")
+
+        runtime._poll_channels = poll_channels  # noqa: SLF001
+        runtime._consume_feedback = lambda: []  # noqa: SLF001
+        runtime._run_one_local_stage = lambda: None  # noqa: SLF001
+
+        try:
+            runtime.progress_one_clock()
+        except RuntimeError as exc:
+            result_queue.put((rank, str(exc), runtime.clock))
+        else:
+            result_queue.put((rank, "", runtime.clock))
+        dist.barrier()
+    finally:
+        dist.get_backend = original_get_backend
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 class TestPipelineTickRuntime:
     def test_pp4_overlaps_dynamic_admission_and_returns_feedback(self) -> None:
         world_size = 4
@@ -960,3 +1067,40 @@ class TestPipelineTickRuntime:
         assert all(results[rank][0] == [] for rank in range(1, world_size))
         assert all(specs[0].intermediate_shape == (2, 2) for _, specs, _ in results.values())
         assert all(active_stages for _, _, active_stages in results.values())
+
+    def test_pp4_device_bootstrap_only_resolves_endpoint_groups(self) -> None:
+        world_size = 4
+        mp_context = torch.multiprocessing.get_context("spawn")
+        manager = mp_context.Manager()
+        result_queue = manager.Queue()
+        try:
+            torch.multiprocessing.spawn(
+                _run_pp4_device_bootstrap_worker,
+                args=(world_size, get_distributed_init_method(), result_queue),
+                nprocs=world_size,
+            )
+            results = dict(result_queue.get() for _ in range(world_size))
+        finally:
+            manager.shutdown()
+
+        assert results == {rank: True for rank in range(world_size)}
+
+    def test_device_clock_error_converges_before_p2p_submission(self) -> None:
+        world_size = 2
+        mp_context = torch.multiprocessing.get_context("spawn")
+        manager = mp_context.Manager()
+        result_queue = manager.Queue()
+        try:
+            torch.multiprocessing.spawn(
+                _run_device_clock_error_worker,
+                args=(world_size, get_distributed_init_method(), result_queue),
+                nprocs=world_size,
+            )
+            results = dict(
+                (rank, (message, clock)) for rank, message, clock in (result_queue.get() for _ in range(world_size))
+            )
+        finally:
+            manager.shutdown()
+
+        assert all(message == "interleaved PP clock failed on pipeline rank(s) 1" for message, _ in results.values())
+        assert all(clock == 0 for _, clock in results.values())
