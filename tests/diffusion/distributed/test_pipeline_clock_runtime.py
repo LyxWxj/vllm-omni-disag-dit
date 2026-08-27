@@ -843,6 +843,75 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
             dist.destroy_process_group()
 
 
+def _run_pipeline_tick_close_barrier_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    result_queue,
+    delayed_rank_ready,
+    rank_zero_closed,
+) -> None:
+    """Prove close waits for every rank after all local Work is retired."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        state_cache = {"A": _make_tick_state("A", 0.0, cfg=False)}
+        edge_pairs = [*zip(range(world_size), range(1, world_size)), (world_size - 1, 0)]
+        edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
+        credit_edge_groups = {edge_pair: dist.new_group(list(edge_pair), backend="gloo") for edge_pair in edge_pairs}
+        pipeline = _TickPipeline(rank, [])
+        runtime = PipelineTickRuntime(
+            pipeline=pipeline,
+            state_cache=state_cache,
+            pp_ranks=tuple(range(world_size)),
+            global_rank=rank,
+            device="cpu",
+            edge_groups={edge_pair: edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair},
+            edge_credit_groups={
+                edge_pair: credit_edge_groups[edge_pair] for edge_pair in edge_pairs if rank in edge_pair
+            },
+            bootstrap_group=dist.group.WORLD,
+        )
+
+        runtime.admit([state_cache["A"]])
+        for clock in range(16):
+            pipeline.clock = clock
+            completions = runtime.progress_one_clock()
+            done = [bool(completions) if rank == 0 else False]
+            dist.broadcast_object_list(done, src=0)
+            dist.barrier()
+            if done[0]:
+                break
+        else:
+            raise RuntimeError("pipeline token did not complete before close")
+
+        rank_zero_returned_early = False
+        if rank == 1:
+            source_channel = next(channel for channel in runtime._all_channels() if channel.is_source)  # noqa: SLF001
+            wait_for_shutdown = source_channel.wait_for_shutdown
+
+            def delay_after_local_shutdown() -> None:
+                nonlocal rank_zero_returned_early
+                wait_for_shutdown()
+                delayed_rank_ready.set()
+                rank_zero_returned_early = rank_zero_closed.wait(timeout=1.0)
+
+            source_channel.wait_for_shutdown = delay_after_local_shutdown
+
+        runtime.close()
+        if rank == 0:
+            rank_zero_closed.set()
+        result_queue.put((rank, rank_zero_returned_early, delayed_rank_ready.is_set()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def _run_pipeline_tick_reconfigure_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
     """Rebuild an idle fixed-shape lane before admitting a new tensor layout."""
     dist.init_process_group(
@@ -1120,6 +1189,36 @@ class TestPipelineTickRuntime:
         assert results[0][0] == [(0, 0)]
         assert all(results[rank][0] == [] for rank in range(1, world_size))
         assert all(results[rank][1] == () for rank in range(world_size)), results
+
+    def test_pp2_close_waits_for_all_ranks_after_local_work_is_retired(self) -> None:
+        world_size = 2
+        mp_context = torch.multiprocessing.get_context("spawn")
+        manager = mp_context.Manager()
+        result_queue = manager.Queue()
+        delayed_rank_ready = manager.Event()
+        rank_zero_closed = manager.Event()
+        try:
+            torch.multiprocessing.spawn(
+                _run_pipeline_tick_close_barrier_worker,
+                args=(
+                    world_size,
+                    get_distributed_init_method(),
+                    result_queue,
+                    delayed_rank_ready,
+                    rank_zero_closed,
+                ),
+                nprocs=world_size,
+            )
+            results = dict(
+                (rank, (rank_zero_returned_early, delayed_rank_was_ready))
+                for rank, rank_zero_returned_early, delayed_rank_was_ready in (
+                    result_queue.get() for _ in range(world_size)
+                )
+            )
+        finally:
+            manager.shutdown()
+
+        assert results == {0: (False, True), 1: (False, True)}
 
     def test_pp2_rebuilds_idle_lane_before_new_tensor_layout(self) -> None:
         world_size = 2
