@@ -287,12 +287,10 @@ class PipelineP2PChannel:
         self._dist = dist
         self._group = group
         # NCCL and HCCL match P2P calls by call order instead of the optional
-        # tag. A pre-posted receive for slot N must therefore not share a
-        # device group with slot N - 1, whose next payload may still be in
-        # flight. Header and payload are issued together through
-        # ``batch_isend_irecv`` on that slot group, which is required for
-        # unbatched NCCL P2P work to make progress reliably. Gloo carries
-        # reverse credits without interfering with device traffic.
+        # tag. Device receives are therefore submitted only in the clock's
+        # globally coordinated edge/slot order. Header and payload are issued
+        # together through ``batch_isend_irecv``; Gloo carries reverse credits
+        # without interfering with device traffic.
         self._slot_groups = (group,) * slots_per_edge if slot_groups is None else tuple(slot_groups)
         if len(self._slot_groups) != slots_per_edge:
             raise ValueError("slot_groups must contain exactly one group per physical slot")
@@ -1681,10 +1679,6 @@ class PipelineTickRuntime:
         for edge_index, (source_rank, destination_rank) in enumerate(pipeline_edge_pairs(self.pp_ranks)):
             is_endpoint = self.global_rank in (source_rank, destination_rank)
             slot_groups = self._edge_slot_groups(source_rank, destination_rank) if is_endpoint else ()
-            if is_endpoint and len({id(edge_group) for edge_group in slot_groups}) != len(slot_groups):
-                raise RuntimeError(
-                    "NCCL/HCCL PP transport requires distinct device groups for every physical receive slot"
-                )
             for slot_id in range(self.slots_per_edge):
                 if is_endpoint:
                     edge_group = slot_groups[slot_id]

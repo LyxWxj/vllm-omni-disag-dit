@@ -898,7 +898,8 @@ def _run_pp4_device_bootstrap_worker(rank: int, world_size: int, init_method: st
         edge_pairs = pipeline_edge_pairs(tuple(range(world_size)))
         endpoint_slot_groups: dict[tuple[int, int], tuple[object, ...]] = {}
         for edge_pair in edge_pairs:
-            slot_groups = tuple(dist.new_group(list(edge_pair), backend="gloo") for _ in range(2))
+            edge_group = dist.new_group(list(edge_pair), backend="gloo")
+            slot_groups = (edge_group, edge_group)
             if rank in edge_pair:
                 endpoint_slot_groups[edge_pair] = slot_groups
 

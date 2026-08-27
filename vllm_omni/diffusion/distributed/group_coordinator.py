@@ -710,11 +710,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         # Retained-state PP clocks exchange independent point-to-point streams
         # on each forward edge and on the last-to-first feedback edge. NCCL
-        # and HCCL match P2P calls by order rather than tag, so every physical
-        # receive slot requires its own device group. This keeps an unmatched
-        # receive for slot N from blocking traffic on slot N - 1. Header and
-        # payload are posted together through one NCCL/HCCL batch on that
-        # group. Scalar reverse credits use a dedicated Gloo pair group.
+        # and HCCL match P2P calls by order rather than tag. Device receives
+        # are posted only after the clock control round pairs them with a send,
+        # so all slots on one directed edge can safely share one communicator
+        # while retaining fixed ring order. Header and payload are posted
+        # together through one NCCL/HCCL batch. Scalar reverse credits use a
+        # dedicated Gloo pair group.
         self._pipeline_transport_slots_per_edge = 2
         self._pipeline_edge_groups: dict[tuple[int, int], ProcessGroup] = {}
         self._pipeline_edge_slot_groups: dict[tuple[int, int], tuple[ProcessGroup, ...]] = {}
@@ -724,13 +725,13 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 continue
             edge_pairs = [*zip(ranks, ranks[1:]), (ranks[-1], ranks[0])]
             for source_rank, destination_rank in edge_pairs:
-                slot_groups = tuple(
-                    torch.distributed.new_group([source_rank, destination_rank], backend=torch_distributed_backend)
-                    for _ in range(self._pipeline_transport_slots_per_edge)
+                edge_group = torch.distributed.new_group(
+                    [source_rank, destination_rank], backend=torch_distributed_backend
                 )
+                slot_groups = (edge_group,) * self._pipeline_transport_slots_per_edge
                 credit_group = torch.distributed.new_group([source_rank, destination_rank], backend="gloo")
                 if self.rank in (source_rank, destination_rank):
-                    self._pipeline_edge_groups[(source_rank, destination_rank)] = slot_groups[0]
+                    self._pipeline_edge_groups[(source_rank, destination_rank)] = edge_group
                     self._pipeline_edge_slot_groups[(source_rank, destination_rank)] = slot_groups
                     self._pipeline_edge_credit_groups[(source_rank, destination_rank)] = credit_group
 
