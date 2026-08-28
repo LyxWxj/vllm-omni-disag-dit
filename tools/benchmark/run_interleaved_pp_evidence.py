@@ -290,10 +290,22 @@ def _filter_startup_trace(trace_dir: Path, output_dir: Path) -> Path:
     filtered_dir = output_dir / "host_trace" / "measured_raw"
     filtered_dir.mkdir(parents=True, exist_ok=False)
     for source in sorted(trace_dir.glob("pp_rank_*.jsonl")):
+        records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        measured_clocks = {
+            record.get("clock")
+            for record in records
+            if record.get("event") == "begin"
+            and record.get("name") == "stage_forward"
+            and "dummy_req_id" not in (record.get("request_ids") or [])
+        }
+        clock_floor = min(measured_clocks) if measured_clocks else None
+        clock_ceiling = max(measured_clocks) if measured_clocks else None
         retained = []
-        for line in source.read_text(encoding="utf-8").splitlines():
-            record = json.loads(line)
+        for record in records:
             if "dummy_req_id" in (record.get("request_ids") or []):
+                continue
+            clock = record.get("clock")
+            if clock_floor is not None and clock is not None and (clock < clock_floor or clock > clock_ceiling + 1):
                 continue
             retained.append(json.dumps(record, separators=(",", ":")))
         (filtered_dir / source.name).write_text("\n".join(retained) + "\n", encoding="utf-8")

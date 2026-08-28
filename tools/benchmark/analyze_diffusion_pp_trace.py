@@ -150,12 +150,19 @@ def _clock_runtime_summary(
         clock_duration_by_id = {
             interval["clock"]: interval["end_ns"] - interval["start_ns"] for interval in rank_clocks
         }
+        local_stage_duration_by_id = {
+            interval["clock"]: interval["end_ns"] - interval["start_ns"]
+            for interval in phases_by_rank[rank]
+            if interval["name"] == "clock_local_stage"
+        }
         phase_durations: dict[str, list[int]] = defaultdict(list)
         for interval in phases_by_rank[rank]:
             phase_durations[interval["name"]].append(interval["end_ns"] - interval["start_ns"])
         action_durations: dict[str, list[int]] = defaultdict(list)
         for event in actions_by_rank[rank]:
-            action_durations[str(event.get("action"))].append(clock_duration_by_id.get(event.get("clock"), 0))
+            action_durations[str(event.get("action"))].append(
+                local_stage_duration_by_id.get(event.get("clock"), clock_duration_by_id.get(event.get("clock"), 0))
+            )
         per_rank[rank] = {
             "pipeline_clock": _timing_summary_ns(clock_durations),
             "inter_clock_gap": _timing_summary_ns(inter_clock_gaps),

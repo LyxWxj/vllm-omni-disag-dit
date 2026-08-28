@@ -200,6 +200,22 @@ def test_trace_summary_attributes_clock_phases_gaps_and_idle_reasons(tmp_path: P
             "clock": 7,
         },
         {
+            "event": "begin",
+            "name": "clock_local_stage",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 4,
+            "clock": 7,
+        },
+        {
+            "event": "end",
+            "name": "clock_local_stage",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 5,
+            "clock": 7,
+        },
+        {
             "event": "instant",
             "name": "clock_local_action",
             "pp_rank": 0,
@@ -234,6 +250,22 @@ def test_trace_summary_attributes_clock_phases_gaps_and_idle_reasons(tmp_path: P
             "action": "stage_forward",
         },
         {
+            "event": "begin",
+            "name": "clock_local_stage",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 16,
+            "clock": 8,
+        },
+        {
+            "event": "end",
+            "name": "clock_local_stage",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 18,
+            "clock": 8,
+        },
+        {
             "event": "end",
             "name": "pipeline_clock",
             "pp_rank": 0,
@@ -265,8 +297,8 @@ def test_trace_summary_attributes_clock_phases_gaps_and_idle_reasons(tmp_path: P
     }
     assert rank_summary["phases"]["clock_poll"]["total_ms"] == 0.000002
     assert rank_summary["local_actions"] == {
-        "forward_credit_wait": {"count": 1, "clock_covered_ms": 0.00001},
-        "stage_forward": {"count": 1, "clock_covered_ms": 0.00002},
+        "forward_credit_wait": {"count": 1, "clock_covered_ms": 0.000001},
+        "stage_forward": {"count": 1, "clock_covered_ms": 0.000002},
     }
 
 
