@@ -341,21 +341,31 @@ class TestWorkerProcShutdown:
             "vllm_omni.diffusion.worker.diffusion_worker.multiprocessing_util._run_finalizers"
         )
         exit_process = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.os._exit")
+        call_order = []
+        run_finalizers.side_effect = lambda: call_order.append("finalizers")
+
+        def exit_after_finalizers(code: int) -> None:
+            call_order.append("exit")
+            raise SystemExit(code)
+
+        exit_process.side_effect = exit_after_finalizers
         pipe_writer = MagicMock()
 
-        WorkerProc.worker_main(
-            0,
-            MagicMock(),
-            pipe_writer,
-            MagicMock(),
-            MagicMock(),
-        )
+        with pytest.raises(SystemExit, match="0"):
+            WorkerProc.worker_main(
+                0,
+                MagicMock(),
+                pipe_writer,
+                MagicMock(),
+                MagicMock(),
+            )
 
         worker_cls.assert_called_once()
         worker_proc.shutdown.assert_called_once_with()
         worker_proc.context.term.assert_called_once_with()
         run_finalizers.assert_called_once_with()
         exit_process.assert_called_once_with(0)
+        assert call_order == ["finalizers", "exit"]
 
     def test_shutdown_stops_async_thread_and_releases_queues(self):
         import threading

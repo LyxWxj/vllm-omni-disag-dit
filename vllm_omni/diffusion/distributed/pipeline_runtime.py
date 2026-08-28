@@ -1173,21 +1173,50 @@ class PipelineTickRuntime:
             return
         sources = [channel for channel in channels if channel.is_source]
         destinations = [channel for channel in channels if channel.is_destination]
-        for channel in sources:
-            channel.begin_shutdown()
+        begin_error: Exception | None = None
+        try:
+            for channel in sources:
+                channel.begin_shutdown()
+        except Exception as exc:
+            begin_error = exc
+        self._converge_channel_shutdown(
+            local_complete=begin_error is None,
+            timed_out=False,
+            local_error=begin_error,
+        )
         shutdown_deadline = time.monotonic() + 10.0
         while True:
-            source_shutdown_complete = [channel.progress_shutdown() for channel in sources]
-            self._coordinate_device_transfers()
-            for channel in destinations:
-                channel.poll()
-                while channel.has_ready_message:
-                    message = channel.begin_compute()
-                    channel.release_after_compute(message)
-            local_complete = all(source_shutdown_complete) and all(channel.is_closed for channel in destinations)
+            local_error: Exception | None = None
+            source_shutdown_complete: list[bool] = []
+            try:
+                source_shutdown_complete = [channel.progress_shutdown() for channel in sources]
+            except Exception as exc:
+                local_error = exc
+
+            try:
+                self._coordinate_device_transfers(local_error=local_error)
+            except Exception as exc:
+                local_error = exc
+
+            if local_error is None:
+                try:
+                    for channel in destinations:
+                        channel.poll()
+                        while channel.has_ready_message:
+                            message = channel.begin_compute()
+                            channel.release_after_compute(message)
+                except Exception as exc:
+                    local_error = exc
+
+            local_complete = (
+                local_error is None
+                and all(source_shutdown_complete)
+                and all(channel.is_closed for channel in destinations)
+            )
             globally_complete, any_timed_out = self._converge_channel_shutdown(
                 local_complete=local_complete,
                 timed_out=time.monotonic() >= shutdown_deadline,
+                local_error=local_error,
             )
             if globally_complete:
                 break
@@ -1197,28 +1226,54 @@ class PipelineTickRuntime:
             # their completion between non-blocking polling rounds.
             time.sleep(0.001)
 
+        cleanup_error: Exception | None = None
         for channel in channels:
-            if channel.is_source:
-                channel.wait_for_shutdown()
-            else:
-                channel.wait_for_sends()
-            if channel.pending_work_count != 0:
-                raise RuntimeError("pipeline channel retained pending Work after shutdown")
+            try:
+                if channel.is_source:
+                    channel.wait_for_shutdown()
+                else:
+                    channel.wait_for_sends()
+                if channel.pending_work_count != 0:
+                    raise RuntimeError("pipeline channel retained pending Work after shutdown")
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         # Every rank has retired the same number of control rounds above. Keep
         # the process groups alive until peers also finish their local Work
         # cleanup, so the next tensor layout cannot reuse a mismatched round.
-        self._converge_channel_shutdown(local_complete=True, timed_out=False)
+        self._converge_channel_shutdown(
+            local_complete=cleanup_error is None,
+            timed_out=False,
+            local_error=cleanup_error,
+        )
 
-    def _converge_channel_shutdown(self, *, local_complete: bool, timed_out: bool) -> tuple[bool, bool]:
+    def _converge_channel_shutdown(
+        self,
+        *,
+        local_complete: bool,
+        timed_out: bool,
+        local_error: Exception | None = None,
+    ) -> tuple[bool, bool]:
         """Make channel shutdown loop completion a PP-lane decision."""
         if self.bootstrap_group is None:
+            if local_error is not None:
+                raise RuntimeError("pipeline channel shutdown failed") from local_error
             return local_complete, timed_out
 
         import torch
         import torch.distributed as dist
 
-        state = torch.tensor((int(local_complete), int(timed_out)), dtype=torch.int64, device="cpu")
+        state = torch.tensor(
+            (int(local_complete), int(timed_out), int(local_error is not None)),
+            dtype=torch.int64,
+            device="cpu",
+        )
         dist.all_reduce(state, group=self.bootstrap_group)
+        if int(state[2].item()):
+            error = RuntimeError("pipeline channel shutdown failed on one or more pipeline ranks")
+            if local_error is not None:
+                raise error from local_error
+            raise error
         return int(state[0].item()) == dist.get_world_size(self.bootstrap_group), bool(state[1].item())
 
     def _all_channels(self) -> Sequence[PipelineP2PChannel]:

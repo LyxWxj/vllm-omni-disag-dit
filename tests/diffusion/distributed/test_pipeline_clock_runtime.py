@@ -843,7 +843,13 @@ def _run_pipeline_tick_abort_worker(rank: int, world_size: int, init_method: str
             dist.destroy_process_group()
 
 
-def _run_asymmetric_channel_shutdown_worker(rank: int, world_size: int, init_method: str, result_queue) -> None:
+def _run_asymmetric_channel_shutdown_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    result_queue,
+    failure_point: str | None = None,
+) -> None:
     """Require every rank to execute the same shutdown control rounds."""
     dist.init_process_group(
         backend="gloo",
@@ -880,7 +886,7 @@ def _run_asymmetric_channel_shutdown_worker(rank: int, world_size: int, init_met
         else:
             raise RuntimeError("pipeline token did not complete before close")
 
-        if rank == 1:
+        if rank == 1 and failure_point is None:
             source = next(channel for channel in runtime._all_channels() if channel.is_source)  # noqa: SLF001
             progress_shutdown = source.progress_shutdown
             delayed_once = False
@@ -903,10 +909,35 @@ def _run_asymmetric_channel_shutdown_worker(rank: int, world_size: int, init_met
             control_rounds += 1
             dist.all_reduce(torch.zeros(1, dtype=torch.int64), group=dist.group.WORLD)
 
-        runtime._coordinate_device_transfers = coordinate_shutdown_round  # noqa: SLF001
-        runtime.close()
+        if failure_point is None:
+            runtime._coordinate_device_transfers = coordinate_shutdown_round  # noqa: SLF001
+        if failure_point == "progress" and rank == 0:
+            source = next(channel for channel in runtime._all_channels() if channel.is_source)  # noqa: SLF001
+
+            def fail_local_progress() -> bool:
+                raise RuntimeError("injected local channel progress failure")
+
+            source.progress_shutdown = fail_local_progress
+        elif failure_point == "cleanup" and rank == 0:
+            source = next(channel for channel in runtime._all_channels() if channel.is_source)  # noqa: SLF001
+
+            def fail_local_cleanup() -> None:
+                raise RuntimeError("injected local channel cleanup failure")
+
+            source.wait_for_shutdown = fail_local_cleanup
+
+        try:
+            runtime.close()
+        except RuntimeError as exc:
+            if failure_point is None:
+                raise
+            result_queue.put((rank, "error", str(exc)))
+            return
         pending_work = tuple(channel.pending_work_count for channel in runtime._all_channels())  # noqa: SLF001
-        result_queue.put((rank, control_rounds, pending_work))
+        if failure_point is not None:
+            result_queue.put((rank, "success", ""))
+        else:
+            result_queue.put((rank, control_rounds, pending_work))
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -1211,6 +1242,29 @@ class TestPipelineTickRuntime:
         assert results[0][0] == results[1][0]
         assert results[0][0] >= 2
         assert all(pending_work == (0, 0) for _, pending_work in results.values())
+
+    @pytest.mark.parametrize("failure_point", ["progress", "cleanup"])
+    def test_pp2_channel_shutdown_converges_local_error(self, failure_point: str) -> None:
+        world_size = 2
+        mp_context = torch.multiprocessing.get_context("spawn")
+        manager = mp_context.Manager()
+        result_queue = manager.Queue()
+        try:
+            torch.multiprocessing.spawn(
+                _run_asymmetric_channel_shutdown_worker,
+                args=(world_size, get_distributed_init_method(), result_queue, failure_point),
+                nprocs=world_size,
+            )
+            results = dict(
+                (rank, (status, message)) for rank, status, message in (result_queue.get() for _ in range(world_size))
+            )
+        finally:
+            manager.shutdown()
+
+        assert {status for status, _ in results.values()} == {"error"}
+        assert {message for _, message in results.values()} == {
+            "pipeline channel shutdown failed on one or more pipeline ranks"
+        }
 
     def test_pp2_rebuilds_idle_lane_before_new_tensor_layout(self) -> None:
         world_size = 2
