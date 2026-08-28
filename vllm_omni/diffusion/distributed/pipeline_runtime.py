@@ -1138,17 +1138,38 @@ class PipelineTickRuntime:
             raise RuntimeError(self._terminal_error)
         completions: list[PipelineTickCompletion] = []
         local_error: Exception | None = None
-        try:
-            self._poll_channels()
-            completions = self._consume_feedback() if self.is_first_stage else []
-            self._run_one_local_stage()
-        except Exception as exc:
-            # Every PP rank must reach the control collective below.  Raising
-            # here would strand the peer ranks in their matching all-reduce.
-            local_error = exc
+        trace_fields = {
+            "pp_rank": self.stage,
+            "pp_size": self.world_size,
+            "clock": self.clock,
+        }
+        with pp_trace.span("pipeline_clock", **trace_fields):
+            try:
+                with pp_trace.span("clock_poll", **trace_fields):
+                    self._poll_channels()
+                if self.is_first_stage:
+                    with pp_trace.span("clock_feedback", **trace_fields):
+                        completions = self._consume_feedback()
+                with pp_trace.span("clock_local_stage", **trace_fields):
+                    local_action = self._run_one_local_stage()
+                pp_trace.event(
+                    "clock_local_action",
+                    action=local_action,
+                    **trace_fields,
+                )
+            except Exception as exc:
+                # Every PP rank must reach the control collective below.
+                # Raising here would strand peers in their matching all-reduce.
+                local_error = exc
+                pp_trace.event(
+                    "clock_local_error",
+                    error_type=type(exc).__name__,
+                    **trace_fields,
+                )
 
-        self._coordinate_device_transfers(local_error=local_error)
-        self.clock += 1
+            with pp_trace.span("clock_transfer_control", **trace_fields):
+                self._coordinate_device_transfers(local_error=local_error)
+            self.clock += 1
         return tuple(completions)
 
     def close(self) -> None:
@@ -1426,14 +1447,14 @@ class PipelineTickRuntime:
                 return channel
         return None
 
-    def _run_one_local_stage(self) -> None:
+    def _run_one_local_stage(self) -> str:
         token_id: int | None = None
         incoming: PipelineP2PChannel | None = None
         message: PipelineTransportMessage | None = None
 
         if self.is_first_stage:
             if not self._waiting:
-                return
+                return "stage0_queue_empty"
             token_id = self._waiting[0]
             plan = self._microbatches[token_id]
             if not self._forward_channel(self.stage, plan.spec).can_send:
@@ -1450,12 +1471,12 @@ class PipelineTickRuntime:
                     model_phase=plan.model_phase,
                     slot_id=None,
                 )
-                return
+                return "forward_credit_wait"
             self._waiting.popleft()
         else:
             candidate = self._next_ready_input()
             if candidate is None:
-                return
+                return "input_not_ready"
             incoming, spec = candidate
             if not self.is_last_stage and not self._forward_channel(self.stage, spec).can_send:
                 pp_trace.event(
@@ -1471,7 +1492,7 @@ class PipelineTickRuntime:
                     model_phase=None,
                     slot_id=None,
                 )
-                return
+                return "forward_credit_wait"
             if self.is_last_stage and not self._feedback_channel(spec).can_send:
                 pp_trace.event(
                     "credit_wait",
@@ -1486,7 +1507,7 @@ class PipelineTickRuntime:
                     model_phase=None,
                     slot_id=None,
                 )
-                return
+                return "feedback_credit_wait"
             message = incoming.begin_compute()
             token_id = message.header.token_id
             self._validate_received_header(message.header, spec)
@@ -1512,7 +1533,7 @@ class PipelineTickRuntime:
             )
             if cancelled:
                 self._forward_cancelled_token(token_id, token, plan)
-                return
+                return "cancelled_forward"
             states = self._states_for(plan)
             self._set_state_step(states, token.step_idx)
             input_batch = self._make_input_batch(states)
@@ -1553,9 +1574,10 @@ class PipelineTickRuntime:
                     self._retire_token(token_id)
                 elif self._is_feedback_token(plan, token_id):
                     self._discard_cancelled_states(plan)
-                return
+                return "stage_forward"
 
             self._finish_last_stage(token_id, token, plan, states, result, trace_fields)
+            return "stage_forward"
         finally:
             if message is not None and incoming is not None:
                 incoming.release_after_compute(message)

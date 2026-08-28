@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -1168,6 +1168,59 @@ def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str,
 
 
 class TestPipelineTickRuntime:
+    def test_clock_trace_records_phases_and_local_idle_reason(self, monkeypatch) -> None:
+        spans: list[tuple[str, str, int]] = []
+        events: list[tuple[str, dict[str, object]]] = []
+
+        @contextmanager
+        def record_span(name: str, **fields):
+            spans.append(("begin", name, fields["clock"]))
+            yield
+            spans.append(("end", name, fields["clock"]))
+
+        monkeypatch.setattr(pipeline_runtime_module.pp_trace, "span", record_span)
+        monkeypatch.setattr(
+            pipeline_runtime_module.pp_trace,
+            "event",
+            lambda name, **fields: events.append((name, fields)),
+        )
+
+        runtime = object.__new__(PipelineTickRuntime)
+        runtime._terminal_error = None
+        runtime.stage = 1
+        runtime.world_size = 4
+        runtime.clock = 7
+        runtime._poll_channels = lambda: None
+        runtime._next_ready_input = lambda: None
+        control_errors: list[Exception | None] = []
+        runtime._coordinate_device_transfers = lambda *, local_error=None: control_errors.append(local_error)
+
+        assert runtime.progress_one_clock() == ()
+
+        assert runtime.clock == 8
+        assert control_errors == [None]
+        assert spans == [
+            ("begin", "pipeline_clock", 7),
+            ("begin", "clock_poll", 7),
+            ("end", "clock_poll", 7),
+            ("begin", "clock_local_stage", 7),
+            ("end", "clock_local_stage", 7),
+            ("begin", "clock_transfer_control", 7),
+            ("end", "clock_transfer_control", 7),
+            ("end", "pipeline_clock", 7),
+        ]
+        assert events == [
+            (
+                "clock_local_action",
+                {
+                    "action": "input_not_ready",
+                    "pp_rank": 1,
+                    "pp_size": 4,
+                    "clock": 7,
+                },
+            )
+        ]
+
     def test_pp4_overlaps_dynamic_admission_and_returns_feedback(self) -> None:
         world_size = 4
         mp_context = torch.multiprocessing.get_context("spawn")

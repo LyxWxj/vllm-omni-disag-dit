@@ -13,21 +13,27 @@ import argparse
 import json
 from collections import defaultdict, deque
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 
-def _load_intervals(trace_dir: Path) -> list[dict[str, Any]]:
+def _load_trace(trace_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     pending: dict[tuple[Any, ...], deque[dict[str, Any]]] = defaultdict(deque)
     intervals: list[dict[str, Any]] = []
+    instant_events: list[dict[str, Any]] = []
     for path in sorted(trace_dir.glob("pp_rank_*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             record = json.loads(line)
+            if record.get("event") == "instant":
+                instant_events.append(record)
+                continue
             if record.get("event") not in {"begin", "end"}:
                 continue
             key = (
                 record.get("name"),
+                record.get("pp_rank"),
                 record.get("token_id"),
                 record.get("clock"),
                 record.get("microbatch_id"),
@@ -61,7 +67,7 @@ def _load_intervals(trace_dir: Path) -> list[dict[str, Any]]:
                     "end_ns": record["ts_ns"],
                 }
             )
-    return intervals
+    return intervals, instant_events
 
 
 def _merged_intervals(intervals: list[dict[str, Any]]) -> list[tuple[int, int]]:
@@ -100,8 +106,77 @@ def _overlap_ns(intervals: list[dict[str, Any]]) -> int:
     return overlap
 
 
+def _timing_summary_ns(values: list[int]) -> dict[str, float | int]:
+    return {
+        "count": len(values),
+        "total_ms": sum(values) / 1e6,
+        "mean_ms": (sum(values) / len(values) / 1e6) if values else 0.0,
+        "median_ms": (median(values) / 1e6) if values else 0.0,
+        "max_ms": (max(values) / 1e6) if values else 0.0,
+    }
+
+
+def _clock_runtime_summary(
+    intervals: list[dict[str, Any]],
+    instant_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    clock_intervals = [interval for interval in intervals if interval["name"] == "pipeline_clock"]
+    phase_names = {
+        "clock_poll",
+        "clock_feedback",
+        "clock_local_stage",
+        "clock_transfer_control",
+    }
+    phases = [interval for interval in intervals if interval["name"] in phase_names]
+    actions = [event for event in instant_events if event.get("name") == "clock_local_action"]
+    clocks_by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    phases_by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    actions_by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for interval in clock_intervals:
+        clocks_by_rank[str(interval["pp_rank"])].append(interval)
+    for interval in phases:
+        phases_by_rank[str(interval["pp_rank"])].append(interval)
+    for event in actions:
+        actions_by_rank[str(event.get("pp_rank"))].append(event)
+
+    per_rank: dict[str, Any] = {}
+    for rank in sorted(set(clocks_by_rank) | set(phases_by_rank) | set(actions_by_rank)):
+        rank_clocks = sorted(clocks_by_rank[rank], key=lambda interval: interval["start_ns"])
+        clock_durations = [interval["end_ns"] - interval["start_ns"] for interval in rank_clocks]
+        inter_clock_gaps = [
+            max(0, next_clock["start_ns"] - previous_clock["end_ns"])
+            for previous_clock, next_clock in zip(rank_clocks, rank_clocks[1:])
+        ]
+        clock_duration_by_id = {
+            interval["clock"]: interval["end_ns"] - interval["start_ns"] for interval in rank_clocks
+        }
+        phase_durations: dict[str, list[int]] = defaultdict(list)
+        for interval in phases_by_rank[rank]:
+            phase_durations[interval["name"]].append(interval["end_ns"] - interval["start_ns"])
+        action_durations: dict[str, list[int]] = defaultdict(list)
+        for event in actions_by_rank[rank]:
+            action_durations[str(event.get("action"))].append(clock_duration_by_id.get(event.get("clock"), 0))
+        per_rank[rank] = {
+            "pipeline_clock": _timing_summary_ns(clock_durations),
+            "inter_clock_gap": _timing_summary_ns(inter_clock_gaps),
+            "phases": {name: _timing_summary_ns(values) for name, values in sorted(phase_durations.items())},
+            "local_actions": {
+                name: {
+                    "count": len(values),
+                    "clock_covered_ms": sum(values) / 1e6,
+                }
+                for name, values in sorted(action_durations.items())
+            },
+        }
+    return {
+        "clock_interval_count": len(clock_intervals),
+        "local_action_count": len(actions),
+        "per_rank": per_rank,
+    }
+
+
 def summarize(trace_dir: Path) -> dict[str, Any]:
-    intervals = _load_intervals(trace_dir)
+    intervals, instant_events = _load_trace(trace_dir)
     stage_intervals = [interval for interval in intervals if interval["name"] == "stage_forward"]
     stage_by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
     all_by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -138,6 +213,7 @@ def summarize(trace_dir: Path) -> dict[str, Any]:
             }
             for rank, items in sorted(all_by_rank.items())
         },
+        "clock_runtime": _clock_runtime_summary(intervals, instant_events),
         "intervals": intervals,
     }
 

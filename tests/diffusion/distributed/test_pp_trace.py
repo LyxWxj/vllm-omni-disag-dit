@@ -173,6 +173,103 @@ def test_trace_summary_does_not_count_nested_spans_on_one_rank_as_overlap(tmp_pa
     assert summary["all_span_per_rank"] == {"0": {"interval_count": 2, "active_ms": 0.00001}}
 
 
+def test_trace_summary_attributes_clock_phases_gaps_and_idle_reasons(tmp_path: Path) -> None:
+    records = [
+        {
+            "event": "begin",
+            "name": "pipeline_clock",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 0,
+            "clock": 7,
+        },
+        {
+            "event": "begin",
+            "name": "clock_poll",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 1,
+            "clock": 7,
+        },
+        {
+            "event": "end",
+            "name": "clock_poll",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 3,
+            "clock": 7,
+        },
+        {
+            "event": "instant",
+            "name": "clock_local_action",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 4,
+            "clock": 7,
+            "action": "forward_credit_wait",
+        },
+        {
+            "event": "end",
+            "name": "pipeline_clock",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 10,
+            "clock": 7,
+        },
+        {
+            "event": "begin",
+            "name": "pipeline_clock",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 15,
+            "clock": 8,
+        },
+        {
+            "event": "instant",
+            "name": "clock_local_action",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 16,
+            "clock": 8,
+            "action": "stage_forward",
+        },
+        {
+            "event": "end",
+            "name": "pipeline_clock",
+            "pp_rank": 0,
+            "pp_size": 2,
+            "ts_ns": 35,
+            "clock": 8,
+        },
+    ]
+    (tmp_path / "pp_rank_0.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    rank_summary = summarize(tmp_path)["clock_runtime"]["per_rank"]["0"]
+
+    assert rank_summary["pipeline_clock"] == {
+        "count": 2,
+        "total_ms": 0.00003,
+        "mean_ms": 0.000015,
+        "median_ms": 0.000015,
+        "max_ms": 0.00002,
+    }
+    assert rank_summary["inter_clock_gap"] == {
+        "count": 1,
+        "total_ms": 0.000005,
+        "mean_ms": 0.000005,
+        "median_ms": 0.000005,
+        "max_ms": 0.000005,
+    }
+    assert rank_summary["phases"]["clock_poll"]["total_ms"] == 0.000002
+    assert rank_summary["local_actions"] == {
+        "forward_credit_wait": {"count": 1, "clock_covered_ms": 0.00001},
+        "stage_forward": {"count": 1, "clock_covered_ms": 0.00002},
+    }
+
+
 def test_npu_kernel_summary_merges_per_rank_and_records_window(tmp_path: Path) -> None:
     header = "Accelerator Core,Start Time(us),Duration(us)\n"
     rows_by_rank = {
