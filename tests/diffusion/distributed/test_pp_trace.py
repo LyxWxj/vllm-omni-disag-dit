@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tools.benchmark.analyze_diffusion_pp_trace import summarize
+from tools.benchmark.analyze_npu_kernel_overlap import summarize as summarize_npu_kernels
 from vllm_omni.diffusion.distributed import pp_trace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -170,3 +171,29 @@ def test_trace_summary_does_not_count_nested_spans_on_one_rank_as_overlap(tmp_pa
     assert summary["all_span_overlap_ms"] == 0.0
     assert summary["all_span_overlap_ratio"] == 0.0
     assert summary["all_span_per_rank"] == {"0": {"interval_count": 2, "active_ms": 0.00001}}
+
+
+def test_npu_kernel_summary_merges_per_rank_and_records_window(tmp_path: Path) -> None:
+    header = "Accelerator Core,Start Time(us),Duration(us)\n"
+    rows_by_rank = {
+        0: ["AI_VECTOR_CORE,0,10", "AI_CUBE_CORE,2,4", "HOST_CPU,0,20"],
+        1: ["AI_VECTOR_CORE,5,10"],
+    }
+    for rank, rows in rows_by_rank.items():
+        output_dir = tmp_path / f"diffusion_rank{rank}" / "profiler" / "ASCEND_PROFILER_OUTPUT"
+        output_dir.mkdir(parents=True)
+        (output_dir / "kernel_details.csv").write_text(header + "\n".join(rows) + "\n", encoding="utf-8")
+
+    summary = summarize_npu_kernels(
+        tmp_path,
+        window_start_us=1,
+        window_end_us=14,
+        git_revision="test-revision",
+    )
+
+    assert summary["selection"]["window"] == {"mode": "explicit", "start_us": 1, "end_us": 14}
+    assert summary["kernel_task_count_per_rank"] == {"0": 2, "1": 1}
+    assert summary["merged_kernel_active_us_per_rank"] == {"0": 9.0, "1": 9.0}
+    assert summary["any_rank_kernel_active_us"] == 13.0
+    assert summary["at_least_2_ranks_active_us"] == 5.0
+    assert summary["cross_rank_kernel_overlap_ratio"] == 5 / 13
