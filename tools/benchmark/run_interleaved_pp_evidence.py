@@ -286,26 +286,60 @@ async def _collect_one(
 
 
 def _filter_startup_trace(trace_dir: Path, output_dir: Path) -> Path:
-    """Keep only measured requests while retaining the original raw trace."""
+    """Keep the real request lifecycle while retaining the original raw trace.
+
+    The runtime continues ticking after the last local forward while feedback
+    drains through the pipeline.  Compute one global window across all ranks:
+    start at the first real admission/forward and end one clock after the last
+    real feedback (or terminal event).  A global end is important because the
+    final feedback is produced by the last stage, while rank zero observes it
+    on a later clock.
+    """
     filtered_dir = output_dir / "host_trace" / "measured_raw"
     filtered_dir.mkdir(parents=True, exist_ok=False)
-    for source in sorted(trace_dir.glob("pp_rank_*.jsonl")):
-        records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
-        measured_clocks = {
-            record.get("clock")
-            for record in records
-            if record.get("event") == "begin"
-            and record.get("name") == "stage_forward"
-            and "dummy_req_id" not in (record.get("request_ids") or [])
-        }
-        clock_floor = min(measured_clocks) if measured_clocks else None
-        clock_ceiling = max(measured_clocks) if measured_clocks else None
+
+    sources = sorted(trace_dir.glob("pp_rank_*.jsonl"))
+    records_by_source = {
+        source: [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        for source in sources
+    }
+
+    def is_dummy(record: dict[str, Any]) -> bool:
+        return "dummy_req_id" in (record.get("request_ids") or [])
+
+    real_records = [record for records in records_by_source.values() for record in records if not is_dummy(record)]
+    lifecycle_start_names = {"token_registered", "stage_forward", "recv_ready"}
+    lifecycle_end_names = {"feedback_ready", "request_complete", "request_terminal"}
+    start_clocks = {
+        record.get("clock")
+        for record in real_records
+        if record.get("name") in lifecycle_start_names and record.get("clock") is not None
+    }
+    forward_clocks = {
+        record.get("clock")
+        for record in real_records
+        if record.get("event") == "begin"
+        and record.get("name") == "stage_forward"
+        and record.get("clock") is not None
+    }
+    end_clocks = {
+        record.get("clock")
+        for record in real_records
+        if record.get("name") in lifecycle_end_names and record.get("clock") is not None
+    }
+    clock_floor = min(start_clocks or forward_clocks) if (start_clocks or forward_clocks) else None
+    last_lifecycle_clock = max(end_clocks or forward_clocks) if (end_clocks or forward_clocks) else None
+    # Keep the clock after final feedback so rank-local drain/idle reasons are
+    # included, but exclude later tombstone and shutdown clocks.
+    clock_ceiling = last_lifecycle_clock + 1 if last_lifecycle_clock is not None else None
+
+    for source, records in records_by_source.items():
         retained = []
         for record in records:
-            if "dummy_req_id" in (record.get("request_ids") or []):
+            if is_dummy(record):
                 continue
             clock = record.get("clock")
-            if clock_floor is not None and clock is not None and (clock < clock_floor or clock > clock_ceiling + 1):
+            if clock_floor is not None and clock is not None and (clock < clock_floor or clock > clock_ceiling):
                 continue
             retained.append(json.dumps(record, separators=(",", ":")))
         (filtered_dir / source.name).write_text("\n".join(retained) + "\n", encoding="utf-8")

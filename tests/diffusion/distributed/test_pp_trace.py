@@ -7,6 +7,7 @@ import pytest
 
 from tools.benchmark.analyze_diffusion_pp_trace import summarize
 from tools.benchmark.analyze_npu_kernel_overlap import summarize as summarize_npu_kernels
+from tools.benchmark.run_interleaved_pp_evidence import _filter_startup_trace
 from vllm_omni.diffusion.distributed import pp_trace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -120,6 +121,49 @@ def test_trace_summary_reports_multi_stage_overlap(tmp_path: Path, monkeypatch) 
     assert summary["all_span_overlap_ms"] == 0.00001
     assert summary["all_span_overlap_ratio"] == 2 / 3
     assert summary["all_span_per_rank"]["1"] == {"interval_count": 2, "active_ms": 0.000015}
+
+
+def test_filter_startup_trace_retains_post_forward_drain_ticks(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "raw"
+    output_dir = tmp_path / "output"
+    trace_dir.mkdir()
+    records_by_rank = {
+        0: [
+            {"event": "instant", "name": "token_registered", "clock": 0, "request_ids": ["dummy_req_id"]},
+            {"event": "begin", "name": "stage_forward", "clock": 0, "request_ids": ["dummy_req_id"]},
+            {"event": "instant", "name": "token_registered", "clock": 5, "request_ids": ["request-a"]},
+            {"event": "begin", "name": "stage_forward", "clock": 5, "request_ids": ["request-a"]},
+            {"event": "instant", "name": "feedback_ready", "clock": 8, "request_ids": ["request-a"]},
+            {"event": "instant", "name": "clock_local_action", "clock": 9, "action": "stage0_queue_empty"},
+            {"event": "instant", "name": "clock_local_action", "clock": 10, "action": "stage0_queue_empty"},
+            {"event": "instant", "name": "clock_local_action", "clock": 11, "action": "stage0_queue_empty"},
+            {"event": "instant", "name": "clock_local_action", "clock": 12, "action": "shutdown"},
+        ],
+        1: [
+            {"event": "instant", "name": "token_registered", "clock": 6, "request_ids": ["request-a"]},
+            {"event": "begin", "name": "stage_forward", "clock": 7, "request_ids": ["request-a"]},
+            {"event": "instant", "name": "feedback_ready", "clock": 10, "request_ids": ["request-a"]},
+            {"event": "instant", "name": "clock_local_action", "clock": 11, "action": "input_not_ready"},
+            {"event": "instant", "name": "clock_local_action", "clock": 12, "action": "shutdown"},
+        ],
+    }
+    for rank, records in records_by_rank.items():
+        (trace_dir / f"pp_rank_{rank}.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+        )
+
+    filtered_dir = _filter_startup_trace(trace_dir, output_dir)
+    filtered = {
+        path.name: [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        for path in sorted(filtered_dir.glob("pp_rank_*.jsonl"))
+    }
+
+    assert all(
+        record.get("request_ids") != ["dummy_req_id"] for record in filtered["pp_rank_0.jsonl"]
+    )
+    assert {record["clock"] for record in filtered["pp_rank_0.jsonl"]} == {5, 8, 9, 10, 11}
+    assert {record["clock"] for record in filtered["pp_rank_1.jsonl"]} == {6, 7, 10, 11}
+    assert all(record.get("clock") != 12 for records in filtered.values() for record in records)
 
 
 def test_trace_summary_does_not_count_nested_spans_on_one_rank_as_overlap(tmp_path: Path, monkeypatch) -> None:
