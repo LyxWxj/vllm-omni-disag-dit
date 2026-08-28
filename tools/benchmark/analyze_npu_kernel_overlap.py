@@ -10,6 +10,8 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+_COMPUTE_CORE_TYPES = frozenset({"AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV"})
+
 
 def _rank_from_path(path: Path) -> str:
     for part in path.parts:
@@ -19,7 +21,9 @@ def _rank_from_path(path: Path) -> str:
     raise ValueError(f"cannot determine diffusion rank from {path}")
 
 
-def _load_ai_kernel_intervals(trace_root: Path) -> tuple[dict[str, list[tuple[float, float]]], dict[str, str]]:
+def _load_compute_kernel_intervals(
+    trace_root: Path,
+) -> tuple[dict[str, list[tuple[float, float]]], dict[str, str]]:
     intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
     sources: dict[str, str] = {}
     paths = sorted(trace_root.rglob("ASCEND_PROFILER_OUTPUT/kernel_details.csv"))
@@ -33,14 +37,14 @@ def _load_ai_kernel_intervals(trace_root: Path) -> tuple[dict[str, list[tuple[fl
         sources[rank] = str(path)
         with path.open(newline="", encoding="utf-8-sig") as file:
             for row in csv.DictReader(file):
-                if not row["Accelerator Core"].strip().startswith("AI_"):
+                if row["Accelerator Core"].strip() not in _COMPUTE_CORE_TYPES:
                     continue
                 start = float(row["Start Time(us)"].strip())
                 duration = float(row["Duration(us)"].strip())
                 if duration > 0:
                     intervals[rank].append((start, start + duration))
     if not intervals:
-        raise ValueError("no positive-duration AI accelerator kernels found")
+        raise ValueError("no positive-duration compute-core kernels found")
     return dict(intervals), sources
 
 
@@ -89,7 +93,7 @@ def summarize(
     window_end_us: float | None = None,
     git_revision: str | None = None,
 ) -> dict[str, object]:
-    intervals_by_rank, sources = _load_ai_kernel_intervals(trace_root)
+    intervals_by_rank, sources = _load_compute_kernel_intervals(trace_root)
     if (window_start_us is None) != (window_end_us is None):
         raise ValueError("--window-start-us and --window-end-us must be specified together")
     window_mode = "explicit"
@@ -115,7 +119,7 @@ def summarize(
         "git_revision": git_revision,
         "source": "CANN ASCEND_PROFILER_OUTPUT/kernel_details.csv",
         "selection": {
-            "accelerator_core_prefix": "AI_",
+            "accelerator_core_types": sorted(_COMPUTE_CORE_TYPES),
             "interval_processing": "clip to window, then merge per rank before cross-rank sweep",
             "window": {
                 "mode": window_mode,

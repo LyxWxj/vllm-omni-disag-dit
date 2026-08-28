@@ -176,8 +176,8 @@ def test_trace_summary_does_not_count_nested_spans_on_one_rank_as_overlap(tmp_pa
 def test_npu_kernel_summary_merges_per_rank_and_records_window(tmp_path: Path) -> None:
     header = "Accelerator Core,Start Time(us),Duration(us)\n"
     rows_by_rank = {
-        0: ["AI_VECTOR_CORE,0,10", "AI_CUBE_CORE,2,4", "HOST_CPU,0,20"],
-        1: ["AI_VECTOR_CORE,5,10"],
+        0: ["AI_CORE,0,10", "MIX_AIC,2,4", "HOST_CPU,0,20"],
+        1: ["AI_VECTOR_CORE,5,10", "MIX_AIV,12,3"],
     }
     for rank, rows in rows_by_rank.items():
         output_dir = tmp_path / f"diffusion_rank{rank}" / "profiler" / "ASCEND_PROFILER_OUTPUT"
@@ -192,8 +192,24 @@ def test_npu_kernel_summary_merges_per_rank_and_records_window(tmp_path: Path) -
     )
 
     assert summary["selection"]["window"] == {"mode": "explicit", "start_us": 1, "end_us": 14}
-    assert summary["kernel_task_count_per_rank"] == {"0": 2, "1": 1}
+    assert summary["selection"]["accelerator_core_types"] == ["AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV"]
+    assert summary["kernel_task_count_per_rank"] == {"0": 2, "1": 2}
     assert summary["merged_kernel_active_us_per_rank"] == {"0": 9.0, "1": 9.0}
     assert summary["any_rank_kernel_active_us"] == 13.0
     assert summary["at_least_2_ranks_active_us"] == 5.0
     assert summary["cross_rank_kernel_overlap_ratio"] == 5 / 13
+
+
+def test_npu_kernel_summary_excludes_ai_cpu(tmp_path: Path) -> None:
+    output_dir = tmp_path / "diffusion_rank0" / "profiler" / "ASCEND_PROFILER_OUTPUT"
+    output_dir.mkdir(parents=True)
+    (output_dir / "kernel_details.csv").write_text(
+        "Accelerator Core,Start Time(us),Duration(us)\nAI_CORE,0,10\nAI_CPU,0,20\n",
+        encoding="utf-8",
+    )
+
+    summary = summarize_npu_kernels(tmp_path)
+
+    assert summary["kernel_task_count_per_rank"] == {"0": 1}
+    assert summary["any_rank_kernel_active_us"] == 10.0
+    assert summary["maximum_simultaneously_active_ranks"] == 1
