@@ -524,7 +524,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="E2E diffusion concurrent benchmark / validation")
     parser.add_argument("--model", type=str, required=True, help="Model name or path")
     parser.add_argument("--num-prompts", type=int, default=8, help="Number of prompts to run")
-    parser.add_argument("--batch-size", type=int, default=1, help="Diffusion batch size (1 = no batching)")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Scheduler in-flight width (--max-num-seqs) and client diffusion_batch_size",
+    )
     parser.add_argument(
         "--mode",
         choices=["batch", "single", "compare", "validate"],
