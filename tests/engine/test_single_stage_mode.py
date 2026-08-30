@@ -1170,7 +1170,7 @@ class TestSingleStageReplicaInitialization:
                 os.environ[device_env_var] = prev_device_env
 
         assert result is sentinel_client
-        assert od_config.max_num_seqs is None
+        assert od_config.max_num_seqs == 4
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
@@ -1207,7 +1207,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",

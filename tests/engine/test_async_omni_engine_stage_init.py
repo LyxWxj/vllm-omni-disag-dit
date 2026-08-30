@@ -505,7 +505,7 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     assert os.environ[runtime_env_var] == "parent-value"
 
 
-def test_initialize_diffusion_stage_forwards_batch_size_without_writing_max_num_seqs(monkeypatch):
+def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.engine.stage_init_utils as init_mod
 
@@ -535,7 +535,7 @@ def test_initialize_diffusion_stage_forwards_batch_size_without_writing_max_num_
         use_inline=True,
     )
 
-    assert od_config.max_num_seqs == 1
+    assert od_config.max_num_seqs == 4
     assert captured == {
         "model": "dummy-model",
         "config": od_config,
@@ -545,7 +545,7 @@ def test_initialize_diffusion_stage_forwards_batch_size_without_writing_max_num_
     }
 
 
-def test_launch_diffusion_stage_replica_does_not_write_max_num_seqs_from_batch_size(monkeypatch):
+def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
     import vllm_omni.engine.stage_engine_startup as startup_mod
@@ -592,7 +592,7 @@ def test_launch_diffusion_stage_replica_does_not_write_max_num_seqs_from_batch_s
     )
 
     assert result is sentinel_client
-    assert od_config.max_num_seqs == 1
+    assert od_config.max_num_seqs == 4
     assert resources.manager is proc_manager
 
 
@@ -611,7 +611,6 @@ def test_initialize_diffusion_stage_does_not_write_max_num_seqs(monkeypatch):
         types.SimpleNamespace(),
         metadata,
         stage_init_timeout=12,
-        batch_size=4,
         use_inline=True,
     )
 
@@ -662,7 +661,6 @@ def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(mo
         stage_config=types.SimpleNamespace(),
         metadata=types.SimpleNamespace(stage_id=0),
         stage_init_timeout=12,
-        batch_size=4,
         use_inline=False,
         omni_master_server=omni_master_server,
     )

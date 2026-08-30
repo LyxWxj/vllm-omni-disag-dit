@@ -669,7 +669,6 @@ class StageRuntime:
                     stage_config=plan.stage_cfg,
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
-                    batch_size=self._diffusion_batch_size,
                     use_inline=plan.num_replicas == 1
                     and bool(self._num_stages == 1 or inline_diffusion or custom_pipeline_args),
                     replica_id=plan.replica_id,

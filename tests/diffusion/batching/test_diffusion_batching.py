@@ -528,7 +528,7 @@ if __name__ == "__main__":
         "--batch-size",
         type=int,
         default=1,
-        help="Scheduler in-flight width (--max-num-seqs) and client diffusion_batch_size",
+        help="Scheduler in-flight width (--max-num-seqs)",
     )
     parser.add_argument(
         "--mode",
