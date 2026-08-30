@@ -1830,7 +1830,7 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 
 def _stage_declares_cfg_pairs(model_config: Any) -> bool:
