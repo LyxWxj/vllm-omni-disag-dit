@@ -1068,20 +1068,30 @@ def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str,
         timeout=timedelta(seconds=30),
     )
     original_get_backend = dist.get_backend
+    created_groups: list[object] = []
     try:
         edge_pairs = pipeline_edge_pairs(tuple(range(world_size)))
-        endpoint_groups: dict[tuple[int, int], object] = {}
-        endpoint_slot_groups: dict[tuple[int, int], tuple[object, ...]] = {}
-        endpoint_credit_groups: dict[tuple[int, int], object] = {}
-        for edge_pair in edge_pairs:
-            slot_groups = (dist.new_group(list(edge_pair), backend="gloo"),)
-            credit_group = dist.new_group(list(edge_pair), backend="gloo")
-            if rank in edge_pair:
-                endpoint_groups[edge_pair] = slot_groups[0]
-                endpoint_slot_groups[edge_pair] = slot_groups
-                endpoint_credit_groups[edge_pair] = credit_group
+        device_group_ids: set[int] = set()
 
-        device_group_ids = {id(group) for group in endpoint_groups.values()}
+        def create_group_bundle():
+            endpoint_groups: dict[tuple[int, int], object] = {}
+            endpoint_slot_groups: dict[tuple[int, int], tuple[object, ...]] = {}
+            endpoint_credit_groups: dict[tuple[int, int], object] = {}
+            for edge_pair in edge_pairs:
+                slot_group = dist.new_group(list(edge_pair), backend="gloo")
+                credit_group = dist.new_group(list(edge_pair), backend="gloo")
+                created_groups.extend((slot_group, credit_group))
+                if rank in edge_pair:
+                    endpoint_groups[edge_pair] = slot_group
+                    endpoint_slot_groups[edge_pair] = (slot_group,)
+                    endpoint_credit_groups[edge_pair] = credit_group
+            return endpoint_groups, endpoint_slot_groups, endpoint_credit_groups
+
+        endpoint_groups, endpoint_slot_groups, endpoint_credit_groups = create_group_bundle()
+        device_group_ids.update(id(group) for group in endpoint_groups.values())
+        # Edge groups are Gloo-backed in this worker but are reported as a
+        # device transport to exercise the edge-local control handshake;
+        # credit/control messages still use their real Gloo backend.
 
         def get_backend(group):
             if id(group) in device_group_ids:
@@ -1090,25 +1100,30 @@ def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str,
 
         dist.get_backend = get_backend
 
-        def make_runtime(state_cache, active_stages):
+        def make_runtime(state_cache, active_stages, groups):
+            groups, slot_groups, credit_groups = groups
             return PipelineTickRuntime(
                 pipeline=_TickPipeline(rank, active_stages),
                 state_cache=state_cache,
                 pp_ranks=tuple(range(world_size)),
                 global_rank=rank,
                 device="cpu",
-                edge_groups=endpoint_groups,
-                edge_slot_groups=endpoint_slot_groups,
-                edge_credit_groups=endpoint_credit_groups,
+                edge_groups=groups,
+                edge_slot_groups=slot_groups,
+                edge_credit_groups=credit_groups,
                 bootstrap_group=dist.group.WORLD,
                 slots_per_edge=1,
             )
 
+        def runtime_debug_state(runtime):
+            return {
+                "fatal": runtime.fatal_control_state(),
+                "channels": tuple(channel.diagnostic_state() for channel in runtime._all_channels()),  # noqa: SLF001
+            }
+
         state_cache = {"A": _make_tick_state("A", 0.0, cfg=False)}
-        runtime = make_runtime(state_cache, [])
+        runtime = make_runtime(state_cache, [], (endpoint_groups, endpoint_slot_groups, endpoint_credit_groups))
         runtime.admit([state_cache["A"]])
-        for channel in runtime._all_channels():  # noqa: SLF001 - device control on top of Gloo transport.
-            channel._slot_requires_wait_thread = (True,)  # noqa: SLF001
         for _ in range(16):
             runtime._poll_channels()  # noqa: SLF001 - await initial source credit.
             dist.barrier()
@@ -1131,43 +1146,244 @@ def _run_device_clock_error_worker(rank: int, world_size: int, init_method: str,
             error_message = str(exc)
         else:
             error_message = ""
-        assert not runtime.has_in_flight_work
-        assert not state_cache
-        runtime.close()
+        # Fatal status is the one permitted global control round.  Converge
+        # the injected failure before issuing another clock so root cannot
+        # submit a device transfer while its peer is already terminal.
+        fatal_state = torch.tensor(int(bool(error_message)), dtype=torch.int64)
+        dist.all_reduce(fatal_state, op=dist.ReduceOp.MAX)
+        if int(fatal_state.item()):
+            error_message = "interleaved PP clock failed on pipeline rank(s) 1"
+            runtime._abort_failed_clock(error_message)  # noqa: SLF001
+        failed_runtime_in_flight = runtime.has_in_flight_work
+        failed_runtime_cache = tuple(state_cache)
+        failed_runtime_state_before_close = runtime_debug_state(runtime)
+        close_error = ""
+        # Enter fatal teardown together; close itself owns the mailbox and
+        # channel cleanup rounds and must not race a peer still in its clock
+        # heartbeat loop.
+        dist.barrier()
+        try:
+            runtime.close()
+        except Exception as exc:
+            close_error = repr(exc)
         failed_runtime_pending_work = [channel.pending_work_count for channel in runtime._all_channels()]  # noqa: SLF001
+        failed_runtime_state_after_close = runtime_debug_state(runtime)
+        failed_runtime_clock = runtime.clock
+        failed_runtime_generation = runtime
+        runtime.detach_process_groups()
+        del runtime
+        import gc
+
+        gc.collect()
+        # Both ranks must finish the failed lane's teardown before creating a
+        # replacement runtime.  The old edge groups are retired first so no
+        # outstanding transport state can leak into recovery.
+        dist.barrier()
+        for group in reversed(created_groups):
+            try:
+                dist.destroy_process_group(group)
+            except Exception:
+                pass
+        created_groups.clear()
+        failed_runtime_generation.finalize_process_groups()
+        del failed_runtime_generation
+        gc.collect()
+        import time
+
+        time.sleep(0.5)
+        dist.barrier()
+
+        endpoint_groups, endpoint_slot_groups, endpoint_credit_groups = create_group_bundle()
 
         recovered_state_cache = {"B": _make_tick_state("B", 10.0, cfg=False)}
         recovered_active_stages: list[tuple[int, int]] = []
-        recovered = make_runtime(recovered_state_cache, recovered_active_stages)
+        recovered = make_runtime(
+            recovered_state_cache,
+            recovered_active_stages,
+            (endpoint_groups, endpoint_slot_groups, endpoint_credit_groups),
+        )
+        # A rebuilt lane must not reuse tags while a backend may still be
+        # retiring old transport work.  This models the runtime generation
+        # counter used by the production executor during recovery.
+        recovered._TAG_BASE = 20_000  # noqa: SLF001
         recovered.admit([recovered_state_cache["B"]])
-        for channel in recovered._all_channels():  # noqa: SLF001 - device control on top of Gloo transport.
-            channel._slot_requires_wait_thread = (True,)  # noqa: SLF001
         completions: list[str] = []
-        for _ in range(8):
+        recovery_snapshots: list[dict[str, object]] = []
+        for _ in range(32):
+            clock_completions: list[str] = []
             for completion in recovered.progress_one_clock():
-                completions.extend(completion.request_ids)
+                clock_completions.extend(completion.request_ids)
+            completions.extend(clock_completions)
+            recovery_snapshots.append(
+                {
+                    "clock": recovered.clock,
+                    "waiting": tuple(recovered._waiting),  # noqa: SLF001
+                    "microbatches": tuple(recovered._microbatches),  # noqa: SLF001
+                    "channels": tuple(
+                        channel.diagnostic_state()
+                        for channel in recovered._all_channels()  # noqa: SLF001
+                    ),
+                }
+            )
             dist.barrier()
-        assert not recovered.has_in_flight_work
-        recovered.close()
+            done = torch.tensor(int(bool(clock_completions)), dtype=torch.int64)
+            dist.all_reduce(done, op=dist.ReduceOp.MAX)
+            if int(done.item()):
+                break
+        recovered_in_flight = recovered.has_in_flight_work
+        recovered_state_before_close = runtime_debug_state(recovered)
+        recovered_close_error = ""
+        try:
+            recovered.close()
+        except Exception as exc:
+            recovered_close_error = repr(exc)
         recovered_pending_work = [channel.pending_work_count for channel in recovered._all_channels()]  # noqa: SLF001
+        recovered_state_after_close = runtime_debug_state(recovered)
+        recovered_generation = recovered
+        recovered.detach_process_groups()
+        del recovered
+        gc.collect()
+        del endpoint_groups, endpoint_slot_groups, endpoint_credit_groups
+        gc.collect()
+        dist.barrier()
+        for group in reversed(created_groups):
+            try:
+                dist.destroy_process_group(group)
+            except Exception:
+                pass
+        created_groups.clear()
+        recovered_generation.finalize_process_groups()
+        del recovered_generation
+        gc.collect()
+        time.sleep(0.5)
+        dist.barrier()
         result_queue.put(
             (
                 rank,
                 error_message,
-                runtime.clock,
+                failed_runtime_clock,
                 failed_runtime_pending_work,
                 recovered_pending_work,
                 completions,
+                close_error + recovered_close_error,
+                failed_runtime_in_flight,
+                failed_runtime_cache,
+                recovery_snapshots,
+                recovered_in_flight,
+                failed_runtime_state_before_close,
+                failed_runtime_state_after_close,
+                recovered_state_before_close,
+                recovered_state_after_close,
             )
         )
         dist.barrier()
     finally:
         dist.get_backend = original_get_backend
         if dist.is_initialized():
+            # Edge groups are owned by the runtime generation and may still
+            # have backend cleanup callbacks in flight.  Retire the world
+            # group here; the process-local group objects are released by
+            # interpreter teardown after all workers leave the test.
             dist.destroy_process_group()
 
 
 class TestPipelineTickRuntime:
+    def test_diagnostic_state_does_not_poll_channel(self, monkeypatch) -> None:
+        channel = object.__new__(PipelineP2PChannel)
+        channel._is_source = True
+        channel._next_send_slot_id = 0
+        channel._credit_slot_id_set = {0}
+        channel._credit_slot_ids = [0]
+        channel._send_slots = [SimpleNamespace(state=PipelineSlotState.FREE)]
+        channel._next_send_sequence = 3
+        channel._next_control_send_slot_id = 1
+        channel._next_control_receive_sequence = 2
+        channel._next_repost_slot_id = 0
+        channel._control_received_by_sequence = {}
+        channel._credit_works = []
+        monkeypatch.setattr(
+            PipelineP2PChannel, "poll", lambda _self: (_ for _ in ()).throw(AssertionError("poll called"))
+        )
+        monkeypatch.setattr(PipelineP2PChannel, "pending_work_count", property(lambda _self: 0))
+        state = channel.diagnostic_state()
+        assert state["can_send"] is True
+        assert state["pending_work"] == 0
+
+    def test_fatal_control_state_reports_all_work_handles(self) -> None:
+        runtime = object.__new__(PipelineTickRuntime)
+        runtime._fatal_control_initialized = True
+        runtime._fatal_control_sent = True
+        runtime._fatal_control_closed = False
+        runtime._fatal_control_status_works = {1: object()}
+        runtime._fatal_control_work = object()
+        runtime._fatal_control_ack_work = object()
+        runtime._fatal_control_broadcast_works = [(object(), object())]
+        assert runtime.fatal_control_state() == {
+            "initialized": True,
+            "sent": True,
+            "closed": False,
+            "status_work_count": 1,
+            "has_send_work": True,
+            "has_ack_work": True,
+            "broadcast_work_count": 1,
+        }
+
+    def test_close_propagates_fatal_mailbox_cleanup_error(self) -> None:
+        runtime = object.__new__(PipelineTickRuntime)
+        runtime._waiting = []
+        runtime._positive_noise = {}
+        runtime._fatal_control_initialized = True
+        runtime._fatal_control_closed = False
+        runtime._fatal_control_broadcast_works = []
+        runtime._fatal_control_status_works = {}
+        runtime._cleanup_failed = False
+        runtime._all_channels = lambda: ()
+        runtime._finish_fatal_error_control = lambda: (_ for _ in ()).throw(RuntimeError("mailbox failed"))
+        with pytest.raises(RuntimeError, match="mailbox failed"):
+            runtime.close()
+        assert runtime._cleanup_failed
+
+    def test_edge_control_record_waits_for_receiver_slot_release(self) -> None:
+        slot = SimpleNamespace(
+            slot_id=0,
+            control_buffer=torch.tensor((0, 0, 1, 0), dtype=torch.int64),
+            control_work=None,
+            control_ack_work=None,
+            state=PipelineSlotState.READY,
+        )
+        channel = object.__new__(PipelineP2PChannel)
+        channel._requires_coordinated_device_transfers = True
+        channel._receive_slots = [slot]
+        channel._next_control_receive_sequence = 0
+        channel._control_received_by_sequence = {0: (slot, 0)}
+
+        channel._poll_destination_control()
+
+        assert channel._control_received_by_sequence == {0: (slot, 0)}
+
+    def test_edge_local_control_does_not_enter_global_transfer_collective(self, monkeypatch) -> None:
+        class PollOnlyChannel:
+            def __init__(self) -> None:
+                self.poll_count = 0
+
+            def poll(self) -> None:
+                self.poll_count += 1
+
+        channel = PollOnlyChannel()
+        runtime = object.__new__(PipelineTickRuntime)
+        runtime.edge_groups = {(0, 1): object()}
+        runtime.bootstrap_group = object()
+        runtime._all_channels = lambda: (channel,)
+        runtime._poll_fatal_error_control = lambda local_error: None
+        monkeypatch.setattr(dist, "get_backend", lambda group: "nccl")
+
+        def fail_all_reduce(*args, **kwargs):
+            raise AssertionError("normal device transfer control must not call all_reduce")
+
+        monkeypatch.setattr(dist, "all_reduce", fail_all_reduce)
+        runtime._coordinate_device_transfers()
+        assert channel.poll_count == 1
+
     def test_clock_trace_records_phases_and_local_idle_reason(self, monkeypatch) -> None:
         spans: list[tuple[str, str, int]] = []
         events: list[tuple[str, dict[str, object]]] = []
@@ -1374,17 +1590,38 @@ class TestPipelineTickRuntime:
                 nprocs=world_size,
             )
             results = {
-                rank: (message, clock, failed_pending_work, recovered_pending_work, completions)
-                for rank, message, clock, failed_pending_work, recovered_pending_work, completions in (
+                rank: (
+                    message,
+                    clock,
+                    failed_pending_work,
+                    recovered_pending_work,
+                    completions,
+                    close_error,
+                    failed_in_flight,
+                    failed_cache,
+                    snapshots,
+                    recovered_in_flight,
+                    failed_state_before,
+                    failed_state_after,
+                    recovered_state_before,
+                    recovered_state_after,
+                )
+                for rank, message, clock, failed_pending_work, recovered_pending_work, completions, close_error, failed_in_flight, failed_cache, snapshots, recovered_in_flight, failed_state_before, failed_state_after, recovered_state_before, recovered_state_after in (
                     result_queue.get() for _ in range(world_size)
                 )
             }
         finally:
             manager.shutdown()
 
-        assert all(message == "interleaved PP clock failed on pipeline rank(s) 1" for message, *_ in results.values())
+        assert all(
+            message == "interleaved PP clock failed on pipeline rank(s) 1" for message, *_ in results.values()
+        ), results
         assert all(clock == 0 for _, clock, *_ in results.values())
-        assert all(not any(failed_pending_work) for _, _, failed_pending_work, _, _ in results.values())
-        assert all(not any(recovered_pending_work) for _, _, _, recovered_pending_work, _ in results.values())
-        assert results[0][-1] == ["B"]
-        assert results[1][-1] == []
+        assert all(not any(value[2]) for value in results.values())
+        assert all(not any(value[3]) for value in results.values())
+        assert all(not value[5] for value in results.values()), results
+        assert all(not value[6] for value in results.values()), results
+        assert all(not value[7] for value in results.values()), results
+        assert all(not value[9] for value in results.values()), results
+        assert results[0][4] == ["B"]
+        assert results[1][4] == []

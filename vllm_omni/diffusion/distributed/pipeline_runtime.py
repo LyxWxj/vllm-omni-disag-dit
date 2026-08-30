@@ -74,6 +74,10 @@ class PipelineSlotState(Enum):
     SEND_PENDING = auto()
 
 
+class PeerFatalError(RuntimeError):
+    """A fatal clock error already reported by another PP rank."""
+
+
 def pipeline_edge_pairs(pp_ranks: Sequence[int]) -> tuple[tuple[int, int], ...]:
     """Return adjacent forward edges plus the last-to-first feedback edge."""
     ranks = tuple(pp_ranks)
@@ -175,6 +179,12 @@ class _P2PSendSlot:
         self.awaits_credit = False
         self.header_work: Any | None = None
         self.payload_work: Any | None = None
+        self.control_buffer: Any | None = None
+        self.control_work: Any | None = None
+        self.control_ack_buffer: Any | None = None
+        self.control_ack_work: Any | None = None
+        self.control_sequence: int | None = None
+        self.control_flags = 0
         self.state = PipelineSlotState.FREE
         self.history = [self.state]
 
@@ -212,6 +222,12 @@ class _P2PReceiveSlot:
         self.payload_buffer = payload_buffer
         self.header_work: Any | None = None
         self.payload_work: Any | None = None
+        self.control_buffer: Any | None = None
+        self.control_work: Any | None = None
+        self.control_ack_buffer: Any | None = None
+        self.control_ack_work: Any | None = None
+        self.control_sequence: int | None = None
+        self.control_flags = 0
         self.header: PipelineTransportHeader | None = None
         self.release_event: Any | None = None
         self.state = PipelineSlotState.FREE
@@ -260,7 +276,8 @@ class PipelineP2PChannel:
     a blocking metadata path.
     """
 
-    _TAGS_PER_SLOT = 3
+    _TAGS_PER_SLOT = 5
+    _CONTROL_FIELD_COUNT = 4
 
     def __init__(
         self,
@@ -324,8 +341,11 @@ class PipelineP2PChannel:
         self._peer_rank = destination_rank if self._is_source else source_rank
         self._next_send_sequence = 0
         self._next_send_slot_id = 0
+        self._next_control_send_slot_id = 0
         self._next_receive_sequence = 0
+        self._next_control_receive_sequence = 0
         self._next_repost_slot_id = 0
+        self._control_received_by_sequence: dict[int, tuple[_P2PReceiveSlot, int]] = {}
         self._ready_slot_ids: deque[int] = deque()
         self._received_by_sequence: dict[int, _P2PReceiveSlot] = {}
         self._max_occupied = 0
@@ -334,6 +354,7 @@ class PipelineP2PChannel:
         self._shutdown_payload: Any | None = None
         self._shutdown_slot_ids: set[int] = set()
         self._closed = False
+        self._retired_works: list[Any] = []
 
         # This constructor is reached from the model runner's inference-mode
         # execution context. Transport buffers outlive one model invocation
@@ -365,6 +386,13 @@ class PipelineP2PChannel:
                     torch.empty(1, dtype=torch.int64, device=self._credit_device) for _ in range(slots_per_edge)
                 ]
 
+            # Control records stay on the CPU/Gloo credit group.  They are
+            # independent from the tensor buffers and may be reused as soon as
+            # the control Work completes.
+            for slot in self._send_slots if self._is_source else self._receive_slots:
+                slot.control_buffer = torch.empty(self._CONTROL_FIELD_COUNT, dtype=torch.int64, device="cpu")
+                slot.control_ack_buffer = torch.empty(self._CONTROL_FIELD_COUNT, dtype=torch.int64, device="cpu")
+
         if self._is_source:
             self._credit_works: list[Any | None] = [None] * slots_per_edge
             self._credit_slot_ids: deque[int] = deque()
@@ -377,6 +405,8 @@ class PipelineP2PChannel:
                 if not self._requires_coordinated_device_transfers:
                     self._post_receive(slot)
                 self._send_credit(slot.slot_id)
+                if self._requires_coordinated_device_transfers:
+                    self._post_control_receive(slot)
 
     @property
     def is_source(self) -> bool:
@@ -441,12 +471,68 @@ class PipelineP2PChannel:
     def pending_work_count(self) -> int:
         """Number of live send/receive Work handles retained by this edge."""
         if self._is_source:
-            return sum(
-                work is not None for slot in self._send_slots for work in (slot.header_work, slot.payload_work)
-            ) + sum(work is not None for work in self._credit_works)
-        return sum(
-            work is not None for slot in self._receive_slots for work in (slot.header_work, slot.payload_work)
-        ) + sum(work is not None for work in self._credit_works)
+            return (
+                sum(work is not None for slot in self._send_slots for work in (slot.header_work, slot.payload_work))
+                + sum(
+                    work is not None for slot in self._send_slots for work in (slot.control_work, slot.control_ack_work)
+                )
+                + sum(work is not None for work in self._credit_works)
+            )
+        return (
+            sum(work is not None for slot in self._receive_slots for work in (slot.header_work, slot.payload_work))
+            + sum(
+                work is not None for slot in self._receive_slots for work in (slot.control_work, slot.control_ack_work)
+            )
+            + sum(work is not None for work in self._credit_works)
+        )
+
+    def diagnostic_state(self) -> dict[str, Any]:
+        """Return transport state without polling or submitting communication."""
+        if self._is_source:
+            next_slot = self._send_slots[self._next_send_slot_id]
+            can_send = self._next_send_slot_id in self._credit_slot_id_set and next_slot.state is PipelineSlotState.FREE
+            ready_queue_len = None
+        else:
+            can_send = None
+            ready_queue_len = len(self._ready_slot_ids)
+        return {
+            "source": self._is_source,
+            "pending_work": self.pending_work_count,
+            "can_send": can_send,
+            "ready_queue_len": ready_queue_len,
+            "next_send_sequence": self._next_send_sequence,
+            "next_control_send_slot_id": self._next_control_send_slot_id,
+            "next_control_receive_sequence": self._next_control_receive_sequence,
+            "next_repost_slot_id": self._next_repost_slot_id,
+            "control_received_sequences": tuple(sorted(self._control_received_by_sequence)),
+            "credits": tuple(self._credit_slot_ids) if self._is_source else (),
+            "send_slots": (
+                tuple(
+                    {
+                        "state": slot.state.name,
+                        "control_sequence": getattr(slot, "control_sequence", None),
+                        "has_control_work": getattr(slot, "control_work", None) is not None,
+                        "has_control_ack_work": getattr(slot, "control_ack_work", None) is not None,
+                    }
+                    for slot in self._send_slots
+                )
+                if self._is_source
+                else ()
+            ),
+            "receive_slots": (
+                tuple(
+                    {
+                        "state": slot.state.name,
+                        "control_sequence": getattr(slot, "control_sequence", None),
+                        "has_control_work": getattr(slot, "control_work", None) is not None,
+                        "has_control_ack_work": getattr(slot, "control_ack_work", None) is not None,
+                    }
+                    for slot in self._receive_slots
+                )
+                if not self._is_source
+                else ()
+            ),
+        }
 
     def poll(self) -> None:
         """Advance local non-blocking work without waiting for a peer."""
@@ -487,6 +573,8 @@ class PipelineP2PChannel:
         else:
             slot.payload_buffer.copy_(payload)
 
+        slot.control_sequence = self._next_send_sequence
+        slot.control_flags = transport_header.flags
         slot.begin_send(awaits_credit=not self._shutdown_requested)
         if self._requires_coordinated_device_transfers:
             return transport_header
@@ -605,6 +693,10 @@ class PipelineP2PChannel:
         for slot_id, work in enumerate(self._credit_works):
             self._wait_for_works(work)
             self._credit_works[slot_id] = None
+        if not self._is_source:
+            for slot in self._receive_slots:
+                self._wait_for_works(slot.control_ack_work)
+                slot.control_ack_work = None
         self._poll_destination()
 
     def wait_for_shutdown(self) -> None:
@@ -623,6 +715,79 @@ class PipelineP2PChannel:
             self._credit_works[slot_id] = None
         self._poll_source()
 
+    def abort_close(self) -> None:
+        """Abort this edge after a fatal clock without sending tombstones.
+
+        Fatal teardown is only used when the lane is permanently retired. Any
+        Work that exposes an abort operation is cancelled; completed Work is
+        reaped, and all Python handles are then dropped before the owning
+        process group is destroyed by the worker.
+        """
+        works = []
+        if self._is_source:
+            for slot in self._send_slots:
+                works.extend((slot.header_work, slot.payload_work, slot.control_work, slot.control_ack_work))
+        else:
+            for slot in self._receive_slots:
+                works.extend((slot.header_work, slot.payload_work, slot.control_work, slot.control_ack_work))
+        works.extend(self._credit_works)
+        for work in works:
+            if work is None:
+                continue
+            if self._works_complete(work):
+                self._wait_for_works(work)
+                continue
+            # A fatal lane may leave a credit receive (or a control receive)
+            # without a matching peer operation.  Dropping that Work handle
+            # lets the backend destructor run while its waiter is active and
+            # can abort the process.  Backends that expose ``abort`` provide
+            # the only supported way to retire such an operation.
+            # Do not call ``Work.abort`` here: Gloo's implementation closes
+            # the pair immediately and can terminate a peer that is still
+            # retiring its fatal mailbox.  The owning process group teardown
+            # is responsible for cancelling these unmatched operations.
+            self._retired_works.append(work)
+        slots = self._send_slots if self._is_source else self._receive_slots
+        for slot in slots:
+            slot.header_work = None
+            slot.payload_work = None
+            slot.control_work = None
+            slot.control_ack_work = None
+            slot.release_event = None
+            slot.header = None
+            slot.state = PipelineSlotState.FREE
+        self._credit_works = [None] * self.slots_per_edge
+        if self._is_source:
+            self._credit_slot_ids.clear()
+            self._credit_slot_id_set.clear()
+        self._control_received_by_sequence.clear()
+        self._received_by_sequence.clear()
+        self._ready_slot_ids.clear()
+        self._closed = True
+
+    def detach_process_groups(self) -> None:
+        """Release process-group references after the lane has been retired."""
+        if self.pending_work_count:
+            raise RuntimeError("cannot detach process groups with pending Work")
+        self._group = None
+        self._slot_groups = ()
+        self._credit_group = None
+
+    def finalize_process_groups(self) -> None:
+        """Release retired Work after the owning ProcessGroup was destroyed."""
+        if self._group is not None or self._slot_groups or self._credit_group is not None:
+            raise RuntimeError("cannot finalize process groups before detach")
+        cleanup_error: Exception | None = None
+        for work in self._retired_works:
+            try:
+                work.wait()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        self._retired_works.clear()
+        if cleanup_error is not None:
+            raise RuntimeError("pipeline retired Work failed during finalization") from cleanup_error
+
     def _poll_source(self) -> None:
         for slot in self._send_slots:
             if slot.is_send_pending and self._works_complete(slot.header_work, slot.payload_work):
@@ -630,6 +795,8 @@ class PipelineP2PChannel:
                 slot.finish_send()
                 if not slot.awaits_credit:
                     slot.release_payload()
+
+        self._poll_source_control()
 
         for expected_slot_id, work in enumerate(self._credit_works):
             if not self._works_complete(work):
@@ -648,6 +815,7 @@ class PipelineP2PChannel:
             self._send_slots[credit_slot_id].release_payload()
 
     def _poll_destination(self) -> None:
+        self._poll_destination_control()
         self._reclaim_completed_receive_slots()
         for slot in self._receive_slots:
             if slot.state is not PipelineSlotState.RECV_POSTED or slot.header is not None:
@@ -723,7 +891,118 @@ class PipelineP2PChannel:
                 if not self._requires_coordinated_device_transfers:
                     self._post_receive(slot)
                 self._send_credit(slot.slot_id)
+                if self._requires_coordinated_device_transfers:
+                    self._post_control_receive(slot)
             self._next_repost_slot_id = self._next_slot_id(slot.slot_id)
+
+    def _post_control_receive(self, slot: _P2PReceiveSlot) -> None:
+        """Keep one fixed-slot ready record posted on the edge-local control group."""
+        if slot.control_work is not None:
+            raise RuntimeError(f"control receive for slot {slot.slot_id} is already posted")
+        slot.control_work = self._start_work(
+            self._dist.irecv(
+                slot.control_buffer,
+                src=self._peer_rank,
+                group=self._credit_group,
+                tag=self._control_tag(slot.slot_id),
+            ),
+            requires_wait_thread=self._credit_requires_wait_thread,
+        )
+
+    def _poll_source_control(self) -> None:
+        """Send ready records and commit data only after the matching ACK."""
+        if not self._requires_coordinated_device_transfers:
+            return
+        slot = self._send_slots[self._next_control_send_slot_id]
+        if (
+            slot.is_send_pending
+            and slot.control_work is None
+            and slot.control_ack_work is None
+            and slot.control_sequence is not None
+        ):
+            slot.control_buffer.copy_(
+                slot.control_buffer.new_tensor((slot.control_sequence, slot.slot_id, 1, slot.control_flags))
+            )
+            slot.control_work = self._start_work(
+                self._dist.isend(
+                    slot.control_buffer,
+                    dst=self._peer_rank,
+                    group=self._credit_group,
+                    tag=self._control_tag(slot.slot_id),
+                ),
+                requires_wait_thread=self._credit_requires_wait_thread,
+            )
+            slot.control_ack_work = self._start_work(
+                self._dist.irecv(
+                    slot.control_ack_buffer,
+                    src=self._peer_rank,
+                    group=self._credit_group,
+                    tag=self._control_ack_tag(slot.slot_id),
+                ),
+                requires_wait_thread=self._credit_requires_wait_thread,
+            )
+
+        if slot.control_ack_work is None or not self._works_complete(slot.control_work, slot.control_ack_work):
+            return
+        self._wait_for_works(slot.control_work, slot.control_ack_work)
+        ack_sequence, ack_slot_id, ack_valid, _ = (int(value) for value in slot.control_ack_buffer.tolist())
+        if (ack_sequence, ack_slot_id, ack_valid) != (slot.control_sequence, slot.slot_id, 1):
+            raise RuntimeError(f"invalid control ACK for slot {slot.slot_id}")
+        slot.control_work = None
+        slot.control_ack_work = None
+        self._next_control_send_slot_id = self._next_slot_id(slot.slot_id)
+        self._commit_prepared_send(slot)
+
+    def _poll_destination_control(self) -> None:
+        """Consume ready records in send-sequence order and ACK posted receives."""
+        if not self._requires_coordinated_device_transfers:
+            return
+        for slot in self._receive_slots:
+            if slot.control_work is None or not self._works_complete(slot.control_work):
+                continue
+            self._wait_for_works(slot.control_work)
+            slot.control_work = None
+            sequence, slot_id, valid, flags = (int(value) for value in slot.control_buffer.tolist())
+            if slot_id != slot.slot_id or valid != 1:
+                raise RuntimeError(f"invalid control record for slot {slot.slot_id}")
+            if sequence < self._next_control_receive_sequence or sequence in self._control_received_by_sequence:
+                raise RuntimeError(
+                    f"stale or duplicate control sequence {sequence} on PP edge "
+                    f"(expected {self._next_control_receive_sequence}, slot {slot.slot_id})"
+                )
+            self._control_received_by_sequence[sequence] = (slot, flags)
+
+        while self._next_control_receive_sequence in self._control_received_by_sequence:
+            slot, flags = self._control_received_by_sequence.pop(self._next_control_receive_sequence)
+            if slot.state is not PipelineSlotState.FREE:
+                # The ready record can overtake the previous payload's local
+                # compute completion. Keep it queued until the receiver-owned
+                # slot is returned; the sequence barrier still prevents later
+                # records from bypassing it.
+                self._control_received_by_sequence[self._next_control_receive_sequence] = (slot, flags)
+                return
+            if slot.control_ack_work is not None:
+                if not self._works_complete(slot.control_ack_work):
+                    self._control_received_by_sequence[self._next_control_receive_sequence] = (slot, flags)
+                    return
+                self._wait_for_works(slot.control_ack_work)
+            slot.control_ack_work = None
+            self._post_receive(slot)
+            slot.control_sequence = self._next_control_receive_sequence
+            slot.control_flags = flags
+            slot.control_ack_buffer.copy_(
+                slot.control_ack_buffer.new_tensor((self._next_control_receive_sequence, slot.slot_id, 1, flags))
+            )
+            slot.control_ack_work = self._start_work(
+                self._dist.isend(
+                    slot.control_ack_buffer,
+                    dst=self._peer_rank,
+                    group=self._credit_group,
+                    tag=self._control_ack_tag(slot.slot_id),
+                ),
+                requires_wait_thread=self._credit_requires_wait_thread,
+            )
+            self._next_control_receive_sequence += 1
 
     def _post_credit_receive(self, slot_id: int) -> None:
         self._credit_works[slot_id] = self._start_work(
@@ -851,6 +1130,12 @@ class PipelineP2PChannel:
     def _credit_tag(self, slot_id: int) -> int:
         return self._header_tag(slot_id) + 2
 
+    def _control_tag(self, slot_id: int) -> int:
+        return self._header_tag(slot_id) + 3
+
+    def _control_ack_tag(self, slot_id: int) -> int:
+        return self._header_tag(slot_id) + 4
+
     def _start_work(self, work: Any, *, requires_wait_thread: bool) -> Any:
         if not requires_wait_thread:
             return work
@@ -965,6 +1250,7 @@ class PipelineTickRuntime:
     _BRANCH_NEGATIVE = 1
     _BRANCH_FEEDBACK = 2
     _TAG_BASE = 10_000
+    _FATAL_CONTROL_TAG = 60_000
     _MODEL_PHASE_SHIFT = 8
 
     def __init__(
@@ -1021,6 +1307,17 @@ class PipelineTickRuntime:
         self._positive_noise: dict[int, Any] = {}
         self._model_phase_ids: dict[str, int] = {}
         self._terminal_error: str | None = None
+        self._fatal_control_buffer: Any | None = None
+        self._fatal_control_work: Any | None = None
+        self._fatal_control_ack_buffer: Any | None = None
+        self._fatal_control_ack_work: Any | None = None
+        self._fatal_control_status_works: dict[int, Any] = {}
+        self._fatal_control_status_buffers: dict[int, Any] = {}
+        self._fatal_control_broadcast_works: list[tuple[Any, Any]] = []
+        self._fatal_control_initialized = False
+        self._fatal_control_sent = False
+        self._fatal_control_closed = False
+        self._cleanup_failed = False
         # HCCL does not use the P2P ``tag`` argument when matching already
         # posted receives. Keep exactly one physical tensor layout live on a
         # PP lane and explicitly drain it before changing layouts. The edge
@@ -1135,7 +1432,11 @@ class PipelineTickRuntime:
     def progress_one_clock(self) -> tuple[PipelineTickCompletion, ...]:
         """Advance at most one local DiT stage and consume ready feedback."""
         if self._terminal_error is not None:
-            raise RuntimeError(self._terminal_error)
+            # Once fatal state has converged, later worker ticks are teardown
+            # heartbeats.  Returning an empty result keeps all ranks in the
+            # caller's barrier/close sequence; the original error is raised
+            # by the owning request path or reported by ``close``.
+            return ()
         completions: list[PipelineTickCompletion] = []
         local_error: Exception | None = None
         trace_fields = {
@@ -1169,6 +1470,10 @@ class PipelineTickRuntime:
 
             with pp_trace.span("clock_transfer_control", **trace_fields):
                 self._coordinate_device_transfers(local_error=local_error)
+            if local_error is not None:
+                message = f"interleaved PP clock failed on pipeline rank(s) {self.pp_ranks[self.stage]}"
+                self._abort_failed_clock(message)
+                raise RuntimeError(message) from local_error
             self.clock += 1
         return tuple(completions)
 
@@ -1185,7 +1490,96 @@ class PipelineTickRuntime:
         if self._waiting or self._positive_noise:
             raise RuntimeError("cannot close PipelineTickRuntime with queued or partial CFG tokens")
 
-        self._shutdown_channels()
+        # A peer may report a fatal clock while this rank is already entering
+        # teardown.  Retire the heartbeat locally, but do not leave the lane
+        # before peers have entered the matching shutdown rounds.
+        try:
+            # All ranks must complete the same fatal-mailbox round.  A peer
+            # may already have set ``_terminal_error`` while root is still
+            # collecting status records; skipping this round on that peer
+            # lets it enter the abort barrier against root's outstanding
+            # mailbox operations.
+            self._finish_fatal_error_control()
+        except PeerFatalError:
+            # The peer error is already represented by ``_terminal_error``;
+            # continue draining channels so every rank follows the same lane
+            # shutdown protocol.
+            pass
+        except RuntimeError:
+            self._cleanup_failed = True
+            raise
+        try:
+            if self._terminal_error is not None:
+                channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
+                # A pure-Gloo lane has already posted its fixed payload
+                # receives.  Tombstones complete those receives and let the
+                # backend waiter threads exit normally; dropping unmatched
+                # Gloo Work before subgroup destruction is process-unsafe.
+                if channels and all(not channel._requires_coordinated_device_transfers for channel in channels):
+                    self._shutdown_channels()
+                else:
+                    self._abort_channels()
+                self._retire_fatal_mailbox()
+            else:
+                self._shutdown_channels()
+        except RuntimeError:
+            self._cleanup_failed = True
+            raise
+        fatal_work = (
+            self._fatal_control_work,
+            self._fatal_control_ack_work,
+            *(work for work, _buffer in self._fatal_control_broadcast_works),
+            *self._fatal_control_status_works.values(),
+        )
+        if any(work is not None for work in fatal_work):
+            self._cleanup_failed = True
+            raise RuntimeError("pipeline fatal mailbox retained pending Work after close")
+        if any(channel.pending_work_count != 0 for channel in self._all_channels()):
+            self._cleanup_failed = True
+            raise RuntimeError("pipeline channel retained pending Work after close")
+
+    def detach_process_groups(self) -> None:
+        """Release generation-owned group references before group destruction."""
+        channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
+        for channel in channels:
+            if channel.pending_work_count:
+                channel.abort_close()
+            channel.detach_process_groups()
+        self.edge_groups = {}
+        self.edge_slot_groups = {}
+        self.edge_credit_groups = {}
+        self.bootstrap_group = None
+
+    def finalize_process_groups(self) -> None:
+        """Release retired channel Work after subgroup destruction."""
+        channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
+        for channel in channels:
+            channel.finalize_process_groups()
+
+    def _retire_fatal_mailbox(self) -> None:
+        """Drop fatal mailbox handles after all ranks entered abort round."""
+        self._fatal_control_work = None
+        self._fatal_control_ack_work = None
+        self._fatal_control_status_works.clear()
+        self._fatal_control_status_buffers.clear()
+        self._fatal_control_broadcast_works.clear()
+        self._fatal_control_closed = True
+
+    def _converge_abort_round(self) -> None:
+        """Synchronize fatal teardown without touching the device data path."""
+        if self.bootstrap_group is None:
+            return
+        import torch
+        import torch.distributed as dist
+
+        state = torch.ones(1, dtype=torch.int64, device="cpu")
+        dist.all_reduce(state, group=self.bootstrap_group)
+
+    def _abort_channels(self) -> None:
+        """Retire fatal lanes without relying on the normal tombstone sequence."""
+        channels = tuple({id(channel): channel for channel in self._all_channels()}.values())
+        for channel in channels:
+            channel.abort_close()
 
     def _shutdown_channels(self) -> None:
         """Drain and close every current transport channel without retiring state."""
@@ -1301,27 +1695,19 @@ class PipelineTickRuntime:
         return (*self._forward_channels.values(), *self._feedback_channels.values())
 
     def _coordinate_device_transfers(self, *, local_error: Exception | None = None) -> None:
-        """Submit this clock's NCCL/HCCL pairs in one fixed edge order.
+        """Advance edge-local control and submit paired device transfers.
 
-        Device P2P calls can block while their peer enters the matching call.
-        A worker that has no local compute would otherwise return from the RPC
-        before an upstream stage has produced its tensor.  The small Gloo
-        bitmap makes each edge's source and destination enter the paired
-        ``batch_isend_irecv`` in the same clock, while all local DiT forwards
-        have already been queued and can overlap.
+        Normal data traffic uses a ready/ack handshake on each edge's Gloo
+        control group.  Fatal local errors retain the slower global reduction
+        so every PP rank retires the lane together.
         """
         if not self._all_channels():
-            if local_error is not None:
-                raise local_error
             return
 
-        import torch
+        local_edge_groups = tuple(self.edge_groups.values())
         import torch.distributed as dist
 
-        local_edge_groups = tuple(self.edge_groups.values())
         if not local_edge_groups or all(dist.get_backend(group) == "gloo" for group in local_edge_groups):
-            if local_error is not None:
-                raise local_error
             return
         if self.bootstrap_group is None:
             error = RuntimeError("NCCL/HCCL PP transport requires a Gloo control group")
@@ -1329,93 +1715,179 @@ class PipelineTickRuntime:
                 raise error from local_error
             raise error
 
-        edge_pairs = pipeline_edge_pairs(self.pp_ranks)
-        plan = torch.zeros(
-            len(edge_pairs) * self.slots_per_edge + self.world_size,
-            dtype=torch.int64,
-            device="cpu",
-        )
-        transfer_plan_size = len(edge_pairs) * self.slots_per_edge
-        if local_error is None:
-            try:
-                for edge_index, (source_rank, destination_rank) in enumerate(edge_pairs):
-                    if self.global_rank != source_rank:
-                        continue
-                    channel = self._local_channel_for_edge(source_rank, destination_rank)
-                    if channel is None:
-                        raise RuntimeError(f"missing source pipeline channel for {source_rank}->{destination_rank}")
-                    for slot_id in channel.coordinated_send_slot_ids():
-                        plan[edge_index * self.slots_per_edge + slot_id] = 1
-            except Exception as exc:
-                local_error = exc
-        else:
-            plan[transfer_plan_size + self.stage] = 1
+        self._poll_fatal_error_control(local_error)
         if local_error is not None:
-            plan[:transfer_plan_size].zero_()
-            plan[transfer_plan_size + self.stage] = 1
+            return
 
-        dist.all_reduce(plan, group=self.bootstrap_group)
-        failed_ranks = tuple(
-            rank for stage, rank in enumerate(self.pp_ranks) if int(plan[transfer_plan_size + stage].item())
-        )
-        if failed_ranks:
-            message = "interleaved PP clock failed on pipeline rank(s) " + ", ".join(map(str, failed_ranks))
-            self._abort_failed_clock(message)
-            if local_error is not None:
-                raise RuntimeError(message) from local_error
-            raise RuntimeError(message)
-        if bool((plan > 1).any()):
-            raise RuntimeError("more than one rank scheduled the same PP transport slot")
+        for channel in {id(channel): channel for channel in self._all_channels()}.values():
+            channel.poll()
 
-        for edge_index, (source_rank, destination_rank) in enumerate(edge_pairs):
-            if self.global_rank not in (source_rank, destination_rank):
-                continue
-            channel = self._local_channel_for_edge(source_rank, destination_rank)
-            if channel is None:
-                raise RuntimeError(f"missing local pipeline channel for {source_rank}->{destination_rank}")
-            for slot_id in range(self.slots_per_edge):
-                if not int(plan[edge_index * self.slots_per_edge + slot_id].item()):
+    def _poll_fatal_error_control(self, local_error: Exception | None) -> None:
+        """Poll the exception-only point-to-point fatal control mailbox."""
+        import torch
+        import torch.distributed as dist
+
+        self._reap_fatal_broadcast()
+
+        if not self._fatal_control_initialized:
+            if self.stage == 0:
+                for stage in range(1, self.world_size):
+                    buffer = torch.zeros(2, dtype=torch.int64, device="cpu")
+                    self._fatal_control_status_buffers[stage] = buffer
+                    self._fatal_control_status_works[stage] = dist.irecv(
+                        buffer,
+                        src=self.pp_ranks[stage],
+                        group=self.bootstrap_group,
+                        tag=self._FATAL_CONTROL_TAG + stage,
+                    )
+            else:
+                self._fatal_control_buffer = torch.zeros(2, dtype=torch.int64, device="cpu")
+                self._fatal_control_ack_buffer = torch.zeros(2, dtype=torch.int64, device="cpu")
+                self._fatal_control_ack_work = dist.irecv(
+                    self._fatal_control_ack_buffer,
+                    src=self.pp_ranks[0],
+                    group=self.bootstrap_group,
+                    tag=self._FATAL_CONTROL_TAG + self.world_size + self.stage,
+                )
+            self._fatal_control_initialized = True
+
+        if local_error is not None and not self._fatal_control_sent:
+            if self.stage == 0:
+                self._broadcast_fatal_control(self.stage, 1)
+            else:
+                self._fatal_control_buffer[0] = self.stage
+                self._fatal_control_buffer[1] = 1
+                self._fatal_control_work = dist.isend(
+                    self._fatal_control_buffer,
+                    dst=self.pp_ranks[0],
+                    group=self.bootstrap_group,
+                    tag=self._FATAL_CONTROL_TAG + self.stage,
+                )
+            self._fatal_control_sent = True
+
+        if self.stage == 0:
+            for stage, work in tuple(self._fatal_control_status_works.items()):
+                if not work.is_completed():
                     continue
-                role = "send" if self.global_rank == source_rank else "receive"
-                pp_trace.event(
-                    "p2p_post_begin",
-                    pp_rank=self.stage,
-                    pp_size=self.world_size,
-                    clock=self.clock,
-                    token_id=None,
-                    request_ids=(),
-                    microbatch_id=None,
-                    step_idx=None,
-                    cfg_branch=None,
-                    model_phase=None,
-                    slot_id=slot_id,
-                    source_rank=source_rank,
-                    destination_rank=destination_rank,
-                    role=role,
+                work.wait()
+                buffer = self._fatal_control_status_buffers[stage]
+                failed_stage, failed = (int(value) for value in buffer.tolist())
+                del self._fatal_control_status_works[stage]
+                del self._fatal_control_status_buffers[stage]
+                if failed:
+                    self._broadcast_fatal_control(failed_stage, 1)
+                    self._reap_fatal_broadcast()
+                    self._raise_fatal_control(failed_stage)
+        elif self._fatal_control_ack_work is not None and self._fatal_control_ack_work.is_completed():
+            self._fatal_control_ack_work.wait()
+            failed_stage, failed = (int(value) for value in self._fatal_control_ack_buffer.tolist())
+            self._fatal_control_ack_work = None
+            if failed:
+                self._raise_fatal_control(failed_stage)
+
+    def _broadcast_fatal_control(self, failed_stage: int, failed: int) -> None:
+        import torch
+        import torch.distributed as dist
+
+        # A fatal notification may be followed by the close notification.
+        # Keep each send buffer alive until its Work is complete before
+        # reusing the mailbox/tag for the next round.
+        for work, _buffer in self._fatal_control_broadcast_works:
+            work.wait()
+        self._fatal_control_broadcast_works.clear()
+        for stage in range(1, self.world_size):
+            buffer = torch.tensor((failed_stage, failed), dtype=torch.int64, device="cpu")
+            work = dist.isend(
+                buffer,
+                dst=self.pp_ranks[stage],
+                group=self.bootstrap_group,
+                tag=self._FATAL_CONTROL_TAG + self.world_size + stage,
+            )
+            self._fatal_control_broadcast_works.append((work, buffer))
+
+    def _reap_fatal_broadcast(self) -> None:
+        """Retire completed fatal mailbox sends before lane teardown."""
+        remaining: list[tuple[Any, Any]] = []
+        for work, buffer in self._fatal_control_broadcast_works:
+            if work.is_completed():
+                work.wait()
+            else:
+                remaining.append((work, buffer))
+        self._fatal_control_broadcast_works = remaining
+
+    def _raise_fatal_control(self, failed_stage: int) -> None:
+        message = f"interleaved PP clock failed on pipeline rank(s) {self.pp_ranks[failed_stage]}"
+        self._abort_failed_clock(message)
+        raise PeerFatalError(message)
+
+    def fatal_control_state(self) -> dict[str, Any]:
+        """Return a read-only diagnostic snapshot of fatal mailbox ownership."""
+        return {
+            "initialized": self._fatal_control_initialized,
+            "sent": self._fatal_control_sent,
+            "closed": self._fatal_control_closed,
+            "status_work_count": len(self._fatal_control_status_works),
+            "has_send_work": self._fatal_control_work is not None,
+            "has_ack_work": self._fatal_control_ack_work is not None,
+            "broadcast_work_count": len(self._fatal_control_broadcast_works),
+        }
+
+    def _finish_fatal_error_control(self) -> None:
+        """Complete the one-shot fatal mailbox before process-group teardown."""
+        if not self._fatal_control_initialized or self._fatal_control_closed:
+            return
+        import torch
+        import torch.distributed as dist
+
+        if self.stage != 0 and not self._fatal_control_sent:
+            status = torch.tensor((self.stage, 0), dtype=torch.int64, device="cpu")
+            self._fatal_control_work = dist.isend(
+                status,
+                dst=self.pp_ranks[0],
+                group=self.bootstrap_group,
+                tag=self._FATAL_CONTROL_TAG + self.stage,
+            )
+            self._fatal_control_sent = True
+        if self.stage == 0:
+            failed_stage = None
+            for stage, work in tuple(self._fatal_control_status_works.items()):
+                work.wait()
+                buffer = self._fatal_control_status_buffers.get(stage)
+                if buffer is not None and int(buffer[1].item()):
+                    failed_stage = int(buffer[0].item())
+            self._fatal_control_status_works.clear()
+            self._fatal_control_status_buffers.clear()
+            if failed_stage is not None:
+                self._terminal_error = f"interleaved PP clock failed on pipeline rank(s) {self.pp_ranks[failed_stage]}"
+                self._broadcast_fatal_control(failed_stage, 1)
+            else:
+                self._broadcast_fatal_control(0, 0)
+            for work, _buffer in self._fatal_control_broadcast_works:
+                work.wait()
+            self._fatal_control_broadcast_works.clear()
+        else:
+            if self._fatal_control_work is not None:
+                self._fatal_control_work.wait()
+                self._fatal_control_work = None
+            if self._fatal_control_ack_work is None:
+                self._fatal_control_ack_buffer = torch.zeros(2, dtype=torch.int64, device="cpu")
+                self._fatal_control_ack_work = dist.irecv(
+                    self._fatal_control_ack_buffer,
+                    src=self.pp_ranks[0],
+                    group=self.bootstrap_group,
+                    tag=self._FATAL_CONTROL_TAG + self.world_size + self.stage,
                 )
-                if self.global_rank == source_rank:
-                    channel.post_coordinated_send(slot_id)
-                else:
-                    channel.post_coordinated_receive(slot_id)
-                pp_trace.event(
-                    "p2p_post_end",
-                    pp_rank=self.stage,
-                    pp_size=self.world_size,
-                    clock=self.clock,
-                    token_id=None,
-                    request_ids=(),
-                    microbatch_id=None,
-                    step_idx=None,
-                    cfg_branch=None,
-                    model_phase=None,
-                    slot_id=slot_id,
-                    source_rank=source_rank,
-                    destination_rank=destination_rank,
-                    role=role,
-                )
+            if self._fatal_control_ack_work is not None:
+                self._fatal_control_ack_work.wait()
+                self._fatal_control_ack_work = None
+        self._fatal_control_closed = True
 
     def _abort_failed_clock(self, message: str) -> None:
         """Discard uncommitted P2P sends and retire an unrecoverable lane."""
+        # The clock is a submission-generation counter.  Once this
+        # generation is retired, no partially completed tick may be observed
+        # by recovery or diagnostics.
+        self.clock = 0
         for channel in {id(channel): channel for channel in self._all_channels()}.values():
             if channel.is_source:
                 channel.discard_prepared_sends()
