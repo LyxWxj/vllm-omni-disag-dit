@@ -435,7 +435,6 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     assert captured == {
         "stage_id": 0,
         "stage_init_timeout": 302,
-        "batch_size": 4,
         "use_inline": expected_inline,
         "omni_master_server": None,
     }
