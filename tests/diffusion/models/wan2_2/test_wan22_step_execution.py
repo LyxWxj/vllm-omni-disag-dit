@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
 from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
@@ -66,6 +67,8 @@ def _pipeline() -> Wan22Pipeline:
     pipeline.transformer_config = pipeline.transformer.config
     pipeline.text_encoder = SimpleNamespace(dtype=torch.float32)
     pipeline.vae = _VAE()
+    pipeline.vae_scale_factor_temporal = pipeline.vae.config.scale_factor_temporal
+    pipeline.vae_scale_factor_spatial = pipeline.vae.config.scale_factor_spatial
     pipeline.od_config = SimpleNamespace(flow_shift=5.0)
     pipeline.scheduler = _Scheduler()
     pipeline.boundary_ratio = None
@@ -201,6 +204,7 @@ def test_prepare_encode_rejects_deferred_modes(monkeypatch) -> None:
 def test_denoise_and_scheduler_use_request_local_state_once(monkeypatch) -> None:
     _patch_scheduler(monkeypatch)
     monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 1)
     pipeline = _pipeline()
     state = _state()
     pipeline.prepare_encode(state)
