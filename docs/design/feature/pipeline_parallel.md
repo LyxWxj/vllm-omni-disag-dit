@@ -41,8 +41,8 @@ For each denoising step:
 4. The last PP rank applies the scheduler step and sends the updated latents back to rank 0 for the next timestep.
 
 This reduces per-rank model memory and enables larger diffusion transformers to run across multiple GPUs. CFG-Parallel
-is available only for pipelines that explicitly advertise the combination; Wan2.2 step execution currently supports
-sequential CFG at PP=1 and rejects CFG when PP>1.
+is available only for pipelines that explicitly advertise the combination. Wan2.2 request-mode PP retains its existing
+CFG support; its step-execution path supports sequential CFG at PP=1 and rejects CFG when PP>1.
 
 ### Architecture
 
@@ -68,7 +68,7 @@ defines how a local stage executes.
     - Rank 0 starts with the input latents
     - Middle ranks receive `intermediate_tensors`, run their local layer range, and asynchronously send downstream
     - The last rank returns the final noise prediction
-    - Wan2.2 step execution currently rejects CFG in this topology; use `guidance_scale=1.0`.
+    - Wan2.2 step execution rejects CFG in this topology; request-mode full `forward()` retains its existing support.
 - **PP + CFG-Parallel** (`pipeline_parallel_size > 1`, `cfg_parallel_size > 1`):
     - Reserved for pipelines with an explicit PP+CFG capability contract.
 
@@ -256,23 +256,24 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=1.0 \
+--guidance-scale=5.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
 --output=t2v_5B_pp2.mp4 \
 --pipeline-parallel-size=2
 ```
 
-Wan2.2 PP+CFG is currently deferred. The supported PP=2 smoke path uses no CFG:
+Wan2.2 step-execution PP+CFG is currently deferred. The request-mode PP+CFG path remains supported:
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=1.0 \
+--guidance-scale=5.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
---output=t2v_5B_pp2_no_cfg.mp4 \
---pipeline-parallel-size=2
+--output=t2v_5B_pp2_cfg2.mp4 \
+--pipeline-parallel-size=2 \
+--cfg-parallel-size=2
 ```
 
 **Verify:**

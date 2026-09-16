@@ -18,8 +18,9 @@ Pipeline Parallelism splits the denoising transformer block-wise into sequential
 part of the transformer, which reduces per-GPU model memory and enables larger diffusion models to run across multiple
 devices.
 
-Other distributed methods are pipeline-specific. For the current Wan2.2 step-execution path, PP=1 supports
-ordinary sequential CFG, while PP>1 + CFG is rejected until branch coordination is implemented.
+Other distributed methods are pipeline-specific. Wan2.2 request-mode PP supports its existing CFG paths; for the
+step-execution path, PP=1 supports ordinary sequential CFG, while PP>1 + CFG is rejected until branch coordination
+is implemented.
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
@@ -72,24 +73,26 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=1.0 \
+--guidance-scale=5.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
 --output=t2v_5B_pp2.mp4 \
 --pipeline-parallel-size=2
 ```
 
-PP+CFG is not currently supported for Wan2.2 step execution. Use PP=1 for sequential CFG, or PP>1 with
-`--guidance-scale 1.0` for the no-CFG PP path.
+The example above uses request-mode full `forward()`, where Wan2.2 PP+CFG remains supported. PP+CFG is not currently
+supported for Wan2.2 step execution. Use PP=1 for sequential CFG, or PP>1 with `--guidance-scale 1.0` for the
+step-execution no-CFG path.
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=1.0 \
+--guidance-scale=5.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
---output=t2v_5B_pp2_no_cfg.mp4 \
---pipeline-parallel-size=2
+--output=t2v_5B_pp2_cfg2.mp4 \
+--pipeline-parallel-size=2 \
+--cfg-parallel-size=2
 ```
 
 ### Online Serving
@@ -100,7 +103,10 @@ Enable Pipeline Parallelism in online serving:
 # Default PP configuration
 vllm serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --omni --port 8091 --pipeline-parallel-size 2
 
-# PP + CFG is deferred for Wan2.2 step execution; use PP=1 for CFG.
+# Wan2.2 request-mode PP + CFG remains supported; step execution has a narrower capability matrix.
+vllm serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --omni --port 8091 \
+  --pipeline-parallel-size 2 \
+  --cfg-parallel-size 2
 ```
 
 ---
