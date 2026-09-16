@@ -1160,6 +1160,27 @@ class Wan22Pipeline(
         )
         state.step_index += 1
 
+    def step_scheduler_pipeline_stage(
+        self,
+        state: StepRequestState,
+        noise_pred: torch.Tensor,
+    ) -> None:
+        """Apply one queued last-stage update without static PP feedback."""
+        timestep = state.current_timestep
+        if timestep is None or state.latents is None or state.scheduler is None:
+            raise ValueError(f"Wan request {state.request_id} is not ready for a scheduler step.")
+        if state.do_true_cfg:
+            raise ValueError("Wan queued pipeline execution does not support classifier-free guidance.")
+        state.latents = CFGParallelMixin.scheduler_step(
+            self,
+            noise_pred,
+            timestep,
+            state.latents,
+            per_request_scheduler=state.scheduler,
+            generator=None,
+        )
+        state.step_index += 1
+
     @staticmethod
     def _materialize_latents(latents: torch.Tensor | AsyncLatents) -> torch.Tensor:
         return latents.resolve() if isinstance(latents, AsyncLatents) else latents

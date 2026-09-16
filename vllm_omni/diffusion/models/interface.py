@@ -138,6 +138,14 @@ class SupportsPipelineStageExecution(Protocol):
         """Run one local partition without communication or solver update."""
         ...
 
+    def step_scheduler_pipeline_stage(
+        self,
+        state: StepRequestState,
+        noise_pred: torch.Tensor,
+    ) -> None:
+        """Apply one numerical update without static PP feedback transport."""
+        ...
+
 
 def supports_pipeline_stage_execution(pipeline: object) -> bool:
     """Return whether a pipeline explicitly supports queued local-stage work."""

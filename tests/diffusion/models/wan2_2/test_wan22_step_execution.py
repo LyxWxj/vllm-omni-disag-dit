@@ -472,6 +472,22 @@ def test_forward_pipeline_stage_rejects_cfg_and_non_m2_topology(monkeypatch) -> 
         )
 
 
+def test_step_scheduler_pipeline_stage_bypasses_static_pp_feedback(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    state = _state()
+    pipeline.prepare_encode(state)
+    pipeline.scheduler_step_maybe_with_cfg = lambda *_args, **_kwargs: pytest.fail(
+        "queued completion must bypass static PP feedback"
+    )
+
+    pipeline.step_scheduler_pipeline_stage(state, torch.ones_like(state.latents))
+
+    assert state.step_index == 1
+    assert len(state.scheduler.step_calls) == 1
+
+
 @pytest.mark.parametrize(
     ("actual_rank", "actual_world_size", "spec", "message"),
     [

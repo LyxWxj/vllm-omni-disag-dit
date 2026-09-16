@@ -65,16 +65,25 @@ class PipelineBatchContext:
     """ModelRunner-owned context reference for one stage/batch execution."""
 
     task: PipelineTask
-    pp_stage_id: int
+    stage_spec: PipelineStageSpec
     request_state_ids: tuple[str, ...]
+    states: tuple[Any, ...]
+    input_batch: Any
     tensors: dict[str, Any] = field(default_factory=dict)
+    result: Any | None = None
     status: PipelineTaskStatus = PipelineTaskStatus.PENDING
+
+    @property
+    def pp_stage_id(self) -> int:
+        return self.stage_spec.pp_stage_id
 
     def __post_init__(self) -> None:
         if self.pp_stage_id < 0:
             raise ValueError("pp_stage_id must be non-negative")
         if not self.request_state_ids:
             raise ValueError("pipeline context requires request state ids")
+        if self.request_state_ids != tuple(state.request_id for state in self.states):
+            raise ValueError("pipeline context request ids must match its states")
 
 
 @dataclass

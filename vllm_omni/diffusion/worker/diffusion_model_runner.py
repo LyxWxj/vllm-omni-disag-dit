@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.interface import (
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
+    supports_pipeline_stage_execution,
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
@@ -64,6 +65,12 @@ from vllm_omni.diffusion.sched.interface import (
     validate_new_request_data_identity,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
+from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineBatchContext,
+    PipelineStageSpec,
+    PipelineTask,
+    PipelineTaskStatus,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
@@ -191,6 +198,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
+        self._pipeline_batch_contexts: dict[tuple[int, str], PipelineBatchContext] = {}
+        self._pipeline_request_owners: dict[tuple[str, int], tuple[int, str]] = {}
 
         # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -984,6 +993,200 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def _supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
+
+    @property
+    def pipeline_batch_contexts(self) -> dict[tuple[int, str], PipelineBatchContext]:
+        if not hasattr(self, "_pipeline_batch_contexts"):
+            self._pipeline_batch_contexts = {}
+        return self._pipeline_batch_contexts
+
+    @property
+    def pipeline_request_owners(self) -> dict[tuple[str, int], tuple[int, str]]:
+        if not hasattr(self, "_pipeline_request_owners"):
+            self._pipeline_request_owners = {}
+        return self._pipeline_request_owners
+
+    def _pipeline_inference_context(self) -> AbstractContextManager[Any]:
+        use_hsdp = bool(getattr(getattr(self.od_config, "parallel_config", None), "use_hsdp", False))
+        return torch.no_grad() if use_hsdp else torch.inference_mode()
+
+    def prepare_pipeline_batch(
+        self,
+        task: PipelineTask,
+        pp_stage_spec: PipelineStageSpec,
+        states: list[StepRequestState],
+    ) -> PipelineBatchContext:
+        """Create an independently owned context from coherently prepared states."""
+        if self.pipeline is None or not supports_pipeline_stage_execution(self.pipeline):
+            raise ValueError("The loaded diffusion pipeline does not support queued local-stage execution.")
+        self.pipeline.validate_pipeline_stage_execution(pp_stage_spec)
+        request_state_ids = tuple(state.request_id for state in states)
+        if request_state_ids != task.request_ids:
+            raise ValueError(
+                f"Pipeline task request ids {task.request_ids!r} do not match prepared states {request_state_ids!r}."
+            )
+        if len(states) != 1:
+            raise ValueError("M2 queued pipeline execution requires exactly one request state per batch.")
+        if states[0].step_index != task.step_index:
+            raise ValueError(
+                f"Pipeline task step {task.step_index} does not match request state step {states[0].step_index}."
+            )
+        key = (pp_stage_spec.pp_stage_id, task.batch_id)
+        if key in self.pipeline_batch_contexts:
+            raise ValueError(f"Pipeline batch context {key!r} already exists.")
+        owner_key = (states[0].request_id, task.step_index)
+        existing_owner = self.pipeline_request_owners.get(owner_key)
+        if existing_owner is not None:
+            raise ValueError(f"Request step {owner_key!r} is already owned by pipeline batch {existing_owner!r}.")
+        with self._pipeline_inference_context():
+            context = PipelineBatchContext(
+                task=task,
+                stage_spec=pp_stage_spec,
+                request_state_ids=request_state_ids,
+                states=tuple(states),
+                input_batch=InputBatch.make_batch(states),
+            )
+        self.pipeline_batch_contexts[key] = context
+        self.pipeline_request_owners[owner_key] = key
+        return context
+
+    def execute_pipeline_stage(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+        intermediate_tensors: Any | None,
+    ) -> Any:
+        """Execute one local partition without transport or numerical update."""
+        self._require_pipeline_context(context, pp_stage_spec)
+        if context.status is not PipelineTaskStatus.PENDING:
+            raise RuntimeError(f"Pipeline batch {context.task.batch_id!r} is not pending.")
+        try:
+            self._validate_pipeline_context_progress(context)
+            context.status = PipelineTaskStatus.ACTIVE
+            kv_backend = getattr(self, "diffusion_kv_backend", None)
+            paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
+            with (
+                self._pipeline_inference_context(),
+                set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata={},
+                    paged_kv_runtime=paged_kv_runtime,
+                    denoise_step_idx=context.task.step_index,
+                ),
+            ):
+                context.result = self.pipeline.forward_pipeline_stage(
+                    context.input_batch,
+                    pp_stage_spec=pp_stage_spec,
+                    intermediate_tensors=intermediate_tensors,
+                    states=context.states,
+                )
+        except BaseException:
+            context.status = PipelineTaskStatus.FAILED
+            raise
+        return context.result
+
+    def complete_pipeline_step(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+    ) -> torch.Tensor:
+        """Apply the one authoritative numerical update on the last stage."""
+        self._require_pipeline_context(context, pp_stage_spec)
+        if not pp_stage_spec.is_last:
+            raise ValueError("Only the last pipeline stage can complete the numerical step.")
+        if context.status is not PipelineTaskStatus.ACTIVE:
+            raise RuntimeError("Pipeline batch must be active before numerical completion.")
+        if not isinstance(context.result, torch.Tensor):
+            context.status = PipelineTaskStatus.FAILED
+            raise RuntimeError("Pipeline batch produced a non-tensor result for numerical completion.")
+        state = context.states[0]
+        try:
+            self._validate_pipeline_context_progress(context)
+            with self._pipeline_inference_context():
+                self.pipeline.step_scheduler_pipeline_stage(state, context.result)
+                if state.latents is None:
+                    raise RuntimeError("Pipeline numerical completion produced no latents.")
+        except BaseException:
+            context.status = PipelineTaskStatus.FAILED
+            raise
+        context.status = PipelineTaskStatus.COMPLETED
+        return state.latents
+
+    def adopt_pipeline_feedback(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+        latents: torch.Tensor,
+    ) -> None:
+        """Adopt last-stage feedback on stage 0 without rerunning the solver."""
+        self._require_pipeline_context(context, pp_stage_spec)
+        if not pp_stage_spec.is_first:
+            raise ValueError("Only the first pipeline stage can adopt latent feedback.")
+        if context.status is not PipelineTaskStatus.ACTIVE:
+            raise RuntimeError("Pipeline batch must be active before feedback adoption.")
+        state = context.states[0]
+        try:
+            self._validate_pipeline_context_progress(context)
+            if state.latents is None:
+                raise RuntimeError("First-stage pipeline state has no latent mirror.")
+            if (
+                state.latents.shape != latents.shape
+                or state.latents.dtype != latents.dtype
+                or state.latents.device != latents.device
+            ):
+                raise ValueError("Pipeline feedback latents do not match the first-stage latent mirror.")
+            with self._pipeline_inference_context():
+                state.latents.copy_(latents)
+                state.step_index = context.task.step_index + 1
+                context.input_batch.latents = state.latents
+        except BaseException:
+            context.status = PipelineTaskStatus.FAILED
+            raise
+        context.status = PipelineTaskStatus.COMPLETED
+
+    def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineBatchContext:
+        """Retire one terminal context after its transfer/consumer leases finish."""
+        key = (pp_stage_id, batch_id)
+        context = self.pipeline_batch_contexts.get(key)
+        if context is None:
+            raise KeyError(f"Unknown pipeline batch context {key!r}.")
+        if context.status not in {
+            PipelineTaskStatus.COMPLETED,
+            PipelineTaskStatus.CANCELLED,
+            PipelineTaskStatus.FAILED,
+        }:
+            raise RuntimeError("Cannot release a non-terminal pipeline batch context.")
+        context = self.pipeline_batch_contexts.pop(key)
+        for request_id in context.request_state_ids:
+            owner_key = (request_id, context.task.step_index)
+            if self.pipeline_request_owners.get(owner_key) == key:
+                self.pipeline_request_owners.pop(owner_key)
+        return context
+
+    def _require_pipeline_context(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+    ) -> None:
+        key = (pp_stage_spec.pp_stage_id, context.task.batch_id)
+        if self.pipeline_batch_contexts.get(key) is not context:
+            raise ValueError(f"Pipeline batch context {key!r} is not owned by this ModelRunner.")
+        if context.stage_spec != pp_stage_spec:
+            raise ValueError("Pipeline batch context stage specification changed after preparation.")
+
+    @staticmethod
+    def _validate_pipeline_context_progress(context: PipelineBatchContext) -> None:
+        mismatched = [
+            (state.request_id, state.step_index)
+            for state in context.states
+            if state.step_index != context.task.step_index
+        ]
+        if mismatched:
+            raise RuntimeError(
+                f"Pipeline batch {context.task.batch_id!r} was prepared for step {context.task.step_index}, "
+                f"but request progress changed: {mismatched!r}."
+            )
 
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
