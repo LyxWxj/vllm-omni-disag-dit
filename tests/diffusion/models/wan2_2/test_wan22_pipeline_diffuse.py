@@ -338,6 +338,36 @@ def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
     assert outputs[0].output.numel() == 0
 
 
+def test_forward_returns_empty_output_when_non_owner_vae_rank_returns_none(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.current_omni_platform.is_available",
+        lambda: False,
+    )
+    pipeline = _make_pipeline()
+    pipeline.vae.decode = lambda latents, return_dict=False: (None,)  # type: ignore[assignment]
+    pipeline.diffuse = lambda **kwargs: torch.zeros_like(kwargs["latents"])  # type: ignore[method-assign]
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type="np",
+                ),
+            )
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 1
+    assert outputs[0].output is None
+    assert outputs[0].media is None
+
+
 def test_forward_batches_precomputed_prompt_embeddings() -> None:
     pipeline = _make_pipeline()
     diffuse_call = {}

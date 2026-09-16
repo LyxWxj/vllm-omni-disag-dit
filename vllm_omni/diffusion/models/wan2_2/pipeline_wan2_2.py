@@ -974,6 +974,10 @@ class Wan22Pipeline(
             latents.device, latents.dtype
         )
         decoded = self.vae.decode(latents / latents_std + latents_mean, return_dict=False)[0]
+        if decoded is None:
+            return DiffusionOutput(
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
         if decoded.dim() == 5:
             return DiffusionOutput(
                 media=DiffusionMediaOutput(
@@ -1288,12 +1292,11 @@ class Wan22Pipeline(
             latents = latents / latents_std + latents_mean
             decoded = self.vae.decode(latents, return_dict=False)[0]
             # Distributed VAE decode uses broadcast_result=False, so only the
-            # output-owning rank receives the full [B, C, T, H, W] video; other
-            # ranks get an empty placeholder. Emit typed media only from the
-            # owning rank and keep the placeholder on the legacy output field, so
-            # the media batch-dimension check in split_diffusion_output_by_request
-            # does not trip on every non-owner rank.
-            if decoded.dim() == 5:
+            # output-owning rank receives the full [B, C, T, H, W] video. Emit
+            # typed media only there; non-output ranks return no payload.
+            if decoded is None:
+                output = None
+            elif decoded.dim() == 5:
                 output = None
                 media = DiffusionMediaOutput(
                     video=VideoMediaOutput(

@@ -249,3 +249,17 @@ def test_post_decode_matches_latent_and_video_output_contract(monkeypatch) -> No
     assert video_output.output is None
     assert video_output.media is not None
     assert video_output.media.video.tensor.shape == (1, 3, 1, 2, 2)
+
+
+def test_post_decode_returns_empty_output_on_non_output_pp_rank(monkeypatch) -> None:
+    monkeypatch.setattr(wan22_module.current_omni_platform, "is_available", lambda: False)
+    pipeline = _pipeline()
+    pipeline.vae.decode = lambda *_args, **_kwargs: (None,)
+    state = _state(output_type="np")
+    state.latents = torch.ones(1, 4, 1, 2, 2)
+    state.extra["wan_output_type"] = "np"
+
+    output = pipeline.post_decode(state)
+
+    assert output.output is None
+    assert output.media is None
