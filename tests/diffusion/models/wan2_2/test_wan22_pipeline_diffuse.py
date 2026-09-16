@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -55,6 +56,12 @@ class _StubScheduler:
 
     def set_timesteps(self, num_steps: int, device: torch.device) -> None:
         self.set_timesteps_calls.append((num_steps, device))
+
+
+@pytest.fixture(autouse=True)
+def _patch_wan_runtime(monkeypatch) -> None:
+    monkeypatch.setattr(wan22_module, "build_wan_scheduler", lambda *_args, **_kwargs: _StubScheduler([9, 5]))
+    monkeypatch.setattr(wan22_module.current_omni_platform, "is_available", lambda: False)
 
 
 @contextmanager
@@ -150,9 +157,17 @@ def test_forward_delegates_denoising_to_diffuse(
     sampling_params_kwargs: dict[str, float],
     expected_low: float,
     expected_high: float,
+    monkeypatch,
 ) -> None:
     pipeline = _make_pipeline()
     captured: dict[str, object] = {}
+    scheduler_factory_calls: list[tuple[str, float]] = []
+
+    def build_scheduler(sample_solver: str, flow_shift: float) -> _StubScheduler:
+        scheduler_factory_calls.append((sample_solver, flow_shift))
+        return _StubScheduler([9, 5])
+
+    monkeypatch.setattr(wan22_module, "build_wan_scheduler", build_scheduler)
 
     def _fake_diffuse(**kwargs):
         captured.update(kwargs)
@@ -184,6 +199,7 @@ def test_forward_delegates_denoising_to_diffuse(
     assert captured["boundary_timestep"] == pytest.approx(875.0)
     assert captured["latent_condition"] is None
     assert captured["first_frame_mask"] is None
+    assert scheduler_factory_calls == [("unipc", 5.0)]
     assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"))]
 
 

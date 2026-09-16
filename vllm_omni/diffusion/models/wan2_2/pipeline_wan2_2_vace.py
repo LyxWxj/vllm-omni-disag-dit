@@ -192,6 +192,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     """
 
     supports_step_execution = False
+    supports_pipeline_stage_execution = False
 
     def __init__(
         self,

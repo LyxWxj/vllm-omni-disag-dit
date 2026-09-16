@@ -1209,7 +1209,6 @@ class OmniDiffusionConfig:
                 raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
             self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
 
-        self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
             raise ValueError(
@@ -1244,6 +1243,12 @@ class OmniDiffusionConfig:
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
         if self.mode == "queued" and self.parallel_config.pipeline_parallel_size != 2:
             raise ValueError("mode='queued' currently requires pipeline_parallel_size=2")
+        if self.mode == "queued":
+            raise NotImplementedError(
+                "mode='queued' is not executable yet; the Engine, Executor, Worker, and ModelRunner queued lifecycle "
+                "must be connected before this mode can be enabled"
+            )
+        self.master_port = self._resolve_master_port()
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)

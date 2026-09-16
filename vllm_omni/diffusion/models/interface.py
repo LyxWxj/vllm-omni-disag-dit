@@ -18,11 +18,13 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import torch
+    from vllm.sequence import IntermediateTensors
 
     from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
     from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.pipeline_state import PipelineStageSpec
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
@@ -113,6 +115,36 @@ class SupportsStepExecution(Protocol):
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Decode output after denoise loop or at a partial chunk boundary."""
         ...
+
+
+@runtime_checkable
+class SupportsPipelineStageExecution(Protocol):
+    """Pure local-stage computation used by queued pipeline execution."""
+
+    supports_pipeline_stage_execution: ClassVar[bool] = True
+
+    def validate_pipeline_stage_execution(self, pp_stage_spec: PipelineStageSpec) -> None:
+        """Reject a stage topology unsupported by this pipeline."""
+        ...
+
+    def forward_pipeline_stage(
+        self,
+        input_batch: InputBatch,
+        *,
+        pp_stage_spec: PipelineStageSpec,
+        intermediate_tensors: IntermediateTensors | None,
+        states: Sequence[StepRequestState] | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        """Run one local partition without communication or solver update."""
+        ...
+
+
+def supports_pipeline_stage_execution(pipeline: object) -> bool:
+    """Return whether a pipeline explicitly supports queued local-stage work."""
+
+    return bool(getattr(pipeline, "supports_pipeline_stage_execution", False)) and isinstance(
+        pipeline, SupportsPipelineStageExecution
+    )
 
 
 @runtime_checkable

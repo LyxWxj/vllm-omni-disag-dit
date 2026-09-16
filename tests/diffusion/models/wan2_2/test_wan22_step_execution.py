@@ -14,10 +14,16 @@ import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
 from vllm_omni.diffusion.ipc import pack_diffusion_output_shm, unpack_diffusion_output_shm
-from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
+from vllm_omni.diffusion.models.interface import (
+    SupportsPipelineStageExecution,
+    SupportsStepExecution,
+    supports_pipeline_stage_execution,
+    supports_step_execution,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.pipeline_state import PipelineStageSpec
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -151,11 +157,24 @@ def _patch_scheduler(monkeypatch) -> None:
     monkeypatch.setattr(wan22_module, "build_wan_scheduler", lambda *_args, **_kwargs: _Scheduler())
 
 
+def _patch_pp_topology(monkeypatch, *, rank: int, world_size: int = 2) -> None:
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: world_size)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_rank", lambda: rank)
+    monkeypatch.setattr(wan22_module, "is_pipeline_first_stage", lambda: rank == 0)
+    monkeypatch.setattr(wan22_module, "is_pipeline_last_stage", lambda: rank == world_size - 1)
+
+
 def test_wan22_declares_step_execution_capability() -> None:
     pipeline = _pipeline()
 
     assert isinstance(pipeline, SupportsStepExecution)
     assert supports_step_execution(pipeline)
+    assert isinstance(pipeline, SupportsPipelineStageExecution)
+    assert supports_pipeline_stage_execution(pipeline)
+
+    prepare_only = SimpleNamespace(supports_step_execution=True, prepare_encode=lambda *_args, **_kwargs: None)
+    assert not isinstance(prepare_only, SupportsStepExecution)
+    assert not supports_step_execution(prepare_only)
 
 
 def test_prepare_encode_creates_request_local_unipc_state(monkeypatch) -> None:
@@ -200,6 +219,32 @@ def test_prepare_encode_prefers_precomputed_conditioning_with_real_validator(mon
     torch.testing.assert_close(state.prompt_embeds, prompt_embeds.unsqueeze(0))
     torch.testing.assert_close(state.negative_prompt_embeds, negative_prompt_embeds.unsqueeze(0))
     assert state.do_true_cfg is True
+
+
+def test_prepare_encode_normalizes_2d_positive_embeds_before_encoding_negative_prompt(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    pipeline.check_inputs = Wan22Pipeline.check_inputs.__get__(pipeline)
+    encode_batch_sizes: list[int] = []
+
+    def encode_prompt(**kwargs):
+        prompt = kwargs["prompt"]
+        batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        encode_batch_sizes.append(batch_size)
+        shape = (batch_size * kwargs["num_videos_per_prompt"], kwargs["max_sequence_length"], 8)
+        return torch.zeros(shape), torch.full(shape, -2.0)
+
+    pipeline.encode_prompt = encode_prompt
+    state = _state()
+    state.sampling.guidance_scale = 4.0
+    state.prompt = {"prompt": "a cat", "prompt_embeds": torch.full((4, 8), 3.0)}
+
+    pipeline.prepare_encode(state)
+
+    assert encode_batch_sizes == [1]
+    assert state.prompt_embeds.shape == (1, 4, 8)
+    assert state.negative_prompt_embeds.shape == (1, 4, 8)
 
 
 def test_prepare_encode_preserves_supplied_latents(monkeypatch) -> None:
@@ -372,6 +417,88 @@ def test_denoise_and_scheduler_use_request_local_state_once(monkeypatch) -> None
     assert state.step_index == 1
 
 
+@pytest.mark.parametrize("rank", [0, 1], ids=["first-stage", "last-stage"])
+def test_forward_pipeline_stage_runs_local_partition_without_pp_wrapper(monkeypatch, rank) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    state = _state()
+    pipeline.prepare_encode(state)
+    batch = InputBatch.make_batch([state])
+    intermediate = None if rank == 0 else object()
+    captured: dict[str, object] = {}
+    pipeline.predict_noise_maybe_with_cfg = lambda **_kwargs: pytest.fail("queued local stage must bypass PP wrapper")
+
+    def predict_noise(**kwargs):
+        captured.update(kwargs)
+        return torch.ones_like(batch.latents)
+
+    pipeline.predict_noise = predict_noise
+    _patch_pp_topology(monkeypatch, rank=rank)
+
+    output = pipeline.forward_pipeline_stage(
+        batch,
+        pp_stage_spec=PipelineStageSpec(
+            pp_stage_id=rank,
+            world_size=2,
+            is_first=rank == 0,
+            is_last=rank == 1,
+        ),
+        intermediate_tensors=intermediate,
+        states=[state],
+    )
+
+    torch.testing.assert_close(output, torch.ones_like(batch.latents))
+    assert captured["intermediate_tensors"] is intermediate
+    assert captured["current_model"] is pipeline.transformer
+
+
+def test_forward_pipeline_stage_rejects_cfg_and_non_m2_topology(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    cfg_state = _state()
+    cfg_state.sampling.guidance_scale = 4.0
+    pipeline.prepare_encode(cfg_state)
+    cfg_batch = InputBatch.make_batch([cfg_state])
+    _patch_pp_topology(monkeypatch, rank=0)
+
+    with pytest.raises(ValueError, match="does not support classifier-free guidance"):
+        pipeline.forward_pipeline_stage(
+            cfg_batch,
+            pp_stage_spec=PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False),
+            intermediate_tensors=None,
+            states=[cfg_state],
+        )
+
+
+@pytest.mark.parametrize(
+    ("actual_rank", "actual_world_size", "spec", "message"),
+    [
+        (0, 2, PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True), "does not match PP rank"),
+        (
+            0,
+            2,
+            PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=False, is_last=True),
+            "endpoint flags",
+        ),
+        (0, 3, PipelineStageSpec(pp_stage_id=0, world_size=3, is_first=True, is_last=False), "exactly two stages"),
+    ],
+)
+def test_pipeline_stage_validation_rejects_topology_mismatch(
+    monkeypatch,
+    actual_rank,
+    actual_world_size,
+    spec,
+    message,
+) -> None:
+    pipeline = _pipeline()
+    _patch_pp_topology(monkeypatch, rank=actual_rank, world_size=actual_world_size)
+
+    with pytest.raises(ValueError, match=message):
+        pipeline.validate_pipeline_stage_execution(spec)
+
+
 def test_pp1_step_cfg_matches_request_denoise_math(monkeypatch) -> None:
     _patch_scheduler(monkeypatch)
     monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
@@ -440,6 +567,38 @@ def test_denoise_cfg_uses_per_row_guidance_across_timestep_boundary(monkeypatch)
     assert isinstance(scale, torch.Tensor)
     assert scale.shape == (2, 1, 1, 1, 1)
     torch.testing.assert_close(scale.flatten(), torch.tensor([2.0, 5.0]))
+
+
+def test_mixed_cfg_batch_matches_independent_positive_and_cfg_predictions(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    high_noise = _state(request_id="positive-only")
+    low_noise = _state(request_id="cfg")
+    for state in (high_noise, low_noise):
+        state.sampling.guidance_scale = 0.0
+        state.sampling.guidance_scale_2 = 5.0
+        state.sampling.guidance_scale_2_provided = True
+        pipeline.prepare_encode(state)
+    high_noise.timesteps = torch.tensor([900.0])
+    low_noise.timesteps = torch.tensor([100.0])
+
+    def predict_noise(**kwargs):
+        value = kwargs["encoder_hidden_states"].mean()
+        return torch.full_like(kwargs["hidden_states"], value)
+
+    pipeline.predict_noise = predict_noise
+    independent = torch.cat(
+        [pipeline.denoise_step(InputBatch.make_batch([state]), states=[state]) for state in (high_noise, low_noise)]
+    )
+    batched = pipeline.denoise_step(
+        InputBatch.make_batch([high_noise, low_noise]),
+        states=[high_noise, low_noise],
+    )
+
+    torch.testing.assert_close(batched, independent)
+    torch.testing.assert_close(batched[:, 0, 0, 0, 0], torch.tensor([2.0, 18.0]))
 
 
 def test_post_decode_matches_latent_and_video_output_contract(monkeypatch) -> None:

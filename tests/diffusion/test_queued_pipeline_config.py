@@ -61,3 +61,13 @@ def test_capacity_counts_are_positive(field: str) -> None:
 def test_stage_buffer_bytes_must_be_positive_when_explicit() -> None:
     with pytest.raises(ValueError, match="stage_buffer_bytes"):
         _queued_config(stage_buffer_bytes=0)
+
+
+def test_valid_queued_contract_is_rejected_before_port_setup(monkeypatch) -> None:
+    monkeypatch.setattr(
+        OmniDiffusionConfig,
+        "_resolve_master_port",
+        lambda _self: pytest.fail("queued rejection must happen before port setup"),
+    )
+    with pytest.raises(NotImplementedError, match="not executable yet"):
+        _queued_config()
