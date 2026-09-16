@@ -215,6 +215,33 @@ def test_release_rejects_non_terminal_context() -> None:
         runner.release_pipeline_batch(0, "batch-a")
 
 
+def test_cancel_pipeline_batch_requires_explicit_release() -> None:
+    runner = _runner()
+    spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
+    context = runner.prepare_pipeline_batch(_task(), spec, [_state()])
+
+    assert runner.cancel_pipeline_batch(0, "batch-a") is context
+    assert context.status is PipelineTaskStatus.CANCELLED
+    assert runner.pipeline_request_owners == {("req-a", 0): (0, "batch-a")}
+    assert runner.release_pipeline_batch(0, "batch-a") is context
+    assert runner.pipeline_request_owners == {}
+
+
+def test_cancel_pipeline_batch_overrides_completed_local_work() -> None:
+    runner = _runner()
+    state = _state()
+    spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
+    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    runner.execute_pipeline_stage(context, spec, intermediate_tensors=object())
+    runner.complete_pipeline_step(context, spec)
+
+    assert context.status is PipelineTaskStatus.COMPLETED
+    assert runner.cancel_pipeline_batch(1, "batch-a") is context
+    assert context.status is PipelineTaskStatus.CANCELLED
+    assert runner.cancel_pipeline_batch(1, "batch-a") is context
+    assert runner.release_pipeline_batch(1, "batch-a") is context
+
+
 def test_context_rejects_changed_stage_specification() -> None:
     runner = _runner()
     first = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)

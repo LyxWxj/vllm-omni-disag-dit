@@ -1164,6 +1164,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.pipeline_request_owners.pop(owner_key)
         return context
 
+    def cancel_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineBatchContext:
+        """Mark one locally owned context terminal without releasing its storage."""
+        key = (pp_stage_id, batch_id)
+        context = self.pipeline_batch_contexts.get(key)
+        if context is None:
+            raise KeyError(f"Unknown pipeline batch context {key!r}.")
+        if context.status is PipelineTaskStatus.CANCELLED:
+            return context
+        if context.status is PipelineTaskStatus.FAILED:
+            raise RuntimeError("Cannot cancel a terminal pipeline batch context.")
+        context.status = PipelineTaskStatus.CANCELLED
+        return context
+
     def _require_pipeline_context(
         self,
         context: PipelineBatchContext,

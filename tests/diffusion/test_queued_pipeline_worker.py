@@ -1,0 +1,260 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineEventType,
+    PipelineStageSpec,
+    PipelineTask,
+    PipelineTaskStatus,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+class _Runner:
+    def __init__(self) -> None:
+        self.pipeline_batch_contexts = {}
+        self.preparation_error: Exception | None = None
+        self.execution_error: Exception | None = None
+        self.feedback_adoptions = 0
+
+    def prepare_pipeline_batch(self, task, spec, states):
+        if self.preparation_error is not None:
+            raise self.preparation_error
+        context = SimpleNamespace(
+            task=task,
+            stage_spec=spec,
+            states=tuple(states),
+            status=PipelineTaskStatus.PENDING,
+        )
+        self.pipeline_batch_contexts[(spec.pp_stage_id, task.batch_id)] = context
+        return context
+
+    def execute_pipeline_stage(self, context, spec, intermediate_tensors):
+        del spec, intermediate_tensors
+        if self.execution_error is not None:
+            context.status = PipelineTaskStatus.FAILED
+            raise self.execution_error
+        context.status = PipelineTaskStatus.ACTIVE
+        return torch.tensor([3.0])
+
+    def complete_pipeline_step(self, context, spec):
+        del spec
+        context.status = PipelineTaskStatus.COMPLETED
+        return torch.tensor([7.0])
+
+    def adopt_pipeline_feedback(self, context, spec, latents):
+        del spec
+        self.feedback_adoptions += 1
+        context.feedback = latents
+        context.status = PipelineTaskStatus.COMPLETED
+
+    def cancel_pipeline_batch(self, pp_stage_id, batch_id):
+        context = self.pipeline_batch_contexts[(pp_stage_id, batch_id)]
+        context.status = PipelineTaskStatus.CANCELLED
+        return context
+
+    def release_pipeline_batch(self, pp_stage_id, batch_id):
+        context = self.pipeline_batch_contexts[(pp_stage_id, batch_id)]
+        if context.status not in {
+            PipelineTaskStatus.COMPLETED,
+            PipelineTaskStatus.CANCELLED,
+            PipelineTaskStatus.FAILED,
+        }:
+            raise RuntimeError("Cannot release a non-terminal pipeline batch context.")
+        return self.pipeline_batch_contexts.pop((pp_stage_id, batch_id))
+
+
+def _worker() -> DiffusionWorker:
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 4
+    worker.model_runner = _Runner()
+    worker._pipeline_stages = {}
+    return worker
+
+
+def _task(batch_id: str = "batch-a") -> PipelineTask:
+    return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=2)
+
+
+def _spec(stage_id: int) -> PipelineStageSpec:
+    return PipelineStageSpec(
+        pp_stage_id=stage_id,
+        world_size=2,
+        is_first=stage_id == 0,
+        is_last=stage_id == 1,
+    )
+
+
+def test_worker_requires_execute_authorization_before_progress() -> None:
+    worker = _worker()
+    task = _task()
+
+    accepted = worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+
+    assert accepted.event_type is PipelineEventType.ACCEPTED
+    assert worker.progress_pipeline(0) is None
+    authorized = worker.authorize_pipeline_batch(0, task.batch_id)
+    assert authorized.event_type is PipelineEventType.AUTHORIZED
+
+    progress = worker.progress_pipeline(0)
+    assert progress is not None
+    assert progress.event.event_type is PipelineEventType.STAGE_COMPLETED
+    torch.testing.assert_close(progress.output, torch.tensor([3.0]))
+
+
+def test_first_stage_emits_step_completion_only_after_feedback() -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    worker.authorize_pipeline_batch(0, task.batch_id)
+    worker.progress_pipeline(0)
+
+    event = worker.complete_pipeline_feedback(0, task.batch_id, torch.tensor([11.0]))
+
+    assert event.event_type is PipelineEventType.STEP_COMPLETED
+    assert worker.pipeline_stages[0].active_task is None
+    released = worker.release_pipeline_batch(0, task.batch_id)
+    assert released.event_type is PipelineEventType.RELEASED
+    assert worker.model_runner.pipeline_batch_contexts == {}
+
+
+def test_last_stage_completes_numerical_step_but_not_global_step() -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(1), [object()])
+    worker.authorize_pipeline_batch(1, task.batch_id)
+
+    progress = worker.progress_pipeline(1, intermediate_tensors=object())
+
+    assert progress is not None
+    assert progress.event.event_type is PipelineEventType.STAGE_COMPLETED
+    torch.testing.assert_close(progress.output, torch.tensor([7.0]))
+    assert worker.pipeline_stages[1].active_task is None
+    assert worker.release_pipeline_batch(1, task.batch_id).event_type is PipelineEventType.RELEASED
+
+
+def test_worker_preserves_fifo_when_only_later_batch_is_authorized() -> None:
+    worker = _worker()
+    first, second = _task(), _task("batch-b")
+    worker.enqueue_pipeline_batch(first, _spec(0), [object()])
+    worker.enqueue_pipeline_batch(second, _spec(0), [object()])
+    worker.authorize_pipeline_batch(0, second.batch_id)
+
+    assert worker.progress_pipeline(0) is None
+    worker.authorize_pipeline_batch(0, first.batch_id)
+    progress = worker.progress_pipeline(0)
+    assert progress is not None
+    assert progress.event.task is first
+
+
+def test_worker_cancellation_is_terminal_until_explicit_release() -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+
+    cancelled = worker.cancel_pipeline_batch(0, task.batch_id)
+
+    assert cancelled.event_type is PipelineEventType.CANCELLED
+    assert (0, task.batch_id) in worker.model_runner.pipeline_batch_contexts
+    assert worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
+
+
+def test_worker_rejects_release_before_stage_is_terminal_without_losing_context() -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+
+    with pytest.raises(RuntimeError, match="not terminal on stage"):
+        worker.release_pipeline_batch(0, task.batch_id)
+
+    assert (0, task.batch_id) in worker.model_runner.pipeline_batch_contexts
+
+
+def test_worker_rolls_back_enqueue_before_acceptance_on_prepare_failure() -> None:
+    worker = _worker()
+    worker.model_runner.preparation_error = RuntimeError("prepare failed")
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        worker.enqueue_pipeline_batch(_task(), _spec(0), [object()])
+
+    assert 0 not in worker.pipeline_stages
+
+
+def test_worker_can_install_valid_stage_after_initial_spec_validation_failure() -> None:
+    worker = _worker()
+    worker.model_runner.preparation_error = ValueError("invalid topology")
+    invalid_spec = PipelineStageSpec(pp_stage_id=0, world_size=3, is_first=True, is_last=False)
+
+    with pytest.raises(ValueError, match="invalid topology"):
+        worker.enqueue_pipeline_batch(_task(), invalid_spec, [object()])
+
+    worker.model_runner.preparation_error = None
+    event = worker.enqueue_pipeline_batch(_task(), _spec(0), [object()])
+    assert event.event_type is PipelineEventType.ACCEPTED
+    assert worker.pipeline_stages[0].spec == _spec(0)
+
+
+def test_prepare_failure_preserves_existing_stage_tombstones() -> None:
+    worker = _worker()
+    first = _task()
+    worker.enqueue_pipeline_batch(first, _spec(0), [object()])
+    worker.cancel_pipeline_batch(0, first.batch_id)
+    worker.release_pipeline_batch(0, first.batch_id)
+    stage = worker.pipeline_stages[0]
+    worker.model_runner.preparation_error = RuntimeError("prepare failed")
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        worker.enqueue_pipeline_batch(_task("batch-b"), _spec(0), [object()])
+
+    assert worker.pipeline_stages[0] is stage
+    assert first.batch_id in stage.retired_batches
+    assert not stage.pending_tasks
+
+
+def test_worker_execution_failure_becomes_releasable_terminal_state() -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    worker.authorize_pipeline_batch(0, task.batch_id)
+    worker.model_runner.execution_error = RuntimeError("forward failed")
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        worker.progress_pipeline(0)
+
+    assert worker.pipeline_stages[0].terminal_statuses[task.batch_id] is PipelineTaskStatus.FAILED
+    assert worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
+
+
+def test_two_stage_cancellation_drains_feedback_without_step_completion() -> None:
+    first_worker = _worker()
+    last_worker = _worker()
+    task = _task()
+    first_worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    last_worker.enqueue_pipeline_batch(task, _spec(1), [object()])
+    first_worker.authorize_pipeline_batch(0, task.batch_id)
+    last_worker.authorize_pipeline_batch(1, task.batch_id)
+
+    activation = first_worker.progress_pipeline(0)
+    assert activation is not None
+    feedback = last_worker.progress_pipeline(1, activation.output)
+    assert feedback is not None
+
+    first_cancelled = first_worker.cancel_pipeline_batch(0, task.batch_id)
+    last_cancelled = last_worker.cancel_pipeline_batch(1, task.batch_id)
+    drained = first_worker.complete_pipeline_feedback(0, task.batch_id, feedback.output)
+
+    assert first_cancelled.event_type is PipelineEventType.CANCELLED
+    assert last_cancelled.event_type is PipelineEventType.CANCELLED
+    assert drained.event_type is PipelineEventType.CANCELLED
+    assert first_worker.model_runner.feedback_adoptions == 0
+    assert first_worker.pipeline_stages[0].terminal_statuses[task.batch_id] is PipelineTaskStatus.CANCELLED
+    assert last_worker.pipeline_stages[1].terminal_statuses[task.batch_id] is PipelineTaskStatus.CANCELLED
+    assert first_worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
+    assert last_worker.release_pipeline_batch(1, task.batch_id).event_type is PipelineEventType.RELEASED

@@ -80,6 +80,15 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineEvent,
+    PipelineEventType,
+    PipelineProgress,
+    PipelineStageSpec,
+    PipelineStageState,
+    PipelineTask,
+    PipelineTaskStatus,
+)
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -256,6 +265,7 @@ class DiffusionWorker:
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._pipeline_stages: dict[int, PipelineStageState] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -714,6 +724,150 @@ class DiffusionWorker:
         if profiler:
             profiler.step()
         return output
+
+    @property
+    def pipeline_stages(self) -> dict[int, PipelineStageState]:
+        if not hasattr(self, "_pipeline_stages"):
+            self._pipeline_stages = {}
+        return self._pipeline_stages
+
+    def _pipeline_event(
+        self,
+        event_type: PipelineEventType,
+        task: PipelineTask,
+        pp_stage_id: int,
+    ) -> PipelineEvent:
+        return PipelineEvent(
+            event_type=event_type,
+            task=task,
+            pp_stage_id=pp_stage_id,
+            physical_rank=self.rank,
+        )
+
+    def _pipeline_stage(self, pp_stage_spec: PipelineStageSpec) -> PipelineStageState:
+        stage = self.pipeline_stages.get(pp_stage_spec.pp_stage_id)
+        if stage is None:
+            stage = PipelineStageState(pp_stage_spec)
+            self.pipeline_stages[pp_stage_spec.pp_stage_id] = stage
+        elif stage.spec != pp_stage_spec:
+            raise ValueError("Pipeline stage specification changed after Worker initialization.")
+        return stage
+
+    def enqueue_pipeline_batch(
+        self,
+        task: PipelineTask,
+        pp_stage_spec: PipelineStageSpec,
+        states: list[Any],
+    ) -> PipelineEvent:
+        """Prepare and queue a batch without authorizing local computation."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        stage_was_new = pp_stage_spec.pp_stage_id not in self.pipeline_stages
+        stage = self._pipeline_stage(pp_stage_spec)
+        stage.enqueue(task)
+        try:
+            self.model_runner.prepare_pipeline_batch(task, pp_stage_spec, states)
+        except BaseException:
+            stage.rollback_pending(task.batch_id)
+            if stage_was_new:
+                self.pipeline_stages.pop(pp_stage_spec.pp_stage_id, None)
+            raise
+        return self._pipeline_event(PipelineEventType.ACCEPTED, task, pp_stage_spec.pp_stage_id)
+
+    def authorize_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
+        """Apply the all-Worker acceptance gate's EXECUTE authorization."""
+        stage = self._require_pipeline_stage(pp_stage_id)
+        task = stage.authorize(batch_id)
+        return self._pipeline_event(PipelineEventType.AUTHORIZED, task, pp_stage_id)
+
+    def progress_pipeline(
+        self,
+        pp_stage_id: int,
+        intermediate_tensors: Any | None = None,
+    ) -> PipelineProgress | None:
+        """Run at most one authorized FIFO head through the local model stage."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        stage = self._require_pipeline_stage(pp_stage_id)
+        task = stage.start_next()
+        if task is None:
+            return None
+        context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, task.batch_id))
+        if context is None:
+            stage.fail_active()
+            raise RuntimeError(f"Pipeline batch {task.batch_id!r} has no ModelRunner context.")
+        try:
+            result = self.model_runner.execute_pipeline_stage(context, stage.spec, intermediate_tensors)
+            output = result
+            if stage.spec.is_last:
+                output = self.model_runner.complete_pipeline_step(context, stage.spec)
+                stage.complete_active()
+        except BaseException:
+            if stage.active_task is not None and stage.active_task.batch_id == task.batch_id:
+                stage.fail_active()
+            raise
+        return PipelineProgress(
+            event=self._pipeline_event(PipelineEventType.STAGE_COMPLETED, task, pp_stage_id),
+            output=output,
+        )
+
+    def complete_pipeline_feedback(
+        self,
+        pp_stage_id: int,
+        batch_id: str,
+        latents: torch.Tensor,
+    ) -> PipelineEvent:
+        """Adopt feedback on stage 0 and emit the sole step-completion event."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        stage = self._require_pipeline_stage(pp_stage_id)
+        if not stage.spec.is_first:
+            raise ValueError("Only the first pipeline stage can complete feedback adoption.")
+        context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
+        if context is None:
+            raise RuntimeError(f"Pipeline batch {batch_id!r} has no ModelRunner context.")
+        if stage.terminal_statuses.get(batch_id) is PipelineTaskStatus.CANCELLED:
+            if context.status is not PipelineTaskStatus.CANCELLED:
+                raise RuntimeError("Cancelled pipeline stage and ModelRunner context disagree.")
+            return self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id)
+        task = stage.active_task
+        if task is None or task.batch_id != batch_id:
+            raise RuntimeError(f"Pipeline batch {batch_id!r} is not active on stage {pp_stage_id}.")
+        try:
+            self.model_runner.adopt_pipeline_feedback(context, stage.spec, latents)
+            stage.complete_active()
+        except BaseException:
+            if stage.active_task is not None and stage.active_task.batch_id == batch_id:
+                stage.fail_active()
+            raise
+        return self._pipeline_event(PipelineEventType.STEP_COMPLETED, task, pp_stage_id)
+
+    def cancel_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
+        """Make a pending or active local batch terminal without releasing it."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        stage = self._require_pipeline_stage(pp_stage_id)
+        context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
+        if context is None:
+            raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
+        self.model_runner.cancel_pipeline_batch(pp_stage_id, batch_id)
+        if not stage.cancel(batch_id):
+            raise RuntimeError(f"Pipeline batch {batch_id!r} was not cancellable on stage {pp_stage_id}.")
+        return self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id)
+
+    def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
+        """Release one terminal ModelRunner context after dependent work retires."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        stage = self._require_pipeline_stage(pp_stage_id)
+        if batch_id in stage.retired_batches:
+            raise ValueError(f"batch {batch_id!r} is already retired")
+        if batch_id not in stage.terminal_statuses:
+            raise RuntimeError(f"Pipeline batch {batch_id!r} is not terminal on stage {pp_stage_id}.")
+        context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
+        stage.retire(batch_id)
+        return self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id)
+
+    def _require_pipeline_stage(self, pp_stage_id: int) -> PipelineStageState:
+        stage = self.pipeline_stages.get(pp_stage_id)
+        if stage is None:
+            raise KeyError(f"Unknown pipeline stage {pp_stage_id}.")
+        return stage
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
