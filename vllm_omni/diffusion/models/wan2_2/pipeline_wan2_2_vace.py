@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import copy
+from typing import Any
 
 import PIL.Image
 import torch
@@ -190,6 +191,8 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
 
+    supports_step_execution = False
+
     def __init__(
         self,
         *,
@@ -204,6 +207,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             od_config.flow_shift = 3.0
 
         super().__init__(od_config=od_config, prefix=prefix)
+
+    def prepare_encode(self, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise NotImplementedError("Wan VACE does not support step execution.")
 
     def _create_transformer(self, config: dict) -> WanVACETransformer3DModel:
         """Build VACE transformer. Respects od_config.quantization_config."""

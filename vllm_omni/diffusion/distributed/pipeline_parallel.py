@@ -51,6 +51,10 @@ class AsyncLatents:
         self._tensor = self._tensor_dict["latents"]
         return self._tensor
 
+    def resolve(self) -> torch.Tensor:
+        """Wait for communication and return the received latent tensor."""
+        return self._resolve()
+
     # Attribute access (e.g. .shape, .to(), .dtype) delegates to the resolved tensor.
     def __getattr__(self, name: str):
         return getattr(self._resolve(), name)

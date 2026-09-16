@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -11,10 +12,13 @@ from torch import nn
 
 import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
+from vllm_omni.diffusion.ipc import pack_diffusion_output_shm, unpack_diffusion_output_shm
 from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -58,6 +62,29 @@ class _VAE:
         return (latents[:, :3],)
 
 
+class _PPGroup:
+    world_size = 2
+
+    def __init__(self, is_first_rank: bool, broadcast_fn) -> None:
+        self.is_first_rank = is_first_rank
+        self.cpu_group = object()
+        self._broadcast_fn = broadcast_fn
+
+    def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        return self._broadcast_fn(tensor, src)
+
+
+class _UnpickleableWork:
+    def __init__(self) -> None:
+        self.waited = False
+
+    def wait(self) -> None:
+        self.waited = True
+
+    def __reduce__(self):
+        raise TypeError("distributed work handles cannot be pickled")
+
+
 def _pipeline() -> Wan22Pipeline:
     pipeline = object.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
@@ -75,13 +102,18 @@ def _pipeline() -> Wan22Pipeline:
     pipeline.expand_timesteps = True
     pipeline.has_transformer_2 = False
     pipeline.is_dmd = False
+    pipeline._sample_solver = "unipc"
+    pipeline._flow_shift = 5.0
     pipeline._num_timesteps = None
     pipeline._current_timestep = None
     pipeline.check_inputs = lambda **_kwargs: None
-    pipeline.encode_prompt = lambda **kwargs: (
-        torch.full((kwargs["num_videos_per_prompt"], kwargs["max_sequence_length"], 8), 2.0),
-        None,
-    )
+
+    def encode_prompt(**kwargs):
+        shape = (kwargs["num_videos_per_prompt"], kwargs["max_sequence_length"], 8)
+        negative = torch.full(shape, -2.0) if kwargs["do_classifier_free_guidance"] else None
+        return torch.full(shape, 2.0), negative
+
+    pipeline.encode_prompt = encode_prompt
     pipeline.prepare_latents = lambda **kwargs: torch.randn(
         kwargs["batch_size"],
         kwargs["num_channels_latents"],
@@ -146,32 +178,76 @@ def test_prepare_encode_creates_request_local_unipc_state(monkeypatch) -> None:
     assert first.extra["wan_boundary_timestep"] == pytest.approx(875.0)
 
 
+def test_prepare_encode_prefers_precomputed_conditioning_with_real_validator(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    pipeline.check_inputs = Wan22Pipeline.check_inputs.__get__(pipeline)
+    pipeline.encode_prompt = lambda **_kwargs: pytest.fail("precomputed conditioning must skip text encoding")
+    prompt_embeds = torch.full((4, 8), 3.0)
+    negative_prompt_embeds = torch.full((4, 8), -3.0)
+    state = _state()
+    state.sampling.guidance_scale = 4.0
+    state.prompt = {
+        "prompt": "a cat",
+        "negative_prompt": "blurry",
+        "prompt_embeds": prompt_embeds,
+        "negative_prompt_embeds": negative_prompt_embeds,
+    }
+
+    pipeline.prepare_encode(state)
+
+    torch.testing.assert_close(state.prompt_embeds, prompt_embeds.unsqueeze(0))
+    torch.testing.assert_close(state.negative_prompt_embeds, negative_prompt_embeds.unsqueeze(0))
+    assert state.do_true_cfg is True
+
+
+def test_prepare_encode_preserves_supplied_latents(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    pipeline.prepare_latents = Wan22Pipeline.prepare_latents.__get__(pipeline)
+    supplied = torch.arange(16, dtype=torch.float32).reshape(1, 4, 1, 2, 2)
+    state = _state()
+    state.sampling.latents = supplied
+
+    pipeline.prepare_encode(state)
+
+    assert state.latents is supplied
+
+
 @pytest.mark.parametrize("seed", [7, None], ids=["seeded", "unseeded"])
 def test_prepare_encode_broadcasts_stage_zero_initial_latents(monkeypatch, seed) -> None:
     _patch_scheduler(monkeypatch)
     source_latents: list[torch.Tensor] = []
 
-    class _Group:
-        def __init__(self, is_first_rank: bool) -> None:
-            self.is_first_rank = is_first_rank
+    def gather_statuses(statuses, local_status, *, group) -> None:
+        del local_status, group
+        statuses[:] = [None, None]
 
-        def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
-            assert src == 0
-            if self.is_first_rank:
-                source_latents.append(tensor.clone())
-                return tensor
-            tensor.copy_(source_latents[0])
-            return tensor
+    monkeypatch.setattr(wan22_module.torch.distributed, "all_gather_object", gather_statuses)
 
     monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 2)
     first_pipeline = _pipeline()
-    monkeypatch.setattr(wan22_module, "get_pp_group", lambda: _Group(True))
+
+    def first_broadcast(tensor: torch.Tensor, src: int) -> torch.Tensor:
+        assert src == 0
+        source_latents.append(tensor.clone())
+        return tensor
+
+    monkeypatch.setattr(wan22_module, "get_pp_group", lambda: _PPGroup(True, first_broadcast))
     first = _state(request_id="first", seed=seed)
     first_pipeline.prepare_encode(first)
 
     last_pipeline = _pipeline()
     last_pipeline.prepare_latents = lambda **_kwargs: pytest.fail("non-first rank must not sample initial latents")
-    monkeypatch.setattr(wan22_module, "get_pp_group", lambda: _Group(False))
+
+    def last_broadcast(tensor: torch.Tensor, src: int) -> torch.Tensor:
+        assert src == 0
+        tensor.copy_(source_latents[0])
+        return tensor
+
+    monkeypatch.setattr(wan22_module, "get_pp_group", lambda: _PPGroup(False, last_broadcast))
     last = _state(request_id="last", seed=seed)
     last_pipeline.prepare_encode(last)
 
@@ -179,15 +255,60 @@ def test_prepare_encode_broadcasts_stage_zero_initial_latents(monkeypatch, seed)
     assert len(source_latents) == 1
 
 
+@pytest.mark.parametrize("is_first_rank", [True, False], ids=["first-rank", "non-first-rank"])
+def test_prepare_encode_coordinates_generator_mismatch_before_broadcast(monkeypatch, is_first_rank) -> None:
+    _patch_scheduler(monkeypatch)
+    pipeline = _pipeline()
+    state = _state()
+    state.sampling.generator = [torch.Generator(), torch.Generator()]
+    broadcasts: list[torch.Tensor] = []
+    group = _PPGroup(is_first_rank, lambda tensor, _src: broadcasts.append(tensor) or tensor)
+    gathered: list[str | None] = []
+
+    def gather_statuses(statuses, local_status, *, group: object) -> None:
+        gathered.append(local_status)
+        statuses[:] = [local_status, None] if is_first_rank else [None, local_status]
+
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(wan22_module, "get_pp_group", lambda: group)
+    monkeypatch.setattr(wan22_module.torch.distributed, "all_gather_object", gather_statuses)
+
+    with pytest.raises(RuntimeError, match="Generator list length 2 does not match batch size 1"):
+        pipeline.prepare_encode(state)
+
+    assert gathered and gathered[0].startswith("ValueError:")
+    assert broadcasts == []
+
+
+def test_prepare_encode_coordinates_rank_local_allocation_failure_before_broadcast(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    pipeline = _pipeline()
+    state = _state()
+    broadcasts: list[torch.Tensor] = []
+    group = _PPGroup(False, lambda tensor, _src: broadcasts.append(tensor) or tensor)
+    gathered: list[str | None] = []
+
+    def gather_statuses(statuses, local_status, *, group: object) -> None:
+        gathered.append(local_status)
+        statuses[:] = [None, local_status]
+
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(wan22_module, "get_pp_group", lambda: group)
+    monkeypatch.setattr(wan22_module.torch.distributed, "all_gather_object", gather_statuses)
+    monkeypatch.setattr(
+        wan22_module.torch, "empty", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("oom"))
+    )
+
+    with pytest.raises(RuntimeError, match="RuntimeError: oom"):
+        pipeline.prepare_encode(state)
+
+    assert gathered == ["RuntimeError: oom"]
+    assert broadcasts == []
+
+
 def test_prepare_encode_rejects_deferred_modes(monkeypatch) -> None:
     _patch_scheduler(monkeypatch)
     monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
-
-    cfg_pipeline = _pipeline()
-    cfg_state = _state()
-    cfg_state.sampling.guidance_scale = 4.0
-    with pytest.raises(ValueError, match="does not support classifier-free guidance"):
-        cfg_pipeline.prepare_encode(cfg_state)
 
     image_pipeline = _pipeline()
     image_state = _state()
@@ -199,6 +320,27 @@ def test_prepare_encode_rejects_deferred_modes(monkeypatch) -> None:
     cascade_pipeline.has_transformer_2 = True
     with pytest.raises(ValueError, match="single-transformer"):
         cascade_pipeline.prepare_encode(_state())
+
+
+def test_prepare_encode_rejects_cfg_with_pipeline_parallelism(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    broadcasts: list[torch.Tensor] = []
+    group = _PPGroup(True, lambda tensor, _src: broadcasts.append(tensor) or tensor)
+
+    def gather_statuses(statuses, local_status, *, group: object) -> None:
+        statuses[:] = [local_status, None]
+
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(wan22_module, "get_pp_group", lambda: group)
+    monkeypatch.setattr(wan22_module.torch.distributed, "all_gather_object", gather_statuses)
+    pipeline = _pipeline()
+    state = _state()
+    state.sampling.guidance_scale = 4.0
+
+    with pytest.raises(RuntimeError, match="classifier-free guidance with PP>1"):
+        pipeline.prepare_encode(state)
+
+    assert broadcasts == []
 
 
 def test_denoise_and_scheduler_use_request_local_state_once(monkeypatch) -> None:
@@ -230,6 +372,76 @@ def test_denoise_and_scheduler_use_request_local_state_once(monkeypatch) -> None
     assert state.step_index == 1
 
 
+def test_pp1_step_cfg_matches_request_denoise_math(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    state = _state()
+    state.sampling.guidance_scale = 4.0
+    pipeline.prepare_encode(state)
+
+    def predict_noise(**kwargs):
+        value = kwargs["encoder_hidden_states"].mean()
+        return torch.full_like(kwargs["hidden_states"], value)
+
+    pipeline.predict_noise = predict_noise
+    initial_latents = state.latents.clone()
+    reference_scheduler = _Scheduler()
+    pipeline.scheduler = reference_scheduler
+    reference = pipeline.diffuse(
+        latents=initial_latents.clone(),
+        timesteps=state.timesteps[:1],
+        prompt_embeds=state.prompt_embeds,
+        negative_prompt_embeds=state.negative_prompt_embeds,
+        guidance_low=4.0,
+        guidance_high=4.0,
+        boundary_timestep=state.extra["wan_boundary_timestep"],
+        dtype=torch.float32,
+        attention_kwargs={},
+    )
+
+    batch = InputBatch.make_batch([state])
+    noise_pred = pipeline.denoise_step(batch, states=[state])
+    pipeline.step_scheduler(state, noise_pred)
+
+    torch.testing.assert_close(state.latents, reference)
+    assert state.do_true_cfg is True
+    assert len(state.scheduler.step_calls) == 1
+
+
+def test_denoise_cfg_uses_per_row_guidance_across_timestep_boundary(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    high_noise = _state(request_id="high-noise")
+    low_noise = _state(request_id="low-noise")
+    for state in (high_noise, low_noise):
+        state.sampling.guidance_scale = 2.0
+        state.sampling.guidance_scale_2 = 5.0
+        state.sampling.guidance_scale_2_provided = True
+        pipeline.prepare_encode(state)
+    high_noise.timesteps = torch.tensor([900.0])
+    low_noise.timesteps = torch.tensor([100.0])
+    batch = InputBatch.make_batch([high_noise, low_noise])
+    captured: dict[str, object] = {}
+
+    def predict_noise_maybe_with_cfg(**kwargs):
+        captured.update(kwargs)
+        return torch.ones_like(batch.latents)
+
+    pipeline.predict_noise_maybe_with_cfg = predict_noise_maybe_with_cfg
+
+    pipeline.denoise_step(batch, states=[high_noise, low_noise])
+
+    assert captured["do_true_cfg"] is True
+    assert captured["negative_kwargs"] is not None
+    scale = captured["true_cfg_scale"]
+    assert isinstance(scale, torch.Tensor)
+    assert scale.shape == (2, 1, 1, 1, 1)
+    torch.testing.assert_close(scale.flatten(), torch.tensor([2.0, 5.0]))
+
+
 def test_post_decode_matches_latent_and_video_output_contract(monkeypatch) -> None:
     monkeypatch.setattr(wan22_module.current_omni_platform, "is_available", lambda: False)
     pipeline = _pipeline()
@@ -249,6 +461,37 @@ def test_post_decode_matches_latent_and_video_output_contract(monkeypatch) -> No
     assert video_output.output is None
     assert video_output.media is not None
     assert video_output.media.video.tensor.shape == (1, 3, 1, 2, 2)
+
+
+def test_post_decode_materializes_async_latents_before_runner_ipc(monkeypatch) -> None:
+    _patch_scheduler(monkeypatch)
+    monkeypatch.setattr(wan22_module.current_omni_platform, "is_available", lambda: False)
+    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
+    pipeline = _pipeline()
+    state = _state(output_type="latent")
+    pipeline.prepare_encode(state)
+    tensor = torch.arange(300_000, dtype=torch.float32).reshape(1, 4, 1, 300, 250)
+    work = _UnpickleableWork()
+    state.latents = AsyncLatents({"latents": tensor}, [work], [])
+    state.extra["wan_output_type"] = "latent"
+
+    output = pipeline.post_decode(state)
+
+    assert work.waited is True
+    assert state.latents is tensor
+    assert output.output is tensor
+
+    input_batch = InputBatch.make_batch([state])
+    runner = object.__new__(DiffusionModelRunner)
+    DiffusionModelRunner._update_states_after(runner, [state], input_batch)
+    payload = BatchRunnerOutput.from_list([RunnerOutput(request_id=state.request_id, finished=True, result=output)])
+
+    pack_diffusion_output_shm(payload)
+    try:
+        assert payload.runner_outputs[0].result.output["__tensor_shm__"] is True
+        pickle.dumps(payload)
+    finally:
+        unpack_diffusion_output_shm(payload)
 
 
 def test_post_decode_returns_empty_output_on_non_output_pp_rank(monkeypatch) -> None:
