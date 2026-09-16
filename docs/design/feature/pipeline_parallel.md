@@ -40,8 +40,9 @@ For each denoising step:
 3. The last PP rank produces the final noise prediction.
 4. The last PP rank applies the scheduler step and sends the updated latents back to rank 0 for the next timestep.
 
-This reduces per-rank model memory and enables larger diffusion transformers to run across multiple GPUs. It can also be
-combined with CFG-Parallel, where each PP pipeline carries one CFG branch.
+This reduces per-rank model memory and enables larger diffusion transformers to run across multiple GPUs. CFG-Parallel
+is available only for pipelines that explicitly advertise the combination; Wan2.2 step execution currently supports
+sequential CFG at PP=1 and rejects CFG when PP>1.
 
 ### Architecture
 
@@ -67,13 +68,9 @@ defines how a local stage executes.
     - Rank 0 starts with the input latents
     - Middle ranks receive `intermediate_tensors`, run their local layer range, and asynchronously send downstream
     - The last rank returns the final noise prediction
-    - When CFG is enabled in this mode (sequential CFG), both the positive and negative branches run through the same
-      PP pipeline, doubling the communication volume per denoising step. Prefer PP + CFG-Parallel when
-      `cfg_parallel_size > 1` is available to avoid this overhead.
+    - Wan2.2 step execution currently rejects CFG in this topology; use `guidance_scale=1.0`.
 - **PP + CFG-Parallel** (`pipeline_parallel_size > 1`, `cfg_parallel_size > 1`):
-    - Each PP pipeline carries one CFG branch
-    - The last PP rank all-gathers across the CFG group
-    - CFG combination happens on every last PP rank in the CFG group, matching the non-PP CFG-parallel behavior
+    - Reserved for pipelines with an explicit PP+CFG capability contract.
 
 `scheduler_step_maybe_with_cfg()` keeps the denoising loop consistent:
 
@@ -242,8 +239,8 @@ synchronization.
 In PP mode:
 
 - Non-last PP ranks return `None` from `predict_noise_maybe_with_cfg()` after sending `IntermediateTensors` downstream.
-- The last PP rank returns the final prediction, and with CFG-Parallel every last PP rank in the CFG group receives the
-  combined result.
+- The last PP rank returns the final prediction. CFG-Parallel behavior is pipeline-specific and must be explicitly
+  enabled by the selected pipeline.
 - Rank 0 receives `AsyncLatents` from `scheduler_step_maybe_with_cfg()`, which resolves only when the latents are
   consumed.
 - Pending non-blocking sends are flushed automatically when `diffuse()` exits.
@@ -259,24 +256,23 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=5.0 \
+--guidance-scale=1.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
 --output=t2v_5B_pp2.mp4 \
 --pipeline-parallel-size=2
 ```
 
-For PP + CFG-Parallel together:
+Wan2.2 PP+CFG is currently deferred. The supported PP=2 smoke path uses no CFG:
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=5.0 \
+--guidance-scale=1.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
---output=t2v_5B_pp2_cfg2.mp4 \
---pipeline-parallel-size=2 \
---cfg-parallel-size=2
+--output=t2v_5B_pp2_no_cfg.mp4 \
+--pipeline-parallel-size=2
 ```
 
 **Verify:**
@@ -351,6 +347,6 @@ Complete examples in the codebase:
 | `PipelineParallelMixin` | `vllm_omni/diffusion/distributed/pipeline_parallel.py`     | Core PP communication and scheduler helpers                                                                             |
 | `CFGParallelMixin`      | `vllm_omni/diffusion/distributed/cfg_parallel.py`          | Default `predict_noise()` tuple normalization and CFG helper fallback                                                   |
 | Wan2.2 transformer      | `vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py`  | Reference for layer partitioning, `IntermediateTensors`, `make_empty_intermediate_tensors`, and PP-aware weight loading |
-| Wan2.2 T2V pipeline     | `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py`     | Reference PP + CFG integration for text-to-video                                                                        |
-| Wan2.2 I2V pipeline     | `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py` | Reference PP + CFG integration for image-to-video                                                                       |
+| Wan2.2 T2V pipeline     | `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py`     | Reference PP integration; PP+CFG capability is explicitly gated                                                        |
+| Wan2.2 I2V pipeline     | `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py` | Reference static PP/CFG integration for image-to-video                                                                  |
 | PP tests                | `tests/diffusion/distributed/test_pipeline_parallel.py`    | Baseline parity and async communication tests                                                                           |

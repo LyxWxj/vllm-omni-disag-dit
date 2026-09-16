@@ -18,8 +18,8 @@ Pipeline Parallelism splits the denoising transformer block-wise into sequential
 part of the transformer, which reduces per-GPU model memory and enables larger diffusion models to run across multiple
 devices.
 
-It can also be combined with other distributed methods such as CFG-Parallel, Tensor Parallelism, and Sequence
-Parallelism.
+Other distributed methods are pipeline-specific. For the current Wan2.2 step-execution path, PP=1 supports
+ordinary sequential CFG, while PP>1 + CFG is rejected until branch coordination is implemented.
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
@@ -72,24 +72,24 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=5.0 \
+--guidance-scale=1.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
 --output=t2v_5B_pp2.mp4 \
 --pipeline-parallel-size=2
 ```
 
-Pipeline Parallelism can also be combined with CFG-Parallel:
+PP+CFG is not currently supported for Wan2.2 step execution. Use PP=1 for sequential CFG, or PP>1 with
+`--guidance-scale 1.0` for the no-CFG PP path.
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
 --model=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 --width=1280 \
 --height=704 \
---guidance-scale=5.0 \
+--guidance-scale=1.0 \
 --prompt="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage" \
---output=t2v_5B_pp2_cfg2.mp4 \
---pipeline-parallel-size=2 \
---cfg-parallel-size=2
+--output=t2v_5B_pp2_no_cfg.mp4 \
+--pipeline-parallel-size=2
 ```
 
 ### Online Serving
@@ -100,10 +100,7 @@ Enable Pipeline Parallelism in online serving:
 # Default PP configuration
 vllm serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --omni --port 8091 --pipeline-parallel-size 2
 
-# PP + CFG-Parallel
-vllm serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --omni --port 8091 \
-  --pipeline-parallel-size 2 \
-  --cfg-parallel-size 2
+# PP + CFG is deferred for Wan2.2 step execution; use PP=1 for CFG.
 ```
 
 ---
@@ -145,7 +142,7 @@ ranks.
 
 - Large diffusion transformers that do not fit comfortably on one GPU
 - Multi-GPU setups where reducing per-GPU model memory is more important than minimizing communication
-- Combining with CFG-Parallel or other distributed methods on supported models
+- Combining with other distributed methods only where the selected pipeline advertises compatibility
 
 **Not for:**
 
@@ -182,7 +179,7 @@ parallel_config = DiffusionParallelConfig(pipeline_parallel_size=2)
     - PP is currently validated only on selected pipelines
 
 3. **Combine with other methods when appropriate:**
-    - PP can be combined with CFG-Parallel, Tensor Parallelism, or Sequence Parallelism on supported models
+    - Wan2.2 PP>1 step execution currently requires no CFG (`guidance_scale=1.0`)
 
 ### Common Issue 2: PP pipeline fails at import
 
@@ -201,5 +198,5 @@ parallel_config = DiffusionParallelConfig(pipeline_parallel_size=2)
 1. ✅ **Enable Pipeline Parallelism** - Set `pipeline_parallel_size > 1` in `DiffusionParallelConfig`
 2. ✅ **Use Supported Models** - Verify your model supports PP in
    [supported models](../../diffusion_features.md#supported-models)
-3. ✅ **Combine When Needed** - PP can be combined with CFG-Parallel and other distributed methods on supported pipelines
+3. ✅ **Check Capability Matrix** - Confirm the selected pipeline supports the requested CFG/PP combination
 4. ✅ **Scale for Memory** - Use PP primarily to reduce per-GPU model memory and fit larger transformers
