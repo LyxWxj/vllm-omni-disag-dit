@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import inspect
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Protocol
 
 
@@ -18,6 +19,191 @@ class PipelineMessage:
     epoch: int
     branch: str
     payload: Any
+
+
+class PipelineEdgeKind(StrEnum):
+    ACTIVATION = "activation"
+    FEEDBACK = "feedback"
+
+
+@dataclass(frozen=True)
+class PipelineTransferOffer:
+    """Metadata-only readiness offer for one directed PP transfer."""
+
+    batch_id: str
+    step_index: int
+    epoch: int
+    branch: str
+    edge_kind: PipelineEdgeKind
+    src_rank: int
+    dst_rank: int
+
+    def __post_init__(self) -> None:
+        if not self.batch_id or self.step_index < 0 or self.epoch < 0:
+            raise ValueError("invalid pipeline transfer identity")
+        if self.branch != "conditional":
+            raise ValueError("M2 supports only the conditional pipeline branch")
+        if not isinstance(self.edge_kind, PipelineEdgeKind):
+            raise ValueError("pipeline transfer requires a valid edge kind")
+        if self.src_rank < 0 or self.dst_rank < 0 or self.src_rank == self.dst_rank:
+            raise ValueError("pipeline transfer endpoints must be distinct non-negative ranks")
+
+    @property
+    def identity(self) -> tuple[str, int, int, str, PipelineEdgeKind, int, int]:
+        return (
+            self.batch_id,
+            self.step_index,
+            self.epoch,
+            self.branch,
+            self.edge_kind,
+            self.src_rank,
+            self.dst_rank,
+        )
+
+
+@dataclass
+class PipelineTransferGrant:
+    offer: PipelineTransferOffer
+    completed_ranks: set[int] = field(default_factory=set)
+
+
+class PipelineTransferCoordinator:
+    """FIFO control-plane grants for matched P2P endpoint readiness."""
+
+    def __init__(
+        self,
+        *,
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
+    ) -> None:
+        self._validate_topology(activation_edges, feedback_edges)
+        self._valid_edges = {
+            PipelineEdgeKind.ACTIVATION: frozenset(activation_edges),
+            PipelineEdgeKind.FEEDBACK: frozenset(feedback_edges),
+        }
+        self._offers: dict[tuple[PipelineEdgeKind, int, int], deque[PipelineTransferOffer]] = {
+            (edge_kind, src_rank, dst_rank): deque()
+            for edge_kind, edges in self._valid_edges.items()
+            for src_rank, dst_rank in edges
+        }
+        self._offer_ids: set[tuple[Any, ...]] = set()
+        self._ready_ids: set[tuple[Any, ...]] = set()
+        self._grants: dict[tuple[Any, ...], PipelineTransferGrant] = {}
+        self._completed_ids: set[tuple[Any, ...]] = set()
+        self._busy_ranks: set[int] = set()
+        self._next_edge = PipelineEdgeKind.FEEDBACK
+        self._edge_cursor = {
+            PipelineEdgeKind.ACTIVATION: 0,
+            PipelineEdgeKind.FEEDBACK: 0,
+        }
+
+    def offer(self, offer: PipelineTransferOffer) -> None:
+        identity = offer.identity
+        if (offer.src_rank, offer.dst_rank) not in self._valid_edges[offer.edge_kind]:
+            raise ValueError("pipeline transfer offer does not match the configured edge topology")
+        if identity in self._offer_ids or identity in self._grants or identity in self._completed_ids:
+            raise ValueError("duplicate pipeline transfer offer")
+        self._offers[(offer.edge_kind, offer.src_rank, offer.dst_rank)].append(offer)
+        self._offer_ids.add(identity)
+
+    def mark_receive_ready(self, identity: tuple[Any, ...]) -> None:
+        if identity not in self._offer_ids:
+            raise KeyError("unknown pipeline transfer offer")
+        self._ready_ids.add(identity)
+
+    def grant_ready(self, limit: int = 1) -> list[PipelineTransferGrant]:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        grants: list[PipelineTransferGrant] = []
+        while len(grants) < limit:
+            edge_order = (
+                self._next_edge,
+                PipelineEdgeKind.ACTIVATION
+                if self._next_edge is PipelineEdgeKind.FEEDBACK
+                else PipelineEdgeKind.FEEDBACK,
+            )
+            selected: PipelineTransferOffer | None = None
+            for edge_kind in edge_order:
+                edge_keys = sorted(key for key in self._offers if key[0] is edge_kind)
+                if not edge_keys:
+                    continue
+                cursor = self._edge_cursor[edge_kind] % len(edge_keys)
+                for offset in range(len(edge_keys)):
+                    edge_index = (cursor + offset) % len(edge_keys)
+                    edge_key = edge_keys[edge_index]
+                    queue = self._offers[edge_key]
+                    if not queue:
+                        continue
+                    candidate = queue[0]
+                    if candidate.identity not in self._ready_ids:
+                        continue
+                    if candidate.src_rank in self._busy_ranks or candidate.dst_rank in self._busy_ranks:
+                        continue
+                    selected = candidate
+                    self._edge_cursor[edge_kind] = (edge_index + 1) % len(edge_keys)
+                    break
+                if selected is not None:
+                    break
+            if selected is None:
+                break
+            offer = selected
+            identity = offer.identity
+            self._offers[(offer.edge_kind, offer.src_rank, offer.dst_rank)].popleft()
+            self._offer_ids.remove(identity)
+            self._ready_ids.remove(identity)
+            grant = PipelineTransferGrant(offer=offer)
+            self._grants[identity] = grant
+            self._busy_ranks.update((offer.src_rank, offer.dst_rank))
+            grants.append(grant)
+            self._next_edge = (
+                PipelineEdgeKind.ACTIVATION
+                if offer.edge_kind is PipelineEdgeKind.FEEDBACK
+                else PipelineEdgeKind.FEEDBACK
+            )
+        return grants
+
+    def complete(self, identity: tuple[Any, ...], rank: int) -> bool:
+        grant = self._grants.get(identity)
+        if grant is None:
+            raise KeyError("unknown pipeline transfer grant")
+        if rank not in {grant.offer.src_rank, grant.offer.dst_rank}:
+            raise ValueError("completion rank is not a transfer endpoint")
+        if rank in grant.completed_ranks:
+            raise ValueError("duplicate pipeline transfer completion")
+        grant.completed_ranks.add(rank)
+        if grant.completed_ranks != {grant.offer.src_rank, grant.offer.dst_rank}:
+            return False
+        self._grants.pop(identity)
+        self._completed_ids.add(identity)
+        self._busy_ranks.difference_update((grant.offer.src_rank, grant.offer.dst_rank))
+        return True
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "offers": sum(len(queue) for queue in self._offers.values()),
+            "ready": len(self._ready_ids),
+            "grants": len(self._grants),
+            "completed": len(self._completed_ids),
+            "busy_ranks": tuple(sorted(self._busy_ranks)),
+        }
+
+    @staticmethod
+    def _validate_topology(
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
+    ) -> None:
+        if not activation_edges or not feedback_edges:
+            raise ValueError("pipeline transfer topology requires activation and feedback edges")
+        expected_feedback = {(dst, src) for src, dst in activation_edges}
+        if feedback_edges != expected_feedback:
+            raise ValueError("feedback edges must exactly reverse the activation edges")
+        endpoints: set[int] = set()
+        for src_rank, dst_rank in activation_edges:
+            if src_rank < 0 or dst_rank < 0 or src_rank == dst_rank:
+                raise ValueError("pipeline topology endpoints must be distinct non-negative ranks")
+            if src_rank in endpoints or dst_rank in endpoints:
+                raise ValueError("queued PP=2 topology requires disjoint two-rank replicas")
+            endpoints.update((src_rank, dst_rank))
 
 
 @dataclass
