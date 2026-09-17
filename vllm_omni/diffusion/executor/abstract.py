@@ -9,6 +9,28 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
+PIPELINE_GRANT_START_TIMEOUT_S = 30.0
+
+
+def validate_pipeline_topology_reports(
+    result: Any,
+    activation_edges: set[tuple[int, int]],
+    feedback_edges: set[tuple[int, int]],
+) -> None:
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not result or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers did not return valid pipeline topology reports")
+    actual_activation = {tuple(item["activation_edge"]) for item in result}
+    actual_feedback = {tuple(item["feedback_edge"]) for item in result}
+    reporting_ranks = {item["rank"] for item in result}
+    expected_ranks = {rank for edge in activation_edges for rank in edge}
+    if actual_activation != activation_edges or actual_feedback != feedback_edges:
+        raise ValueError("Executor pipeline topology does not match Worker PP groups")
+    if reporting_ranks != expected_ranks:
+        raise ValueError("pipeline topology reports do not cover every configured endpoint")
+
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -145,6 +167,17 @@ class DiffusionExecutor(ABC):
     def drain_pipeline(self, deadline: float | None = None) -> Any:
         """Drain queued transport and Worker contexts before shutdown."""
         raise NotImplementedError("queued pipeline drain is not wired for this executor")
+
+    def initialize_pipeline_transfers(
+        self,
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
+        max_slots: int = 1,
+    ) -> Any:
+        raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
+
+    def coordinate_pipeline_transfer(self, offer: Any) -> list[Any]:
+        raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""

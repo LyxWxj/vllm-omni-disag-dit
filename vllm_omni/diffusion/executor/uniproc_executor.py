@@ -30,7 +30,15 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
+    PipelineTransferCoordinator,
+    PipelineTransferOffer,
+)
+from vllm_omni.diffusion.executor.abstract import (
+    PIPELINE_GRANT_START_TIMEOUT_S,
+    DiffusionExecutor,
+    validate_pipeline_topology_reports,
+)
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -184,12 +192,15 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
-    def _queued_control_rpc(self, method: str, *, args: tuple = ()) -> Any:
+    def _queued_control_rpc(self, method: str, *, args: tuple = (), timeout: float | None = None) -> Any:
         if self._is_failed:
             raise EngineDeadError()
         self._ensure_open()
         try:
-            return self.collective_rpc(method, args=args)
+            kwargs: dict[str, Any] = {"args": args}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            return self.collective_rpc(method, **kwargs)
         except BaseException:
             self._mark_failed()
             raise
@@ -220,6 +231,43 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
             return result[0]
         return result
+
+    def initialize_pipeline_transfers(
+        self,
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
+        max_slots: int = 1,
+    ) -> Any:
+        if hasattr(self, "_pipeline_transfer_coordinator"):
+            raise RuntimeError("pipeline transfer coordinator is already initialized")
+        coordinator = PipelineTransferCoordinator(
+            activation_edges=activation_edges,
+            feedback_edges=feedback_edges,
+        )
+        result = self._queued_control_rpc("initialize_pipeline_transports_all_ranks", args=(max_slots,))
+        try:
+            validate_pipeline_topology_reports(result, activation_edges, feedback_edges)
+        except BaseException:
+            self._mark_failed()
+            raise
+        self._pipeline_transfer_coordinator = coordinator
+        return result
+
+    def coordinate_pipeline_transfer(self, offer: PipelineTransferOffer) -> list[Any]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.offer(offer)
+        self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+        coordinator.mark_receive_ready(offer.identity)
+        grants = coordinator.grant_ready()
+        for grant in grants:
+            self._queued_control_rpc(
+                "start_pipeline_transfer",
+                args=(grant,),
+                timeout=PIPELINE_GRANT_START_TIMEOUT_S,
+            )
+        return grants
 
     def _device_is_usable(self) -> bool:
         """Whether the accelerator context survived the failure we just caught.

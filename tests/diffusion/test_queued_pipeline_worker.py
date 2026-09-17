@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
+    PipelineEdgeKind,
+    PipelineTransferGrant,
+    PipelineTransferOffer,
+)
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineEventType,
@@ -310,3 +315,162 @@ def test_two_stage_cancellation_drains_feedback_without_step_completion() -> Non
     assert last_worker.pipeline_stages[1].terminal_statuses[task.batch_id] is PipelineTaskStatus.CANCELLED
     assert first_worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
     assert last_worker.release_pipeline_batch(1, task.batch_id).event_type is PipelineEventType.RELEASED
+
+
+class _PPGroup:
+    world_size = 2
+    ranks = [0, 1]
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+        self.rank_in_group = rank
+        self.send_calls = []
+        self.recv_calls = []
+
+    def isend_tensor_dict(self, payload, dst):
+        self.send_calls.append((payload, dst))
+        return []
+
+    def irecv_tensor_dict(self, src):
+        self.recv_calls.append(src)
+        return {"hidden_states": torch.tensor([1.0])}, [], []
+
+
+def test_worker_starts_only_matching_granted_p2p_endpoint(mocker) -> None:
+    sender = _worker()
+    receiver = _worker()
+    sender.rank = 0
+    receiver.rank = 1
+    sender_group = _PPGroup(0)
+    receiver_group = _PPGroup(1)
+    get_group = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
+        side_effect=[sender_group, receiver_group],
+    )
+    sender.initialize_pipeline_transports()
+    receiver.initialize_pipeline_transports()
+    assert get_group.call_count == 2
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    payload = {"hidden_states": torch.tensor([2.0])}
+    sender.reserve_pipeline_send(offer, payload)
+    assert sender_group.send_calls == []
+    assert receiver.accept_pipeline_transfer_offer(offer)
+    grant = PipelineTransferGrant(offer)
+
+    assert sender.start_pipeline_transfer(grant)
+    assert receiver.start_pipeline_transfer(grant)
+    assert sender_group.send_calls == [(payload, 1)]
+    assert receiver_group.recv_calls == [0]
+
+
+def test_worker_readiness_rejects_missing_sender_reservation_before_receive(mocker) -> None:
+    sender = _worker()
+    receiver = _worker()
+    sender.rank = 0
+    receiver.rank = 1
+    sender_group = _PPGroup(0)
+    receiver_group = _PPGroup(1)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
+        side_effect=[sender_group, receiver_group],
+    )
+    sender.initialize_pipeline_transports()
+    receiver.initialize_pipeline_transports()
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+
+    with pytest.raises(KeyError, match="no reserved sender ticket"):
+        sender.accept_pipeline_transfer_offer(offer)
+
+    assert receiver_group.recv_calls == []
+
+
+def test_worker_readiness_reserves_receive_credit_until_release(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    receiver_group = _PPGroup(1)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
+        return_value=receiver_group,
+    )
+    receiver.initialize_pipeline_transports(max_slots=1)
+    first = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    second = PipelineTransferOffer(
+        batch_id="batch-b",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+
+    assert receiver.accept_pipeline_transfer_offer(first)
+    with pytest.raises(RuntimeError, match="no receive credit"):
+        receiver.accept_pipeline_transfer_offer(second)
+    with pytest.raises(RuntimeError, match="reserved receive credit"):
+        receiver.drain_pipeline()
+
+    receiver.start_pipeline_transfer(PipelineTransferGrant(first))
+    messages = receiver.poll_pipeline_received(PipelineEdgeKind.ACTIVATION)
+    assert len(messages) == 1
+    receiver.release_pipeline_received(PipelineEdgeKind.ACTIVATION, messages[0])
+    assert receiver.accept_pipeline_transfer_offer(second)
+
+
+def test_worker_two_receive_slots_do_not_double_count_leased_message(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    receiver_group = _PPGroup(1)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
+        return_value=receiver_group,
+    )
+    receiver.initialize_pipeline_transports(max_slots=2)
+
+    def offer(batch_id: str) -> PipelineTransferOffer:
+        return PipelineTransferOffer(
+            batch_id=batch_id,
+            step_index=0,
+            epoch=1,
+            branch="conditional",
+            edge_kind=PipelineEdgeKind.ACTIVATION,
+            src_rank=0,
+            dst_rank=1,
+        )
+
+    first, second, third = offer("batch-a"), offer("batch-b"), offer("batch-c")
+    assert receiver.accept_pipeline_transfer_offer(first)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(first))
+    leased = receiver.poll_pipeline_received(PipelineEdgeKind.ACTIVATION)
+    assert len(leased) == 1
+
+    assert receiver.accept_pipeline_transfer_offer(second)
+    with pytest.raises(RuntimeError, match="no receive credit"):
+        receiver.accept_pipeline_transfer_offer(third)
+
+    receiver.release_pipeline_received(PipelineEdgeKind.ACTIVATION, leased[0])
+    assert receiver.accept_pipeline_transfer_offer(third)

@@ -1,15 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import PipelineEdgeKind, PipelineTransferOffer
+from vllm_omni.diffusion.executor.abstract import PIPELINE_GRANT_START_TIMEOUT_S
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def _topology_reports():
+    return [
+        [
+            {"rank": 0, "activation_edge": (0, 1), "feedback_edge": (1, 0)},
+            {"rank": 1, "activation_edge": (0, 1), "feedback_edge": (1, 0)},
+        ]
+    ]
 
 
 @pytest.fixture(params=[MultiprocDiffusionExecutor, UniProcDiffusionExecutor])
@@ -71,3 +82,62 @@ def test_drain_aggregates_nonzero_rank_events(executor) -> None:
 
     assert executor.drain_pipeline(deadline=3.0) == ["rank-0-released", "rank-1-released"]
     executor.collective_rpc.assert_called_once_with("drain_pipeline_all_ranks", args=(3.0,))
+
+
+def test_executor_coordinates_ready_offer_and_dispatches_grant(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)}, max_slots=1)
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.return_value = [True]
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+
+    grants = executor.coordinate_pipeline_transfer(offer)
+
+    assert grants[0].offer is offer
+    assert executor.collective_rpc.call_args_list == [
+        call("accept_pipeline_transfer_offer_all_ranks", args=(offer,)),
+        call(
+            "start_pipeline_transfer",
+            args=(grants[0],),
+            timeout=PIPELINE_GRANT_START_TIMEOUT_S,
+        ),
+    ]
+
+
+def test_executor_readiness_rejection_never_dispatches_grant(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.side_effect = RuntimeError("sender reservation missing")
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+
+    with pytest.raises(RuntimeError, match="sender reservation missing"):
+        executor.coordinate_pipeline_transfer(offer)
+
+    executor.collective_rpc.assert_called_once_with("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+    assert executor._is_failed
+
+
+def test_executor_rejects_worker_topology_mismatch_and_fails_closed(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+
+    with pytest.raises(ValueError, match="does not match Worker PP groups"):
+        executor.initialize_pipeline_transfers({(2, 3)}, {(3, 2)})
+
+    assert executor._is_failed

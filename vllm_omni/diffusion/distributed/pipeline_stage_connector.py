@@ -283,6 +283,10 @@ class DistributedP2PTransport:
         self._completed_receive_ids: set[tuple[str, int, int, str]] = set()
         self._closed = False
 
+    @property
+    def has_outstanding_operations(self) -> bool:
+        return bool(self._send_handles or self._pending_receives or self._ready_receives or self._active_receive_ids)
+
     def start_granted_transfer(
         self,
         grant: PipelineTransferGrant,
@@ -390,7 +394,7 @@ class DistributedP2PTransport:
     def close(self) -> None:
         if self._closed:
             return
-        if self._send_handles or self._pending_receives or self._ready_receives or self._active_receive_ids:
+        if self.has_outstanding_operations:
             raise RuntimeError("cannot close distributed P2P transport with outstanding operations")
         self._closed = True
 
@@ -564,7 +568,7 @@ class PipelineStageConnector:
         self._transport_pending = deque(message for message in self._transport_pending if message.batch_id != batch_id)
 
     def health(self) -> dict[str, Any]:
-        return {
+        health = {
             "edge": self.edge,
             "closed": self._closed,
             "send_in_use": self.send_in_use,
@@ -573,6 +577,9 @@ class PipelineStageConnector:
             "transport_pending": self.transport_pending,
             "max_slots": self.max_slots,
         }
+        transport_outstanding = getattr(self.transport, "has_outstanding_operations", False)
+        health["transport_outstanding"] = bool(transport_outstanding)
+        return health
 
     def close(self, *, drain: bool = False) -> None:
         if self._closed:
