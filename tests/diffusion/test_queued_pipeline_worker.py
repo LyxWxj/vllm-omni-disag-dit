@@ -608,3 +608,310 @@ def test_worker_two_receive_slots_do_not_double_count_leased_message(mocker) -> 
 
     receiver.release_pipeline_received(PipelineEdgeKind.ACTIVATION, leased[0])
     assert receiver.accept_pipeline_transfer_offer(third)
+
+
+def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> None:
+    first = _worker()
+    last = _worker()
+    first_group = _PPGroup(0)
+    last_group = _PPGroup(1)
+    first.rank = 0
+    last.rank = 1
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
+        side_effect=[first_group, last_group],
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=None,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_available",
+        return_value=False,
+    )
+    first.initialize_pipeline_transports()
+    last.initialize_pipeline_transports()
+    task = _task()
+    for worker, stage_id in ((first, 0), (last, 1)):
+        worker.enqueue_pipeline_batch(task, _spec(stage_id))
+        worker.authorize_pipeline_batch(stage_id, task.batch_id)
+
+    activation = first.progress_pipeline(0).output
+    assert isinstance(activation, PipelineTransferOffer)
+    assert first.accept_pipeline_transfer_offer(activation)
+    assert last.accept_pipeline_transfer_offer(activation)
+    activation_grant = PipelineTransferGrant(activation)
+    first.start_pipeline_transfer(activation_grant)
+    last_group.receive_payload = first.pipeline_send_tickets[activation.identity].message.payload
+    last.start_pipeline_transfer(activation_grant)
+
+    first_activation_progress = first.progress_pipeline_transfers()
+    last_activation_progress = last.progress_pipeline_transfers()
+    assert [completion.rank for completion in first_activation_progress.completions] == [0]
+    assert [completion.rank for completion in last_activation_progress.completions] == [1]
+    feedback = last_activation_progress.offers[0]
+    assert feedback.edge_kind is PipelineEdgeKind.FEEDBACK
+
+    assert first.accept_pipeline_transfer_offer(feedback)
+    assert last.accept_pipeline_transfer_offer(feedback)
+    feedback_grant = PipelineTransferGrant(feedback)
+    last.start_pipeline_transfer(feedback_grant)
+    first_group.receive_payload = last.pipeline_send_tickets[feedback.identity].message.payload
+    first.start_pipeline_transfer(feedback_grant)
+
+    last_feedback_progress = last.progress_pipeline_transfers()
+    first_feedback_progress = first.progress_pipeline_transfers()
+    assert [completion.rank for completion in last_feedback_progress.completions] == [1]
+    assert [completion.rank for completion in first_feedback_progress.completions] == [0]
+    assert first.pipeline_stages[0].terminal_statuses[task.batch_id] is PipelineTaskStatus.COMPLETED
+    assert not first.pipeline_send_tickets
+    assert not last.pipeline_send_tickets
+    assert not first.pipeline_receive_reservations
+    assert not last.pipeline_receive_reservations
+
+
+def test_worker_holds_receive_lease_until_consumer_event_completes(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    event = Mock()
+    event.query.side_effect = [False, True]
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=event,
+    )
+    receiver.initialize_pipeline_transports()
+    task = _task()
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    receiver.authorize_pipeline_batch(1, task.batch_id)
+    offer = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    receiver.accept_pipeline_transfer_offer(offer)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
+
+    first_progress = receiver.progress_pipeline_transfers()
+    assert first_progress.completions == []
+    assert offer.identity in receiver.pipeline_receive_reservations
+    second_progress = receiver.progress_pipeline_transfers()
+    assert [completion.identity for completion in second_progress.completions] == [offer.identity]
+    assert offer.identity not in receiver.pipeline_receive_reservations
+
+
+def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    event = Mock()
+    event.query.side_effect = [False, True]
+    record_event = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=event,
+    )
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    receiver.initialize_pipeline_transports()
+    task = _task()
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    offer = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    receiver.accept_pipeline_transfer_offer(offer)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
+
+    before_authorization = receiver.progress_pipeline_transfers()
+    assert before_authorization.offers == []
+    assert before_authorization.completions == []
+    assert offer.identity in receiver.pipeline_receive_reservations
+    assert len(receiver.pipeline_pending_received[PipelineEdgeKind.ACTIVATION]) == 1
+    record_event.assert_not_called()
+
+    receiver.authorize_pipeline_batch(1, task.batch_id)
+    after_authorization = receiver.progress_pipeline_transfers()
+    assert len(after_authorization.offers) == 1
+    assert after_authorization.offers[0].edge_kind is PipelineEdgeKind.FEEDBACK
+    assert after_authorization.completions == []
+    assert offer.identity in receiver.pipeline_receive_reservations
+    assert len(receiver.pipeline_pending_received[PipelineEdgeKind.ACTIVATION]) == 0
+
+    after_device_completion = receiver.progress_pipeline_transfers()
+    assert [completion.identity for completion in after_device_completion.completions] == [offer.identity]
+    assert offer.identity not in receiver.pipeline_receive_reservations
+
+
+def test_worker_rejects_stale_activation_identity_before_execution(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    receiver.initialize_pipeline_transports()
+    task = _task(epoch=2)
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    receiver.authorize_pipeline_batch(1, task.batch_id)
+    stale = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=1,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    receiver.accept_pipeline_transfer_offer(stale)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(stale))
+
+    with pytest.raises(RuntimeError, match="Stale pipeline message identity"):
+        receiver.progress_pipeline_transfers()
+
+    context = receiver.model_runner.pipeline_batch_contexts[(1, task.batch_id)]
+    assert context.status is PipelineTaskStatus.PENDING
+    assert receiver.model_runner.pipeline_batch_contexts[(1, task.batch_id)].task is task
+
+
+def test_worker_rejects_stale_feedback_identity_before_adoption(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 0
+    group = _PPGroup(0)
+    group.receive_payload = {"latents": torch.tensor([5.0])}
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    receiver.initialize_pipeline_transports()
+    task = _task(epoch=2)
+    receiver.enqueue_pipeline_batch(task, _spec(0))
+    receiver.authorize_pipeline_batch(0, task.batch_id)
+    assert receiver.pipeline_stages[0].start_next() is task
+    context = receiver.model_runner.pipeline_batch_contexts[(0, task.batch_id)]
+    context.status = PipelineTaskStatus.ACTIVE
+    stale = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index + 1,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.FEEDBACK,
+        src_rank=1,
+        dst_rank=0,
+    )
+    receiver.accept_pipeline_transfer_offer(stale)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(stale))
+
+    with pytest.raises(RuntimeError, match="Stale pipeline message identity"):
+        receiver.progress_pipeline_transfers()
+
+    assert receiver.model_runner.feedback_adoptions == 0
+    assert context.status is PipelineTaskStatus.ACTIVE
+
+
+def test_cancelled_stage_one_drains_activation_without_execution(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    record_event = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event")
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    receiver.initialize_pipeline_transports()
+    task = _task()
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    offer = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    receiver.accept_pipeline_transfer_offer(offer)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
+    receiver.cancel_pipeline_batch(1, task.batch_id)
+
+    progress = receiver.progress_pipeline_transfers()
+
+    assert progress.offers == []
+    assert [completion.identity for completion in progress.completions] == [offer.identity]
+    assert receiver.model_runner.pipeline_batch_contexts[(1, task.batch_id)].status is PipelineTaskStatus.CANCELLED
+    assert offer.identity not in receiver.pipeline_receive_reservations
+    record_event.assert_not_called()
+
+
+def test_cancelled_stage_zero_drains_feedback_without_adoption(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 0
+    group = _PPGroup(0)
+    group.receive_payload = {"latents": torch.tensor([5.0])}
+    record_event = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event")
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    receiver.initialize_pipeline_transports()
+    task = _task()
+    receiver.enqueue_pipeline_batch(task, _spec(0))
+    receiver.authorize_pipeline_batch(0, task.batch_id)
+    assert receiver.pipeline_stages[0].start_next() is task
+    receiver.model_runner.pipeline_batch_contexts[(0, task.batch_id)].status = PipelineTaskStatus.ACTIVE
+    offer = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.FEEDBACK,
+        src_rank=1,
+        dst_rank=0,
+    )
+    receiver.accept_pipeline_transfer_offer(offer)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
+    receiver.cancel_pipeline_batch(0, task.batch_id)
+
+    progress = receiver.progress_pipeline_transfers()
+
+    assert [completion.identity for completion in progress.completions] == [offer.identity]
+    assert receiver.model_runner.feedback_adoptions == 0
+    assert offer.identity not in receiver.pipeline_receive_reservations
+    record_event.assert_not_called()
+
+
+def test_accelerator_consumer_event_failure_retains_receive_ownership(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=None,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_available",
+        return_value=True,
+    )
+    receiver.initialize_pipeline_transports()
+    task = _task()
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    receiver.authorize_pipeline_batch(1, task.batch_id)
+    offer = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    receiver.accept_pipeline_transfer_offer(offer)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
+
+    with pytest.raises(RuntimeError, match="failed to record.*consumer completion"):
+        receiver.progress_pipeline_transfers()
+
+    assert offer.identity in receiver.pipeline_receive_reservations
+    assert offer.identity in receiver.pipeline_receive_consumers
+    assert receiver.pipeline_stages[1].terminal_statuses[task.batch_id] is PipelineTaskStatus.COMPLETED
+    later = receiver.progress_pipeline_transfers()
+    assert later.completions == []
+    assert offer.identity in receiver.pipeline_receive_reservations

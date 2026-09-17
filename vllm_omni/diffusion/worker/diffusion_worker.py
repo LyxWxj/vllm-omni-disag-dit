@@ -17,6 +17,7 @@ import sys
 import threading
 import traceback
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
@@ -29,6 +30,7 @@ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
+from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.system_utils import decorate_logs, set_process_title
@@ -66,10 +68,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     DistributedP2PTransport,
     PipelineEdgeKind,
+    PipelineEndpointCompletion,
     PipelineMessage,
     PipelineStageConnector,
     PipelineTransferGrant,
     PipelineTransferOffer,
+    PipelineTransportProgress,
     TransferTicket,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
@@ -118,6 +122,7 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
+_PIPELINE_CONSUMER_EVENT_FAILED = object()
 
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
@@ -279,6 +284,13 @@ class DiffusionWorker:
         self._pipeline_connectors: dict[PipelineEdgeKind, PipelineStageConnector] = {}
         self._pipeline_send_tickets: dict[tuple[Any, ...], TransferTicket] = {}
         self._pipeline_receive_reservations: dict[tuple[Any, ...], PipelineEdgeKind] = {}
+        self._pipeline_receive_consumers: dict[
+            tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]
+        ] = {}
+        self._pipeline_pending_received: dict[PipelineEdgeKind, deque[PipelineMessage]] = {
+            PipelineEdgeKind.ACTIVATION: deque(),
+            PipelineEdgeKind.FEEDBACK: deque(),
+        }
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -768,6 +780,23 @@ class DiffusionWorker:
             self._pipeline_receive_reservations = {}
         return self._pipeline_receive_reservations
 
+    @property
+    def pipeline_receive_consumers(
+        self,
+    ) -> dict[tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]]:
+        if not hasattr(self, "_pipeline_receive_consumers"):
+            self._pipeline_receive_consumers = {}
+        return self._pipeline_receive_consumers
+
+    @property
+    def pipeline_pending_received(self) -> dict[PipelineEdgeKind, deque[PipelineMessage]]:
+        if not hasattr(self, "_pipeline_pending_received"):
+            self._pipeline_pending_received = {
+                PipelineEdgeKind.ACTIVATION: deque(),
+                PipelineEdgeKind.FEEDBACK: deque(),
+            }
+        return self._pipeline_pending_received
+
     def initialize_pipeline_transports(self, max_slots: int = 1) -> dict[str, Any]:
         """Build this Worker's granted activation and feedback P2P endpoints."""
         if self.pipeline_connectors:
@@ -899,6 +928,139 @@ class DiffusionWorker:
         connector.release_send(ticket)
         self.pipeline_send_tickets.pop(identity)
         return True
+
+    def progress_pipeline_transfers(self) -> PipelineTransportProgress:
+        """Advance bounded send completion and consume ready activation/feedback."""
+        progress = PipelineTransportProgress()
+
+        for identity, ticket in list(self.pipeline_send_tickets.items()):
+            connector = self._require_pipeline_connector(identity[4])
+            if connector.poll_send_completion(ticket):
+                connector.release_send(ticket)
+                self.pipeline_send_tickets.pop(identity)
+                progress.completions.append(PipelineEndpointCompletion(identity=identity, rank=self.rank))
+
+        self._release_completed_pipeline_consumers(progress)
+
+        for edge_kind in (PipelineEdgeKind.FEEDBACK, PipelineEdgeKind.ACTIVATION):
+            connector = self._require_pipeline_connector(edge_kind)
+            for message in connector.poll_received(limit=1):
+                self.pipeline_pending_received[edge_kind].append(message)
+            self._consume_ready_pipeline_message(edge_kind, progress)
+
+        self._release_completed_pipeline_consumers(progress)
+        return progress
+
+    def _consume_ready_pipeline_message(
+        self,
+        edge_kind: PipelineEdgeKind,
+        progress: PipelineTransportProgress,
+    ) -> None:
+        pending = self.pipeline_pending_received[edge_kind]
+        if not pending:
+            return
+        message = pending[0]
+        cancelled_context = self._cancelled_pipeline_message_context(edge_kind, message)
+        if cancelled_context is not None:
+            self._validate_pipeline_message_task_identity(cancelled_context.task, message)
+            pending.popleft()
+            reservation = self._find_pipeline_receive_reservation(edge_kind, message)
+            self.release_pipeline_received(edge_kind, message)
+            progress.completions.append(PipelineEndpointCompletion(identity=reservation, rank=self.rank))
+            return
+        if not self._pipeline_message_is_runnable(edge_kind, message):
+            return
+        reservation = self._find_pipeline_receive_reservation(edge_kind, message)
+        if edge_kind is PipelineEdgeKind.ACTIVATION:
+            stage_progress = self.progress_pipeline(
+                1,
+                intermediate_tensors=IntermediateTensors(message.payload),
+            )
+            if stage_progress is None or not isinstance(stage_progress.output, PipelineTransferOffer):
+                raise RuntimeError("runnable pipeline activation made no local stage progress")
+            progress.offers.append(stage_progress.output)
+        else:
+            latents = message.payload.get("latents") if isinstance(message.payload, dict) else None
+            if not isinstance(latents, torch.Tensor):
+                raise RuntimeError("pipeline feedback message has no latent tensor")
+            self.complete_pipeline_feedback(0, message.batch_id, latents)
+        consumer_event = current_omni_platform.record_device_event()
+        pending.popleft()
+        if consumer_event is None and current_omni_platform.is_available():
+            self.pipeline_receive_consumers[reservation] = (
+                edge_kind,
+                message,
+                _PIPELINE_CONSUMER_EVENT_FAILED,
+            )
+            raise RuntimeError("failed to record pipeline receive consumer completion event")
+        self.pipeline_receive_consumers[reservation] = (edge_kind, message, consumer_event)
+
+    def _cancelled_pipeline_message_context(
+        self,
+        edge_kind: PipelineEdgeKind,
+        message: PipelineMessage,
+    ) -> Any | None:
+        stage_id = 1 if edge_kind is PipelineEdgeKind.ACTIVATION else 0
+        context = self.model_runner.pipeline_batch_contexts.get((stage_id, message.batch_id))
+        if context is not None and context.status is PipelineTaskStatus.CANCELLED:
+            return context
+        return None
+
+    def _pipeline_message_is_runnable(
+        self,
+        edge_kind: PipelineEdgeKind,
+        message: PipelineMessage,
+    ) -> bool:
+        stage_id = 1 if edge_kind is PipelineEdgeKind.ACTIVATION else 0
+        stage = self._require_pipeline_stage(stage_id)
+        if edge_kind is PipelineEdgeKind.FEEDBACK:
+            if stage.active_task is None:
+                return False
+            if stage.active_task.batch_id != message.batch_id:
+                return False
+            self._validate_pipeline_message_task_identity(stage.active_task, message)
+            return True
+        if stage.active_task is not None or not stage.pending_tasks:
+            return False
+        head = stage.pending_tasks[0]
+        if head.batch_id != message.batch_id:
+            return False
+        self._validate_pipeline_message_task_identity(head, message)
+        return message.batch_id in stage.authorized_batches
+
+    @staticmethod
+    def _validate_pipeline_message_task_identity(task: PipelineTask, message: PipelineMessage) -> None:
+        task_identity = (task.batch_id, task.step_index, task.epoch, task.branch)
+        message_identity = (message.batch_id, message.step_index, message.epoch, message.branch)
+        if task_identity != message_identity:
+            raise RuntimeError(
+                f"Stale pipeline message identity {message_identity!r} does not match task {task_identity!r}."
+            )
+
+    def _release_completed_pipeline_consumers(self, progress: PipelineTransportProgress) -> None:
+        for identity, (edge_kind, message, event) in list(self.pipeline_receive_consumers.items()):
+            if event is _PIPELINE_CONSUMER_EVENT_FAILED:
+                continue
+            if event is not None and not event.query():
+                continue
+            self.release_pipeline_received(edge_kind, message)
+            self.pipeline_receive_consumers.pop(identity)
+            progress.completions.append(PipelineEndpointCompletion(identity=identity, rank=self.rank))
+
+    def _find_pipeline_receive_reservation(
+        self,
+        edge_kind: PipelineEdgeKind,
+        message: PipelineMessage,
+    ) -> tuple[Any, ...]:
+        identity = (message.batch_id, message.step_index, message.epoch, message.branch)
+        matching = [
+            key
+            for key, reserved_edge in self.pipeline_receive_reservations.items()
+            if key[:4] == identity and reserved_edge is edge_kind
+        ]
+        if len(matching) != 1:
+            raise RuntimeError("pipeline receive message has no unique reservation")
+        return matching[0]
 
     def poll_pipeline_received(
         self,

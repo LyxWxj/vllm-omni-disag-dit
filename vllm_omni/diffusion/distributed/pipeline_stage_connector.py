@@ -67,6 +67,18 @@ class PipelineTransferGrant:
     completed_ranks: set[int] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class PipelineEndpointCompletion:
+    identity: tuple[Any, ...]
+    rank: int
+
+
+@dataclass
+class PipelineTransportProgress:
+    offers: list[PipelineTransferOffer] = field(default_factory=list)
+    completions: list[PipelineEndpointCompletion] = field(default_factory=list)
+
+
 class PipelineTransferCoordinator:
     """FIFO control-plane grants for matched P2P endpoint readiness."""
 
@@ -386,6 +398,17 @@ class DistributedP2PTransport:
         self._completed_send_ids.add(identity)
         return True
 
+    def is_send_ready(self, ticket: TransferTicket) -> bool:
+        """Return a nonblocking readiness hint for a known active send."""
+        self._ensure_open()
+        identity = self._message_identity(ticket.message)
+        handles = self._send_handles.get(identity)
+        if handles is None:
+            if identity in self._send_handles:
+                return False
+            raise ValueError("unknown distributed P2P send ticket")
+        return all(handle.is_completed() for handle in handles)
+
     def abort(self, ticket: TransferTicket) -> bool:
         # NCCL P2P has no safe per-operation cancellation. Discard therefore
         # drains the send before allowing its source tensor to be released.
@@ -507,6 +530,21 @@ class PipelineStageConnector:
         if self.transport is None or not self.transport.wait(ticket):
             raise RuntimeError("transport wait did not complete transfer")
         ticket.completed = True
+
+    def poll_send_completion(self, ticket: TransferTicket) -> bool:
+        """Verify a ready backend send without blocking on unfinished Work."""
+        self._ensure_open()
+        if ticket not in self._send_tickets:
+            raise ValueError("unknown transfer ticket")
+        if not ticket.started:
+            return False
+        if ticket.completed:
+            return True
+        is_ready = getattr(self.transport, "is_send_ready", None)
+        if not callable(is_ready) or not is_ready(ticket):
+            return False
+        self.wait_send_completion(ticket)
+        return True
 
     def poll_received(self, limit: int = 1) -> list[PipelineMessage]:
         self._ensure_open()
