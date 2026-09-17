@@ -887,6 +887,19 @@ class DiffusionWorker:
             transport.start_granted_transfer(grant)
         return True
 
+    def retire_pipeline_send(self, identity: tuple[Any, ...]) -> bool:
+        """Wait, release connector credit, and drop the retained tensor payload."""
+        ticket = self.pipeline_send_tickets.get(identity)
+        if ticket is None:
+            raise KeyError("unknown pipeline send reservation")
+        if len(identity) < 5 or not isinstance(identity[4], PipelineEdgeKind):
+            raise ValueError("invalid pipeline transfer identity")
+        connector = self._require_pipeline_connector(identity[4])
+        connector.wait_send_completion(ticket)
+        connector.release_send(ticket)
+        self.pipeline_send_tickets.pop(identity)
+        return True
+
     def poll_pipeline_received(
         self,
         edge_kind: PipelineEdgeKind,
@@ -988,6 +1001,11 @@ class DiffusionWorker:
     ) -> PipelineProgress | None:
         """Run at most one authorized FIFO head through the local model stage."""
         assert self.model_runner is not None, "Model runner not initialized"
+        if set(self.pipeline_connectors) != {
+            PipelineEdgeKind.ACTIVATION,
+            PipelineEdgeKind.FEEDBACK,
+        }:
+            raise RuntimeError("pipeline transports must be initialized before queued progression")
         stage = self._require_pipeline_stage(pp_stage_id)
         task = stage.start_next()
         if task is None:
@@ -1001,8 +1019,24 @@ class DiffusionWorker:
             output = result
             if stage.spec.is_last:
                 output = self.model_runner.complete_pipeline_step(context, stage.spec)
+            if self.pipeline_connectors:
+                if stage.spec.is_first:
+                    tensors = getattr(output, "tensors", None)
+                    if not isinstance(tensors, dict):
+                        raise RuntimeError("first pipeline stage did not produce intermediate tensors")
+                    offer = self._make_pipeline_transfer_offer(task, PipelineEdgeKind.ACTIVATION)
+                    self.reserve_pipeline_send(offer, tensors)
+                    output = offer
+                elif stage.spec.is_last:
+                    if not isinstance(output, torch.Tensor):
+                        raise RuntimeError("last pipeline stage did not produce latent feedback")
+                    offer = self._make_pipeline_transfer_offer(task, PipelineEdgeKind.FEEDBACK)
+                    self.reserve_pipeline_send(offer, {"latents": output})
+                    output = offer
+            if stage.spec.is_last:
                 stage.complete_active()
         except BaseException:
+            context.status = PipelineTaskStatus.FAILED
             if stage.active_task is not None and stage.active_task.batch_id == task.batch_id:
                 stage.fail_active()
             raise
@@ -1011,6 +1045,25 @@ class DiffusionWorker:
                 self._pipeline_event(PipelineEventType.STAGE_COMPLETED, task, pp_stage_id)
             ),
             output=output,
+        )
+
+    def _make_pipeline_transfer_offer(
+        self,
+        task: PipelineTask,
+        edge_kind: PipelineEdgeKind,
+    ) -> PipelineTransferOffer:
+        connector = self._require_pipeline_connector(edge_kind)
+        transport = connector.transport
+        if not isinstance(transport, DistributedP2PTransport):
+            raise RuntimeError("queued pipeline stage does not use distributed P2P transport")
+        return PipelineTransferOffer(
+            batch_id=task.batch_id,
+            step_index=task.step_index,
+            epoch=task.epoch,
+            branch=task.branch,
+            edge_kind=edge_kind,
+            src_rank=transport.src_rank,
+            dst_rank=transport.dst_rank,
         )
 
     def complete_pipeline_feedback(
@@ -1065,6 +1118,12 @@ class DiffusionWorker:
             raise ValueError(f"batch {batch_id!r} is already retired")
         if batch_id not in stage.terminal_statuses:
             raise RuntimeError(f"Pipeline batch {batch_id!r} is not terminal on stage {pp_stage_id}.")
+        retained_transfers = [identity for identity in self.pipeline_send_tickets if identity[0] == batch_id]
+        if retained_transfers:
+            raise RuntimeError("Cannot release a pipeline batch with retained transfer ownership.")
+        retained_receives = [identity for identity in self.pipeline_receive_reservations if identity[0] == batch_id]
+        if retained_receives:
+            raise RuntimeError("Cannot release a pipeline batch with retained receive ownership.")
         context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
         stage.retire(batch_id)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id))

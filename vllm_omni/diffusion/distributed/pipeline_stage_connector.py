@@ -495,6 +495,19 @@ class PipelineStageConnector:
             raise RuntimeError("cannot complete a transfer before its grant starts")
         ticket.completed = True
 
+    def wait_send_completion(self, ticket: TransferTicket) -> None:
+        """Verify backend completion while retaining connector ownership."""
+        self._ensure_open()
+        if ticket not in self._send_tickets:
+            raise ValueError("unknown transfer ticket")
+        if not ticket.started:
+            raise RuntimeError("cannot wait for a transfer before its grant starts")
+        if ticket.completed:
+            return
+        if self.transport is None or not self.transport.wait(ticket):
+            raise RuntimeError("transport wait did not complete transfer")
+        ticket.completed = True
+
     def poll_received(self, limit: int = 1) -> list[PipelineMessage]:
         self._ensure_open()
         if type(limit) is not int or limit <= 0:

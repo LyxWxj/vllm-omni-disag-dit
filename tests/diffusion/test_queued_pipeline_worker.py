@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -44,12 +45,14 @@ class _Runner:
         return context
 
     def execute_pipeline_stage(self, context, spec, intermediate_tensors):
-        del spec, intermediate_tensors
+        del intermediate_tensors
         if self.execution_error is not None:
             context.status = PipelineTaskStatus.FAILED
             raise self.execution_error
         context.status = PipelineTaskStatus.ACTIVE
-        return torch.tensor([3.0])
+        if spec.is_last:
+            return torch.tensor([3.0])
+        return SimpleNamespace(tensors={"hidden_states": torch.tensor([3.0])})
 
     def complete_pipeline_step(self, context, spec):
         del spec
@@ -99,8 +102,17 @@ def _spec(stage_id: int) -> PipelineStageSpec:
     )
 
 
-def test_worker_requires_execute_authorization_before_progress() -> None:
+def _initialize_worker_transports(worker, rank: int, mocker):
+    worker.rank = rank
+    group = _PPGroup(rank)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    worker.initialize_pipeline_transports()
+    return group
+
+
+def test_worker_requires_execute_authorization_before_progress(mocker) -> None:
     worker = _worker()
+    _initialize_worker_transports(worker, 0, mocker)
     task = _task()
 
     accepted = worker.enqueue_pipeline_batch(task, _spec(0))
@@ -113,7 +125,24 @@ def test_worker_requires_execute_authorization_before_progress() -> None:
     progress = worker.progress_pipeline(0)
     assert progress is not None
     assert progress.event.event_type is PipelineEventType.STAGE_COMPLETED
-    torch.testing.assert_close(progress.output, torch.tensor([3.0]))
+    assert isinstance(progress.output, PipelineTransferOffer)
+
+
+def test_worker_rejects_progress_before_transport_initialization_without_advancing() -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.authorize_pipeline_batch(0, task.batch_id)
+    stage = worker.pipeline_stages[0]
+    context = worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)]
+
+    with pytest.raises(RuntimeError, match="transports must be initialized"):
+        worker.progress_pipeline(0)
+
+    assert stage.active_task is None
+    assert list(stage.pending_tasks) == [task]
+    assert task.batch_id in stage.authorized_batches
+    assert context.status is PipelineTaskStatus.PENDING
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -150,12 +179,16 @@ def test_worker_all_rank_event_poll_clears_every_rank(mocker) -> None:
     assert worker.poll_pipeline_events() == []
 
 
-def test_first_stage_emits_step_completion_only_after_feedback() -> None:
+def test_first_stage_emits_step_completion_only_after_feedback(mocker) -> None:
     worker = _worker()
+    _initialize_worker_transports(worker, 0, mocker)
     task = _task()
     worker.enqueue_pipeline_batch(task, _spec(0))
     worker.authorize_pipeline_batch(0, task.batch_id)
-    worker.progress_pipeline(0)
+    progress = worker.progress_pipeline(0)
+    assert progress is not None
+    worker.start_pipeline_transfer(PipelineTransferGrant(progress.output))
+    worker.retire_pipeline_send(progress.output.identity)
 
     event = worker.complete_pipeline_feedback(0, task.batch_id, torch.tensor([11.0]))
 
@@ -166,8 +199,9 @@ def test_first_stage_emits_step_completion_only_after_feedback() -> None:
     assert worker.model_runner.pipeline_batch_contexts == {}
 
 
-def test_last_stage_completes_numerical_step_but_not_global_step() -> None:
+def test_last_stage_completes_numerical_step_but_not_global_step(mocker) -> None:
     worker = _worker()
+    _initialize_worker_transports(worker, 1, mocker)
     task = _task()
     worker.enqueue_pipeline_batch(task, _spec(1))
     worker.authorize_pipeline_batch(1, task.batch_id)
@@ -176,13 +210,16 @@ def test_last_stage_completes_numerical_step_but_not_global_step() -> None:
 
     assert progress is not None
     assert progress.event.event_type is PipelineEventType.STAGE_COMPLETED
-    torch.testing.assert_close(progress.output, torch.tensor([7.0]))
+    assert isinstance(progress.output, PipelineTransferOffer)
     assert worker.pipeline_stages[1].active_task is None
+    worker.start_pipeline_transfer(PipelineTransferGrant(progress.output))
+    worker.retire_pipeline_send(progress.output.identity)
     assert worker.release_pipeline_batch(1, task.batch_id).event_type is PipelineEventType.RELEASED
 
 
-def test_worker_preserves_fifo_when_only_later_batch_is_authorized() -> None:
+def test_worker_preserves_fifo_when_only_later_batch_is_authorized(mocker) -> None:
     worker = _worker()
+    _initialize_worker_transports(worker, 0, mocker)
     first, second = _task(), _task("batch-b")
     worker.enqueue_pipeline_batch(first, _spec(0))
     worker.enqueue_pipeline_batch(second, _spec(0))
@@ -275,8 +312,9 @@ def test_prepare_failure_preserves_existing_stage_tombstones() -> None:
     assert not stage.pending_tasks
 
 
-def test_worker_execution_failure_becomes_releasable_terminal_state() -> None:
+def test_worker_execution_failure_becomes_releasable_terminal_state(mocker) -> None:
     worker = _worker()
+    _initialize_worker_transports(worker, 0, mocker)
     task = _task()
     worker.enqueue_pipeline_batch(task, _spec(0))
     worker.authorize_pipeline_batch(0, task.batch_id)
@@ -298,14 +336,17 @@ def test_two_stage_cancellation_drains_feedback_without_step_completion() -> Non
     first_worker.authorize_pipeline_batch(0, task.batch_id)
     last_worker.authorize_pipeline_batch(1, task.batch_id)
 
-    activation = first_worker.progress_pipeline(0)
-    assert activation is not None
-    feedback = last_worker.progress_pipeline(1, activation.output)
-    assert feedback is not None
+    first_context = first_worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)]
+    last_context = last_worker.model_runner.pipeline_batch_contexts[(1, task.batch_id)]
+    assert first_worker.pipeline_stages[0].start_next() is task
+    first_context.status = PipelineTaskStatus.ACTIVE
+    assert last_worker.pipeline_stages[1].start_next() is task
+    last_context.status = PipelineTaskStatus.COMPLETED
+    last_worker.pipeline_stages[1].complete_active()
 
     first_cancelled = first_worker.cancel_pipeline_batch(0, task.batch_id)
     last_cancelled = last_worker.cancel_pipeline_batch(1, task.batch_id)
-    drained = first_worker.complete_pipeline_feedback(0, task.batch_id, feedback.output)
+    drained = first_worker.complete_pipeline_feedback(0, task.batch_id, torch.tensor([7.0]))
 
     assert first_cancelled.event_type is PipelineEventType.CANCELLED
     assert last_cancelled.event_type is PipelineEventType.CANCELLED
@@ -326,6 +367,7 @@ class _PPGroup:
         self.rank_in_group = rank
         self.send_calls = []
         self.recv_calls = []
+        self.receive_payload = {"hidden_states": torch.tensor([1.0])}
 
     def isend_tensor_dict(self, payload, dst):
         self.send_calls.append((payload, dst))
@@ -333,7 +375,7 @@ class _PPGroup:
 
     def irecv_tensor_dict(self, src):
         self.recv_calls.append(src)
-        return {"hidden_states": torch.tensor([1.0])}, [], []
+        return self.receive_payload, [], []
 
 
 def test_worker_starts_only_matching_granted_p2p_endpoint(mocker) -> None:
@@ -369,6 +411,98 @@ def test_worker_starts_only_matching_granted_p2p_endpoint(mocker) -> None:
     assert receiver.start_pipeline_transfer(grant)
     assert sender_group.send_calls == [(payload, 1)]
     assert receiver_group.recv_calls == [0]
+
+
+def test_first_stage_progress_reserves_activation_without_returning_tensors(mocker) -> None:
+    worker = _worker()
+    worker.rank = 0
+    group = _PPGroup(0)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    worker.initialize_pipeline_transports()
+    worker.model_runner.execute_pipeline_stage = Mock(
+        return_value=SimpleNamespace(tensors={"hidden_states": torch.tensor([3.0])})
+    )
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.authorize_pipeline_batch(0, task.batch_id)
+
+    progress = worker.progress_pipeline(0)
+
+    assert progress is not None
+    assert isinstance(progress.output, PipelineTransferOffer)
+    assert progress.output.edge_kind is PipelineEdgeKind.ACTIVATION
+    ticket = worker.pipeline_send_tickets[progress.output.identity]
+    assert ticket.message.payload.keys() == {"hidden_states"}
+    assert not ticket.started
+    assert group.send_calls == []
+
+
+def test_last_stage_progress_reserves_feedback_without_returning_latents(mocker) -> None:
+    worker = _worker()
+    worker.rank = 1
+    group = _PPGroup(1)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    worker.initialize_pipeline_transports()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(1))
+    worker.authorize_pipeline_batch(1, task.batch_id)
+
+    progress = worker.progress_pipeline(1, intermediate_tensors=object())
+
+    assert progress is not None
+    assert isinstance(progress.output, PipelineTransferOffer)
+    assert progress.output.edge_kind is PipelineEdgeKind.FEEDBACK
+    ticket = worker.pipeline_send_tickets[progress.output.identity]
+    torch.testing.assert_close(ticket.message.payload["latents"], torch.tensor([7.0]))
+    assert not ticket.started
+    assert group.send_calls == []
+
+    with pytest.raises(RuntimeError, match="retained transfer ownership"):
+        worker.release_pipeline_batch(1, task.batch_id)
+    assert (1, task.batch_id) in worker.model_runner.pipeline_batch_contexts
+
+    worker.start_pipeline_transfer(PipelineTransferGrant(progress.output))
+    assert worker.retire_pipeline_send(progress.output.identity)
+    assert progress.output.identity not in worker.pipeline_send_tickets
+    assert worker.release_pipeline_batch(1, task.batch_id).event_type is PipelineEventType.RELEASED
+
+
+def test_first_stage_release_waits_for_feedback_receive_lease(mocker) -> None:
+    worker = _worker()
+    worker.rank = 0
+    group = _PPGroup(0)
+    feedback = torch.tensor([5.0])
+    group.receive_payload = {"latents": feedback}
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    worker.initialize_pipeline_transports()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.authorize_pipeline_batch(0, task.batch_id)
+    stage = worker.pipeline_stages[0]
+    assert stage.start_next() is task
+    context = worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)]
+    context.status = PipelineTaskStatus.ACTIVE
+    offer = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.FEEDBACK,
+        src_rank=1,
+        dst_rank=0,
+    )
+    assert worker.accept_pipeline_transfer_offer(offer)
+    worker.start_pipeline_transfer(PipelineTransferGrant(offer))
+    messages = worker.poll_pipeline_received(PipelineEdgeKind.FEEDBACK)
+    assert len(messages) == 1
+    worker.complete_pipeline_feedback(0, task.batch_id, messages[0].payload["latents"])
+
+    with pytest.raises(RuntimeError, match="retained receive ownership"):
+        worker.release_pipeline_batch(0, task.batch_id)
+    assert (0, task.batch_id) in worker.model_runner.pipeline_batch_contexts
+
+    worker.release_pipeline_received(PipelineEdgeKind.FEEDBACK, messages[0])
+    assert worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
 
 
 def test_worker_readiness_rejects_missing_sender_reservation_before_receive(mocker) -> None:
