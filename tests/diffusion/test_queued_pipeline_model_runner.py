@@ -20,11 +20,30 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 class _QueuedPipeline:
+    supports_step_execution = True
     supports_pipeline_stage_execution = True
 
     def __init__(self) -> None:
+        self.prepare_calls = 0
+        self.denoise_calls = 0
         self.scheduler_calls = 0
         self.forward_context_seen = None
+
+    def prepare_encode(self, state) -> None:
+        del state
+        self.prepare_calls += 1
+
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
+        self.denoise_calls += 1
+        raise AssertionError("queued preparation must not denoise")
+
+    def step_scheduler(self, state, noise_pred) -> None:
+        del state, noise_pred
+
+    def post_decode(self, state, **kwargs):
+        del state, kwargs
+        return None
 
     def validate_pipeline_stage_execution(self, pp_stage_spec: PipelineStageSpec) -> None:
         if pp_stage_spec.world_size != 2:
@@ -58,6 +77,7 @@ def _state(request_id: str = "req-a") -> StepRequestState:
 def _runner() -> DiffusionModelRunner:
     runner = object.__new__(DiffusionModelRunner)
     runner.pipeline = _QueuedPipeline()
+    runner.device = torch.device("cpu")
     runner.vllm_config = None
     runner.od_config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=False))
     runner.diffusion_kv_backend = None
@@ -69,6 +89,199 @@ def _runner() -> DiffusionModelRunner:
 
 def _task(batch_id: str = "batch-a") -> PipelineTask:
     return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=1)
+
+
+def test_prepare_pipeline_requests_retains_local_state_without_denoising(mocker) -> None:
+    runner = _runner()
+    runner.od_config.cache_backend = None
+    runner.state_cache = {}
+    runner.input_batch = None
+    state = _state()
+    new_request = SimpleNamespace(
+        request_id="req-a",
+        req=SimpleNamespace(request_id="req-a", use_step_execution=True),
+        diffusion_kv_metadata=None,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[new_request],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        finished_req_ids=set(),
+    )
+
+    def update_states(_scheduler_output):
+        runner.state_cache[state.request_id] = state
+        return [state], [state.request_id]
+
+    mocker.patch.object(runner, "_update_states", side_effect=update_states)
+
+    request_ids = runner.prepare_pipeline_requests(scheduler_output)
+
+    assert request_ids == ("req-a",)
+    assert runner.state_cache == {"req-a": state}
+    assert runner.pipeline.prepare_calls == 1
+    assert runner.pipeline.denoise_calls == 0
+    assert runner.pipeline.scheduler_calls == 0
+
+
+def test_prepare_pipeline_requests_rolls_back_local_state_failure(mocker) -> None:
+    runner = _runner()
+    runner.od_config.cache_backend = None
+    runner.state_cache = {}
+    new_request = SimpleNamespace(
+        request_id="req-a",
+        req=SimpleNamespace(request_id="req-a", use_step_execution=True),
+        diffusion_kv_metadata=None,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[new_request],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        finished_req_ids=set(),
+    )
+
+    def fail_update(_scheduler_output):
+        runner.state_cache["req-a"] = _state()
+        raise RuntimeError("local state allocation failed")
+
+    mocker.patch.object(runner, "_update_states", side_effect=fail_update)
+    failure_agreement = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        side_effect=lambda failed: failed,
+    )
+
+    with pytest.raises(RuntimeError, match="local state allocation failed"):
+        runner.prepare_pipeline_requests(scheduler_output)
+
+    failure_agreement.assert_called_once_with(True)
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
+    assert runner.pipeline.prepare_calls == 0
+    assert runner.pipeline.denoise_calls == 0
+
+
+def test_prepare_pipeline_requests_agrees_and_rolls_back_metadata_install_failure(mocker) -> None:
+    runner = _runner()
+    runner.od_config.cache_backend = None
+    runner.state_cache = {}
+    metadata = SimpleNamespace(request_id="req-a")
+    new_request = SimpleNamespace(
+        request_id="req-a",
+        req=SimpleNamespace(request_id="req-a", use_step_execution=True),
+        diffusion_kv_metadata=metadata,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[new_request],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        finished_req_ids=set(),
+    )
+    mocker.patch.object(runner, "_validate_diffusion_kv_metadata")
+    install = mocker.patch.object(
+        runner,
+        "install_diffusion_kv_metadata",
+        side_effect=RuntimeError("metadata install failed"),
+    )
+    remove = mocker.patch.object(runner, "remove_diffusion_kv_requests", return_value=0)
+    update_states = mocker.patch.object(runner, "_update_states")
+    failure_agreement = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        side_effect=lambda failed: failed,
+    )
+
+    with pytest.raises(RuntimeError, match="metadata install failed"):
+        runner.prepare_pipeline_requests(scheduler_output)
+
+    install.assert_called_once_with(metadata)
+    failure_agreement.assert_called_once_with(True)
+    update_states.assert_not_called()
+    remove.assert_called_once_with(["req-a"])
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
+    assert runner.pipeline.prepare_calls == 0
+    assert runner.pipeline.denoise_calls == 0
+
+
+def test_prepare_pipeline_requests_agrees_before_encode_on_generator_failure(mocker) -> None:
+    runner = _runner()
+    runner.od_config.cache_backend = None
+    runner.state_cache = {}
+    runner.input_batch = None
+    state = _state()
+    new_request = SimpleNamespace(
+        request_id="req-a",
+        req=SimpleNamespace(request_id="req-a", use_step_execution=True),
+        diffusion_kv_metadata=None,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[new_request],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        finished_req_ids=set(),
+    )
+
+    def update_states(_scheduler_output):
+        runner.state_cache[state.request_id] = state
+        return [state], [state.request_id]
+
+    mocker.patch.object(runner, "_update_states", side_effect=update_states)
+    mocker.patch.object(
+        runner,
+        "_initialize_generator",
+        side_effect=RuntimeError("generator setup failed"),
+    )
+    failure_agreement = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        side_effect=lambda failed: failed,
+    )
+
+    with pytest.raises(RuntimeError, match="generator setup failed"):
+        runner.prepare_pipeline_requests(scheduler_output)
+
+    assert [item.args for item in failure_agreement.call_args_list] == [(False,), (True,)]
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
+    assert runner.pipeline.prepare_calls == 0
+    assert runner.pipeline.denoise_calls == 0
+
+
+def test_prepare_pipeline_requests_rolls_back_successful_peer_on_late_remote_failure(mocker) -> None:
+    runner = _runner()
+    runner.od_config.cache_backend = None
+    runner.state_cache = {}
+    runner.input_batch = None
+    state = _state()
+    metadata = SimpleNamespace(request_id="req-a")
+    new_request = SimpleNamespace(
+        request_id="req-a",
+        req=SimpleNamespace(request_id="req-a", use_step_execution=True),
+        diffusion_kv_metadata=metadata,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[new_request],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        finished_req_ids=set(),
+    )
+
+    def update_states(_scheduler_output):
+        runner.state_cache[state.request_id] = state
+        return [state], [state.request_id]
+
+    mocker.patch.object(runner, "_update_states", side_effect=update_states)
+    mocker.patch.object(runner, "_validate_diffusion_kv_metadata")
+    install = mocker.patch.object(runner, "install_diffusion_kv_metadata", return_value=True)
+    remove = mocker.patch.object(runner, "remove_diffusion_kv_requests", return_value=1)
+    failure_agreement = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        side_effect=[False, False, False, True],
+    )
+
+    with pytest.raises(RuntimeError, match="batch construction failed on another rank"):
+        runner.prepare_pipeline_requests(scheduler_output)
+
+    assert failure_agreement.call_count == 4
+    install.assert_called_once_with(metadata)
+    remove.assert_called_once_with(["req-a"])
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
+    assert runner.pipeline.prepare_calls == 1
+    assert runner.pipeline.denoise_calls == 0
 
 
 def test_prepare_pipeline_batch_owns_independent_context() -> None:

@@ -46,6 +46,23 @@ def normalize_pipeline_transport_progress(
     return result
 
 
+def normalize_pipeline_preparation_reports(
+    result: Any,
+    expected_ranks: frozenset[int],
+    expected_request_ids: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers returned invalid pipeline preparation reports")
+    reporting_ranks = [item.get("rank") for item in result]
+    if len(reporting_ranks) != len(expected_ranks) or set(reporting_ranks) != expected_ranks:
+        raise RuntimeError("pipeline preparation reports do not cover every configured endpoint")
+    if any(tuple(item.get("request_ids", ())) != expected_request_ids for item in result):
+        raise RuntimeError("pipeline preparation reports disagree on request identity")
+    return result
+
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -166,6 +183,10 @@ class DiffusionExecutor(ABC):
     def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
         """Submit one queued batch to every Worker without authorizing compute."""
         raise NotImplementedError("queued pipeline submission is not wired for this executor")
+
+    def prepare_pipeline_requests(self, scheduler_output: Any) -> Any:
+        """Prepare rank-local request state at a coordinated drained boundary."""
+        raise NotImplementedError("queued pipeline preparation is not wired for this executor")
 
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
         """Authorize execution after all Workers have accepted a batch."""

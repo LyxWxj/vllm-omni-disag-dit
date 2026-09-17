@@ -1146,6 +1146,19 @@ class DiffusionWorker:
             self._pipeline_event(PipelineEventType.ACCEPTED, task, pp_stage_spec.pp_stage_id)
         )
 
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> dict[str, Any]:
+        """Prepare this Worker's request-local state without running a stage."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        request_ids = self.model_runner.prepare_pipeline_requests(scheduler_output)
+        return {"rank": self.rank, "request_ids": request_ids}
+
+    def prepare_pipeline_requests_all_ranks(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
+        """Prepare every rank at the same drained collective boundary."""
+        return _run_and_gather_rank_values(
+            "queued pipeline request preparation",
+            lambda: self.prepare_pipeline_requests(scheduler_output),
+        )
+
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> PipelineEvent:
         """Apply the all-Worker acceptance gate's EXECUTE authorization."""
         if isinstance(pp_stage_id, dict):

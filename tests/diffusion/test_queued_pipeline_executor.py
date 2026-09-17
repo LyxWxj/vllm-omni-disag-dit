@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -71,6 +73,41 @@ def test_authorization_passes_rank_local_stage_ids(executor) -> None:
         "authorize_pipeline_batch",
         args=({0: 0, 1: 1}, "batch-a"),
     )
+
+
+def test_prepare_pipeline_requests_requires_matching_all_rank_reports(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id="req-a")],
+    )
+    reports = [
+        {"rank": 0, "request_ids": ("req-a",)},
+        {"rank": 1, "request_ids": ("req-a",)},
+    ]
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.return_value = [reports]
+
+    assert executor.prepare_pipeline_requests(scheduler_output) == reports
+    executor.collective_rpc.assert_called_once_with(
+        "prepare_pipeline_requests_all_ranks",
+        args=(scheduler_output,),
+    )
+
+
+def test_prepare_pipeline_requests_rejects_missing_rank(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id="req-a")],
+    )
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.return_value = [[{"rank": 0, "request_ids": ("req-a",)}]]
+
+    with pytest.raises(RuntimeError, match="do not cover every configured endpoint"):
+        executor.prepare_pipeline_requests(scheduler_output)
+
+    assert executor._is_failed
 
 
 def test_event_poll_uses_all_rank_gather_and_flattens_reply(executor) -> None:

@@ -32,6 +32,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
 from vllm_omni.diffusion.executor.abstract import (
     PIPELINE_GRANT_START_TIMEOUT_S,
     DiffusionExecutor,
+    normalize_pipeline_preparation_reports,
     normalize_pipeline_transport_progress,
     validate_pipeline_topology_reports,
 )
@@ -771,6 +772,25 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
         return self._queued_control_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        expected_request_ids = tuple(request.request_id for request in scheduler_output.scheduled_new_reqs)
+        if len(expected_request_ids) != 1:
+            raise ValueError("M2 queued preparation requires exactly one new request.")
+        try:
+            result = self._queued_control_rpc("prepare_pipeline_requests_all_ranks", args=(scheduler_output,))
+            return normalize_pipeline_preparation_reports(
+                result,
+                coordinator.endpoint_ranks,
+                expected_request_ids,
+            )
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline request preparation", exc)
+            raise
 
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
         return self._queued_control_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
