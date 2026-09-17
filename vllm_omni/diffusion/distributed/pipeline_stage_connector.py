@@ -209,12 +209,17 @@ class PipelineTransferCoordinator:
 @dataclass
 class TransferTicket:
     message: PipelineMessage
+    started: bool = False
     completed: bool = False
     released: bool = False
 
 
 class PipelineTransport(Protocol):
-    def send(self, message: PipelineMessage) -> Any: ...
+    def start_granted_transfer(
+        self,
+        grant: PipelineTransferGrant,
+        message: PipelineMessage | None = None,
+    ) -> None: ...
 
     def poll(self, limit: int | None = None) -> list[PipelineMessage]: ...
 
@@ -223,6 +228,189 @@ class PipelineTransport(Protocol):
     def abort(self, ticket: TransferTicket) -> bool: ...
 
     def close(self) -> None: ...
+
+
+@dataclass
+class _PendingReceive:
+    message: PipelineMessage
+    identity: tuple[str, int, int, str]
+    handles: list[Any]
+    postprocess: list[Any]
+    handles_verified: bool = False
+    postprocess_index: int = 0
+    failure: BaseException | None = None
+
+
+class DistributedP2PTransport:
+    """Granted tensor-dictionary P2P over the existing PP group primitives."""
+
+    def __init__(
+        self,
+        *,
+        group: Any,
+        local_rank: int,
+        edge_kind: PipelineEdgeKind,
+        src_rank: int,
+        dst_rank: int,
+    ) -> None:
+        if local_rank not in {src_rank, dst_rank}:
+            raise ValueError("local rank must be a transport endpoint")
+        group_ranks = tuple(getattr(group, "ranks", ()))
+        if src_rank not in group_ranks or dst_rank not in group_ranks:
+            raise ValueError("transport endpoints must belong to the supplied PP group")
+        group_rank = getattr(group, "rank", None)
+        rank_in_group = getattr(group, "rank_in_group", None)
+        if group_rank is None and rank_in_group is not None:
+            group_rank = group_ranks[rank_in_group]
+        if group_rank is None:
+            raise ValueError("supplied PP group does not expose its local physical rank")
+        if group_rank != local_rank:
+            raise ValueError("local rank does not match the supplied PP group rank")
+        if rank_in_group is not None and group_ranks[rank_in_group] != group_rank:
+            raise ValueError("supplied PP group rank metadata is inconsistent")
+        self.group = group
+        self.local_rank = local_rank
+        self.edge_kind = edge_kind
+        self.src_rank = src_rank
+        self.dst_rank = dst_rank
+        self._src_group_rank = group_ranks.index(src_rank)
+        self._dst_group_rank = group_ranks.index(dst_rank)
+        self._send_handles: dict[tuple[str, int, int, str], list[Any] | None] = {}
+        self._completed_send_ids: set[tuple[str, int, int, str]] = set()
+        self._pending_receives: deque[_PendingReceive] = deque()
+        self._ready_receives: deque[PipelineMessage] = deque()
+        self._active_receive_ids: set[tuple[str, int, int, str]] = set()
+        self._completed_receive_ids: set[tuple[str, int, int, str]] = set()
+        self._closed = False
+
+    def start_granted_transfer(
+        self,
+        grant: PipelineTransferGrant,
+        message: PipelineMessage | None = None,
+    ) -> None:
+        self._ensure_open()
+        offer = grant.offer
+        if offer.edge_kind is not self.edge_kind or offer.src_rank != self.src_rank or offer.dst_rank != self.dst_rank:
+            raise ValueError("transfer grant does not match this P2P transport")
+        if self.local_rank == self.src_rank:
+            if message is None:
+                raise ValueError("sender requires a pipeline message payload")
+            self._validate_message_matches_offer(message, offer)
+            self._start_send(message)
+            return
+        if message is not None:
+            raise ValueError("receiver must not provide a sender payload")
+        identity = (offer.batch_id, offer.step_index, offer.epoch, offer.branch)
+        if identity in self._active_receive_ids or identity in self._completed_receive_ids:
+            raise ValueError("duplicate distributed P2P receive grant")
+        # Register before entering the blocking metadata receive. If the
+        # backend raises after partially posting work, keep the identity active
+        # so a replay cannot post an unmatched second receive.
+        self._active_receive_ids.add(identity)
+        tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(src=self._src_group_rank)
+        self._pending_receives.append(
+            _PendingReceive(
+                message=PipelineMessage(
+                    batch_id=offer.batch_id,
+                    step_index=offer.step_index,
+                    epoch=offer.epoch,
+                    branch=offer.branch,
+                    payload=tensor_dict,
+                ),
+                identity=identity,
+                handles=list(handles),
+                postprocess=list(postprocess),
+            )
+        )
+
+    def _start_send(self, message: PipelineMessage) -> None:
+        self._ensure_open()
+        if self.local_rank != self.src_rank:
+            raise RuntimeError("only the source endpoint can send")
+        if not isinstance(message.payload, dict):
+            raise TypeError("distributed P2P payload must be a tensor dictionary")
+        identity = self._message_identity(message)
+        if identity in self._send_handles or identity in self._completed_send_ids:
+            raise ValueError("duplicate distributed P2P send identity")
+        # Register before entering the blocking metadata send. Ambiguous
+        # backend failure retains ownership and prevents replay.
+        self._send_handles[identity] = None
+        self._send_handles[identity] = list(self.group.isend_tensor_dict(message.payload, dst=self._dst_group_rank))
+
+    def poll(self, limit: int | None = None) -> list[PipelineMessage]:
+        self._ensure_open()
+        if limit is None or type(limit) is not int or limit <= 0:
+            raise ValueError("distributed P2P polling requires a positive limit")
+        if self._ready_receives:
+            return [self._ready_receives.popleft() for _ in range(min(limit, len(self._ready_receives)))]
+        while self._pending_receives and len(self._ready_receives) < limit:
+            pending = self._pending_receives[0]
+            if pending.failure is not None:
+                raise pending.failure
+            if not all(handle.is_completed() for handle in pending.handles):
+                break
+            try:
+                if not pending.handles_verified:
+                    for handle in pending.handles:
+                        if handle.wait() is False:
+                            raise RuntimeError("distributed P2P receive Work reported unsuccessful completion")
+                    pending.handles_verified = True
+                while pending.postprocess_index < len(pending.postprocess):
+                    pending.postprocess[pending.postprocess_index]()
+                    pending.postprocess_index += 1
+            except BaseException as exc:
+                pending.failure = exc
+                raise
+            self._pending_receives.popleft()
+            self._active_receive_ids.remove(pending.identity)
+            self._completed_receive_ids.add(pending.identity)
+            self._ready_receives.append(pending.message)
+        return [self._ready_receives.popleft() for _ in range(min(limit, len(self._ready_receives)))]
+
+    def wait(self, ticket: TransferTicket) -> bool:
+        self._ensure_open()
+        handles = self._send_handles.get(self._message_identity(ticket.message))
+        if handles is None:
+            if self._message_identity(ticket.message) in self._send_handles:
+                raise RuntimeError("distributed P2P send launch outcome is ambiguous")
+            raise ValueError("unknown distributed P2P send ticket")
+        for handle in handles:
+            if handle.wait() is False:
+                raise RuntimeError("distributed P2P send Work reported unsuccessful completion")
+        identity = self._message_identity(ticket.message)
+        self._send_handles.pop(identity)
+        self._completed_send_ids.add(identity)
+        return True
+
+    def abort(self, ticket: TransferTicket) -> bool:
+        # NCCL P2P has no safe per-operation cancellation. Discard therefore
+        # drains the send before allowing its source tensor to be released.
+        return self.wait(ticket)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._send_handles or self._pending_receives or self._ready_receives or self._active_receive_ids:
+            raise RuntimeError("cannot close distributed P2P transport with outstanding operations")
+        self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("distributed P2P transport is closed")
+
+    @staticmethod
+    def _message_identity(message: PipelineMessage) -> tuple[str, int, int, str]:
+        return (message.batch_id, message.step_index, message.epoch, message.branch)
+
+    @staticmethod
+    def _validate_message_matches_offer(message: PipelineMessage, offer: PipelineTransferOffer) -> None:
+        if DistributedP2PTransport._message_identity(message) != (
+            offer.batch_id,
+            offer.step_index,
+            offer.epoch,
+            offer.branch,
+        ):
+            raise ValueError("pipeline message identity does not match its transfer grant")
 
 
 class PipelineStageConnector:
@@ -268,20 +456,39 @@ class PipelineStageConnector:
         self._validate_message(message)
         if self.send_in_use >= self.max_slots:
             raise RuntimeError(f"pipeline edge {self.edge!r} has no send credit")
-        ticket = TransferTicket(message=message)
+        ticket = TransferTicket(message=message, started=self.transport is None)
         self._send_tickets.append(ticket)
-        try:
-            if self.transport is not None:
-                self.transport.send(message)
-        except BaseException:
-            self._send_tickets.remove(ticket)
-            raise
         return ticket
+
+    def start_granted_send(self, ticket: TransferTicket, grant: PipelineTransferGrant) -> None:
+        """Launch one reserved send only after its coordinator grant arrives."""
+        self._ensure_open()
+        if ticket not in self._send_tickets:
+            raise ValueError("unknown transfer ticket")
+        if ticket.started:
+            raise ValueError("transfer ticket has already started")
+        if self.transport is None:
+            raise RuntimeError("connector has no transport for granted send")
+        offer = grant.offer
+        if self._message_identity(ticket.message) != (
+            offer.batch_id,
+            offer.step_index,
+            offer.epoch,
+            offer.branch,
+        ):
+            raise ValueError("transfer grant does not match the reserved send")
+        # Once control enters the backend, failure is ambiguous: metadata or
+        # device work may already have started. Keep transport ownership until
+        # the execution group is drained or torn down.
+        ticket.started = True
+        self.transport.start_granted_transfer(grant, ticket.message)
 
     def mark_send_complete(self, ticket: TransferTicket) -> None:
         self._ensure_open()
         if ticket not in self._send_tickets:
             raise ValueError("unknown transfer ticket")
+        if not ticket.started:
+            raise RuntimeError("cannot complete a transfer before its grant starts")
         ticket.completed = True
 
     def poll_received(self, limit: int = 1) -> list[PipelineMessage]:
@@ -327,7 +534,7 @@ class PipelineStageConnector:
         self._ensure_open()
         if ticket not in self._send_tickets:
             raise ValueError("unknown transfer ticket")
-        if not ticket.completed:
+        if ticket.started and not ticket.completed:
             raise RuntimeError("cannot release a transfer before transport completion")
         self._send_tickets.remove(ticket)
         ticket.released = True
@@ -342,11 +549,11 @@ class PipelineStageConnector:
         if leased:
             raise RuntimeError("cannot retire a batch before receive consumers complete")
         if matching and not discard_results:
-            unreleased = [ticket for ticket in matching if not ticket.completed]
+            unreleased = [ticket for ticket in matching if ticket.started and not ticket.completed]
             if unreleased:
                 raise RuntimeError("cannot retire a batch before transport completion")
         for ticket in matching:
-            if not ticket.completed:
+            if ticket.started and not ticket.completed:
                 if not discard_results:
                     raise RuntimeError("cannot retire a batch before transport completion")
                 self._wait_or_abort(ticket, discard=True)
@@ -376,7 +583,7 @@ class PipelineStageConnector:
             raise RuntimeError("cannot close a connector with outstanding transfers")
         if drain:
             for ticket in self._send_tickets:
-                if not ticket.completed:
+                if ticket.started and not ticket.completed:
                     self._wait_or_abort(ticket, discard=False)
         transport_close = getattr(self.transport, "close", None)
         if self.transport is not None and not callable(transport_close):

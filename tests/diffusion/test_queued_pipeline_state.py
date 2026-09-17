@@ -3,7 +3,13 @@
 
 import pytest
 
-from vllm_omni.diffusion.distributed.pipeline_stage_connector import PipelineMessage, PipelineStageConnector
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
+    PipelineEdgeKind,
+    PipelineMessage,
+    PipelineStageConnector,
+    PipelineTransferGrant,
+    PipelineTransferOffer,
+)
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineStageSpec,
     PipelineStageState,
@@ -16,6 +22,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _task(batch_id: str = "batch-a") -> PipelineTask:
     return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=1)
+
+
+def _grant() -> PipelineTransferGrant:
+    return PipelineTransferGrant(
+        PipelineTransferOffer(
+            batch_id="batch-a",
+            step_index=0,
+            epoch=1,
+            branch="conditional",
+            edge_kind=PipelineEdgeKind.ACTIVATION,
+            src_rank=0,
+            dst_rank=1,
+        )
+    )
 
 
 def test_stage_state_preserves_fifo_and_one_active_task() -> None:
@@ -104,10 +124,10 @@ def test_connector_enforces_credit_and_completion_before_release() -> None:
     assert connector.send_in_use == 0
 
 
-def test_connector_transport_failure_rolls_back_send_credit() -> None:
+def test_connector_granted_start_failure_preserves_started_send_ownership() -> None:
     class FailingTransport:
-        def send(self, message):
-            del message
+        def start_granted_transfer(self, grant, message):
+            del grant, message
             raise RuntimeError("send failed")
 
         def poll(self):
@@ -116,9 +136,13 @@ def test_connector_transport_failure_rolls_back_send_credit() -> None:
     connector = PipelineStageConnector(edge="0->1", transport=FailingTransport())
     message = PipelineMessage(batch_id="batch-a", step_index=0, epoch=1, branch="conditional", payload="x")
 
+    ticket = connector.enqueue_send(message)
+    assert connector.send_in_use == 1
+    assert not ticket.started
     with pytest.raises(RuntimeError, match="send failed"):
-        connector.enqueue_send(message)
-    assert connector.send_in_use == 0
+        connector.start_granted_send(ticket, _grant())
+    assert connector.send_in_use == 1
+    assert ticket.started
 
 
 def test_connector_bounds_receive_polling_and_retirement() -> None:
@@ -305,6 +329,7 @@ def test_connector_discard_rejects_incomplete_send_without_transport_abort() -> 
     connector = PipelineStageConnector(edge="0->1")
     message = PipelineMessage(batch_id="batch-a", step_index=0, epoch=1, branch="conditional", payload="x")
     ticket = connector.enqueue_send(message)
+    ticket.started = True
 
     with pytest.raises(RuntimeError, match="does not support abort"):
         connector.retire_batch("batch-a", discard_results=True)
@@ -330,6 +355,7 @@ def test_connector_discard_waits_for_transport_abort_before_release() -> None:
     connector = PipelineStageConnector(edge="0->1", transport=transport)
     message = PipelineMessage(batch_id="batch-a", step_index=0, epoch=1, branch="conditional", payload="x")
     ticket = connector.enqueue_send(message)
+    ticket.started = True
 
     connector.retire_batch("batch-a", discard_results=True)
     assert transport.aborted is ticket
@@ -357,6 +383,7 @@ def test_connector_failed_close_wait_preserves_outstanding_ticket() -> None:
     connector = PipelineStageConnector(edge="0->1", transport=Transport())
     message = PipelineMessage(batch_id="batch-a", step_index=0, epoch=1, branch="conditional", payload="x")
     ticket = connector.enqueue_send(message)
+    ticket.started = True
 
     with pytest.raises(RuntimeError, match="wait did not complete"):
         connector.close(drain=True)
@@ -420,6 +447,7 @@ def test_connector_backend_close_failure_preserves_local_ownership() -> None:
     connector = PipelineStageConnector(edge="0->1", transport=Transport())
     message = PipelineMessage(batch_id="batch-a", step_index=0, epoch=1, branch="conditional", payload="x")
     ticket = connector.enqueue_send(message)
+    ticket.started = True
 
     with pytest.raises(RuntimeError, match="backend close failed"):
         connector.close(drain=True)
