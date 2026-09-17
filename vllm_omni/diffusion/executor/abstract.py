@@ -126,6 +126,26 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
+        """Submit one queued batch to every Worker without authorizing compute."""
+        raise NotImplementedError("queued pipeline submission is not wired for this executor")
+
+    def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
+        """Authorize execution after all Workers have accepted a batch."""
+        raise NotImplementedError("queued pipeline authorization is not wired for this executor")
+
+    def poll_pipeline_events(self) -> list[Any]:
+        """Poll Worker-side queued progress events."""
+        raise NotImplementedError("queued pipeline event polling is not wired for this executor")
+
+    def cancel_pipeline_requests(self, request_generations: Any) -> Any:
+        """Cancel queued work while retaining resources until retirement."""
+        raise NotImplementedError("queued pipeline cancellation is not wired for this executor")
+
+    def drain_pipeline(self, deadline: float | None = None) -> Any:
+        """Drain queued transport and Worker contexts before shutdown."""
+        raise NotImplementedError("queued pipeline drain is not wired for this executor")
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""
 

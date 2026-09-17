@@ -266,6 +266,7 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self._pipeline_stages: dict[int, PipelineStageState] = {}
+        self._pipeline_events: list[PipelineEvent] = []
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -731,6 +732,12 @@ class DiffusionWorker:
             self._pipeline_stages = {}
         return self._pipeline_stages
 
+    @property
+    def pipeline_events(self) -> list[PipelineEvent]:
+        if not hasattr(self, "_pipeline_events"):
+            self._pipeline_events = []
+        return self._pipeline_events
+
     def _pipeline_event(
         self,
         event_type: PipelineEventType,
@@ -744,6 +751,10 @@ class DiffusionWorker:
             physical_rank=self.rank,
         )
 
+    def _record_pipeline_event(self, event: PipelineEvent) -> PipelineEvent:
+        self.pipeline_events.append(event)
+        return event
+
     def _pipeline_stage(self, pp_stage_spec: PipelineStageSpec) -> PipelineStageState:
         stage = self.pipeline_stages.get(pp_stage_spec.pp_stage_id)
         if stage is None:
@@ -756,11 +767,18 @@ class DiffusionWorker:
     def enqueue_pipeline_batch(
         self,
         task: PipelineTask,
-        pp_stage_spec: PipelineStageSpec,
-        states: list[Any],
+        pp_stage_spec: PipelineStageSpec | dict[int, PipelineStageSpec],
     ) -> PipelineEvent:
-        """Prepare and queue a batch without authorizing local computation."""
+        """Resolve local request state and queue a metadata-only descriptor."""
         assert self.model_runner is not None, "Model runner not initialized"
+        if isinstance(pp_stage_spec, dict):
+            pp_stage_spec = self._select_rank_value(pp_stage_spec)
+        states = []
+        for request_id in task.request_ids:
+            state = self.model_runner.state_cache.get(request_id)
+            if state is None:
+                raise ValueError(f"Missing prepared pipeline state for request {request_id!r}.")
+            states.append(state)
         stage_was_new = pp_stage_spec.pp_stage_id not in self.pipeline_stages
         stage = self._pipeline_stage(pp_stage_spec)
         stage.enqueue(task)
@@ -771,13 +789,26 @@ class DiffusionWorker:
             if stage_was_new:
                 self.pipeline_stages.pop(pp_stage_spec.pp_stage_id, None)
             raise
-        return self._pipeline_event(PipelineEventType.ACCEPTED, task, pp_stage_spec.pp_stage_id)
+        return self._record_pipeline_event(
+            self._pipeline_event(PipelineEventType.ACCEPTED, task, pp_stage_spec.pp_stage_id)
+        )
 
-    def authorize_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
+    def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> PipelineEvent:
         """Apply the all-Worker acceptance gate's EXECUTE authorization."""
+        if isinstance(pp_stage_id, dict):
+            pp_stage_id = self._select_rank_value(pp_stage_id)
         stage = self._require_pipeline_stage(pp_stage_id)
         task = stage.authorize(batch_id)
-        return self._pipeline_event(PipelineEventType.AUTHORIZED, task, pp_stage_id)
+        return self._record_pipeline_event(self._pipeline_event(PipelineEventType.AUTHORIZED, task, pp_stage_id))
+
+    @staticmethod
+    def _select_rank_value(values: dict[int, Any]) -> Any:
+        from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_rank
+
+        rank = get_pipeline_parallel_rank()
+        if rank not in values:
+            raise KeyError(f"No pipeline descriptor for local PP rank {rank}.")
+        return values[rank]
 
     def progress_pipeline(
         self,
@@ -805,7 +836,9 @@ class DiffusionWorker:
                 stage.fail_active()
             raise
         return PipelineProgress(
-            event=self._pipeline_event(PipelineEventType.STAGE_COMPLETED, task, pp_stage_id),
+            event=self._record_pipeline_event(
+                self._pipeline_event(PipelineEventType.STAGE_COMPLETED, task, pp_stage_id)
+            ),
             output=output,
         )
 
@@ -826,7 +859,9 @@ class DiffusionWorker:
         if stage.terminal_statuses.get(batch_id) is PipelineTaskStatus.CANCELLED:
             if context.status is not PipelineTaskStatus.CANCELLED:
                 raise RuntimeError("Cancelled pipeline stage and ModelRunner context disagree.")
-            return self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id)
+            return self._record_pipeline_event(
+                self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id)
+            )
         task = stage.active_task
         if task is None or task.batch_id != batch_id:
             raise RuntimeError(f"Pipeline batch {batch_id!r} is not active on stage {pp_stage_id}.")
@@ -837,7 +872,7 @@ class DiffusionWorker:
             if stage.active_task is not None and stage.active_task.batch_id == batch_id:
                 stage.fail_active()
             raise
-        return self._pipeline_event(PipelineEventType.STEP_COMPLETED, task, pp_stage_id)
+        return self._record_pipeline_event(self._pipeline_event(PipelineEventType.STEP_COMPLETED, task, pp_stage_id))
 
     def cancel_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
         """Make a pending or active local batch terminal without releasing it."""
@@ -849,7 +884,7 @@ class DiffusionWorker:
         self.model_runner.cancel_pipeline_batch(pp_stage_id, batch_id)
         if not stage.cancel(batch_id):
             raise RuntimeError(f"Pipeline batch {batch_id!r} was not cancellable on stage {pp_stage_id}.")
-        return self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id)
+        return self._record_pipeline_event(self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id))
 
     def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
         """Release one terminal ModelRunner context after dependent work retires."""
@@ -861,7 +896,63 @@ class DiffusionWorker:
             raise RuntimeError(f"Pipeline batch {batch_id!r} is not terminal on stage {pp_stage_id}.")
         context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
         stage.retire(batch_id)
-        return self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id)
+        return self._record_pipeline_event(self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id))
+
+    def poll_pipeline_events(self) -> list[PipelineEvent]:
+        """Return and clear buffered metadata-only pipeline events."""
+        events, self._pipeline_events = self.pipeline_events, []
+        return events
+
+    def poll_pipeline_events_all_ranks(self) -> list[PipelineEvent]:
+        """Clear every rank's queue and return all events on the reply rank."""
+        rank_events = _all_gather_rank_values(self.poll_pipeline_events())
+        return [event for events in rank_events for event in events]
+
+    def cancel_pipeline_requests(self, request_generations: Any) -> list[PipelineEvent]:
+        """Cancel all local contexts matching request IDs or (ID, generation)."""
+        is_single_pair = (
+            isinstance(request_generations, (tuple, list))
+            and len(request_generations) == 2
+            and isinstance(request_generations[0], str)
+            and type(request_generations[1]) is int
+        )
+        requested = (
+            [request_generations]
+            if is_single_pair or not isinstance(request_generations, (list, tuple, set))
+            else request_generations
+        )
+        request_ids: set[str] = set()
+        request_epochs: set[tuple[str, int]] = set()
+        for item in requested:
+            if isinstance(item, (tuple, list)):
+                if len(item) != 2 or not isinstance(item[0], str) or type(item[1]) is not int:
+                    raise ValueError("generation-scoped cancellation requires (request_id, epoch)")
+                request_epochs.add((item[0], item[1]))
+            elif isinstance(item, str):
+                request_ids.add(item)
+            else:
+                raise ValueError("pipeline cancellation selectors must be request IDs or (request_id, epoch)")
+        events: list[PipelineEvent] = []
+        for (pp_stage_id, batch_id), context in list(self.model_runner.pipeline_batch_contexts.items()):
+            matches_request = bool(request_ids.intersection(context.request_state_ids))
+            matches_generation = any(
+                (request_id, context.task.epoch) in request_epochs for request_id in context.request_state_ids
+            )
+            if matches_request or matches_generation:
+                events.append(self.cancel_pipeline_batch(pp_stage_id, batch_id))
+        return events
+
+    def drain_pipeline(self, deadline: float | None = None) -> list[PipelineEvent]:
+        """Require all local pipeline contexts to be retired before shutdown."""
+        del deadline
+        if self.model_runner.pipeline_batch_contexts:
+            raise RuntimeError("cannot drain pipeline with unreleased batch contexts")
+        return []
+
+    def drain_pipeline_all_ranks(self, deadline: float | None = None) -> list[PipelineEvent]:
+        """Coordinate the drain guard, then gather terminal events from all ranks."""
+        _run_and_gather_rank_values("queued pipeline drain", lambda: self.drain_pipeline(deadline))
+        return self.poll_pipeline_events_all_ranks()
 
     def _require_pipeline_stage(self, pp_stage_id: int) -> PipelineStageState:
         stage = self.pipeline_stages.get(pp_stage_id)

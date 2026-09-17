@@ -736,6 +736,53 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def _fail_queued_control(self, operation: str, exc: BaseException) -> None:
+        logger.error("Queued pipeline %s failed after dispatch; failing the worker group: %s", operation, exc)
+        self._is_failed = True
+        self.shutdown()
+        for callback in self._failure_callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.exception("failure_callback raised")
+
+    def _queued_control_rpc(self, method: str, *, args: tuple = ()) -> Any:
+        if self._is_failed:
+            raise EngineDeadError()
+        self._ensure_open()
+        try:
+            return self.collective_rpc(method, args=args)
+        except BaseException as exc:
+            self._fail_queued_control(method, exc)
+            raise
+
+    def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
+        return self._queued_control_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
+
+    def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
+        return self._queued_control_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
+
+    def poll_pipeline_events(self) -> list[Any]:
+        self._ensure_open()
+        result = self.collective_rpc("poll_pipeline_events_all_ranks")
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+            return result[0]
+        return result if isinstance(result, list) else [result]
+
+    def cancel_pipeline_requests(self, request_generations: Any) -> Any:
+        self._ensure_open()
+        return self.collective_rpc(
+            "cancel_pipeline_requests",
+            args=(request_generations,),
+        )
+
+    def drain_pipeline(self, deadline: float | None = None) -> Any:
+        self._ensure_open()
+        result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,))
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+            return result[0]
+        return result
+
     def collective_rpc(
         self,
         method: str,

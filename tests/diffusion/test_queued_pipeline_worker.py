@@ -20,6 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 class _Runner:
     def __init__(self) -> None:
         self.pipeline_batch_contexts = {}
+        self.state_cache = {"req-a": object()}
         self.preparation_error: Exception | None = None
         self.execution_error: Exception | None = None
         self.feedback_adoptions = 0
@@ -31,6 +32,7 @@ class _Runner:
             task=task,
             stage_spec=spec,
             states=tuple(states),
+            request_state_ids=task.request_ids,
             status=PipelineTaskStatus.PENDING,
         )
         self.pipeline_batch_contexts[(spec.pp_stage_id, task.batch_id)] = context
@@ -79,8 +81,8 @@ def _worker() -> DiffusionWorker:
     return worker
 
 
-def _task(batch_id: str = "batch-a") -> PipelineTask:
-    return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=2)
+def _task(batch_id: str = "batch-a", *, epoch: int = 2) -> PipelineTask:
+    return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=epoch)
 
 
 def _spec(stage_id: int) -> PipelineStageSpec:
@@ -96,7 +98,7 @@ def test_worker_requires_execute_authorization_before_progress() -> None:
     worker = _worker()
     task = _task()
 
-    accepted = worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    accepted = worker.enqueue_pipeline_batch(task, _spec(0))
 
     assert accepted.event_type is PipelineEventType.ACCEPTED
     assert worker.progress_pipeline(0) is None
@@ -109,10 +111,44 @@ def test_worker_requires_execute_authorization_before_progress() -> None:
     torch.testing.assert_close(progress.output, torch.tensor([3.0]))
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_worker_selects_rank_local_pipeline_descriptor(mocker, rank: int) -> None:
+    worker = _worker()
+    specs = {0: _spec(0), 1: _spec(1)}
+    mocker.patch(
+        "vllm_omni.diffusion.distributed.parallel_state.get_pipeline_parallel_rank",
+        return_value=rank,
+    )
+
+    event = worker.enqueue_pipeline_batch(_task(), specs)
+    worker.authorize_pipeline_batch({0: 0, 1: 1}, "batch-a")
+
+    assert event.pp_stage_id == rank
+    assert worker.pipeline_stages[rank].spec == specs[rank]
+    assert worker.model_runner.pipeline_batch_contexts[(rank, "batch-a")].states == (
+        worker.model_runner.state_cache["req-a"],
+    )
+
+
+def test_worker_all_rank_event_poll_clears_every_rank(mocker) -> None:
+    worker = _worker()
+    local = worker._pipeline_event(PipelineEventType.ACCEPTED, _task(), 0)
+    remote = worker._pipeline_event(PipelineEventType.ACCEPTED, _task("batch-b"), 1)
+    worker._pipeline_events = [local]
+    gather = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker._all_gather_rank_values",
+        return_value=[[local], [remote]],
+    )
+
+    assert worker.poll_pipeline_events_all_ranks() == [local, remote]
+    gather.assert_called_once_with([local])
+    assert worker.poll_pipeline_events() == []
+
+
 def test_first_stage_emits_step_completion_only_after_feedback() -> None:
     worker = _worker()
     task = _task()
-    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    worker.enqueue_pipeline_batch(task, _spec(0))
     worker.authorize_pipeline_batch(0, task.batch_id)
     worker.progress_pipeline(0)
 
@@ -128,7 +164,7 @@ def test_first_stage_emits_step_completion_only_after_feedback() -> None:
 def test_last_stage_completes_numerical_step_but_not_global_step() -> None:
     worker = _worker()
     task = _task()
-    worker.enqueue_pipeline_batch(task, _spec(1), [object()])
+    worker.enqueue_pipeline_batch(task, _spec(1))
     worker.authorize_pipeline_batch(1, task.batch_id)
 
     progress = worker.progress_pipeline(1, intermediate_tensors=object())
@@ -143,8 +179,8 @@ def test_last_stage_completes_numerical_step_but_not_global_step() -> None:
 def test_worker_preserves_fifo_when_only_later_batch_is_authorized() -> None:
     worker = _worker()
     first, second = _task(), _task("batch-b")
-    worker.enqueue_pipeline_batch(first, _spec(0), [object()])
-    worker.enqueue_pipeline_batch(second, _spec(0), [object()])
+    worker.enqueue_pipeline_batch(first, _spec(0))
+    worker.enqueue_pipeline_batch(second, _spec(0))
     worker.authorize_pipeline_batch(0, second.batch_id)
 
     assert worker.progress_pipeline(0) is None
@@ -157,7 +193,7 @@ def test_worker_preserves_fifo_when_only_later_batch_is_authorized() -> None:
 def test_worker_cancellation_is_terminal_until_explicit_release() -> None:
     worker = _worker()
     task = _task()
-    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    worker.enqueue_pipeline_batch(task, _spec(0))
 
     cancelled = worker.cancel_pipeline_batch(0, task.batch_id)
 
@@ -166,10 +202,26 @@ def test_worker_cancellation_is_terminal_until_explicit_release() -> None:
     assert worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
 
 
+def test_generation_scoped_cancellation_does_not_cancel_reused_request_id() -> None:
+    worker = _worker()
+    old_task = _task("batch-old", epoch=2)
+    new_task = _task("batch-new", epoch=3)
+    worker.enqueue_pipeline_batch(old_task, _spec(0))
+    worker.enqueue_pipeline_batch(new_task, _spec(0))
+
+    events = worker.cancel_pipeline_requests([("req-a", 2)])
+
+    assert [event.task.batch_id for event in events] == ["batch-old"]
+    assert worker.pipeline_stages[0].terminal_statuses["batch-old"] is PipelineTaskStatus.CANCELLED
+    assert all(task.batch_id != "batch-old" for task in worker.pipeline_stages[0].pending_tasks)
+    assert any(task.batch_id == "batch-new" for task in worker.pipeline_stages[0].pending_tasks)
+    assert worker.model_runner.pipeline_batch_contexts[(0, "batch-new")].status is PipelineTaskStatus.PENDING
+
+
 def test_worker_rejects_release_before_stage_is_terminal_without_losing_context() -> None:
     worker = _worker()
     task = _task()
-    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    worker.enqueue_pipeline_batch(task, _spec(0))
 
     with pytest.raises(RuntimeError, match="not terminal on stage"):
         worker.release_pipeline_batch(0, task.batch_id)
@@ -182,7 +234,7 @@ def test_worker_rolls_back_enqueue_before_acceptance_on_prepare_failure() -> Non
     worker.model_runner.preparation_error = RuntimeError("prepare failed")
 
     with pytest.raises(RuntimeError, match="prepare failed"):
-        worker.enqueue_pipeline_batch(_task(), _spec(0), [object()])
+        worker.enqueue_pipeline_batch(_task(), _spec(0))
 
     assert 0 not in worker.pipeline_stages
 
@@ -193,10 +245,10 @@ def test_worker_can_install_valid_stage_after_initial_spec_validation_failure() 
     invalid_spec = PipelineStageSpec(pp_stage_id=0, world_size=3, is_first=True, is_last=False)
 
     with pytest.raises(ValueError, match="invalid topology"):
-        worker.enqueue_pipeline_batch(_task(), invalid_spec, [object()])
+        worker.enqueue_pipeline_batch(_task(), invalid_spec)
 
     worker.model_runner.preparation_error = None
-    event = worker.enqueue_pipeline_batch(_task(), _spec(0), [object()])
+    event = worker.enqueue_pipeline_batch(_task(), _spec(0))
     assert event.event_type is PipelineEventType.ACCEPTED
     assert worker.pipeline_stages[0].spec == _spec(0)
 
@@ -204,14 +256,14 @@ def test_worker_can_install_valid_stage_after_initial_spec_validation_failure() 
 def test_prepare_failure_preserves_existing_stage_tombstones() -> None:
     worker = _worker()
     first = _task()
-    worker.enqueue_pipeline_batch(first, _spec(0), [object()])
+    worker.enqueue_pipeline_batch(first, _spec(0))
     worker.cancel_pipeline_batch(0, first.batch_id)
     worker.release_pipeline_batch(0, first.batch_id)
     stage = worker.pipeline_stages[0]
     worker.model_runner.preparation_error = RuntimeError("prepare failed")
 
     with pytest.raises(RuntimeError, match="prepare failed"):
-        worker.enqueue_pipeline_batch(_task("batch-b"), _spec(0), [object()])
+        worker.enqueue_pipeline_batch(_task("batch-b"), _spec(0))
 
     assert worker.pipeline_stages[0] is stage
     assert first.batch_id in stage.retired_batches
@@ -221,7 +273,7 @@ def test_prepare_failure_preserves_existing_stage_tombstones() -> None:
 def test_worker_execution_failure_becomes_releasable_terminal_state() -> None:
     worker = _worker()
     task = _task()
-    worker.enqueue_pipeline_batch(task, _spec(0), [object()])
+    worker.enqueue_pipeline_batch(task, _spec(0))
     worker.authorize_pipeline_batch(0, task.batch_id)
     worker.model_runner.execution_error = RuntimeError("forward failed")
 
@@ -236,8 +288,8 @@ def test_two_stage_cancellation_drains_feedback_without_step_completion() -> Non
     first_worker = _worker()
     last_worker = _worker()
     task = _task()
-    first_worker.enqueue_pipeline_batch(task, _spec(0), [object()])
-    last_worker.enqueue_pipeline_batch(task, _spec(1), [object()])
+    first_worker.enqueue_pipeline_batch(task, _spec(0))
+    last_worker.enqueue_pipeline_batch(task, _spec(1))
     first_worker.authorize_pipeline_batch(0, task.batch_id)
     last_worker.authorize_pipeline_batch(1, task.batch_id)
 
