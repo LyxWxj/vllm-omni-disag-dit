@@ -75,8 +75,15 @@ class PipelineEndpointCompletion:
 
 @dataclass
 class PipelineTransportProgress:
+    rank: int
     offers: list[PipelineTransferOffer] = field(default_factory=list)
     completions: list[PipelineEndpointCompletion] = field(default_factory=list)
+
+
+@dataclass
+class PipelineCoordinatorProgress:
+    grants: list[PipelineTransferGrant] = field(default_factory=list)
+    completed: list[tuple[Any, ...]] = field(default_factory=list)
 
 
 class PipelineTransferCoordinator:
@@ -108,6 +115,10 @@ class PipelineTransferCoordinator:
             PipelineEdgeKind.ACTIVATION: 0,
             PipelineEdgeKind.FEEDBACK: 0,
         }
+
+    @property
+    def endpoint_ranks(self) -> frozenset[int]:
+        return frozenset(rank for edge in self._valid_edges[PipelineEdgeKind.ACTIVATION] for rank in edge)
 
     def offer(self, offer: PipelineTransferOffer) -> None:
         identity = offer.identity

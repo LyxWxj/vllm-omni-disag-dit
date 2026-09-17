@@ -931,7 +931,7 @@ class DiffusionWorker:
 
     def progress_pipeline_transfers(self) -> PipelineTransportProgress:
         """Advance bounded send completion and consume ready activation/feedback."""
-        progress = PipelineTransportProgress()
+        progress = PipelineTransportProgress(rank=self.rank)
 
         for identity, ticket in list(self.pipeline_send_tickets.items()):
             connector = self._require_pipeline_connector(identity[4])
@@ -950,6 +950,13 @@ class DiffusionWorker:
 
         self._release_completed_pipeline_consumers(progress)
         return progress
+
+    def progress_pipeline_transfers_all_ranks(self) -> list[PipelineTransportProgress]:
+        """Advance each Worker once and gather metadata-only progress records."""
+        return _run_and_gather_rank_values(
+            "queued pipeline transport progress",
+            self.progress_pipeline_transfers,
+        )
 
     def _consume_ready_pipeline_message(
         self,

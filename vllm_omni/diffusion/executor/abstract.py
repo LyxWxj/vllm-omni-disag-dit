@@ -8,6 +8,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import PipelineTransportProgress
 
 PIPELINE_GRANT_START_TIMEOUT_S = 30.0
 
@@ -29,6 +30,20 @@ def validate_pipeline_topology_reports(
         raise ValueError("Executor pipeline topology does not match Worker PP groups")
     if reporting_ranks != expected_ranks:
         raise ValueError("pipeline topology reports do not cover every configured endpoint")
+
+
+def normalize_pipeline_transport_progress(
+    result: Any,
+    expected_ranks: frozenset[int],
+) -> list[PipelineTransportProgress]:
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not all(isinstance(item, PipelineTransportProgress) for item in result):
+        raise RuntimeError("Workers returned invalid pipeline transport progress")
+    reporting_ranks = [item.rank for item in result]
+    if len(reporting_ranks) != len(expected_ranks) or set(reporting_ranks) != expected_ranks:
+        raise RuntimeError("pipeline transport progress does not cover every configured endpoint")
+    return result
 
 
 if TYPE_CHECKING:
@@ -178,6 +193,9 @@ class DiffusionExecutor(ABC):
 
     def coordinate_pipeline_transfer(self, offer: Any) -> list[Any]:
         raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
+
+    def progress_pipeline(self) -> Any:
+        raise NotImplementedError("queued pipeline progress is not wired for this executor")
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""

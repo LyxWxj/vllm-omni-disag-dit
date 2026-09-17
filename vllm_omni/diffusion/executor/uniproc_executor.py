@@ -31,12 +31,14 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
+    PipelineCoordinatorProgress,
     PipelineTransferCoordinator,
     PipelineTransferOffer,
 )
 from vllm_omni.diffusion.executor.abstract import (
     PIPELINE_GRANT_START_TIMEOUT_S,
     DiffusionExecutor,
+    normalize_pipeline_transport_progress,
     validate_pipeline_topology_reports,
 )
 from vllm_omni.platforms import current_omni_platform
@@ -260,6 +262,10 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         coordinator.offer(offer)
         self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
         coordinator.mark_receive_ready(offer.identity)
+        return self._start_ready_pipeline_transfers()
+
+    def _start_ready_pipeline_transfers(self) -> list[Any]:
+        coordinator = self._pipeline_transfer_coordinator
         grants = coordinator.grant_ready()
         for grant in grants:
             self._queued_control_rpc(
@@ -268,6 +274,27 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                 timeout=PIPELINE_GRANT_START_TIMEOUT_S,
             )
         return grants
+
+    def progress_pipeline(self) -> PipelineCoordinatorProgress:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        try:
+            result = self._queued_control_rpc("progress_pipeline_transfers_all_ranks")
+            worker_progress = normalize_pipeline_transport_progress(result, coordinator.endpoint_ranks)
+            progress = PipelineCoordinatorProgress()
+            for rank_progress in worker_progress:
+                for completion in rank_progress.completions:
+                    if coordinator.complete(completion.identity, completion.rank):
+                        progress.completed.append(completion.identity)
+            for rank_progress in worker_progress:
+                for offer in rank_progress.offers:
+                    progress.grants.extend(self.coordinate_pipeline_transfer(offer))
+            progress.grants.extend(self._start_ready_pipeline_transfers())
+            return progress
+        except BaseException:
+            self._mark_failed()
+            raise
 
     def _device_is_usable(self) -> bool:
         """Whether the accelerator context survived the failure we just caught.
