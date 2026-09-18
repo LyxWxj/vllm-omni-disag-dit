@@ -13,6 +13,7 @@ from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    SchedulerRequestState,
 )
 
 if TYPE_CHECKING:
@@ -33,9 +34,11 @@ class StepScheduler(BaseScheduler):
     def __init__(self) -> None:
         super().__init__()
         self._request_progress: dict[str, _StepProgress] = {}
+        self._pipeline_finalizing: set[str] = set()
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
+        self._pipeline_finalizing.clear()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         request_id = request.request_id
@@ -61,6 +64,17 @@ class StepScheduler(BaseScheduler):
             len(self._waiting),
         )
         return request_id
+
+    def schedule(self) -> DiffusionSchedulerOutput:
+        """Exclude decode-owned requests while retaining their running capacity."""
+        scheduler_output = super().schedule()
+        if self._pipeline_finalizing:
+            scheduler_output.scheduled_cached_reqs.request_ids = [
+                request_id
+                for request_id in scheduler_output.scheduled_cached_reqs.request_ids
+                if request_id not in self._pipeline_finalizing
+            ]
+        return scheduler_output
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
@@ -115,8 +129,54 @@ class StepScheduler(BaseScheduler):
 
         return self._finalize_update_from_output(sched_output, terminal_statuses, terminal_errors)
 
+    def commit_pipeline_step(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        resulting_steps: dict[str, int],
+    ) -> set[str]:
+        """Commit validated queued denoise progress without completing decode."""
+        scheduled_request_ids = tuple(sched_output.scheduled_request_ids)
+        if len(scheduled_request_ids) != len(set(scheduled_request_ids)):
+            raise ValueError("Queued pipeline step contains duplicate scheduled request IDs.")
+        if not scheduled_request_ids or set(resulting_steps) != set(scheduled_request_ids):
+            raise ValueError("Queued pipeline step results must exactly cover the scheduled requests.")
+
+        commits: list[tuple[str, SchedulerRequestState, _StepProgress, int]] = []
+        for request_id in scheduled_request_ids:
+            state = self._request_states.get(request_id)
+            progress = self._request_progress.get(request_id)
+            if state is None or progress is None:
+                raise KeyError(f"Queued pipeline request {request_id!r} is not owned by this Scheduler.")
+            if state.status is not DiffusionRequestStatus.RUNNING:
+                raise RuntimeError(f"Queued pipeline request {request_id!r} is not running.")
+            if request_id in self._pipeline_finalizing:
+                raise RuntimeError(f"Queued pipeline request {request_id!r} is already finalizing.")
+            resulting_step = resulting_steps[request_id]
+            if type(resulting_step) is not int or resulting_step != progress.current_step + 1:
+                raise ValueError(
+                    f"Queued pipeline request {request_id!r} expected step {progress.current_step + 1}, "
+                    f"got {resulting_step!r}."
+                )
+            if resulting_step > progress.total_steps:
+                raise ValueError(f"Queued pipeline request {request_id!r} advanced past its denoise schedule.")
+            commits.append((request_id, state, progress, resulting_step))
+
+        finalizing: set[str] = set()
+        for request_id, state, progress, resulting_step in commits:
+            progress.current_step = resulting_step
+            state.req.sampling_params.step_index = resulting_step
+            state.error = None
+            if resulting_step == progress.total_steps:
+                self._pipeline_finalizing.add(request_id)
+                finalizing.add(request_id)
+        return finalizing
+
+    def is_pipeline_finalizing(self, request_id: str) -> bool:
+        return request_id in self._pipeline_finalizing
+
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
+        self._pipeline_finalizing.discard(request_id)
 
     def _get_total_steps(self, request: OmniDiffusionRequest) -> int:
         sampling = request.sampling_params

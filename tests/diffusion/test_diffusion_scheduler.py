@@ -1465,6 +1465,66 @@ class TestStepScheduler:
         assert request.sampling_params.step_index == 3
         assert self.scheduler.has_requests() is False
 
+    def test_pipeline_step_commit_separates_final_denoise_from_request_completion(self) -> None:
+        request = _make_step_request("queued", num_inference_steps=2)
+        request_id = self.scheduler.add_request(request)
+
+        first = self.scheduler.schedule()
+        assert self.scheduler.commit_pipeline_step(first, {request_id: 1}) == set()
+        assert request.sampling_params.step_index == 1
+        assert self.scheduler.get_request_state(request_id).status is DiffusionRequestStatus.RUNNING
+
+        second = self.scheduler.schedule()
+        assert self.scheduler.commit_pipeline_step(second, {request_id: 2}) == {request_id}
+        assert request.sampling_params.step_index == 2
+        assert self.scheduler.is_pipeline_finalizing(request_id)
+        assert self.scheduler.get_request_state(request_id).status is DiffusionRequestStatus.RUNNING
+        assert self.scheduler.has_requests() is True
+
+        with pytest.raises(RuntimeError, match="already finalizing"):
+            self.scheduler.commit_pipeline_step(second, {request_id: 3})
+
+    def test_pipeline_step_commit_rejects_stale_progress_without_mutation(self) -> None:
+        request = _make_step_request("queued-stale", num_inference_steps=3)
+        request_id = self.scheduler.add_request(request)
+        sched_output = self.scheduler.schedule()
+
+        with pytest.raises(ValueError, match="expected step 1"):
+            self.scheduler.commit_pipeline_step(sched_output, {request_id: 2})
+
+        assert request.sampling_params.step_index == 0
+        assert not self.scheduler.is_pipeline_finalizing(request_id)
+
+    def test_pipeline_step_commit_rejects_duplicate_ids_without_mutation(self) -> None:
+        request = _make_step_request("queued-duplicate", num_inference_steps=1)
+        request_id = self.scheduler.add_request(request)
+        sched_output = self.scheduler.schedule()
+        sched_output.scheduled_cached_reqs.request_ids.append(request_id)
+
+        with pytest.raises(ValueError, match="duplicate scheduled request IDs"):
+            self.scheduler.commit_pipeline_step(sched_output, {request_id: 1})
+
+        assert request.sampling_params.step_index == 0
+        assert not self.scheduler.is_pipeline_finalizing(request_id)
+        assert self.scheduler.get_request_state(request_id).status is DiffusionRequestStatus.RUNNING
+
+    def test_pipeline_finalizing_request_is_not_rescheduled_or_replaced(self) -> None:
+        finalizing_request = _make_step_request("queued-finalizing", num_inference_steps=1)
+        waiting_request = _make_step_request("queued-waiting", num_inference_steps=2)
+        finalizing_id = self.scheduler.add_request(finalizing_request)
+        waiting_id = self.scheduler.add_request(waiting_request)
+        first = self.scheduler.schedule()
+
+        assert self.scheduler.commit_pipeline_step(first, {finalizing_id: 1}) == {finalizing_id}
+
+        while_finalizing = self.scheduler.schedule()
+        assert while_finalizing.is_empty
+        assert while_finalizing.scheduled_request_ids == []
+        assert while_finalizing.num_running_reqs == 1
+        assert while_finalizing.num_waiting_reqs == 1
+        assert self.scheduler.get_request_state(finalizing_id).status is DiffusionRequestStatus.RUNNING
+        assert self.scheduler.get_request_state(waiting_id).status is DiffusionRequestStatus.WAITING
+
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=2))
         req_id_b = self.scheduler.add_request(_make_step_request("b", num_inference_steps=2))

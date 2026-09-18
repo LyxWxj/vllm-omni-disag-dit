@@ -167,3 +167,33 @@ def test_queued_completion_uses_nonzero_physical_topology(mocker) -> None:
     engine.executor.submit_pipeline_batch.assert_called_once_with(batch.task, batch.stage_specs)
     engine.executor.authorize_pipeline_batch.assert_called_once_with({0: 0, 1: 1}, batch.task.batch_id)
     assert batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED
+
+
+def test_queued_step_commit_advances_scheduler_once_without_finishing_request(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.scheduler.commit_pipeline_step = mocker.Mock(return_value=set())
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
+
+    assert engine._commit_queued_pipeline_step(batch) == frozenset()
+    engine.scheduler.commit_pipeline_step.assert_called_once_with(
+        scheduler_output,
+        {"req-a": 1},
+    )
+    assert batch.phase is _QueuedPipelineBatchPhase.STEP_COMMITTED
+
+    with pytest.raises(RuntimeError, match="has not completed"):
+        engine._commit_queued_pipeline_step(batch)
+
+
+def test_queued_final_step_enters_finalizing_without_client_completion(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.scheduler.commit_pipeline_step = mocker.Mock(return_value={"req-a"})
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
+
+    assert engine._commit_queued_pipeline_step(batch) == frozenset({"req-a"})
+    assert batch.finalizing_request_ids == frozenset({"req-a"})
+    assert batch.phase is _QueuedPipelineBatchPhase.FINALIZING

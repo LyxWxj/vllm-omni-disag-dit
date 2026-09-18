@@ -227,6 +227,8 @@ class _QueuedPipelineBatchPhase(str, Enum):
     SUBMITTED = "submitted"
     AUTHORIZED = "authorized"
     STEP_COMPLETED = "step_completed"
+    STEP_COMMITTED = "step_committed"
+    FINALIZING = "finalizing"
     FAILED = "failed"
 
 
@@ -236,6 +238,7 @@ class _QueuedPipelineBatch:
     scheduler_output: Any
     stage_specs: dict[int, PipelineStageSpec]
     stage_physical_ranks: dict[int, int]
+    finalizing_request_ids: frozenset[str] = frozenset()
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
@@ -498,6 +501,34 @@ class DiffusionEngine:
             if step_completed:
                 batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
             return step_completed
+        except BaseException:
+            batch.phase = _QueuedPipelineBatchPhase.FAILED
+            raise
+
+    def _commit_queued_pipeline_step(self, batch: _QueuedPipelineBatch) -> frozenset[str]:
+        if self._queued_pipeline_batches.get(batch.task.batch_id) is not batch:
+            raise ValueError("Queued pipeline batch is not owned by this Engine.")
+        if batch.phase is not _QueuedPipelineBatchPhase.STEP_COMPLETED:
+            raise RuntimeError("Queued pipeline batch has not completed its Worker step.")
+        commit_pipeline_step = getattr(self.scheduler, "commit_pipeline_step", None)
+        if not callable(commit_pipeline_step):
+            batch.phase = _QueuedPipelineBatchPhase.FAILED
+            raise RuntimeError("Queued pipeline execution requires StepScheduler.commit_pipeline_step().")
+        resulting_step = batch.task.step_index + 1
+        try:
+            finalizing = frozenset(
+                commit_pipeline_step(
+                    batch.scheduler_output,
+                    {request_id: resulting_step for request_id in batch.task.request_ids},
+                )
+            )
+            if not finalizing.issubset(batch.task.request_ids):
+                raise RuntimeError("Scheduler finalized a request outside the queued pipeline batch.")
+            batch.finalizing_request_ids = finalizing
+            batch.phase = (
+                _QueuedPipelineBatchPhase.FINALIZING if finalizing else _QueuedPipelineBatchPhase.STEP_COMMITTED
+            )
+            return finalizing
         except BaseException:
             batch.phase = _QueuedPipelineBatchPhase.FAILED
             raise
