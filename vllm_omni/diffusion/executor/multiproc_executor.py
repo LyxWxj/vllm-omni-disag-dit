@@ -879,6 +879,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._fail_queued_control("pipeline progress", exc)
             raise
 
+    def pipeline_stage_physical_ranks(self) -> dict[int, int]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.stage_physical_ranks
+
     def collective_rpc(
         self,
         method: str,

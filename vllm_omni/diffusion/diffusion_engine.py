@@ -56,6 +56,12 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineEvent,
+    PipelineEventType,
+    PipelineStageSpec,
+    PipelineTask,
+)
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -213,6 +219,24 @@ class _RpcTask:
 class DiffusionExecutionMode(str, Enum):
     REQUEST_BATCH = "request_batch"
     STEP_BATCH = "step_batch"
+
+
+class _QueuedPipelineBatchPhase(str, Enum):
+    RESERVED = "reserved"
+    PREPARED = "prepared"
+    SUBMITTED = "submitted"
+    AUTHORIZED = "authorized"
+    STEP_COMPLETED = "step_completed"
+    FAILED = "failed"
+
+
+@dataclass
+class _QueuedPipelineBatch:
+    task: PipelineTask
+    scheduler_output: Any
+    stage_specs: dict[int, PipelineStageSpec]
+    stage_physical_ranks: dict[int, int]
+    phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
 class DiffusionEngine:
@@ -388,12 +412,95 @@ class DiffusionEngine:
         # Copied onto the existing output metrics payload so queue monitoring
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
+        self._queued_pipeline_batches: dict[str, _QueuedPipelineBatch] = {}
+        self._queued_pipeline_epoch = 0
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
             self.execute_fn = self.executor.execute_step
         else:
             self.execute_fn = self.executor.execute_batch
+
+    def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
+        if self._queued_pipeline_batches:
+            raise RuntimeError("M2 queued execution permits only one retained pipeline batch.")
+        request_ids = tuple(scheduler_output.scheduled_request_ids)
+        if len(request_ids) != 1:
+            raise ValueError("M2 queued execution requires exactly one scheduled request.")
+        request_id = request_ids[0]
+        request_state = self.scheduler.get_request_state(request_id)
+        if request_state is None:
+            raise RuntimeError(f"Queued request {request_id!r} has no Scheduler state.")
+        step_index = request_state.req.sampling_params.step_index
+        if step_index is None:
+            step_index = 0
+        epoch = self._queued_pipeline_epoch
+        self._queued_pipeline_epoch += 1
+        stage_physical_ranks = self.executor.pipeline_stage_physical_ranks()
+        if set(stage_physical_ranks) != {0, 1}:
+            raise ValueError("Queued PP topology must map logical stages 0 and 1")
+        task = PipelineTask(
+            batch_id=f"pp-{epoch}-{scheduler_output.step_id}",
+            request_ids=request_ids,
+            step_index=step_index,
+            epoch=epoch,
+        )
+        stage_specs = {
+            0: PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False),
+            1: PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True),
+        }
+        batch = _QueuedPipelineBatch(
+            task=task,
+            scheduler_output=scheduler_output,
+            stage_specs=stage_specs,
+            stage_physical_ranks=stage_physical_ranks,
+        )
+        if task.batch_id in self._queued_pipeline_batches:
+            raise ValueError(f"Queued pipeline batch {task.batch_id!r} already exists.")
+        self._queued_pipeline_batches[task.batch_id] = batch
+        return batch
+
+    def _submit_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
+        batch = self._reserve_queued_pipeline_batch(scheduler_output)
+        try:
+            if scheduler_output.scheduled_new_reqs:
+                self.executor.prepare_pipeline_requests(scheduler_output)
+            batch.phase = _QueuedPipelineBatchPhase.PREPARED
+            self.executor.submit_pipeline_batch(batch.task, batch.stage_specs)
+            batch.phase = _QueuedPipelineBatchPhase.SUBMITTED
+            self.executor.authorize_pipeline_batch({0: 0, 1: 1}, batch.task.batch_id)
+            batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
+            return batch
+        except BaseException:
+            batch.phase = _QueuedPipelineBatchPhase.FAILED
+            raise
+
+    def _progress_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> bool:
+        if self._queued_pipeline_batches.get(batch.task.batch_id) is not batch:
+            raise ValueError("Queued pipeline batch is not owned by this Engine.")
+        if batch.phase is not _QueuedPipelineBatchPhase.AUTHORIZED:
+            raise RuntimeError("Queued pipeline batch is not authorized for progress.")
+        try:
+            self.executor.progress_pipeline()
+            step_completed = False
+            for event in self.executor.poll_pipeline_events():
+                if not isinstance(event, PipelineEvent) or event.task != batch.task:
+                    raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
+                if event.event_type is PipelineEventType.STEP_COMPLETED:
+                    if event.pp_stage_id != 0:
+                        raise RuntimeError("STEP_COMPLETED must be emitted by the first pipeline stage.")
+                    first_rank = batch.stage_physical_ranks[0]
+                    if event.physical_rank != first_rank:
+                        raise RuntimeError("STEP_COMPLETED physical rank does not own the first pipeline stage.")
+                    if step_completed:
+                        raise RuntimeError("Worker returned duplicate STEP_COMPLETED events.")
+                    step_completed = True
+            if step_completed:
+                batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
+            return step_completed
+        except BaseException:
+            batch.phase = _QueuedPipelineBatchPhase.FAILED
+            raise
 
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:

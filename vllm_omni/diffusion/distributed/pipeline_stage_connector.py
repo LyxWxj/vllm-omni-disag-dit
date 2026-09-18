@@ -120,6 +120,15 @@ class PipelineTransferCoordinator:
     def endpoint_ranks(self) -> frozenset[int]:
         return frozenset(rank for edge in self._valid_edges[PipelineEdgeKind.ACTIVATION] for rank in edge)
 
+    @property
+    def stage_physical_ranks(self) -> dict[int, int]:
+        """Return the physical rank for logical stages in the single M2 replica."""
+        edges = self._valid_edges[PipelineEdgeKind.ACTIVATION]
+        if len(edges) != 1:
+            raise RuntimeError("M2 Engine submission requires exactly one configured PP replica")
+        src_rank, dst_rank = next(iter(edges))
+        return {0: src_rank, 1: dst_rank}
+
     def offer(self, offer: PipelineTransferOffer) -> None:
         identity = offer.identity
         if (offer.src_rank, offer.dst_rank) not in self._valid_edges[offer.edge_kind]:
