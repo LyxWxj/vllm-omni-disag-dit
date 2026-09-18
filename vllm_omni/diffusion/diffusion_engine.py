@@ -239,6 +239,10 @@ class _QueuedPipelineBatch:
     stage_specs: dict[int, PipelineStageSpec]
     stage_physical_ranks: dict[int, int]
     finalizing_request_ids: frozenset[str] = frozenset()
+    decoded_output: BatchRunnerOutput | None = None
+    release_acknowledged: bool = False
+    cleanup_completed_request_ids: set[str] = field(default_factory=set)
+    scheduler_completed_request_ids: set[str] = field(default_factory=set)
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
@@ -536,6 +540,8 @@ class DiffusionEngine:
     def _finalize_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput:
         if batch.phase is not _QueuedPipelineBatchPhase.FINALIZING:
             raise RuntimeError("Queued pipeline batch is not ready for final decode.")
+        if batch.decoded_output is not None:
+            return batch.decoded_output
         output_rank = batch.stage_physical_ranks[0]
         try:
             output = self.executor.finalize_pipeline_batch(
@@ -546,8 +552,7 @@ class DiffusionEngine:
             finished = output.get_request_output(batch.task.request_ids[0])
             if finished is None or finished.result is None or finished.result.error is not None:
                 raise RuntimeError("Queued pipeline final decode returned an unsuccessful output.")
-            for request_id in batch.finalizing_request_ids:
-                self.scheduler.complete_pipeline_request(request_id)
+            batch.decoded_output = output
             return output
         except BaseException:
             batch.phase = _QueuedPipelineBatchPhase.FAILED
@@ -559,28 +564,56 @@ class DiffusionEngine:
             _QueuedPipelineBatchPhase.FINALIZING,
         }:
             raise RuntimeError("Queued pipeline batch is not ready for retirement.")
-        events = self.executor.release_pipeline_batch({0: 0, 1: 1}, batch.task.batch_id)
-        if not isinstance(events, list) or len(events) != 2:
-            raise RuntimeError("Queued pipeline retirement did not acknowledge both stages.")
-        expected = {(stage_id, batch.stage_physical_ranks[stage_id]) for stage_id in (0, 1)}
-        actual: set[tuple[int, int]] = set()
-        for event in events:
-            if not isinstance(event, PipelineEvent):
-                raise RuntimeError("Queued pipeline retirement returned an invalid event.")
-            if event.event_type is not PipelineEventType.RELEASED or event.task != batch.task:
-                raise RuntimeError("Queued pipeline retirement returned an invalid acknowledgement.")
-            actual.add((event.pp_stage_id, event.physical_rank))
-        if actual != expected:
-            raise RuntimeError(
-                "Queued pipeline retirement acknowledgements do not match topology: "
-                f"expected={expected}, actual={actual}"
-            )
+        if not batch.release_acknowledged:
+            events = self.executor.release_pipeline_batch({0: 0, 1: 1}, batch.task.batch_id)
+            if not isinstance(events, list) or len(events) != 2:
+                raise RuntimeError("Queued pipeline retirement did not acknowledge both stages.")
+            expected = {(stage_id, batch.stage_physical_ranks[stage_id]) for stage_id in (0, 1)}
+            actual: set[tuple[int, int]] = set()
+            for event in events:
+                if not isinstance(event, PipelineEvent):
+                    raise RuntimeError("Queued pipeline retirement returned an invalid event.")
+                if event.event_type is not PipelineEventType.RELEASED or event.task != batch.task:
+                    raise RuntimeError("Queued pipeline retirement returned an invalid acknowledgement.")
+                actual.add((event.pp_stage_id, event.physical_rank))
+            if actual != expected:
+                raise RuntimeError(
+                    "Queued pipeline retirement acknowledgements do not match topology: "
+                    f"expected={expected}, actual={actual}"
+                )
+            batch.release_acknowledged = True
         if batch.finalizing_request_ids:
             for request_id in batch.finalizing_request_ids:
+                if request_id in batch.cleanup_completed_request_ids:
+                    continue
                 cleanup = self.executor.cleanup_finalized_pipeline_request(request_id)
                 if not isinstance(cleanup, list) or len(cleanup) != 2 or not all(cleanup):
                     raise RuntimeError("Queued finalized-request cleanup did not acknowledge both stages.")
+                batch.cleanup_completed_request_ids.add(request_id)
+        if batch.finalizing_request_ids:
+            for request_id in batch.finalizing_request_ids:
+                if request_id in batch.scheduler_completed_request_ids:
+                    continue
+                self.scheduler.complete_pipeline_request(request_id)
+                batch.scheduler_completed_request_ids.add(request_id)
         self._queued_pipeline_batches.pop(batch.task.batch_id, None)
+
+    def _advance_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput | None:
+        """Drive one retained batch through progress, commit, decode, and retirement."""
+        if batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED:
+            if not self._progress_queued_pipeline_batch(batch):
+                return None
+        if batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED:
+            self._commit_queued_pipeline_step(batch)
+        output: BatchRunnerOutput | None = None
+        if batch.phase is _QueuedPipelineBatchPhase.FINALIZING:
+            output = self._finalize_queued_pipeline_batch(batch)
+        if batch.phase in {
+            _QueuedPipelineBatchPhase.STEP_COMMITTED,
+            _QueuedPipelineBatchPhase.FINALIZING,
+        }:
+            self._retire_queued_pipeline_batch(batch)
+        return output
 
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
