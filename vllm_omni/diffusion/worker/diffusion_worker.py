@@ -159,6 +159,22 @@ def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list
     return [result for _, result in rank_results]
 
 
+def _run_and_agree_rank_status(operation: str, func: Callable[[], Any]) -> Any:
+    """Run locally, agree on failures, and retain the local result in place."""
+    local_result: Any = None
+    try:
+        local_result = func()
+        local_status = (True, None)
+    except Exception as exc:
+        logger.exception("%s failed on this Worker rank", operation)
+        local_status = (False, f"{type(exc).__name__}: {exc}")
+    rank_statuses = _all_gather_rank_values(local_status)
+    failures = [f"rank {rank}: {error}" for rank, (ok, error) in enumerate(rank_statuses) if not ok]
+    if failures:
+        raise RuntimeError(f"{operation} failed on " + "; ".join(failures))
+    return local_result
+
+
 def _setup_diffusion_worker_proc_title_and_log_prefix(
     enable_ep: bool,
     use_hsdp: bool,
@@ -1309,6 +1325,66 @@ class DiffusionWorker:
         context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
         stage.retire(batch_id)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id))
+
+    def finalize_pipeline_batch(
+        self,
+        pp_stage_id: int | dict[int, int],
+        batch_id: str,
+    ) -> BatchRunnerOutput | None:
+        """Decode only on the first logical stage; peers participate in status agreement."""
+        if isinstance(pp_stage_id, dict):
+            pp_stage_id = self._select_rank_value(pp_stage_id)
+
+        def finalize_local() -> BatchRunnerOutput | None:
+            stage = self._require_pipeline_stage(pp_stage_id)
+            context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
+            if context is None:
+                raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
+            if not stage.spec.is_first:
+                return None
+            return self.model_runner.finalize_pipeline_batch(context, stage.spec)
+
+        return _run_and_agree_rank_status("queued pipeline final decode", finalize_local)
+
+    def release_pipeline_batch_all_ranks(
+        self,
+        pp_stage_id: int | dict[int, int],
+        batch_id: str,
+    ) -> list[PipelineEvent]:
+        """Release every rank-local context and gather acknowledgements."""
+        local_event: PipelineEvent | None = None
+
+        def release_local() -> PipelineEvent:
+            nonlocal local_event
+            local_event = self.release_pipeline_batch(
+                self._select_rank_value(pp_stage_id) if isinstance(pp_stage_id, dict) else pp_stage_id,
+                batch_id,
+            )
+            return local_event
+
+        acknowledgements = _run_and_gather_rank_values(
+            "queued pipeline batch release",
+            release_local,
+        )
+        if local_event is not None:
+            self._pipeline_events = [event for event in self.pipeline_events if event is not local_event]
+        return acknowledgements
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> bool:
+        """Drop persistent request tensors after final decode and retirement."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.state_cache.pop(request_id, None)
+        self.model_runner.input_batch = None
+        remove_kv = getattr(self.model_runner, "remove_diffusion_kv_requests", None)
+        if callable(remove_kv):
+            remove_kv([request_id])
+        return True
+
+    def cleanup_finalized_pipeline_request_all_ranks(self, request_id: str) -> list[bool]:
+        return _run_and_gather_rank_values(
+            "queued finalized request cleanup",
+            lambda: self.cleanup_finalized_pipeline_request(request_id),
+        )
 
     def poll_pipeline_events(self) -> list[PipelineEvent]:
         """Return and clear buffered metadata-only pipeline events."""

@@ -174,6 +174,16 @@ class StepScheduler(BaseScheduler):
     def is_pipeline_finalizing(self, request_id: str) -> bool:
         return request_id in self._pipeline_finalizing
 
+    def complete_pipeline_request(self, request_id: str) -> set[str]:
+        """Mark a decoded queued request complete and release scheduler capacity."""
+        if request_id not in self._pipeline_finalizing:
+            raise RuntimeError(f"Queued pipeline request {request_id!r} is not finalizing.")
+        finished = self._finish_requests({request_id: DiffusionRequestStatus.FINISHED_COMPLETED})
+        if finished != {request_id}:
+            raise RuntimeError(f"Queued pipeline request {request_id!r} could not be completed.")
+        self._pipeline_finalizing.remove(request_id)
+        return finished
+
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
         self._pipeline_finalizing.discard(request_id)

@@ -45,10 +45,10 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -791,6 +791,42 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if not self._is_failed:
                 self._fail_queued_control("pipeline request preparation", exc)
             raise
+
+    def finalize_pipeline_batch(
+        self,
+        pp_stage_id: dict[int, int],
+        batch_id: str,
+        output_rank: int,
+    ) -> BaseRunnerOutput:
+        try:
+            result = self.collective_rpc(
+                "finalize_pipeline_batch",
+                args=(pp_stage_id, batch_id),
+                unique_reply_rank=output_rank,
+                exec_all_ranks=True,
+            )
+            if not isinstance(result, BaseRunnerOutput):
+                raise RuntimeError("Queued pipeline final decode returned an invalid output.")
+            return result
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline final decode", exc)
+            raise
+
+    def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
+        result = self._queued_control_rpc("release_pipeline_batch_all_ranks", args=(pp_stage_id, batch_id))
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+            return result[0]
+        return result
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
+        result = self._queued_control_rpc(
+            "cleanup_finalized_pipeline_request_all_ranks",
+            args=(request_id,),
+        )
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+            return result[0]
+        return result
 
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
         return self._queued_control_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))

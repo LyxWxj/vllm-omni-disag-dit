@@ -188,6 +188,15 @@ class DiffusionExecutor(ABC):
         """Prepare rank-local request state at a coordinated drained boundary."""
         raise NotImplementedError("queued pipeline preparation is not wired for this executor")
 
+    def finalize_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str, output_rank: int) -> Any:
+        raise NotImplementedError("queued pipeline final decode is not wired for this executor")
+
+    def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
+        raise NotImplementedError("queued pipeline retirement is not wired for this executor")
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
+        raise NotImplementedError("queued finalized-request cleanup is not wired for this executor")
+
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
         """Authorize execution after all Workers have accepted a batch."""
         raise NotImplementedError("queued pipeline authorization is not wired for this executor")

@@ -1245,6 +1245,49 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             raise
         context.status = PipelineTaskStatus.COMPLETED
 
+    def finalize_pipeline_batch(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+    ) -> BatchRunnerOutput:
+        """Decode a completed request on the first-stage output owner."""
+        self._require_pipeline_context(context, pp_stage_spec)
+        if not pp_stage_spec.is_first:
+            raise ValueError("Only the first pipeline stage can finalize queued output.")
+        if context.status is not PipelineTaskStatus.COMPLETED:
+            raise RuntimeError("Pipeline batch must be completed before final decode.")
+        state = context.states[0]
+        if not state.request_denoise_completed:
+            raise RuntimeError("Pipeline request has not completed its denoise schedule.")
+        try:
+            with (
+                self._pipeline_inference_context(),
+                set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata={},
+                    denoise_step_idx=context.task.step_index,
+                ),
+            ):
+                result = self.pipeline.post_decode(state)
+            if not isinstance(result, DiffusionOutput):
+                raise RuntimeError("Pipeline final decode produced no DiffusionOutput.")
+            result = self._prepare_output_for_transport(result, state.sampling)
+            self._attach_stepwise_metadata(state, result)
+            return BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(
+                        request_id=state.request_id,
+                        step_index=state.step_index,
+                        finished=True,
+                        result=result,
+                    )
+                ]
+            )
+        except BaseException:
+            context.status = PipelineTaskStatus.FAILED
+            raise
+
     def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineBatchContext:
         """Retire one terminal context after its transfer/consumer leases finish."""
         key = (pp_stage_id, batch_id)

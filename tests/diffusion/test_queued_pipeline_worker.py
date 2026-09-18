@@ -670,6 +670,30 @@ def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> N
     assert not last.pipeline_receive_reservations
 
 
+def test_release_rpc_consumes_acknowledgement_without_dropping_next_batch_event() -> None:
+    worker = _worker()
+    first = _task("batch-a")
+    second = _task("batch-b")
+    spec = _spec(0)
+    worker.enqueue_pipeline_batch(first, spec)
+    worker.authorize_pipeline_batch(0, first.batch_id)
+    worker.pipeline_stages[0].start_next()
+    worker.model_runner.pipeline_batch_contexts[(0, first.batch_id)].status = PipelineTaskStatus.COMPLETED
+    worker.pipeline_stages[0].complete_active()
+    worker.enqueue_pipeline_batch(second, spec)
+    second_event = worker.pipeline_events[-1]
+
+    acknowledgements = worker.release_pipeline_batch_all_ranks(0, first.batch_id)
+
+    assert len(acknowledgements) == 1
+    assert acknowledgements[0].event_type is PipelineEventType.RELEASED
+    remaining = worker.poll_pipeline_events()
+    assert second_event in remaining
+    assert not any(
+        event.event_type is PipelineEventType.RELEASED and event.task.batch_id == first.batch_id for event in remaining
+    )
+
+
 def test_worker_holds_receive_lease_until_consumer_event_completes(mocker) -> None:
     receiver = _worker()
     receiver.rank = 1

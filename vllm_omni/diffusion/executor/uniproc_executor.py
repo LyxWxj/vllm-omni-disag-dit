@@ -42,11 +42,11 @@ from vllm_omni.diffusion.executor.abstract import (
     normalize_pipeline_transport_progress,
     validate_pipeline_topology_reports,
 )
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -228,6 +228,41 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         except BaseException:
             self._mark_failed()
             raise
+
+    def finalize_pipeline_batch(
+        self,
+        pp_stage_id: dict[int, int],
+        batch_id: str,
+        output_rank: int,
+    ) -> BaseRunnerOutput:
+        try:
+            result = self.collective_rpc(
+                "finalize_pipeline_batch",
+                args=(pp_stage_id, batch_id),
+                unique_reply_rank=output_rank,
+                exec_all_ranks=True,
+            )
+            if not isinstance(result, BaseRunnerOutput):
+                raise RuntimeError("Queued pipeline final decode returned an invalid output.")
+            return result
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
+        result = self._queued_control_rpc("release_pipeline_batch_all_ranks", args=(pp_stage_id, batch_id))
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+            return result[0]
+        return result
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
+        result = self._queued_control_rpc(
+            "cleanup_finalized_pipeline_request_all_ranks",
+            args=(request_id,),
+        )
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+            return result[0]
+        return result
 
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
         return self._queued_control_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
