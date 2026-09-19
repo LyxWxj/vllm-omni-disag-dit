@@ -507,13 +507,30 @@ class DiffusionEngine:
         )
         if batch is None:
             raise RuntimeError(f"Queued failure has no owned batch for requests {request_ids!r}") from failure
-        batch.failure = failure
+        if batch.failure is None:
+            batch.failure = failure
         try:
-            self._cancel_queued_pipeline_batch(batch)
+            if not batch.cancelled:
+                self._cancel_queued_pipeline_batch(batch)
             self._retire_queued_pipeline_batch(batch)
             self._finish_failed_queued_batch(batch)
         except Exception:
             logger.error("Queued batch cleanup is pending; retaining ownership", exc_info=True)
+
+    def _advance_unhandled_queued_batches(self, handled_request_ids: set[str]) -> None:
+        """Progress retained tasks that were not represented in this scheduler cycle."""
+        for batch in list(self._queued_pipeline_batches.values()):
+            if set(batch.task.request_ids) & handled_request_ids:
+                continue
+            try:
+                if batch.failure is not None:
+                    self._run_queued_pipeline_iteration(batch.scheduler_output)
+                    continue
+                output = self._advance_queued_pipeline_batch(batch)
+                if output is not None:
+                    self._emit_finished_outputs(set(batch.task.request_ids), output)
+            except Exception as exc:
+                self._handle_queued_iteration_failure(batch.scheduler_output, exc)
 
     def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
         max_inflight_batches = int(getattr(self.od_config, "max_inflight_batches", 1))
@@ -966,7 +983,9 @@ class DiffusionEngine:
                 continue
 
             if self.od_config.mode == "queued":
+                handled_request_ids: set[str] = set()
                 for task_output in self._split_queued_scheduler_output(sched_output):
+                    handled_request_ids.update(task_output.scheduled_request_ids)
                     try:
                         self._run_queued_pipeline_iteration(task_output)
                     except _QueuedAdmissionDeferredError:
@@ -980,6 +999,7 @@ class DiffusionEngine:
                             exc_info=True,
                         )
                         self._handle_queued_iteration_failure(task_output, exc)
+                self._advance_unhandled_queued_batches(handled_request_ids)
                 continue
 
             try:

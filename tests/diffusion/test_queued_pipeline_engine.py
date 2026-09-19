@@ -43,6 +43,7 @@ def _engine(mocker, scheduler_output: DiffusionSchedulerOutput) -> DiffusionEngi
     )
     engine.executor = mocker.Mock()
     engine.executor.pipeline_stage_physical_ranks.return_value = {0: 0, 1: 1}
+    engine.od_config = SimpleNamespace(max_inflight_batches=2)
     engine._queued_pipeline_batches = {}
     engine._queued_pipeline_epoch = 3
     return engine
@@ -119,6 +120,36 @@ def test_failed_queued_batch_retries_cancellation_before_retirement(mocker) -> N
     cancel.assert_called_once_with(batch)
     retire.assert_called_once_with(batch)
     finish.assert_called_once_with(batch)
+
+
+def test_unhandled_retained_batch_failure_uses_descriptor_cleanup(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    second_output = _scheduler_output("req-b")
+    second = engine._submit_queued_pipeline_batch(second_output)
+    advance = mocker.patch.object(engine, "_advance_queued_pipeline_batch", side_effect=RuntimeError("progress failed"))
+    cleanup = mocker.patch.object(engine, "_handle_queued_iteration_failure")
+
+    engine._advance_unhandled_queued_batches({"req-a"})
+
+    advance.assert_called_once_with(second)
+    cleanup.assert_called_once_with(second_output, advance.side_effect)
+
+
+def test_cleanup_retry_preserves_failure_and_skips_repeat_cancellation(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    output = _scheduler_output("req-a")
+    batch = engine._submit_queued_pipeline_batch(output)
+    original = RuntimeError("original progress failure")
+    batch.failure = original
+    batch.cancelled = True
+    cancel = mocker.patch.object(engine, "_cancel_queued_pipeline_batch")
+    mocker.patch.object(engine, "_retire_queued_pipeline_batch", side_effect=RuntimeError("release retry failed"))
+
+    engine._handle_queued_iteration_failure(output, RuntimeError("cleanup failure"))
+
+    assert batch.failure is original
+    cancel.assert_not_called()
 
 
 def test_queued_progress_accepts_only_matching_first_stage_completion(mocker) -> None:
