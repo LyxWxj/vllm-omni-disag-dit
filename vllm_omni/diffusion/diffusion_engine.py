@@ -523,8 +523,7 @@ class DiffusionEngine:
     def _submit_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
         batch = self._reserve_queued_pipeline_batch(scheduler_output)
         try:
-            if scheduler_output.scheduled_new_reqs:
-                self.executor.prepare_pipeline_requests(scheduler_output)
+            self.executor.prepare_pipeline_requests(scheduler_output)
             batch.phase = _QueuedPipelineBatchPhase.PREPARED
             self.executor.submit_pipeline_batch(batch.task, batch.stage_specs)
             batch.phase = _QueuedPipelineBatchPhase.SUBMITTED

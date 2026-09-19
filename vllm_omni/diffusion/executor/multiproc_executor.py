@@ -778,6 +778,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
         expected_request_ids = tuple(request.request_id for request in scheduler_output.scheduled_new_reqs)
+        expected_request_ids += tuple(
+            getattr(getattr(scheduler_output, "scheduled_cached_reqs", None), "request_ids", ())
+        )
         if len(expected_request_ids) != 1:
             raise ValueError("M2 queued preparation requires exactly one new request.")
         try:

@@ -1014,8 +1014,27 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Prepare one queued request coherently without executing a denoise step."""
         new_requests = list(scheduler_output.scheduled_new_reqs)
         cached_request_ids = list(scheduler_output.scheduled_cached_reqs.request_ids)
-        if len(new_requests) != 1 or cached_request_ids:
-            raise ValueError("M2 queued preparation requires exactly one new request and no cached requests.")
+        if len(new_requests) + len(cached_request_ids) != 1 or (new_requests and cached_request_ids):
+            raise ValueError("M2 queued preparation requires exactly one new or cached request.")
+        if cached_request_ids:
+            request_id = cached_request_ids[0]
+            local_error: Exception | None = None
+            try:
+                with self._pipeline_inference_context():
+                    states, _ = self._update_states(scheduler_output)
+                if len(states) != 1 or states[0].request_id != request_id:
+                    raise RuntimeError("Queued cached preparation did not retain the expected request state.")
+                input_batch = InputBatch.make_batch(states, cached_batch=self.input_batch)
+                if input_batch is None:
+                    raise RuntimeError("Queued cached batch construction produced no input batch.")
+                self.input_batch = input_batch
+            except Exception as exc:
+                local_error = exc
+            if _dit_any_rank_failed(local_error is not None):
+                if local_error is None:
+                    local_error = RuntimeError(f"Queued cached preparation failed on another rank for {request_id}")
+                raise local_error
+            return (request_id,)
         new_request = new_requests[0]
         validate_new_request_data_identity(new_request)
         if not getattr(new_request.req, "use_step_execution", True):
