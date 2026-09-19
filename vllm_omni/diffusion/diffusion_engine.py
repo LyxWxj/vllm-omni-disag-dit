@@ -234,6 +234,10 @@ class _QueuedPipelineBatchPhase(str, Enum):
     FAILED = "failed"
 
 
+class _QueuedAdmissionDeferredError(RuntimeError):
+    """The scheduler selected a request before queued capacity was available."""
+
+
 @dataclass
 class _QueuedPipelineBatch:
     task: PipelineTask
@@ -512,6 +516,9 @@ class DiffusionEngine:
             logger.error("Queued batch cleanup is pending; retaining ownership", exc_info=True)
 
     def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
+        max_inflight_batches = int(getattr(self.od_config, "max_inflight_batches", 1))
+        if len(self._queued_pipeline_batches) >= max_inflight_batches:
+            raise _QueuedAdmissionDeferredError("queued pipeline admission capacity is exhausted")
         request_ids = tuple(scheduler_output.scheduled_request_ids)
         if len(request_ids) != 1:
             raise ValueError("Queued pipeline task construction requires exactly one scheduled request.")
@@ -962,6 +969,10 @@ class DiffusionEngine:
                 for task_output in self._split_queued_scheduler_output(sched_output):
                     try:
                         self._run_queued_pipeline_iteration(task_output)
+                    except _QueuedAdmissionDeferredError:
+                        for request_id in task_output.scheduled_request_ids:
+                            self.scheduler.preempt_request(request_id)
+                        break
                     except Exception as exc:
                         logger.error(
                             "Queued execution failed for diffusion requests %s",
