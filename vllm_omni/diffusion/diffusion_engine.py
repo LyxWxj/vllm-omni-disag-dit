@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import dataclasses
 import inspect
 import os
 import queue
@@ -55,7 +56,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionRequestStatus
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineEvent,
     PipelineEventType,
@@ -444,9 +445,18 @@ class DiffusionEngine:
     def _run_queued_pipeline_iteration(self, scheduler_output: Any) -> None:
         """Drive one queued batch through submission, progress, and retirement."""
         self._ensure_queued_pipeline_transports()
-        if not self._queued_pipeline_batches:
+        request_ids = tuple(scheduler_output.scheduled_request_ids)
+        existing = next(
+            (batch for batch in self._queued_pipeline_batches.values() if batch.task.request_ids == request_ids),
+            None,
+        )
+        if existing is None:
             self._submit_queued_pipeline_batch(scheduler_output)
-        batch = next(iter(self._queued_pipeline_batches.values()))
+            batch = next(
+                batch for batch in self._queued_pipeline_batches.values() if batch.task.request_ids == request_ids
+            )
+        else:
+            batch = existing
         if batch.failure is not None:
             if not batch.cancelled:
                 self._cancel_queued_pipeline_batch(batch)
@@ -481,12 +491,31 @@ class DiffusionEngine:
         )
         self._emit_finished_outputs(set(batch.task.request_ids), runner_output)
 
+    def _handle_queued_iteration_failure(self, scheduler_output: Any, failure: BaseException) -> None:
+        request_ids = tuple(scheduler_output.scheduled_request_ids)
+        batch = next(
+            (
+                candidate
+                for candidate in self._queued_pipeline_batches.values()
+                if candidate.task.request_ids == request_ids
+            ),
+            None,
+        )
+        if batch is None:
+            raise RuntimeError(f"Queued failure has no owned batch for requests {request_ids!r}") from failure
+        batch.failure = failure
+        try:
+            self._cancel_queued_pipeline_batch(batch)
+            self._retire_queued_pipeline_batch(batch)
+            self._finish_failed_queued_batch(batch)
+        except Exception:
+            logger.error("Queued batch cleanup is pending; retaining ownership", exc_info=True)
+
     def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
-        if self._queued_pipeline_batches:
-            raise RuntimeError("M2 queued execution permits only one retained pipeline batch.")
         request_ids = tuple(scheduler_output.scheduled_request_ids)
         if len(request_ids) != 1:
-            raise ValueError("M2 queued execution requires exactly one scheduled request.")
+            raise ValueError("Queued pipeline task construction requires exactly one scheduled request.")
+
         request_id = request_ids[0]
         request_state = self.scheduler.get_request_state(request_id)
         if request_state is None:
@@ -519,6 +548,28 @@ class DiffusionEngine:
             raise ValueError(f"Queued pipeline batch {task.batch_id!r} already exists.")
         self._queued_pipeline_batches[task.batch_id] = batch
         return batch
+
+    @staticmethod
+    def _split_queued_scheduler_output(scheduler_output: Any) -> list[Any]:
+        """Split a scheduler cycle into one-request task descriptors."""
+        outputs = []
+        for request in scheduler_output.scheduled_new_reqs:
+            outputs.append(
+                dataclasses.replace(
+                    scheduler_output,
+                    scheduled_new_reqs=[request],
+                    scheduled_cached_reqs=CachedRequestData.make_empty(),
+                )
+            )
+        for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
+            outputs.append(
+                dataclasses.replace(
+                    scheduler_output,
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=CachedRequestData(request_ids=[request_id]),
+                )
+            )
+        return outputs
 
     def _submit_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
         batch = self._reserve_queued_pipeline_batch(scheduler_output)
@@ -908,24 +959,16 @@ class DiffusionEngine:
                 continue
 
             if self.od_config.mode == "queued":
-                try:
-                    self._run_queued_pipeline_iteration(sched_output)
-                except Exception as exc:
-                    logger.error(
-                        "Queued execution failed for diffusion requests %s",
-                        sched_output.scheduled_request_ids,
-                        exc_info=True,
-                    )
-                    batch = next(iter(self._queued_pipeline_batches.values()), None)
-                    if batch is None:
-                        raise
-                    batch.failure = exc
+                for task_output in self._split_queued_scheduler_output(sched_output):
                     try:
-                        self._cancel_queued_pipeline_batch(batch)
-                        self._retire_queued_pipeline_batch(batch)
-                        self._finish_failed_queued_batch(batch)
-                    except Exception:
-                        logger.error("Queued batch cleanup is pending; retaining ownership", exc_info=True)
+                        self._run_queued_pipeline_iteration(task_output)
+                    except Exception as exc:
+                        logger.error(
+                            "Queued execution failed for diffusion requests %s",
+                            task_output.scheduled_request_ids,
+                            exc_info=True,
+                        )
+                        self._handle_queued_iteration_failure(task_output, exc)
                 continue
 
             try:

@@ -74,13 +74,34 @@ def test_queued_submission_records_ownership_before_control_dispatch(mocker) -> 
     engine.executor.authorize_pipeline_batch.assert_called_once_with({0: 0, 1: 1}, batch.task.batch_id)
 
 
-def test_queued_reservation_rejects_second_retained_batch(mocker) -> None:
+def test_queued_reservation_keeps_distinct_request_ownership(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
-    engine._submit_queued_pipeline_batch(scheduler_output)
+    first = engine._submit_queued_pipeline_batch(scheduler_output)
 
-    with pytest.raises(RuntimeError, match="only one retained pipeline batch"):
-        engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
+    second = engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
+
+    assert first.task.request_ids == ("req-a",)
+    assert second.task.request_ids == ("req-b",)
+    assert len(engine._queued_pipeline_batches) == 2
+
+
+def test_queued_failure_targets_matching_descriptor_batch(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    second_output = _scheduler_output("req-b")
+    second = engine._submit_queued_pipeline_batch(second_output)
+    engine._cancel_queued_pipeline_batch = mocker.Mock()
+    engine._retire_queued_pipeline_batch = mocker.Mock()
+    engine._finish_failed_queued_batch = mocker.Mock()
+
+    engine._handle_queued_iteration_failure(second_output, RuntimeError("second failed"))
+
+    assert first.failure is None
+    assert second.failure is not None
+    engine._cancel_queued_pipeline_batch.assert_called_once_with(second)
+    engine._retire_queued_pipeline_batch.assert_called_once_with(second)
+    engine._finish_failed_queued_batch.assert_called_once_with(second)
 
 
 def test_failed_queued_batch_retries_cancellation_before_retirement(mocker) -> None:
