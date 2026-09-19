@@ -1430,6 +1430,26 @@ class DiffusionWorker:
                 events.append(self.cancel_pipeline_batch(pp_stage_id, batch_id))
         return events
 
+    def cancel_pipeline_requests_all_ranks(self, request_generations: Any) -> list[PipelineEvent]:
+        """Cancel matching local contexts and gather acknowledgements from every rank."""
+        local_events: list[PipelineEvent] = []
+
+        def cancel_local() -> list[PipelineEvent]:
+            nonlocal local_events
+            local_events = self.cancel_pipeline_requests(request_generations)
+            return local_events
+
+        try:
+            rank_events = _run_and_gather_rank_values(
+                "queued pipeline cancellation",
+                cancel_local,
+            )
+        finally:
+            if local_events:
+                local_event_ids = {id(event) for event in local_events}
+                self._pipeline_events = [event for event in self.pipeline_events if id(event) not in local_event_ids]
+        return [event for events in rank_events for event in events]
+
     def drain_pipeline(self, deadline: float | None = None) -> list[PipelineEvent]:
         """Require all local pipeline contexts to be retired before shutdown."""
         del deadline

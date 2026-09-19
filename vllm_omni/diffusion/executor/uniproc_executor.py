@@ -276,10 +276,13 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
     def cancel_pipeline_requests(self, request_generations: Any) -> Any:
         self._ensure_open()
-        return self.collective_rpc(
-            "cancel_pipeline_requests",
+        result = self.collective_rpc(
+            "cancel_pipeline_requests_all_ranks",
             args=(request_generations,),
         )
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+            return result[0]
+        return result
 
     def drain_pipeline(self, deadline: float | None = None) -> Any:
         self._ensure_open()

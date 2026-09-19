@@ -117,6 +117,19 @@ def test_event_poll_uses_all_rank_gather_and_flattens_reply(executor) -> None:
     executor.collective_rpc.assert_called_once_with("poll_pipeline_events_all_ranks")
 
 
+def test_cancellation_uses_all_rank_gather_and_flattens_reply(executor) -> None:
+    executor.collective_rpc.return_value = [["rank-0-cancelled", "rank-1-cancelled"]]
+
+    assert executor.cancel_pipeline_requests([("req-a", 3)]) == [
+        "rank-0-cancelled",
+        "rank-1-cancelled",
+    ]
+    executor.collective_rpc.assert_called_once_with(
+        "cancel_pipeline_requests_all_ranks",
+        args=([("req-a", 3)],),
+    )
+
+
 def test_drain_aggregates_nonzero_rank_events(executor) -> None:
     executor.collective_rpc.return_value = [["rank-0-released", "rank-1-released"]]
 

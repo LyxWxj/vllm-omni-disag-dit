@@ -14,6 +14,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
 )
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineEvent,
     PipelineEventType,
     PipelineStageSpec,
     PipelineTask,
@@ -258,6 +259,48 @@ def test_generation_scoped_cancellation_does_not_cancel_reused_request_id() -> N
     assert all(task.batch_id != "batch-old" for task in worker.pipeline_stages[0].pending_tasks)
     assert any(task.batch_id == "batch-new" for task in worker.pipeline_stages[0].pending_tasks)
     assert worker.model_runner.pipeline_batch_contexts[(0, "batch-new")].status is PipelineTaskStatus.PENDING
+
+
+def test_cancellation_rpc_consumes_acknowledgement_without_dropping_unrelated_event() -> None:
+    worker = _worker()
+    task = _task("batch-cancel")
+    unrelated = PipelineTask(
+        batch_id="batch-other",
+        request_ids=("req-other",),
+        step_index=0,
+        epoch=task.epoch,
+    )
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.cancel_pipeline_batch(0, task.batch_id)
+    worker.pipeline_events.clear()
+    unrelated_event = PipelineEvent(PipelineEventType.ACCEPTED, unrelated, 0, worker.rank)
+    worker.pipeline_events.append(unrelated_event)
+
+    acknowledgements = worker.cancel_pipeline_requests_all_ranks([("req-a", task.epoch)])
+
+    assert [event.task.batch_id for event in acknowledgements] == [task.batch_id]
+    assert worker.poll_pipeline_events() == [unrelated_event]
+
+
+def test_cancellation_rpc_consumes_local_acknowledgement_when_peer_fails(mocker) -> None:
+    worker = _worker()
+    task = _task("batch-cancel")
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.pipeline_events.clear()
+
+    def fail_after_local_cancel(_description, callback):
+        callback()
+        raise RuntimeError("peer cancellation failed")
+
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker._run_and_gather_rank_values",
+        side_effect=fail_after_local_cancel,
+    )
+
+    with pytest.raises(RuntimeError, match="peer cancellation failed"):
+        worker.cancel_pipeline_requests_all_ranks([("req-a", task.epoch)])
+
+    assert worker.poll_pipeline_events() == []
 
 
 def test_worker_rejects_release_before_stage_is_terminal_without_losing_context() -> None:

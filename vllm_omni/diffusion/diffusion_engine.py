@@ -229,6 +229,7 @@ class _QueuedPipelineBatchPhase(str, Enum):
     STEP_COMPLETED = "step_completed"
     STEP_COMMITTED = "step_committed"
     FINALIZING = "finalizing"
+    CANCELLING = "cancelling"
     FAILED = "failed"
 
 
@@ -243,6 +244,7 @@ class _QueuedPipelineBatch:
     release_acknowledged: bool = False
     cleanup_completed_request_ids: set[str] = field(default_factory=set)
     scheduler_completed_request_ids: set[str] = field(default_factory=set)
+    cancelled: bool = False
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
@@ -562,6 +564,7 @@ class DiffusionEngine:
         if batch.phase not in {
             _QueuedPipelineBatchPhase.STEP_COMMITTED,
             _QueuedPipelineBatchPhase.FINALIZING,
+            _QueuedPipelineBatchPhase.CANCELLING,
         }:
             raise RuntimeError("Queued pipeline batch is not ready for retirement.")
         if not batch.release_acknowledged:
@@ -596,7 +599,39 @@ class DiffusionEngine:
                     continue
                 self.scheduler.complete_pipeline_request(request_id)
                 batch.scheduler_completed_request_ids.add(request_id)
+        if batch.cancelled:
+            for request_id in batch.task.request_ids:
+                if request_id in batch.scheduler_completed_request_ids:
+                    continue
+                self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+                batch.scheduler_completed_request_ids.add(request_id)
         self._queued_pipeline_batches.pop(batch.task.batch_id, None)
+
+    def _cancel_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
+        if batch.phase is _QueuedPipelineBatchPhase.FAILED:
+            return
+        if batch.task.batch_id not in self._queued_pipeline_batches:
+            raise ValueError("Queued pipeline batch is not owned by this Engine.")
+        events = self.executor.cancel_pipeline_requests(
+            [(request_id, batch.task.epoch) for request_id in batch.task.request_ids]
+        )
+        if not isinstance(events, list):
+            raise RuntimeError("Queued pipeline cancellation returned an invalid response.")
+        expected = {(stage_id, batch.stage_physical_ranks[stage_id]) for stage_id in (0, 1)}
+        actual: set[tuple[int, int]] = set()
+        for event in events:
+            if not isinstance(event, PipelineEvent):
+                raise RuntimeError("Queued pipeline cancellation returned an invalid event.")
+            if event.event_type is not PipelineEventType.CANCELLED or event.task != batch.task:
+                raise RuntimeError("Queued pipeline cancellation returned an invalid acknowledgement.")
+            actual.add((event.pp_stage_id, event.physical_rank))
+        if actual != expected:
+            raise RuntimeError(
+                "Queued pipeline cancellation acknowledgements do not match topology: "
+                f"expected={expected}, actual={actual}"
+            )
+        batch.cancelled = True
+        batch.phase = _QueuedPipelineBatchPhase.CANCELLING
 
     def _advance_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput | None:
         """Drive one retained batch through progress, commit, decode, and retirement."""
@@ -611,6 +646,7 @@ class DiffusionEngine:
         if batch.phase in {
             _QueuedPipelineBatchPhase.STEP_COMMITTED,
             _QueuedPipelineBatchPhase.FINALIZING,
+            _QueuedPipelineBatchPhase.CANCELLING,
         }:
             self._retire_queued_pipeline_batch(batch)
         return output

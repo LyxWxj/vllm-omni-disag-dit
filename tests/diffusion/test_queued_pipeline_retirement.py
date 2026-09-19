@@ -7,6 +7,7 @@ import pytest
 
 from tests.diffusion.test_queued_pipeline_engine import _engine, _scheduler_output
 from vllm_omni.diffusion.diffusion_engine import _QueuedPipelineBatchPhase
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.pipeline_state import PipelineEvent, PipelineEventType
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -181,6 +182,57 @@ def test_retirement_retry_skips_successful_release_after_cleanup_failure(mocker)
     engine.executor.cleanup_finalized_pipeline_request.assert_called_with("req-a")
     engine.scheduler.complete_pipeline_request.assert_called_once_with("req-a")
     assert engine._queued_pipeline_batches == {}
+
+
+def test_cancellation_keeps_scheduler_capacity_until_retirement(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.scheduler.finish_requests = mocker.Mock()
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    engine.executor.cancel_pipeline_requests.return_value = [
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 1, 1),
+    ]
+
+    engine._cancel_queued_pipeline_batch(batch)
+
+    assert batch.cancelled
+    assert batch.phase is _QueuedPipelineBatchPhase.CANCELLING
+    engine.scheduler.finish_requests.assert_not_called()
+
+    engine.executor.release_pipeline_batch.return_value = [
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),
+    ]
+    engine._retire_queued_pipeline_batch(batch)
+
+    engine.scheduler.finish_requests.assert_called_once_with("req-a", DiffusionRequestStatus.FINISHED_ABORTED)
+    assert engine._queued_pipeline_batches == {}
+
+
+def test_partial_cancellation_acknowledgement_is_retryable(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.scheduler.finish_requests = mocker.Mock()
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    partial = PipelineEvent(PipelineEventType.CANCELLED, batch.task, 0, 0)
+    complete = [
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 1, 1),
+    ]
+    engine.executor.cancel_pipeline_requests.side_effect = [[partial], complete]
+
+    with pytest.raises(RuntimeError, match="do not match topology"):
+        engine._cancel_queued_pipeline_batch(batch)
+
+    assert not batch.cancelled
+    assert batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
+
+    engine._cancel_queued_pipeline_batch(batch)
+
+    assert batch.cancelled
+    assert batch.phase is _QueuedPipelineBatchPhase.CANCELLING
+    assert engine.executor.cancel_pipeline_requests.call_count == 2
 
 
 @pytest.mark.parametrize(
