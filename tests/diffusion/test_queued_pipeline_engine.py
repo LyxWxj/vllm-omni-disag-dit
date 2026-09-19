@@ -83,6 +83,23 @@ def test_queued_reservation_rejects_second_retained_batch(mocker) -> None:
         engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
 
 
+def test_failed_queued_batch_retries_cancellation_before_retirement(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch.failure = RuntimeError("progress failed")
+    batch.phase = _QueuedPipelineBatchPhase.FAILED
+    cancel = mocker.patch.object(engine, "_cancel_queued_pipeline_batch")
+    retire = mocker.patch.object(engine, "_retire_queued_pipeline_batch")
+    finish = mocker.patch.object(engine, "_finish_failed_queued_batch")
+
+    engine._run_queued_pipeline_iteration(scheduler_output)
+
+    cancel.assert_called_once_with(batch)
+    retire.assert_called_once_with(batch)
+    finish.assert_called_once_with(batch)
+
+
 def test_queued_progress_accepts_only_matching_first_stage_completion(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)

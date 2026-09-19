@@ -1243,11 +1243,6 @@ class OmniDiffusionConfig:
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
         if self.mode == "queued" and self.parallel_config.pipeline_parallel_size != 2:
             raise ValueError("mode='queued' currently requires pipeline_parallel_size=2")
-        if self.mode == "queued":
-            raise NotImplementedError(
-                "mode='queued' is not executable yet; the Engine, Executor, Worker, and ModelRunner queued lifecycle "
-                "must be connected before this mode can be enabled"
-            )
         self.master_port = self._resolve_master_port()
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.

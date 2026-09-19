@@ -63,11 +63,12 @@ def test_stage_buffer_bytes_must_be_positive_when_explicit() -> None:
         _queued_config(stage_buffer_bytes=0)
 
 
-def test_valid_queued_contract_is_rejected_before_port_setup(monkeypatch) -> None:
+def test_valid_queued_contract_is_accepted_before_engine_setup(monkeypatch) -> None:
     monkeypatch.setattr(
         OmniDiffusionConfig,
         "_resolve_master_port",
-        lambda _self: pytest.fail("queued rejection must happen before port setup"),
+        lambda _self: 29500,
     )
-    with pytest.raises(NotImplementedError, match="not executable yet"):
-        _queued_config()
+    config = _queued_config()
+
+    assert config.mode == "queued"
