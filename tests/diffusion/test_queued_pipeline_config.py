@@ -43,7 +43,6 @@ def test_queued_mode_requires_step_execution() -> None:
     ("overrides", "message"),
     [
         ({"parallel_config": DiffusionParallelConfig(pipeline_parallel_size=1)}, "pipeline_parallel_size=2"),
-        ({"max_num_seqs": 2}, "max_num_seqs=1"),
         ({"max_inflight_batches": 2}, "max_inflight_batches=1"),
     ],
 )
@@ -61,6 +60,12 @@ def test_capacity_counts_are_positive(field: str) -> None:
 def test_stage_buffer_bytes_must_be_positive_when_explicit() -> None:
     with pytest.raises(ValueError, match="stage_buffer_bytes"):
         _queued_config(stage_buffer_bytes=0)
+
+
+def test_queued_mode_accepts_multiple_scheduler_requests() -> None:
+    config = _queued_config(max_num_seqs=2)
+
+    assert config.max_num_seqs == 2
 
 
 def test_valid_queued_contract_is_accepted_before_engine_setup(monkeypatch) -> None:
