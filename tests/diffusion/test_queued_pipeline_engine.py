@@ -136,6 +136,19 @@ def test_unhandled_retained_batch_failure_uses_descriptor_cleanup(mocker) -> Non
     cleanup.assert_called_once_with(second_output, advance.side_effect)
 
 
+def test_unhandled_retained_batches_progress_independently(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    second = engine._submit_queued_pipeline_batch(_scheduler_output("req-b"))
+    first.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
+    second.phase = _QueuedPipelineBatchPhase.AUTHORIZED
+    advance = mocker.patch.object(engine, "_advance_queued_pipeline_batch", return_value=None)
+
+    engine._advance_unhandled_queued_batches({"req-a"})
+
+    advance.assert_called_once_with(second)
+
+
 def test_cleanup_retry_preserves_failure_and_skips_repeat_cancellation(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
     output = _scheduler_output("req-a")

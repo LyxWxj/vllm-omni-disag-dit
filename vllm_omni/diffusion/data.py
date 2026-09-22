@@ -1178,8 +1178,6 @@ class OmniDiffusionConfig:
                 raise ValueError("stage_buffer_bytes must be a positive integer when set")
             if not self.step_execution:
                 raise ValueError("mode='queued' requires step_execution=True")
-            if self.max_inflight_batches != 1:
-                raise ValueError("mode='queued' currently requires max_inflight_batches=1")
 
         if self.omni_kv_config is None:
             self.omni_kv_config = {}

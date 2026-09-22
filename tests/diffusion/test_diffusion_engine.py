@@ -137,6 +137,21 @@ class MockScheduler:
         pass
 
 
+def test_queued_runtime_scheduler_capacity_scales_with_inflight_batches() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = SimpleNamespace(max_num_running_reqs=1)
+    engine.od_config = SimpleNamespace(
+        mode="queued",
+        max_num_seqs=2,
+        max_inflight_batches=3,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+
+    engine._init_runtime_state()
+
+    assert engine.scheduler.max_num_running_reqs == 6
+
+
 def _make_admission_engine(pre_process_func) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()

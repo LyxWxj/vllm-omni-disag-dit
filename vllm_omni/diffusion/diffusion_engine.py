@@ -408,6 +408,10 @@ class DiffusionEngine:
             )
         else:
             self.dp_concurrent = False
+        if getattr(self.od_config, "mode", "static") == "queued":
+            self.scheduler.max_num_running_reqs = _max_num_seqs(self.od_config) * int(
+                getattr(self.od_config, "max_inflight_batches", 1)
+            )
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None

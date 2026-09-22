@@ -43,7 +43,6 @@ def test_queued_mode_requires_step_execution() -> None:
     ("overrides", "message"),
     [
         ({"parallel_config": DiffusionParallelConfig(pipeline_parallel_size=1)}, "pipeline_parallel_size=2"),
-        ({"max_inflight_batches": 2}, "max_inflight_batches=1"),
     ],
 )
 def test_queued_mode_rejects_out_of_scope_capacity_or_topology(overrides, message) -> None:
@@ -66,6 +65,12 @@ def test_queued_mode_accepts_multiple_scheduler_requests() -> None:
     config = _queued_config(max_num_seqs=2)
 
     assert config.max_num_seqs == 2
+
+
+def test_queued_mode_accepts_multiple_inflight_batches() -> None:
+    config = _queued_config(max_inflight_batches=2)
+
+    assert config.max_inflight_batches == 2
 
 
 def test_valid_queued_contract_is_accepted_before_engine_setup(monkeypatch) -> None:
