@@ -238,6 +238,10 @@ class _QueuedAdmissionDeferredError(RuntimeError):
     """The scheduler selected a request before queued capacity was available."""
 
 
+class _QueuedAdmissionOversizeError(RuntimeError):
+    """The request's reservation cannot fit even in an empty stage budget."""
+
+
 @dataclass
 class _QueuedPipelineBatch:
     task: PipelineTask
@@ -252,6 +256,7 @@ class _QueuedPipelineBatch:
     cancelled: bool = False
     failure: BaseException | None = None
     abort_requested: bool = False
+    reserved_bytes: int = 0
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
@@ -433,6 +438,8 @@ class DiffusionEngine:
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
         self._queued_pipeline_batches: dict[str, _QueuedPipelineBatch] = {}
+        self._queued_reserved_bytes = 0
+        self._queued_stage_buffer_budget_bytes: int | None = None
         self._queued_pipeline_epoch = 0
 
     def _init_execute_fn(self) -> None:
@@ -443,13 +450,25 @@ class DiffusionEngine:
 
     def _ensure_queued_pipeline_transports(self) -> None:
         """Initialize the M2 two-stage transport lazily after engine startup."""
-        if getattr(self.executor, "_pipeline_transfer_coordinator", None) is not None:
+        if (
+            getattr(self.executor, "_pipeline_transfer_coordinator", None) is not None
+            and self._queued_stage_buffer_budget_bytes is not None
+        ):
             return
-        self.executor.initialize_pipeline_transfers(
-            activation_edges={(0, 1)},
-            feedback_edges={(1, 0)},
-            max_slots=int(getattr(self.od_config, "edge_buffer_slots", 1)),
-        )
+        if getattr(self.executor, "_pipeline_transfer_coordinator", None) is None:
+            self.executor.initialize_pipeline_transfers(
+                activation_edges={(0, 1)},
+                feedback_edges={(1, 0)},
+                max_slots=int(getattr(self.od_config, "edge_buffer_slots", 1)),
+            )
+        configured_budget = getattr(self.od_config, "stage_buffer_bytes", None)
+        if configured_budget is not None:
+            self._queued_stage_buffer_budget_bytes = int(configured_budget)
+        elif hasattr(self.executor, "pipeline_stage_memory_budget_bytes"):
+            stage_free_bytes = int(self.executor.pipeline_stage_memory_budget_bytes())
+            self._queued_stage_buffer_budget_bytes = max(stage_free_bytes // 4, 1)
+        else:
+            raise RuntimeError("queued pipeline requires a resolvable stage buffer budget")
 
     def _run_queued_pipeline_iteration(self, scheduler_output: Any) -> None:
         """Drive one queued batch through submission, progress, and retirement."""
@@ -531,6 +550,22 @@ class DiffusionEngine:
         except Exception:
             logger.error("Queued batch cleanup is pending; retaining ownership", exc_info=True)
 
+    def _reject_queued_admission(self, scheduler_output: Any, failure: BaseException) -> None:
+        request_ids = tuple(scheduler_output.scheduled_request_ids)
+        self.scheduler.finish_requests(list(request_ids), DiffusionRequestStatus.FINISHED_ERROR)
+        runner_output = BatchRunnerOutput.from_list(
+            [
+                RunnerOutput(
+                    request_id=request_id,
+                    step_index=None,
+                    finished=True,
+                    result=DiffusionOutput.from_exception(failure),
+                )
+                for request_id in request_ids
+            ]
+        )
+        self._emit_finished_outputs(set(request_ids), runner_output)
+
     def _advance_unhandled_queued_batches(self, handled_request_ids: set[str]) -> None:
         """Progress retained tasks that were not represented in this scheduler cycle."""
         for batch in list(self._queued_pipeline_batches.values()):
@@ -567,6 +602,18 @@ class DiffusionEngine:
         request_state = self.scheduler.get_request_state(request_id)
         if request_state is None:
             raise RuntimeError(f"Queued request {request_id!r} has no Scheduler state.")
+        reserved_bytes = self._estimate_queued_request_bytes(scheduler_output, request_state.req)
+        budget = getattr(self, "_queued_stage_buffer_budget_bytes", None)
+        if budget is not None:
+            if reserved_bytes > budget:
+                raise _QueuedAdmissionOversizeError(
+                    f"request reservation {reserved_bytes} exceeds stage buffer budget {budget}"
+                )
+            if self._queued_reserved_bytes + reserved_bytes > budget:
+                raise _QueuedAdmissionDeferredError(
+                    "queued pipeline stage buffer capacity is exhausted "
+                    f"(reserved={self._queued_reserved_bytes}, request={reserved_bytes}, budget={budget})"
+                )
         step_index = request_state.req.sampling_params.step_index
         if step_index is None:
             step_index = 0
@@ -590,11 +637,44 @@ class DiffusionEngine:
             scheduler_output=scheduler_output,
             stage_specs=stage_specs,
             stage_physical_ranks=stage_physical_ranks,
+            reserved_bytes=reserved_bytes,
         )
         if task.batch_id in self._queued_pipeline_batches:
             raise ValueError(f"Queued pipeline batch {task.batch_id!r} already exists.")
         self._queued_pipeline_batches[task.batch_id] = batch
+        self._queued_reserved_bytes += reserved_bytes
         return batch
+
+    def _estimate_queued_request_bytes(self, scheduler_output: Any, request: Any | None = None) -> int:
+        """Estimate retained latent, transfer, and solver/workspace storage."""
+        if request is None and scheduler_output.scheduled_new_reqs:
+            request = scheduler_output.scheduled_new_reqs[0].req
+        sampling = getattr(request, "sampling_params", None)
+        height = max(int(getattr(sampling, "height", None) or 480), 1)
+        width = max(int(getattr(sampling, "width", None) or 832), 1)
+        frames = max(int(getattr(sampling, "num_frames", None) or 81), 1)
+        config = getattr(self.od_config, "tf_model_config", None)
+        params = getattr(config, "params", {}) or {}
+        patch_size = tuple(params.get("patch_size", (1, 2, 2)))
+        spatial_scale = int(params.get("vae_scale_factor_spatial", 8))
+        temporal_scale = int(params.get("vae_scale_factor_temporal", 4))
+        channels = int(params.get("in_channels", 16))
+        heads = int(params.get("num_attention_heads", 40))
+        head_dim = int(params.get("attention_head_dim", 128))
+        dtype = getattr(self.od_config, "dtype", torch.bfloat16)
+        try:
+            element_bytes = torch.tensor([], dtype=dtype).element_size()
+        except (TypeError, RuntimeError):
+            raise ValueError(f"Queued pipeline reservation does not support dtype {dtype!r}") from None
+        latent_frames = (frames - 1) // temporal_scale + 1
+        latent_height = height // spatial_scale
+        latent_width = width // spatial_scale
+        latent_bytes = channels * latent_frames * latent_height * latent_width * element_bytes
+        tokens = latent_frames * (latent_height // patch_size[1]) * (latent_width // patch_size[2])
+        hidden_bytes = tokens * heads * head_dim * element_bytes
+        # Account for latent mirrors, activation/feedback, hidden-state
+        # intermediates, solver history, and decode workspace.
+        return max((latent_bytes * 4) + (hidden_bytes * 4), 1)
 
     @staticmethod
     def _split_queued_scheduler_output(scheduler_output: Any) -> list[Any]:
@@ -754,6 +834,9 @@ class DiffusionEngine:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
                 batch.scheduler_completed_request_ids.add(request_id)
         self._queued_pipeline_batches.pop(batch.task.batch_id, None)
+        self._queued_reserved_bytes -= batch.reserved_bytes
+        if self._queued_reserved_bytes < 0:
+            raise RuntimeError("queued pipeline byte reservation accounting underflow")
 
     def _cancel_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
         if batch.task.batch_id not in self._queued_pipeline_batches:
@@ -1015,13 +1098,24 @@ class DiffusionEngine:
                         for request_id in task_output.scheduled_request_ids:
                             self.scheduler.preempt_request(request_id)
                         break
+                    except _QueuedAdmissionOversizeError as exc:
+                        self._reject_queued_admission(task_output, exc)
+                        continue
                     except Exception as exc:
                         logger.error(
                             "Queued execution failed for diffusion requests %s",
                             task_output.scheduled_request_ids,
                             exc_info=True,
                         )
-                        self._handle_queued_iteration_failure(task_output, exc)
+                        if not any(
+                            batch.task.request_ids == tuple(task_output.scheduled_request_ids)
+                            for batch in self._queued_pipeline_batches.values()
+                        ):
+                            self._reject_queued_admission(task_output, exc)
+                            if getattr(self.executor, "_is_failed", False) is True:
+                                break
+                        else:
+                            self._handle_queued_iteration_failure(task_output, exc)
                 self._advance_unhandled_queued_batches(handled_request_ids)
                 continue
 

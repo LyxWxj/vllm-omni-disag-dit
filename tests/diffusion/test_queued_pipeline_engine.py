@@ -44,8 +44,11 @@ def _engine(mocker, scheduler_output: DiffusionSchedulerOutput) -> DiffusionEngi
     )
     engine.executor = mocker.Mock()
     engine.executor.pipeline_stage_physical_ranks.return_value = {0: 0, 1: 1}
+    engine.executor.pipeline_stage_memory_budget_bytes.return_value = 1 << 30
     engine.od_config = SimpleNamespace(max_inflight_batches=2)
     engine._queued_pipeline_batches = {}
+    engine._queued_reserved_bytes = 0
+    engine._queued_stage_buffer_budget_bytes = None
     engine._queued_pipeline_epoch = 3
     return engine
 
@@ -86,6 +89,36 @@ def test_queued_reservation_keeps_distinct_request_ownership(mocker) -> None:
     assert first.task.request_ids == ("req-a",)
     assert second.task.request_ids == ("req-b",)
     assert len(engine._queued_pipeline_batches) == 2
+
+
+def test_queued_byte_reservation_defers_after_budget_is_consumed(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine._queued_stage_buffer_budget_bytes = engine._estimate_queued_request_bytes(_scheduler_output("req-a"))
+
+    first = engine._reserve_queued_pipeline_batch(_scheduler_output("req-a"))
+
+    with pytest.raises(RuntimeError, match="stage buffer capacity is exhausted"):
+        engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
+
+    assert engine._queued_reserved_bytes == first.reserved_bytes
+    assert len(engine._queued_pipeline_batches) == 1
+
+
+def test_queued_oversize_request_is_rejected_without_retry_loop(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine._queued_stage_buffer_budget_bytes = 1
+    engine.scheduler.finish_requests = mocker.Mock()
+    engine._emit_finished_outputs = mocker.Mock()
+    scheduler_output = _scheduler_output("req-too-large")
+
+    with pytest.raises(RuntimeError, match="exceeds stage buffer budget"):
+        engine._reserve_queued_pipeline_batch(scheduler_output)
+
+    engine._reject_queued_admission(scheduler_output, RuntimeError("request exceeds stage buffer budget"))
+
+    engine.scheduler.finish_requests.assert_called_once_with(["req-too-large"], DiffusionRequestStatus.FINISHED_ERROR)
+    engine._emit_finished_outputs.assert_called_once()
+    assert engine._queued_pipeline_batches == {}
 
 
 def test_queued_failure_targets_matching_descriptor_batch(mocker) -> None:

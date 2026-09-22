@@ -180,6 +180,32 @@ def test_worker_all_rank_event_poll_clears_every_rank(mocker) -> None:
     assert worker.poll_pipeline_events() == []
 
 
+def test_pipeline_memory_budget_gathers_the_pp_group(mocker) -> None:
+    worker = _worker()
+    worker.device = torch.device("cpu")
+    pp_group = SimpleNamespace(world_size=2, cpu_group=object())
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=pp_group)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.get_free_memory",
+        return_value=100,
+    )
+
+    def gather(output, value, *, group):
+        assert group is pp_group.cpu_group
+        output[:] = [{"rank": 4, "free_bytes": 100}, {"rank": 5, "free_bytes": 80}]
+
+    gather_mock = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.dist.all_gather_object",
+        side_effect=gather,
+    )
+
+    assert worker.pipeline_stage_memory_budget_bytes() == [
+        {"rank": 4, "free_bytes": 100},
+        {"rank": 5, "free_bytes": 80},
+    ]
+    gather_mock.assert_called_once()
+
+
 def test_first_stage_emits_step_completion_only_after_feedback(mocker) -> None:
     worker = _worker()
     _initialize_worker_transports(worker, 0, mocker)

@@ -1391,6 +1391,15 @@ class DiffusionWorker:
         events, self._pipeline_events = self.pipeline_events, []
         return events
 
+    def pipeline_stage_memory_budget_bytes(self) -> list[dict[str, int]]:
+        local_report = {"rank": self.rank, "free_bytes": int(current_omni_platform.get_free_memory(self.device))}
+        pp_group = get_pp_group()
+        if pp_group.world_size == 1:
+            return [local_report]
+        reports: list[dict[str, int] | None] = [None] * pp_group.world_size
+        dist.all_gather_object(reports, local_report, group=pp_group.cpu_group)
+        return [report for report in reports if report is not None]
+
     def poll_pipeline_events_all_ranks(self) -> list[PipelineEvent]:
         """Clear every rank's queue and return all events on the reply rank."""
         rank_events = _all_gather_rank_values(self.poll_pipeline_events())

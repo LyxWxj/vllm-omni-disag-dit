@@ -230,6 +230,9 @@ class DiffusionExecutor(ABC):
     def pipeline_stage_physical_ranks(self) -> dict[int, int]:
         raise NotImplementedError("queued pipeline topology is not wired for this executor")
 
+    def pipeline_stage_memory_budget_bytes(self) -> int:
+        raise NotImplementedError("queued pipeline memory budgeting is not wired for this executor")
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""
 

@@ -110,6 +110,45 @@ def test_prepare_pipeline_requests_rejects_missing_rank(executor) -> None:
     assert executor._is_failed
 
 
+def test_memory_budget_queries_all_endpoints_and_takes_minimum(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.return_value = [
+        [
+            {"rank": 0, "free_bytes": 200},
+            {"rank": 1, "free_bytes": 100},
+        ]
+    ]
+
+    assert executor.pipeline_stage_memory_budget_bytes() == 100
+    executor.collective_rpc.assert_called_once_with(
+        "pipeline_stage_memory_budget_bytes",
+        args=(),
+        exec_all_ranks=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "reports",
+    [
+        [[{"rank": 0, "free_bytes": 100}]],
+        [[{"rank": 0, "free_bytes": 100}, {"rank": 0, "free_bytes": 90}]],
+        [[{"rank": 0, "free_bytes": 100}, {"rank": 1, "free_bytes": 0}]],
+    ],
+)
+def test_malformed_memory_budget_reports_fail_executor(executor, reports) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.return_value = reports
+
+    with pytest.raises(RuntimeError):
+        executor.pipeline_stage_memory_budget_bytes()
+
+    assert executor._is_failed
+
+
 def test_event_poll_uses_all_rank_gather_and_flattens_reply(executor) -> None:
     executor.collective_rpc.return_value = [["rank-0-event", "rank-1-event"]]
 
