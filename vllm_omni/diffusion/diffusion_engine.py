@@ -251,6 +251,7 @@ class _QueuedPipelineBatch:
     scheduler_completed_request_ids: set[str] = field(default_factory=set)
     cancelled: bool = False
     failure: BaseException | None = None
+    abort_requested: bool = False
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
@@ -465,6 +466,12 @@ class DiffusionEngine:
             )
         else:
             batch = existing
+        if batch.abort_requested:
+            if not batch.cancelled:
+                self._cancel_queued_pipeline_batch(batch)
+            self._retire_queued_pipeline_batch(batch)
+            self._emit_finished_outputs(set(batch.task.request_ids), None)
+            return
         if batch.failure is not None:
             if not batch.cancelled:
                 self._cancel_queued_pipeline_batch(batch)
@@ -511,6 +518,9 @@ class DiffusionEngine:
         )
         if batch is None:
             raise RuntimeError(f"Queued failure has no owned batch for requests {request_ids!r}") from failure
+        if batch.abort_requested:
+            logger.error("Queued abort cleanup is pending; retaining ownership", exc_info=True)
+            return
         if batch.failure is None:
             batch.failure = failure
         try:
@@ -527,6 +537,12 @@ class DiffusionEngine:
             if set(batch.task.request_ids) & handled_request_ids:
                 continue
             try:
+                if batch.abort_requested:
+                    if not batch.cancelled:
+                        self._cancel_queued_pipeline_batch(batch)
+                    self._retire_queued_pipeline_batch(batch)
+                    self._emit_finished_outputs(set(batch.task.request_ids), None)
+                    continue
                 if batch.failure is not None:
                     self._run_queued_pipeline_iteration(batch.scheduler_output)
                     continue
@@ -534,7 +550,10 @@ class DiffusionEngine:
                 if output is not None:
                     self._emit_finished_outputs(set(batch.task.request_ids), output)
             except Exception as exc:
-                self._handle_queued_iteration_failure(batch.scheduler_output, exc)
+                if batch.abort_requested:
+                    logger.error("Queued abort cleanup is pending; retaining ownership", exc_info=True)
+                else:
+                    self._handle_queued_iteration_failure(batch.scheduler_output, exc)
 
     def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
         max_inflight_batches = int(getattr(self.od_config, "max_inflight_batches", 1))
@@ -722,13 +741,13 @@ class DiffusionEngine:
                 if not isinstance(cleanup, list) or len(cleanup) != 2 or not all(cleanup):
                     raise RuntimeError("Queued finalized-request cleanup did not acknowledge both stages.")
                 batch.cleanup_completed_request_ids.add(request_id)
-        if batch.finalizing_request_ids:
+        if batch.finalizing_request_ids and not batch.abort_requested:
             for request_id in batch.finalizing_request_ids:
                 if request_id in batch.scheduler_completed_request_ids:
                     continue
                 self.scheduler.complete_pipeline_request(request_id)
                 batch.scheduler_completed_request_ids.add(request_id)
-        if batch.cancelled and batch.failure is None:
+        if batch.abort_requested or (batch.cancelled and batch.failure is None):
             for request_id in batch.task.request_ids:
                 if request_id in batch.scheduler_completed_request_ids:
                     continue
@@ -1735,8 +1754,25 @@ class DiffusionEngine:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         request_ids = list(dict.fromkeys(request_ids))
 
-        self._remove_diffusion_kv_requests(request_ids)
+        queued_request_ids = set(request_ids)
+        queued_batches = getattr(self, "_queued_pipeline_batches", {})
+        owned_queued_request_ids = {
+            request_id for batch in queued_batches.values() for request_id in batch.task.request_ids
+        }
+        for batch in list(queued_batches.values()):
+            if not queued_request_ids.intersection(batch.task.request_ids):
+                continue
+            batch.abort_requested = True
+            try:
+                if not batch.cancelled:
+                    self._cancel_queued_pipeline_batch(batch)
+                self._retire_queued_pipeline_batch(batch)
+                self._emit_finished_outputs(set(batch.task.request_ids), None)
+            except Exception:
+                logger.error("Queued abort cleanup is pending; retaining ownership", exc_info=True)
 
+        request_ids = [request_id for request_id in request_ids if request_id not in owned_queued_request_ids]
+        self._remove_diffusion_kv_requests(request_ids)
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)

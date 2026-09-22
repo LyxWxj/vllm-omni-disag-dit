@@ -11,6 +11,7 @@ from vllm_omni.diffusion.diffusion_engine import (
 )
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
+    DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     NewRequestData,
 )
@@ -163,6 +164,63 @@ def test_cleanup_retry_preserves_failure_and_skips_repeat_cancellation(mocker) -
 
     assert batch.failure is original
     cancel.assert_not_called()
+
+
+def test_abort_retains_batch_until_cancel_and_release_complete(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine.scheduler.finish_requests = mocker.Mock()
+    engine._emit_finished_outputs = mocker.Mock()
+    batch = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    acknowledgements = [
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 1, 1),
+    ]
+    released = [
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),
+    ]
+    engine.executor.cancel_pipeline_requests.side_effect = [RuntimeError("cancel timeout"), acknowledgements]
+    engine.executor.release_pipeline_batch.return_value = released
+
+    engine._abort_requests("req-a")
+    assert batch.abort_requested
+    assert batch.task.batch_id in engine._queued_pipeline_batches
+
+    engine._advance_unhandled_queued_batches(set())
+
+    assert engine._queued_pipeline_batches == {}
+    engine._emit_finished_outputs.assert_called_once_with({"req-a"}, None)
+
+
+@pytest.mark.parametrize("finalizing", [False, True])
+def test_abort_overrides_failure_or_finalizing_success(mocker, finalizing: bool) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine.scheduler.finish_requests = mocker.Mock()
+    engine.scheduler.complete_pipeline_request = mocker.Mock()
+    engine._emit_finished_outputs = mocker.Mock()
+    batch = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    if finalizing:
+        batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+        batch.finalizing_request_ids = frozenset({"req-a"})
+        engine.executor.cleanup_finalized_pipeline_request.return_value = [True, True]
+    else:
+        batch.phase = _QueuedPipelineBatchPhase.FAILED
+        batch.failure = RuntimeError("execution failed")
+    engine.executor.cancel_pipeline_requests.return_value = [
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.CANCELLED, batch.task, 1, 1),
+    ]
+    engine.executor.release_pipeline_batch.return_value = [
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),
+    ]
+
+    engine._abort_requests("req-a")
+
+    engine.scheduler.complete_pipeline_request.assert_not_called()
+    engine.scheduler.finish_requests.assert_called_once_with("req-a", DiffusionRequestStatus.FINISHED_ABORTED)
+    engine._emit_finished_outputs.assert_called_once_with({"req-a"}, None)
+    assert engine._queued_pipeline_batches == {}
 
 
 def test_queued_progress_accepts_only_matching_first_stage_completion(mocker) -> None:

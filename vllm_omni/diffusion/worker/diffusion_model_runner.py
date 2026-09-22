@@ -1010,6 +1010,95 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = bool(getattr(getattr(self.od_config, "parallel_config", None), "use_hsdp", False))
         return torch.no_grad() if use_hsdp else torch.inference_mode()
 
+    def _run_queued_preparation_phase(
+        self,
+        request_id: str,
+        phase: str,
+        operation: Callable[[], Any],
+    ) -> Any:
+        """Run one rank-local preparation phase and agree on its outcome."""
+        local_error: Exception | None = None
+        result: Any = None
+        try:
+            result = operation()
+        except Exception as exc:
+            local_error = exc
+        if _dit_any_rank_failed(local_error is not None):
+            if local_error is None:
+                local_error = RuntimeError(f"Queued pipeline {phase} failed on another rank for {request_id}")
+            raise local_error
+        return result
+
+    def _prepare_cached_pipeline_request(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        request_id: str,
+    ) -> tuple[str, ...]:
+        def prepare() -> tuple[str, ...]:
+            with self._pipeline_inference_context():
+                states, _ = self._update_states(scheduler_output)
+            if len(states) != 1 or states[0].request_id != request_id:
+                raise RuntimeError("Queued cached preparation did not retain the expected request state.")
+            input_batch = InputBatch.make_batch(states, cached_batch=self.input_batch)
+            if input_batch is None:
+                raise RuntimeError("Queued cached batch construction produced no input batch.")
+            self.input_batch = input_batch
+            return (request_id,)
+
+        return self._run_queued_preparation_phase(request_id, "cached preparation", prepare)
+
+    def _prepare_queued_new_preamble(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        new_request: NewRequestData,
+        installed_request_ids: list[str],
+    ) -> list[StepRequestState]:
+        if self.pipeline is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        if not self._supports_step_mode() or not supports_pipeline_stage_execution(self.pipeline):
+            raise ValueError("The loaded diffusion pipeline does not support queued local-stage execution.")
+        if self.od_config.cache_backend not in (None, "none"):
+            raise ValueError("Queued pipeline preparation does not support cache_backend yet.")
+        self._cleanup_finished_step_requests(scheduler_output)
+        if new_request.diffusion_kv_metadata is not None:
+            self._validate_diffusion_kv_metadata(
+                request_id=new_request.request_id,
+                metadata=new_request.diffusion_kv_metadata,
+            )
+            installed_request_ids.append(new_request.request_id)
+            self.install_diffusion_kv_metadata(new_request.diffusion_kv_metadata)
+        with self._pipeline_inference_context():
+            states, _ = self._update_states(scheduler_output)
+        return states
+
+    def _prepare_queued_new_setup(self, states: list[StepRequestState]) -> None:
+        for state in states:
+            self._initialize_generator(state.sampling)
+            clear_pipeline_stage_durations(self.pipeline)
+
+    def _prepare_queued_new_encode(self, states: list[StepRequestState]) -> None:
+        with self._pipeline_inference_context():
+            for state in states:
+                self.pipeline.prepare_encode(state)
+                merge_stage_durations(
+                    state,
+                    consume_pipeline_stage_durations(self.pipeline),
+                )
+
+    def _prepare_queued_new_batch(
+        self,
+        states: list[StepRequestState],
+        expected_request_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        prepared_request_ids = tuple(state.request_id for state in states)
+        if prepared_request_ids != expected_request_ids:
+            raise RuntimeError("Queued pipeline preparation did not retain the expected request state.")
+        input_batch = InputBatch.make_batch(states, cached_batch=None)
+        if input_batch is None:
+            raise RuntimeError("Queued pipeline batch construction produced no input batch.")
+        self.input_batch = input_batch
+        return prepared_request_ids
+
     def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[str, ...]:
         """Prepare one queued request coherently without executing a denoise step."""
         new_requests = list(scheduler_output.scheduled_new_reqs)
@@ -1017,24 +1106,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if len(new_requests) + len(cached_request_ids) != 1 or (new_requests and cached_request_ids):
             raise ValueError("M2 queued preparation requires exactly one new or cached request.")
         if cached_request_ids:
-            request_id = cached_request_ids[0]
-            local_error: Exception | None = None
-            try:
-                with self._pipeline_inference_context():
-                    states, _ = self._update_states(scheduler_output)
-                if len(states) != 1 or states[0].request_id != request_id:
-                    raise RuntimeError("Queued cached preparation did not retain the expected request state.")
-                input_batch = InputBatch.make_batch(states, cached_batch=self.input_batch)
-                if input_batch is None:
-                    raise RuntimeError("Queued cached batch construction produced no input batch.")
-                self.input_batch = input_batch
-            except Exception as exc:
-                local_error = exc
-            if _dit_any_rank_failed(local_error is not None):
-                if local_error is None:
-                    local_error = RuntimeError(f"Queued cached preparation failed on another rank for {request_id}")
-                raise local_error
-            return (request_id,)
+            return self._prepare_cached_pipeline_request(scheduler_output, cached_request_ids[0])
         new_request = new_requests[0]
         validate_new_request_data_identity(new_request)
         if not getattr(new_request.req, "use_step_execution", True):
@@ -1042,86 +1114,27 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         expected_request_ids = (new_request.request_id,)
         installed_request_ids: list[str] = []
-        states: list[StepRequestState] = []
-        local_error: Exception | None = None
         try:
-            try:
-                if self.pipeline is None:
-                    raise RuntimeError("Model not loaded. Call load_model() first.")
-                if not self._supports_step_mode() or not supports_pipeline_stage_execution(self.pipeline):
-                    raise ValueError("The loaded diffusion pipeline does not support queued local-stage execution.")
-                if self.od_config.cache_backend not in (None, "none"):
-                    raise ValueError("Queued pipeline preparation does not support cache_backend yet.")
-                self._cleanup_finished_step_requests(scheduler_output)
-                if new_request.diffusion_kv_metadata is not None:
-                    self._validate_diffusion_kv_metadata(
-                        request_id=new_request.request_id,
-                        metadata=new_request.diffusion_kv_metadata,
-                    )
-                    installed_request_ids.append(new_request.request_id)
-                    self.install_diffusion_kv_metadata(new_request.diffusion_kv_metadata)
-                with self._pipeline_inference_context():
-                    states, _ = self._update_states(scheduler_output)
-            except Exception as exc:
-                local_error = exc
-            if _dit_any_rank_failed(local_error is not None):
-                if local_error is None:
-                    local_error = RuntimeError(
-                        f"Queued pipeline preamble failed on another rank for {new_request.request_id}"
-                    )
-                raise local_error
-
-            local_error = None
-            try:
-                for state in states:
-                    self._initialize_generator(state.sampling)
-                    clear_pipeline_stage_durations(self.pipeline)
-            except Exception as exc:
-                local_error = exc
-            if _dit_any_rank_failed(local_error is not None):
-                if local_error is None:
-                    local_error = RuntimeError(
-                        f"Queued pipeline local setup failed on another rank for {new_request.request_id}"
-                    )
-                raise local_error
-
-            local_error = None
-            try:
-                with self._pipeline_inference_context():
-                    for state in states:
-                        self.pipeline.prepare_encode(state)
-                        merge_stage_durations(
-                            state,
-                            consume_pipeline_stage_durations(self.pipeline),
-                        )
-            except Exception as exc:
-                local_error = exc
-            if _dit_any_rank_failed(local_error is not None):
-                if local_error is None:
-                    local_error = RuntimeError(
-                        f"Queued pipeline encoding failed on another rank for {new_request.request_id}"
-                    )
-                raise local_error
-
-            input_batch: InputBatch | None = None
-            local_error = None
-            try:
-                prepared_request_ids = tuple(state.request_id for state in states)
-                if prepared_request_ids != expected_request_ids:
-                    raise RuntimeError("Queued pipeline preparation did not retain the expected request state.")
-                input_batch = InputBatch.make_batch(states, cached_batch=None)
-                if input_batch is None:
-                    raise RuntimeError("Queued pipeline batch construction produced no input batch.")
-            except Exception as exc:
-                local_error = exc
-            if _dit_any_rank_failed(local_error is not None):
-                if local_error is None:
-                    local_error = RuntimeError(
-                        f"Queued pipeline batch construction failed on another rank for {new_request.request_id}"
-                    )
-                raise local_error
-            self.input_batch = cast(InputBatch, input_batch)
-            return prepared_request_ids
+            states = self._run_queued_preparation_phase(
+                new_request.request_id,
+                "pipeline preamble",
+                lambda: self._prepare_queued_new_preamble(scheduler_output, new_request, installed_request_ids),
+            )
+            self._run_queued_preparation_phase(
+                new_request.request_id,
+                "local setup",
+                lambda: self._prepare_queued_new_setup(states),
+            )
+            self._run_queued_preparation_phase(
+                new_request.request_id,
+                "encoding",
+                lambda: self._prepare_queued_new_encode(states),
+            )
+            return self._run_queued_preparation_phase(
+                new_request.request_id,
+                "batch construction",
+                lambda: self._prepare_queued_new_batch(states, expected_request_ids),
+            )
         except Exception:
             self.state_cache.pop(new_request.request_id, None)
             self.input_batch = None
