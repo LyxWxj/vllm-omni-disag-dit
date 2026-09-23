@@ -470,7 +470,13 @@ class DiffusionEngine:
         else:
             raise RuntimeError("queued pipeline requires a resolvable stage buffer budget")
 
-    def _run_queued_pipeline_iteration(self, scheduler_output: Any) -> None:
+    def _run_queued_pipeline_iteration(
+        self,
+        scheduler_output: Any,
+        *,
+        pipeline_events: list[PipelineEvent] | None = None,
+        submit_only: bool = False,
+    ) -> None:
         """Drive one queued batch through submission, progress, and retirement."""
         self._ensure_queued_pipeline_transports()
         request_ids = tuple(scheduler_output.scheduled_request_ids)
@@ -485,6 +491,8 @@ class DiffusionEngine:
             )
         else:
             batch = existing
+        if submit_only:
+            return
         if batch.abort_requested:
             if not batch.cancelled:
                 self._cancel_queued_pipeline_batch(batch)
@@ -500,7 +508,7 @@ class DiffusionEngine:
         if tuple(scheduler_output.scheduled_request_ids) != tuple(batch.task.request_ids):
             raise RuntimeError("queued pipeline scheduler selected a request while another batch is retained")
 
-        output = self._advance_queued_pipeline_batch(batch)
+        output = self._advance_queued_pipeline_batch(batch, pipeline_events=pipeline_events)
         if output is not None:
             self._emit_finished_outputs(set(batch.task.request_ids), output)
 
@@ -566,7 +574,11 @@ class DiffusionEngine:
         )
         self._emit_finished_outputs(set(request_ids), runner_output)
 
-    def _advance_unhandled_queued_batches(self, handled_request_ids: set[str]) -> None:
+    def _advance_unhandled_queued_batches(
+        self,
+        handled_request_ids: set[str],
+        events_by_batch: dict[str, list[PipelineEvent]] | None = None,
+    ) -> None:
         """Progress retained tasks that were not represented in this scheduler cycle."""
         for batch in list(self._queued_pipeline_batches.values()):
             if set(batch.task.request_ids) & handled_request_ids:
@@ -581,7 +593,8 @@ class DiffusionEngine:
                 if batch.failure is not None:
                     self._run_queued_pipeline_iteration(batch.scheduler_output)
                     continue
-                output = self._advance_queued_pipeline_batch(batch)
+                pipeline_events = None if events_by_batch is None else events_by_batch.get(batch.task.batch_id, [])
+                output = self._advance_queued_pipeline_batch(batch, pipeline_events=pipeline_events)
                 if output is not None:
                     self._emit_finished_outputs(set(batch.task.request_ids), output)
             except Exception as exc:
@@ -589,6 +602,45 @@ class DiffusionEngine:
                     logger.error("Queued abort cleanup is pending; retaining ownership", exc_info=True)
                 else:
                     self._handle_queued_iteration_failure(batch.scheduler_output, exc)
+
+    def _has_unhandled_authorized_queued_batch(self, handled_request_ids: set[str]) -> bool:
+        return any(
+            batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
+            and batch.failure is None
+            and not batch.abort_requested
+            and not (set(batch.task.request_ids) & handled_request_ids)
+            for batch in self._queued_pipeline_batches.values()
+        )
+
+    def _collect_queued_pipeline_events(self) -> dict[str, list[PipelineEvent]]:
+        self.executor.progress_pipeline()
+        events = self.executor.poll_pipeline_events()
+        grouped: dict[str, list[PipelineEvent]] = {}
+        known_batches = set(self._queued_pipeline_batches)
+        for event in events:
+            if not isinstance(event, PipelineEvent) or event.task.batch_id not in known_batches:
+                raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
+            grouped.setdefault(event.task.batch_id, []).append(event)
+        return grouped
+
+    def _handle_queued_progress_snapshot_failure(
+        self,
+        admitted_outputs: list[Any],
+        handled_request_ids: set[str],
+        failure: BaseException,
+    ) -> None:
+        logger.error("Queued transport progress failed", exc_info=True)
+        for task_output in admitted_outputs:
+            if any(
+                batch.task.request_ids == tuple(task_output.scheduled_request_ids)
+                for batch in self._queued_pipeline_batches.values()
+            ):
+                self._handle_queued_iteration_failure(task_output, failure)
+            else:
+                self._reject_queued_admission(task_output, failure)
+        # The failed snapshot already consumed the transport event queue. Retained
+        # batches may use no event from it, but must not trigger another poll here.
+        self._advance_unhandled_queued_batches(handled_request_ids, {})
 
     def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
         max_inflight_batches = int(getattr(self.od_config, "max_inflight_batches", 1))
@@ -712,15 +764,21 @@ class DiffusionEngine:
             batch.phase = _QueuedPipelineBatchPhase.FAILED
             raise
 
-    def _progress_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> bool:
+    def _progress_queued_pipeline_batch(
+        self,
+        batch: _QueuedPipelineBatch,
+        pipeline_events: list[PipelineEvent] | None = None,
+    ) -> bool:
         if self._queued_pipeline_batches.get(batch.task.batch_id) is not batch:
             raise ValueError("Queued pipeline batch is not owned by this Engine.")
         if batch.phase is not _QueuedPipelineBatchPhase.AUTHORIZED:
             raise RuntimeError("Queued pipeline batch is not authorized for progress.")
         try:
-            self.executor.progress_pipeline()
+            if pipeline_events is None:
+                self.executor.progress_pipeline()
+                pipeline_events = self.executor.poll_pipeline_events()
             step_completed = False
-            for event in self.executor.poll_pipeline_events():
+            for event in pipeline_events:
                 if not isinstance(event, PipelineEvent) or event.task != batch.task:
                     raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
                 if event.event_type is PipelineEventType.STEP_COMPLETED:
@@ -862,10 +920,14 @@ class DiffusionEngine:
         batch.cancelled = True
         batch.phase = _QueuedPipelineBatchPhase.CANCELLING
 
-    def _advance_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput | None:
+    def _advance_queued_pipeline_batch(
+        self,
+        batch: _QueuedPipelineBatch,
+        pipeline_events: list[PipelineEvent] | None = None,
+    ) -> BatchRunnerOutput | None:
         """Drive one retained batch through progress, commit, decode, and retirement."""
         if batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED:
-            if not self._progress_queued_pipeline_batch(batch):
+            if not self._progress_queued_pipeline_batch(batch, pipeline_events):
                 return None
         if batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED:
             self._commit_queued_pipeline_step(batch)
@@ -1090,10 +1152,13 @@ class DiffusionEngine:
 
             if self.od_config.mode == "queued":
                 handled_request_ids: set[str] = set()
-                for task_output in self._split_queued_scheduler_output(sched_output):
+                task_outputs = self._split_queued_scheduler_output(sched_output)
+                admitted_outputs: list[Any] = []
+                for task_output in task_outputs:
                     handled_request_ids.update(task_output.scheduled_request_ids)
                     try:
-                        self._run_queued_pipeline_iteration(task_output)
+                        self._run_queued_pipeline_iteration(task_output, submit_only=True)
+                        admitted_outputs.append(task_output)
                     except _QueuedAdmissionDeferredError:
                         for request_id in task_output.scheduled_request_ids:
                             self.scheduler.preempt_request(request_id)
@@ -1116,7 +1181,39 @@ class DiffusionEngine:
                                 break
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
-                self._advance_unhandled_queued_batches(handled_request_ids)
+                try:
+                    should_progress = bool(admitted_outputs) or self._has_unhandled_authorized_queued_batch(
+                        handled_request_ids
+                    )
+                    events_by_batch = self._collect_queued_pipeline_events() if should_progress else {}
+                except Exception as exc:
+                    self._handle_queued_progress_snapshot_failure(admitted_outputs, handled_request_ids, exc)
+                    continue
+                for task_output in admitted_outputs:
+                    batch_id = next(
+                        (
+                            batch.task.batch_id
+                            for batch in self._queued_pipeline_batches.values()
+                            if batch.task.request_ids == tuple(task_output.scheduled_request_ids)
+                        ),
+                        None,
+                    )
+                    try:
+                        self._run_queued_pipeline_iteration(
+                            task_output,
+                            pipeline_events=events_by_batch.get(batch_id, []) if batch_id is not None else [],
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Queued execution failed for diffusion requests %s",
+                            task_output.scheduled_request_ids,
+                            exc_info=True,
+                        )
+                        if batch_id is None:
+                            self._reject_queued_admission(task_output, exc)
+                        else:
+                            self._handle_queued_iteration_failure(task_output, exc)
+                self._advance_unhandled_queued_batches(handled_request_ids, events_by_batch)
                 continue
 
             try:

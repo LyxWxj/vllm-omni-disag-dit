@@ -166,7 +166,7 @@ def test_unhandled_retained_batch_failure_uses_descriptor_cleanup(mocker) -> Non
 
     engine._advance_unhandled_queued_batches({"req-a"})
 
-    advance.assert_called_once_with(second)
+    advance.assert_called_once_with(second, pipeline_events=None)
     cleanup.assert_called_once_with(second_output, advance.side_effect)
 
 
@@ -180,7 +180,100 @@ def test_unhandled_retained_batches_progress_independently(mocker) -> None:
 
     engine._advance_unhandled_queued_batches({"req-a"})
 
-    advance.assert_called_once_with(second)
+    advance.assert_called_once_with(second, pipeline_events=None)
+
+
+def test_shared_progress_delivers_events_to_retained_batch(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    first_output = _scheduler_output("req-a")
+    second_output = _scheduler_output("req-b")
+    first = engine._submit_queued_pipeline_batch(first_output)
+    second = engine._submit_queued_pipeline_batch(second_output)
+    engine.executor.progress_pipeline.reset_mock()
+    engine.executor.poll_pipeline_events.return_value = [
+        PipelineEvent(PipelineEventType.STEP_COMPLETED, first.task, 0, 0),
+        PipelineEvent(PipelineEventType.STEP_COMPLETED, second.task, 0, 0),
+    ]
+
+    events_by_batch = engine._collect_queued_pipeline_events()
+    received: dict[str, list[PipelineEvent] | None] = {}
+
+    def advance(batch, pipeline_events=None):
+        received[batch.task.batch_id] = pipeline_events
+        return None
+
+    mocker.patch.object(engine, "_advance_queued_pipeline_batch", side_effect=advance)
+    engine._run_queued_pipeline_iteration(
+        first_output,
+        pipeline_events=events_by_batch[first.task.batch_id],
+    )
+    engine._advance_unhandled_queued_batches({"req-a"}, events_by_batch)
+
+    assert received == {
+        first.task.batch_id: events_by_batch[first.task.batch_id],
+        second.task.batch_id: events_by_batch[second.task.batch_id],
+    }
+    engine.executor.progress_pipeline.assert_called_once_with()
+    engine.executor.poll_pipeline_events.assert_called_once_with()
+
+
+def test_retained_authorized_batch_forces_progress_when_all_admission_deferred(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    retained_output = _scheduler_output("req-a")
+    retained = engine._submit_queued_pipeline_batch(retained_output)
+    engine.executor.progress_pipeline.reset_mock()
+    event = PipelineEvent(PipelineEventType.STEP_COMPLETED, retained.task, 0, 0)
+    engine.executor.poll_pipeline_events.return_value = [event]
+    handled_request_ids = {"req-b"}
+
+    assert engine._has_unhandled_authorized_queued_batch(handled_request_ids)
+    events_by_batch = engine._collect_queued_pipeline_events()
+    received: list[PipelineEvent] = []
+    mocker.patch.object(
+        engine,
+        "_advance_queued_pipeline_batch",
+        side_effect=lambda batch, pipeline_events=None: received.extend(pipeline_events or []),
+    )
+
+    engine._advance_unhandled_queued_batches(handled_request_ids, events_by_batch)
+
+    assert received == [event]
+    engine.executor.progress_pipeline.assert_called_once_with()
+    engine.executor.poll_pipeline_events.assert_called_once_with()
+
+
+def test_malformed_shared_snapshot_does_not_repoll_retained_batch(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    admitted_output = _scheduler_output("req-a")
+    retained_output = _scheduler_output("req-b")
+    admitted = engine._submit_queued_pipeline_batch(admitted_output)
+    retained = engine._submit_queued_pipeline_batch(retained_output)
+    unknown_task = PipelineTask("unknown", ("req-c",), step_index=0, epoch=99)
+    engine.executor.poll_pipeline_events.return_value = [
+        PipelineEvent(PipelineEventType.STEP_COMPLETED, unknown_task, 0, 0)
+    ]
+    failure_cleanup = mocker.patch.object(engine, "_handle_queued_iteration_failure")
+    retained_progress: list[tuple[object, list[PipelineEvent] | None]] = []
+    mocker.patch.object(
+        engine,
+        "_advance_queued_pipeline_batch",
+        side_effect=lambda batch, pipeline_events=None: retained_progress.append((batch, pipeline_events)),
+    )
+
+    with pytest.raises(RuntimeError, match="unknown queued pipeline task"):
+        engine._collect_queued_pipeline_events()
+    engine._handle_queued_progress_snapshot_failure(
+        [admitted_output],
+        {"req-a"},
+        RuntimeError("malformed progress snapshot"),
+    )
+
+    failure_cleanup.assert_called_once_with(admitted_output, mocker.ANY)
+    assert retained_progress == [(retained, [])]
+    assert admitted.task.batch_id in engine._queued_pipeline_batches
+    assert retained.task.batch_id in engine._queued_pipeline_batches
+    engine.executor.progress_pipeline.assert_called_once_with()
+    engine.executor.poll_pipeline_events.assert_called_once_with()
 
 
 def test_cleanup_retry_preserves_failure_and_skips_repeat_cancellation(mocker) -> None:
