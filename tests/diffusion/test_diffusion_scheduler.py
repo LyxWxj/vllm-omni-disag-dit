@@ -1910,6 +1910,22 @@ class TestStepScheduler:
         assert _new_ids(retry) == [req_id]
         assert _cached_ids(retry) == []
 
+    def test_engine_capacity_deferral_returns_unprocessed_new_tail_in_order(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+        request_ids = [scheduler.add_request(_make_step_request(f"queued-{index}")) for index in range(4)]
+        selected = scheduler.schedule()
+        assert _new_ids(selected) == request_ids
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = scheduler
+        descriptors = engine._split_queued_scheduler_output(selected)
+        engine._defer_queued_admission_tail(descriptors[2:])
+
+        retry = scheduler.schedule()
+        assert _cached_ids(retry) == request_ids[:2]
+        assert _new_ids(retry) == request_ids[2:]
+
     @pytest.mark.parametrize(
         ("sampling_params", "expected_steps"),
         [

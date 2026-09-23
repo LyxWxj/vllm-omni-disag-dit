@@ -591,6 +591,11 @@ class DiffusionEngine:
         if not self.scheduler.preempt_request(request_id):
             raise RuntimeError(f"Could not preempt cached request {request_id!r} for queued admission.")
 
+    def _defer_queued_admission_tail(self, scheduler_outputs: list[Any]) -> None:
+        """Return an unprocessed scheduler suffix in its original FIFO order."""
+        for scheduler_output in reversed(scheduler_outputs):
+            self._defer_queued_admission(scheduler_output)
+
     def _advance_unhandled_queued_batches(
         self,
         handled_request_ids: set[str],
@@ -1171,13 +1176,16 @@ class DiffusionEngine:
                 handled_request_ids: set[str] = set()
                 task_outputs = self._split_queued_scheduler_output(sched_output)
                 admitted_outputs: list[Any] = []
-                for task_output in task_outputs:
+                for output_index, task_output in enumerate(task_outputs):
                     handled_request_ids.update(task_output.scheduled_request_ids)
                     try:
                         self._run_queued_pipeline_iteration(task_output, submit_only=True)
                         admitted_outputs.append(task_output)
                     except _QueuedAdmissionDeferredError:
-                        self._defer_queued_admission(task_output)
+                        deferred_outputs = task_outputs[output_index:]
+                        self._defer_queued_admission_tail(deferred_outputs)
+                        for deferred_output in deferred_outputs[1:]:
+                            handled_request_ids.update(deferred_output.scheduled_request_ids)
                         break
                     except _QueuedAdmissionOversizeError as exc:
                         self._reject_queued_admission(task_output, exc)
