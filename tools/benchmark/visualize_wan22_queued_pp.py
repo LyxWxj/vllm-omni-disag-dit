@@ -65,9 +65,15 @@ def render_timeline(queued_dir: Path, static_dir: Path, output: Path) -> dict[st
     all_markers = queued + static
     if not all_markers:
         raise RuntimeError("No profiler markers found")
-    origin = min(item["start"] for item in all_markers)
-    end = max(item["end"] for item in all_markers)
-    max_ms = max((end - origin) / 1000.0, 1.0)
+    origins = {
+        "queued": min(item["start"] for item in queued),
+        "static": min(item["start"] for item in static),
+    }
+    max_ms = max(
+        max((item["end"] - origins["queued"]) / 1000.0 for item in queued),
+        max((item["end"] - origins["static"]) / 1000.0 for item in static),
+        1.0,
+    )
     width, left, right = 1900, 220, 1850
     row_height, row_gap = 58, 28
     height = 430
@@ -107,8 +113,9 @@ def render_timeline(queued_dir: Path, static_dir: Path, output: Path) -> dict[st
             selected = [item for item in markers if item["rank"] == 0 and "stage0" in item["name"]]
         elif color_key == "static":
             selected = [item for item in markers if item["rank"] == (row % 2)]
+        mode_origin = origins["static" if color_key == "static" else "queued"]
         for marker in selected:
-            start_ms = (marker["start"] - origin) / 1000.0
+            start_ms = (marker["start"] - mode_origin) / 1000.0
             duration_ms = (marker["end"] - marker["start"]) / 1000.0
             x = left + (right - left) * start_ms / max_ms
             bar_width = max((right - left) * duration_ms / max_ms, 2.0)
