@@ -104,6 +104,33 @@ def test_queued_byte_reservation_defers_after_budget_is_consumed(mocker) -> None
     assert len(engine._queued_pipeline_batches) == 1
 
 
+def test_queued_admission_deferral_preserves_new_and_cached_identity(mocker) -> None:
+    scheduler_output = _scheduler_output("req-a")
+    engine = _engine(mocker, scheduler_output)
+    engine.scheduler.defer_request = mocker.Mock(return_value=True)
+    engine.scheduler.preempt_request = mocker.Mock(return_value=True)
+
+    engine._defer_queued_admission(scheduler_output)
+
+    engine.scheduler.defer_request.assert_called_once_with("req-a")
+    engine.scheduler.preempt_request.assert_not_called()
+
+    cached_output = DiffusionSchedulerOutput(
+        step_id=8,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=["req-b"]),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+    engine.scheduler.defer_request.reset_mock()
+
+    engine._defer_queued_admission(cached_output)
+
+    engine.scheduler.defer_request.assert_not_called()
+    engine.scheduler.preempt_request.assert_called_once_with("req-b")
+
+
 def test_queued_oversize_request_is_rejected_without_retry_loop(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
     engine._queued_stage_buffer_budget_bytes = 1

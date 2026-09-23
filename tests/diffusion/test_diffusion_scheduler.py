@@ -1897,6 +1897,19 @@ class TestStepScheduler:
         assert _cached_ids(third) == [req_id]
         assert request.sampling_params.step_index == 1
 
+    def test_defer_unprepared_request_preserves_new_request_classification(self) -> None:
+        request = _make_step_request("deferred-new", num_inference_steps=2)
+        req_id = self.scheduler.add_request(request)
+
+        first = self.scheduler.schedule()
+        assert _new_ids(first) == [req_id]
+        assert self.scheduler.defer_request(req_id) is True
+        assert self.scheduler.get_request_state(req_id).status is DiffusionRequestStatus.WAITING
+
+        retry = self.scheduler.schedule()
+        assert _new_ids(retry) == [req_id]
+        assert _cached_ids(retry) == []
+
     @pytest.mark.parametrize(
         ("sampling_params", "expected_steps"),
         [

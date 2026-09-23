@@ -574,6 +574,23 @@ class DiffusionEngine:
         )
         self._emit_finished_outputs(set(request_ids), runner_output)
 
+    def _defer_queued_admission(self, scheduler_output: Any) -> None:
+        """Restore an unadmitted descriptor without changing its new/cached identity."""
+        request_ids = tuple(scheduler_output.scheduled_request_ids)
+        if len(request_ids) != 1:
+            raise ValueError("Queued admission deferral requires exactly one request.")
+        request_id = request_ids[0]
+        new_request_ids = {request.request_id for request in scheduler_output.scheduled_new_reqs}
+        cached_request_ids = set(scheduler_output.scheduled_cached_reqs.request_ids)
+        if (request_id in new_request_ids) == (request_id in cached_request_ids):
+            raise RuntimeError("Queued admission descriptor has ambiguous new/cached request identity.")
+        if request_id in new_request_ids:
+            if not self.scheduler.defer_request(request_id):
+                raise RuntimeError(f"Could not return unprepared request {request_id!r} to the waiting queue.")
+            return
+        if not self.scheduler.preempt_request(request_id):
+            raise RuntimeError(f"Could not preempt cached request {request_id!r} for queued admission.")
+
     def _advance_unhandled_queued_batches(
         self,
         handled_request_ids: set[str],
@@ -1160,8 +1177,7 @@ class DiffusionEngine:
                         self._run_queued_pipeline_iteration(task_output, submit_only=True)
                         admitted_outputs.append(task_output)
                     except _QueuedAdmissionDeferredError:
-                        for request_id in task_output.scheduled_request_ids:
-                            self.scheduler.preempt_request(request_id)
+                        self._defer_queued_admission(task_output)
                         break
                     except _QueuedAdmissionOversizeError as exc:
                         self._reject_queued_admission(task_output, exc)

@@ -288,6 +288,18 @@ class BaseScheduler(ABC):
             return True
         return False
 
+    def defer_request(self, request_id: str) -> bool:
+        """Return a selected but unprepared request to the new-request queue."""
+        state = self._request_states.get(request_id)
+        if state is None or request_id not in self._running or state.status is not DiffusionRequestStatus.RUNNING:
+            return False
+        self._running.remove(request_id)
+        if not self._running:
+            self._running_sampling_params_key = None
+        self._waiting.appendleft(request_id)
+        state.status = DiffusionRequestStatus.WAITING
+        return True
+
     def finish_requests(self, request_ids: str | list[str], status: DiffusionRequestStatus) -> None:
         assert DiffusionRequestStatus.is_finished(status)
         if isinstance(request_ids, str):
