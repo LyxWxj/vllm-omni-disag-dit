@@ -14,6 +14,7 @@ COLORS = {
     "stage0": "#1f77b4",
     "stage1": "#e67e22",
     "static": "#6c757d",
+    "main": "#6c757d",
     "queued": "#167c80",
 }
 
