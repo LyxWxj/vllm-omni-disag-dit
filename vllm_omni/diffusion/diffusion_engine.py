@@ -588,6 +588,10 @@ class DiffusionEngine:
             if not self.scheduler.defer_request(request_id):
                 raise RuntimeError(f"Could not return unprepared request {request_id!r} to the waiting queue.")
             return
+        if any(request_id in batch.task.request_ids for batch in self._queued_pipeline_batches.values()):
+            # A cached request that already owns a queued batch must remain RUNNING
+            # while its retained transport work is advanced below.
+            return
         if not self.scheduler.preempt_request(request_id):
             raise RuntimeError(f"Could not preempt cached request {request_id!r} for queued admission.")
 
@@ -635,6 +639,10 @@ class DiffusionEngine:
         )
 
     def _collect_queued_pipeline_events(self) -> dict[str, list[PipelineEvent]]:
+        logger.info(
+            "Queued pipeline progress begin: retained=%s",
+            sorted(self._queued_pipeline_batches),
+        )
         self.executor.progress_pipeline()
         events = self.executor.poll_pipeline_events()
         grouped: dict[str, list[PipelineEvent]] = {}
@@ -643,7 +651,15 @@ class DiffusionEngine:
             if not isinstance(event, PipelineEvent) or event.task.batch_id not in known_batches:
                 raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
             grouped.setdefault(event.task.batch_id, []).append(event)
+        logger.info(
+            "Queued pipeline progress end: events=%s",
+            {batch_id: len(batch_events) for batch_id, batch_events in grouped.items()},
+        )
         return grouped
+
+    def _has_queued_pipeline_work(self) -> bool:
+        """Return whether retained queued ownership still needs an Engine round."""
+        return self.od_config.mode == "queued" and bool(self._queued_pipeline_batches)
 
     def _handle_queued_progress_snapshot_failure(
         self,
@@ -1143,6 +1159,7 @@ class DiffusionEngine:
         )
 
     def _busy_loop(self):
+        queued_round = 0
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
@@ -1150,6 +1167,7 @@ class DiffusionEngine:
             with self._cv:
                 while (
                     not self.scheduler.has_requests()
+                    and not self._has_queued_pipeline_work()
                     and self._rpc_queue.empty()
                     and self.abort_queue.empty()
                     and not self.stop_event.is_set()
@@ -1159,38 +1177,50 @@ class DiffusionEngine:
                 if self.stop_event.is_set():
                     break
 
-                if not self.scheduler.has_requests():
+                if not self.scheduler.has_requests() and not self._has_queued_pipeline_work():
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                self._wait_for_admission_if_needed_locked()
+                if self.scheduler.has_requests():
+                    self._wait_for_admission_if_needed_locked()
 
                 sched_output = self.scheduler.schedule()
                 self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
-            if sched_output.is_empty:
+            if sched_output.is_empty and self.od_config.mode != "queued":
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
                 continue
 
             if self.od_config.mode == "queued":
+                queued_round += 1
+                logger.info(
+                    "Queued pipeline scheduler round=%d step_id=%s new=%s cached=%s waiting=%s running=%s retained=%s",
+                    queued_round,
+                    sched_output.step_id,
+                    [request.request_id for request in sched_output.scheduled_new_reqs],
+                    list(sched_output.scheduled_cached_reqs.request_ids),
+                    sched_output.num_waiting_reqs,
+                    sched_output.num_running_reqs,
+                    sorted(self._queued_pipeline_batches),
+                )
                 handled_request_ids: set[str] = set()
                 task_outputs = self._split_queued_scheduler_output(sched_output)
                 admitted_outputs: list[Any] = []
                 for output_index, task_output in enumerate(task_outputs):
-                    handled_request_ids.update(task_output.scheduled_request_ids)
                     try:
                         self._run_queued_pipeline_iteration(task_output, submit_only=True)
                         admitted_outputs.append(task_output)
+                        handled_request_ids.update(task_output.scheduled_request_ids)
                     except _QueuedAdmissionDeferredError:
                         deferred_outputs = task_outputs[output_index:]
                         self._defer_queued_admission_tail(deferred_outputs)
-                        for deferred_output in deferred_outputs[1:]:
-                            handled_request_ids.update(deferred_output.scheduled_request_ids)
                         break
                     except _QueuedAdmissionOversizeError as exc:
+                        handled_request_ids.update(task_output.scheduled_request_ids)
                         self._reject_queued_admission(task_output, exc)
                         continue
                     except Exception as exc:
+                        handled_request_ids.update(task_output.scheduled_request_ids)
                         logger.error(
                             "Queued execution failed for diffusion requests %s",
                             task_output.scheduled_request_ids,

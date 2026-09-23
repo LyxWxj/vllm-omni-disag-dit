@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import queue
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
+    _QueuedAdmissionDeferredError,
     _QueuedPipelineBatchPhase,
 )
 from vllm_omni.diffusion.sched.interface import (
@@ -129,6 +132,26 @@ def test_queued_admission_deferral_preserves_new_and_cached_identity(mocker) -> 
 
     engine.scheduler.defer_request.assert_not_called()
     engine.scheduler.preempt_request.assert_called_once_with("req-b")
+
+
+def test_queued_admission_deferral_keeps_owned_cached_request_running(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    engine.scheduler.preempt_request = mocker.Mock(return_value=True)
+    engine._queued_pipeline_batches = {
+        "owned": SimpleNamespace(task=SimpleNamespace(request_ids=("req-b",))),
+    }
+    cached_output = DiffusionSchedulerOutput(
+        step_id=8,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=["req-b"]),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    engine._defer_queued_admission(cached_output)
+
+    engine.scheduler.preempt_request.assert_not_called()
 
 
 def test_queued_oversize_request_is_rejected_without_retry_loop(mocker) -> None:
@@ -267,6 +290,89 @@ def test_retained_authorized_batch_forces_progress_when_all_admission_deferred(m
     assert received == [event]
     engine.executor.progress_pipeline.assert_called_once_with()
     engine.executor.poll_pipeline_events.assert_called_once_with()
+
+
+def test_busy_loop_progresses_retained_batch_when_scheduler_snapshot_is_empty(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    engine.od_config.mode = "queued"
+    engine.stop_event = threading.Event()
+    engine._cv = threading.Condition()
+    engine._rpc_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    retained = SimpleNamespace(
+        phase=_QueuedPipelineBatchPhase.AUTHORIZED,
+        failure=None,
+        abort_requested=False,
+        task=SimpleNamespace(request_ids=("req-a",)),
+    )
+    engine._queued_pipeline_batches = {"retained": retained}
+    empty = DiffusionSchedulerOutput(
+        step_id=8,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=0,
+        num_waiting_reqs=0,
+    )
+    engine.scheduler.has_requests = mocker.Mock(return_value=False)
+    engine.scheduler.schedule = mocker.Mock(return_value=empty)
+    engine._process_aborts_queue = mocker.Mock()
+    engine._process_rpc_queue = mocker.Mock()
+    engine._advance_unhandled_queued_batches = mocker.Mock()
+
+    def collect_once():
+        engine.stop_event.set()
+        return {}
+
+    engine._collect_queued_pipeline_events = mocker.Mock(side_effect=collect_once)
+
+    engine._busy_loop()
+
+    engine._collect_queued_pipeline_events.assert_called_once_with()
+    engine._advance_unhandled_queued_batches.assert_called_once_with(set(), {})
+
+
+def test_busy_loop_progresses_cached_retained_batch_after_deferred_new_tail(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    engine.od_config.mode = "queued"
+    engine.stop_event = threading.Event()
+    engine._cv = threading.Condition()
+    engine._rpc_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    retained = SimpleNamespace(
+        phase=_QueuedPipelineBatchPhase.AUTHORIZED,
+        failure=None,
+        abort_requested=False,
+        task=SimpleNamespace(request_ids=("req-a",)),
+    )
+    engine._queued_pipeline_batches = {"retained": retained}
+    mixed = DiffusionSchedulerOutput(
+        step_id=8,
+        scheduled_new_reqs=[_scheduler_output("req-b").scheduled_new_reqs[0]],
+        scheduled_cached_reqs=CachedRequestData(request_ids=["req-a"]),
+        finished_req_ids=set(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+    engine.scheduler.has_requests = mocker.Mock(return_value=True)
+    engine.scheduler.schedule = mocker.Mock(return_value=mixed)
+    engine._wait_for_admission_if_needed_locked = mocker.Mock()
+    engine._process_aborts_queue = mocker.Mock()
+    engine._process_rpc_queue = mocker.Mock()
+    engine._run_queued_pipeline_iteration = mocker.Mock(side_effect=_QueuedAdmissionDeferredError())
+    engine._defer_queued_admission_tail = mocker.Mock()
+    engine._advance_unhandled_queued_batches = mocker.Mock()
+
+    def collect_once():
+        engine.stop_event.set()
+        return {}
+
+    engine._collect_queued_pipeline_events = mocker.Mock(side_effect=collect_once)
+
+    engine._busy_loop()
+
+    engine._collect_queued_pipeline_events.assert_called_once_with()
+    engine._advance_unhandled_queued_batches.assert_called_once_with(set(), {})
 
 
 def test_malformed_shared_snapshot_does_not_repoll_retained_batch(mocker) -> None:
