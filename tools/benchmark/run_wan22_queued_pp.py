@@ -12,6 +12,7 @@ import math
 import os
 import subprocess
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +68,58 @@ def _tensor_bytes(value: Any) -> int:
 def _install_worker_trace_hooks() -> None:
     """Record task lifecycle metadata and profiler ranges inside each Worker."""
     from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    def trace_worker_method(method_name: str) -> None:
+        original = getattr(DiffusionWorker, method_name)
+        if getattr(original, "_queued_pp_trace_hook", False):
+            return
+
+        @functools.wraps(original)
+        def traced(worker: Any, offer: Any, *args: Any, **kwargs: Any) -> Any:
+            started_ns = time.monotonic_ns()
+            common = {
+                "kind": "transfer_control",
+                "method": method_name,
+                "physical_rank": worker.rank,
+                "identity": list(offer.identity),
+                "edge_kind": offer.edge_kind.value,
+                "src_rank": offer.src_rank,
+                "dst_rank": offer.dst_rank,
+            }
+            _write_worker_event(worker, {**common, "phase": "enter", "timestamp_ns": started_ns})
+            try:
+                result = original(worker, offer, *args, **kwargs)
+            except BaseException as exc:
+                _write_worker_event(
+                    worker,
+                    {
+                        **common,
+                        "phase": "error",
+                        "timestamp_ns": time.monotonic_ns(),
+                        "duration_ns": time.monotonic_ns() - started_ns,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+                raise
+            _write_worker_event(
+                worker,
+                {
+                    **common,
+                    "phase": "return",
+                    "timestamp_ns": time.monotonic_ns(),
+                    "duration_ns": time.monotonic_ns() - started_ns,
+                    "result": result if isinstance(result, (bool, type(None))) else type(result).__name__,
+                },
+            )
+            return result
+
+        traced._queued_pp_trace_hook = True  # type: ignore[attr-defined]
+        setattr(DiffusionWorker, method_name, traced)
+
+    for method_name in ("accept_pipeline_transfer_offer_all_ranks", "start_pipeline_transfer"):
+        trace_worker_method(method_name)
 
     original_record = DiffusionWorker._record_pipeline_event
     if getattr(original_record, "_queued_pp_trace_hook", False):
