@@ -33,6 +33,7 @@ from vllm_omni.diffusion.executor.abstract import (
     PIPELINE_GRANT_START_TIMEOUT_S,
     DiffusionExecutor,
     normalize_pipeline_preparation_reports,
+    normalize_pipeline_transfer_readiness,
     normalize_pipeline_transport_progress,
     validate_pipeline_topology_reports,
 )
@@ -886,6 +887,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._fail_queued_control("pipeline topology validation", exc)
             raise
         self._pipeline_transfer_coordinator = coordinator
+        self._pipeline_pending_readiness: dict[tuple[Any, ...], PipelineTransferOffer] = {}
         return result
 
     def coordinate_pipeline_transfer(self, offer: PipelineTransferOffer) -> list[Any]:
@@ -893,8 +895,24 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
         coordinator.offer(offer)
-        self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
-        coordinator.mark_receive_ready(offer.identity)
+        self._pipeline_pending_readiness[offer.identity] = offer
+        return self._retry_pipeline_transfer_readiness()
+
+    def _retry_pipeline_transfer_readiness(self) -> list[Any]:
+        coordinator = self._pipeline_transfer_coordinator
+        attempted: set[tuple[Any, ...]] = set()
+        while True:
+            candidates = [offer for offer in coordinator.pending_readiness_offers() if offer.identity not in attempted]
+            if not candidates:
+                break
+            for offer in candidates:
+                attempted.add(offer.identity)
+                ready = normalize_pipeline_transfer_readiness(
+                    self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+                )
+                if ready:
+                    coordinator.mark_receive_ready(offer.identity)
+                    self._pipeline_pending_readiness.pop(offer.identity, None)
         return self._start_ready_pipeline_transfers()
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
@@ -922,8 +940,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         progress.completed.append(completion.identity)
             for rank_progress in worker_progress:
                 for offer in rank_progress.offers:
-                    progress.grants.extend(self.coordinate_pipeline_transfer(offer))
-            progress.grants.extend(self._start_ready_pipeline_transfers())
+                    coordinator.offer(offer)
+                    self._pipeline_pending_readiness[offer.identity] = offer
+            progress.grants.extend(self._retry_pipeline_transfer_readiness())
             return progress
         except BaseException as exc:
             if not self._is_failed:

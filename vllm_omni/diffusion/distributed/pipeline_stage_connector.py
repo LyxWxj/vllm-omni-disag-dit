@@ -143,6 +143,10 @@ class PipelineTransferCoordinator:
             raise KeyError("unknown pipeline transfer offer")
         self._ready_ids.add(identity)
 
+    def pending_readiness_offers(self) -> list[PipelineTransferOffer]:
+        """Return FIFO heads whose endpoint readiness has not been confirmed."""
+        return [queue[0] for queue in self._offers.values() if queue and queue[0].identity not in self._ready_ids]
+
     def grant_ready(self, limit: int = 1) -> list[PipelineTransferGrant]:
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be a positive integer")

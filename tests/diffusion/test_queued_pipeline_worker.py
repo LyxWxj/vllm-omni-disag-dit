@@ -409,6 +409,7 @@ def test_two_stage_cancellation_drains_feedback_without_step_completion() -> Non
     last_context = last_worker.model_runner.pipeline_batch_contexts[(1, task.batch_id)]
     assert first_worker.pipeline_stages[0].start_next() is task
     first_context.status = PipelineTaskStatus.ACTIVE
+    first_worker.pipeline_stages[0].await_feedback()
     assert last_worker.pipeline_stages[1].start_next() is task
     last_context.status = PipelineTaskStatus.COMPLETED
     last_worker.pipeline_stages[1].complete_active()
@@ -549,6 +550,7 @@ def test_first_stage_release_waits_for_feedback_receive_lease(mocker) -> None:
     worker.authorize_pipeline_batch(0, task.batch_id)
     stage = worker.pipeline_stages[0]
     assert stage.start_next() is task
+    stage.await_feedback()
     context = worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)]
     context.status = PipelineTaskStatus.ACTIVE
     offer = PipelineTransferOffer(
@@ -632,8 +634,7 @@ def test_worker_readiness_reserves_receive_credit_until_release(mocker) -> None:
     )
 
     assert receiver.accept_pipeline_transfer_offer(first)
-    with pytest.raises(RuntimeError, match="no receive credit"):
-        receiver.accept_pipeline_transfer_offer(second)
+    assert not receiver.accept_pipeline_transfer_offer(second)
     with pytest.raises(RuntimeError, match="reserved receive credit"):
         receiver.drain_pipeline()
 
@@ -672,8 +673,7 @@ def test_worker_two_receive_slots_do_not_double_count_leased_message(mocker) -> 
     assert len(leased) == 1
 
     assert receiver.accept_pipeline_transfer_offer(second)
-    with pytest.raises(RuntimeError, match="no receive credit"):
-        receiver.accept_pipeline_transfer_offer(third)
+    assert not receiver.accept_pipeline_transfer_offer(third)
 
     receiver.release_pipeline_received(PipelineEdgeKind.ACTIVATION, leased[0])
     assert receiver.accept_pipeline_transfer_offer(third)
@@ -737,6 +737,120 @@ def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> N
     assert not last.pipeline_send_tickets
     assert not first.pipeline_receive_reservations
     assert not last.pipeline_receive_reservations
+
+
+def test_progress_poll_executes_next_first_stage_batch_while_prior_feedback_is_pending(mocker) -> None:
+    worker = _worker()
+    worker.rank = 0
+    group = _PPGroup(0)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    worker.initialize_pipeline_transports(max_slots=1)
+
+    first = _task("batch-a")
+    second = PipelineTask(batch_id="batch-b", request_ids=("req-b",), step_index=0, epoch=3)
+    worker.model_runner.state_cache["req-b"] = object()
+    for task in (first, second):
+        worker.enqueue_pipeline_batch(task, _spec(0))
+        worker.authorize_pipeline_batch(0, task.batch_id)
+
+    first_progress = worker.progress_pipeline_transfers()
+    first_offer = first_progress.offers[0]
+    assert first_offer.batch_id == first.batch_id
+    assert worker.pipeline_stages[0].active_task is None
+    assert worker.pipeline_stages[0].awaiting_feedback == {first.batch_id: first}
+
+    grant = PipelineTransferGrant(first_offer)
+    worker.accept_pipeline_transfer_offer(first_offer)
+    worker.start_pipeline_transfer(grant)
+    second_progress = worker.progress_pipeline_transfers()
+
+    assert [completion.identity for completion in second_progress.completions] == [first_offer.identity]
+    assert [offer.batch_id for offer in second_progress.offers] == [second.batch_id]
+    assert worker.pipeline_stages[0].active_task is None
+    assert worker.pipeline_stages[0].awaiting_feedback == {
+        first.batch_id: first,
+        second.batch_id: second,
+    }
+
+    event = worker.complete_pipeline_feedback(0, first.batch_id, torch.tensor([9.0]))
+
+    assert event.event_type is PipelineEventType.STEP_COMPLETED
+    assert worker.pipeline_stages[0].terminal_statuses[first.batch_id] is PipelineTaskStatus.COMPLETED
+    assert worker.pipeline_stages[0].awaiting_feedback == {second.batch_id: second}
+
+
+def test_two_batch_progress_runs_stage0_b_while_stage1_consumes_a(mocker) -> None:
+    first = _worker()
+    last = _worker()
+    first.rank = 0
+    last.rank = 1
+    first_group = _PPGroup(0)
+    last_group = _PPGroup(1)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
+        side_effect=[first_group, last_group],
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=None,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_available",
+        return_value=False,
+    )
+    first.initialize_pipeline_transports(max_slots=2)
+    last.initialize_pipeline_transports(max_slots=2)
+
+    batch_a = _task("batch-a")
+    batch_b = PipelineTask(batch_id="batch-b", request_ids=("req-b",), step_index=0, epoch=3)
+    first.model_runner.state_cache["req-b"] = object()
+    last.model_runner.state_cache["req-b"] = object()
+    for worker in (first, last):
+        for task in (batch_a, batch_b):
+            worker.enqueue_pipeline_batch(task, _spec(worker.rank))
+            worker.authorize_pipeline_batch(worker.rank, task.batch_id)
+
+    def start_transfer(sender, receiver, receiver_group, offer) -> None:
+        sender.accept_pipeline_transfer_offer(offer)
+        receiver.accept_pipeline_transfer_offer(offer)
+        grant = PipelineTransferGrant(offer)
+        sender.start_pipeline_transfer(grant)
+        receiver_group.receive_payload = sender.pipeline_send_tickets[offer.identity].message.payload
+        receiver.start_pipeline_transfer(grant)
+
+    # Round 1 creates and grants batch A's activation.
+    first_round = first.progress_pipeline_transfers()
+    last_round = last.progress_pipeline_transfers()
+    activation_a = first_round.offers[0]
+    assert activation_a.batch_id == batch_a.batch_id
+    assert last_round.offers == []
+    start_transfer(first, last, last_group, activation_a)
+
+    # In one shared progress round, stage 0 forwards B while stage 1 executes A.
+    first_round = first.progress_pipeline_transfers()
+    last_round = last.progress_pipeline_transfers()
+    activation_b = first_round.offers[0]
+    feedback_a = last_round.offers[0]
+    assert activation_b.batch_id == batch_b.batch_id
+    assert feedback_a.batch_id == batch_a.batch_id
+    assert first.model_runner.pipeline_batch_contexts[(0, batch_b.batch_id)].status is PipelineTaskStatus.ACTIVE
+    assert last.pipeline_stages[1].terminal_statuses[batch_a.batch_id] is PipelineTaskStatus.COMPLETED
+    start_transfer(first, last, last_group, activation_b)
+    start_transfer(last, first, first_group, feedback_a)
+
+    # Stage 1 consumes B while stage 0 adopts A's feedback; both remain identity-scoped.
+    first_round = first.progress_pipeline_transfers()
+    last_round = last.progress_pipeline_transfers()
+    feedback_b = last_round.offers[0]
+    assert feedback_b.batch_id == batch_b.batch_id
+    assert any(event.task == batch_a for event in first.pipeline_events)
+    start_transfer(last, first, first_group, feedback_b)
+
+    first.progress_pipeline_transfers()
+    last.progress_pipeline_transfers()
+    assert first.pipeline_stages[0].terminal_statuses[batch_a.batch_id] is PipelineTaskStatus.COMPLETED
+    assert first.pipeline_stages[0].terminal_statuses[batch_b.batch_id] is PipelineTaskStatus.COMPLETED
+    assert last.pipeline_stages[1].terminal_statuses[batch_b.batch_id] is PipelineTaskStatus.COMPLETED
 
 
 def test_release_rpc_consumes_acknowledgement_without_dropping_next_batch_event() -> None:
@@ -884,6 +998,7 @@ def test_worker_rejects_stale_feedback_identity_before_adoption(mocker) -> None:
     receiver.enqueue_pipeline_batch(task, _spec(0))
     receiver.authorize_pipeline_batch(0, task.batch_id)
     assert receiver.pipeline_stages[0].start_next() is task
+    receiver.pipeline_stages[0].await_feedback()
     context = receiver.model_runner.pipeline_batch_contexts[(0, task.batch_id)]
     context.status = PipelineTaskStatus.ACTIVE
     stale = PipelineTransferOffer(

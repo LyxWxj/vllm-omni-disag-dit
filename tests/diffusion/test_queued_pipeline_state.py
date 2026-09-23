@@ -52,6 +52,26 @@ def test_stage_state_preserves_fifo_and_one_active_task() -> None:
     assert state.start_next() == second
 
 
+def test_stage_state_releases_compute_slot_while_first_batch_awaits_feedback() -> None:
+    state = PipelineStageState(PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False))
+    first, second = _task(), _task("batch-b")
+    state.enqueue(first)
+    state.enqueue(second)
+    state.authorize(first.batch_id)
+    state.authorize(second.batch_id)
+
+    assert state.start_next() == first
+    assert state.await_feedback() == first
+    assert state.active_task is None
+    assert state.awaiting_feedback == {first.batch_id: first}
+    assert state.start_next() == second
+    assert state.await_feedback() == second
+
+    assert state.complete_feedback(first.batch_id) == first
+    assert state.terminal_statuses[first.batch_id] is PipelineTaskStatus.COMPLETED
+    assert state.awaiting_feedback == {second.batch_id: second}
+
+
 def test_stage_state_rejects_reenqueue_after_completion() -> None:
     state = PipelineStageState(PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False))
     task = _task()

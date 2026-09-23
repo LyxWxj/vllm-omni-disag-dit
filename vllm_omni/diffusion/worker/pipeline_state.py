@@ -120,6 +120,7 @@ class PipelineStageState:
     spec: PipelineStageSpec
     pending_tasks: deque[PipelineTask] = field(default_factory=deque)
     active_task: PipelineTask | None = None
+    awaiting_feedback: dict[str, PipelineTask] = field(default_factory=dict)
     authorized_batches: set[str] = field(default_factory=set)
     completed_batches: set[str] = field(default_factory=set)
     terminal_statuses: dict[str, PipelineTaskStatus] = field(default_factory=dict)
@@ -130,6 +131,8 @@ class PipelineStageState:
             raise ValueError(f"batch {task.batch_id!r} is already terminal")
         if self.active_task is not None and task.batch_id == self.active_task.batch_id:
             raise ValueError(f"batch {task.batch_id!r} is already active")
+        if task.batch_id in self.awaiting_feedback:
+            raise ValueError(f"batch {task.batch_id!r} is already awaiting feedback")
         if any(item.batch_id == task.batch_id for item in self.pending_tasks):
             raise ValueError(f"batch {task.batch_id!r} is already pending")
         self.pending_tasks.append(task)
@@ -171,6 +174,30 @@ class PipelineStageState:
         self.terminal_statuses[task.batch_id] = PipelineTaskStatus.COMPLETED
         return task
 
+    def await_feedback(self) -> PipelineTask:
+        """Release the compute slot while retaining ownership until feedback arrives."""
+        if self.active_task is None:
+            raise RuntimeError("cannot await feedback without an active task")
+        task = self.active_task
+        self.active_task = None
+        self.awaiting_feedback[task.batch_id] = task
+        return task
+
+    def complete_feedback(self, batch_id: str) -> PipelineTask:
+        task = self.awaiting_feedback.pop(batch_id, None)
+        if task is None:
+            raise RuntimeError(f"batch {batch_id!r} is not awaiting feedback")
+        self.completed_batches.add(batch_id)
+        self.terminal_statuses[batch_id] = PipelineTaskStatus.COMPLETED
+        return task
+
+    def fail_feedback(self, batch_id: str) -> PipelineTask:
+        task = self.awaiting_feedback.pop(batch_id, None)
+        if task is None:
+            raise RuntimeError(f"batch {batch_id!r} is not awaiting feedback")
+        self.terminal_statuses[batch_id] = PipelineTaskStatus.FAILED
+        return task
+
     def fail_active(self) -> PipelineTask:
         if self.active_task is None:
             raise RuntimeError("cannot fail a stage without an active task")
@@ -191,6 +218,10 @@ class PipelineStageState:
             return False
         if self.active_task is not None and self.active_task.batch_id == batch_id:
             self.active_task = None
+            self.terminal_statuses[batch_id] = PipelineTaskStatus.CANCELLED
+            return True
+        if batch_id in self.awaiting_feedback:
+            self.awaiting_feedback.pop(batch_id)
             self.terminal_statuses[batch_id] = PipelineTaskStatus.CANCELLED
             return True
         retained = deque(task for task in self.pending_tasks if task.batch_id != batch_id)

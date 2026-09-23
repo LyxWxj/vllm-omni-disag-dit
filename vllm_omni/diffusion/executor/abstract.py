@@ -46,6 +46,14 @@ def normalize_pipeline_transport_progress(
     return result
 
 
+def normalize_pipeline_transfer_readiness(result: Any) -> bool:
+    while isinstance(result, list) and len(result) == 1:
+        result = result[0]
+    if type(result) is not bool:
+        raise RuntimeError("Workers returned invalid pipeline transfer readiness")
+    return result
+
+
 def normalize_pipeline_preparation_reports(
     result: Any,
     expected_ranks: frozenset[int],

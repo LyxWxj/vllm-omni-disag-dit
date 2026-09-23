@@ -204,6 +204,41 @@ def test_executor_coordinates_ready_offer_and_dispatches_grant(executor) -> None
     }
 
 
+def test_executor_defers_offer_until_receive_credit_is_available(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)}, max_slots=1)
+    executor.collective_rpc.reset_mock()
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+
+    executor.collective_rpc.return_value = [False]
+    assert executor.coordinate_pipeline_transfer(offer) == []
+    assert executor._pipeline_transfer_coordinator.snapshot()["offers"] == 1
+    assert executor._pipeline_transfer_coordinator.snapshot()["ready"] == 0
+    assert not executor._is_failed
+
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.side_effect = [
+        [[PipelineTransportProgress(rank=0), PipelineTransportProgress(rank=1)]],
+        [True],
+        [True],
+    ]
+    progress = executor.progress_pipeline()
+
+    assert len(progress.grants) == 1
+    assert progress.grants[0].offer == offer
+    assert executor._pipeline_transfer_coordinator.snapshot()["offers"] == 0
+    assert executor.collective_rpc.call_args_list[1].args == ("accept_pipeline_transfer_offer_all_ranks",)
+    assert executor.collective_rpc.call_args_list[2].args == ("start_pipeline_transfer",)
+
+
 def test_executor_readiness_rejection_never_dispatches_grant(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
     executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})

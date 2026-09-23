@@ -870,7 +870,7 @@ class DiffusionWorker:
         return offer
 
     def accept_pipeline_transfer_offer(self, offer: PipelineTransferOffer) -> bool:
-        """Confirm sender reservation and destination receive capacity."""
+        """Check sender ownership and reserve receive credit, if currently available."""
         if self.rank not in {offer.src_rank, offer.dst_rank}:
             return True
         connector = self._require_pipeline_connector(offer.edge_kind)
@@ -897,20 +897,26 @@ class DiffusionWorker:
             # Reservations span accepted offer through consumer release, so a
             # published lease is already represented here.
             if reserved >= connector.max_slots:
-                raise RuntimeError("pipeline destination has no receive credit")
+                return False
             self.pipeline_receive_reservations[offer.identity] = offer.edge_kind
         return True
 
     def accept_pipeline_transfer_offer_all_ranks(self, offer: PipelineTransferOffer) -> bool:
-        """Coordinate two-sided readiness without stranding peers on local rejection."""
+        """Return false for temporary receive backpressure; raise on invalid readiness."""
         rank_results = _run_and_gather_rank_values(
             "queued pipeline transfer readiness",
             lambda: (self.rank, self.accept_pipeline_transfer_offer(offer)),
         )
-        acknowledged = {rank for rank, ready in rank_results if ready and rank in {offer.src_rank, offer.dst_rank}}
-        if acknowledged != {offer.src_rank, offer.dst_rank}:
-            raise RuntimeError("pipeline transfer readiness did not acknowledge both endpoints")
-        return True
+        endpoint_results: dict[int, bool] = {}
+        for rank, ready in rank_results:
+            if rank not in {offer.src_rank, offer.dst_rank}:
+                continue
+            if rank in endpoint_results or type(ready) is not bool:
+                raise RuntimeError("pipeline transfer readiness returned invalid endpoint reports")
+            endpoint_results[rank] = ready
+        if set(endpoint_results) != {offer.src_rank, offer.dst_rank}:
+            raise RuntimeError("pipeline transfer readiness did not report both endpoints")
+        return all(endpoint_results.values())
 
     def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
         """Start only this Worker's endpoint after the Executor grants it."""
@@ -946,7 +952,7 @@ class DiffusionWorker:
         return True
 
     def progress_pipeline_transfers(self) -> PipelineTransportProgress:
-        """Advance bounded send completion and consume ready activation/feedback."""
+        """Advance one local FIFO compute task and bounded transport work."""
         progress = PipelineTransportProgress(rank=self.rank)
 
         for identity, ticket in list(self.pipeline_send_tickets.items()):
@@ -957,6 +963,16 @@ class DiffusionWorker:
                 progress.completions.append(PipelineEndpointCompletion(identity=identity, rank=self.rank))
 
         self._release_completed_pipeline_consumers(progress)
+
+        first_stage = self.pipeline_stages.get(0)
+        if first_stage is not None and first_stage.spec.is_first:
+            activation_connector = self._require_pipeline_connector(PipelineEdgeKind.ACTIVATION)
+            if activation_connector.send_in_use < activation_connector.max_slots:
+                stage_progress = self.progress_pipeline(0)
+                if stage_progress is not None:
+                    if not isinstance(stage_progress.output, PipelineTransferOffer):
+                        raise RuntimeError("first pipeline stage did not reserve an activation transfer")
+                    progress.offers.append(stage_progress.output)
 
         for edge_kind in (PipelineEdgeKind.FEEDBACK, PipelineEdgeKind.ACTIVATION):
             connector = self._require_pipeline_connector(edge_kind)
@@ -1037,11 +1053,10 @@ class DiffusionWorker:
         stage_id = 1 if edge_kind is PipelineEdgeKind.ACTIVATION else 0
         stage = self._require_pipeline_stage(stage_id)
         if edge_kind is PipelineEdgeKind.FEEDBACK:
-            if stage.active_task is None:
+            task = stage.awaiting_feedback.get(message.batch_id)
+            if task is None:
                 return False
-            if stage.active_task.batch_id != message.batch_id:
-                return False
-            self._validate_pipeline_message_task_identity(stage.active_task, message)
+            self._validate_pipeline_message_task_identity(task, message)
             return True
         if stage.active_task is not None or not stage.pending_tasks:
             return False
@@ -1233,6 +1248,8 @@ class DiffusionWorker:
                     output = offer
             if stage.spec.is_last:
                 stage.complete_active()
+            else:
+                stage.await_feedback()
         except BaseException:
             context.status = PipelineTaskStatus.FAILED
             if stage.active_task is not None and stage.active_task.batch_id == task.batch_id:
@@ -1284,15 +1301,15 @@ class DiffusionWorker:
             return self._record_pipeline_event(
                 self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id)
             )
-        task = stage.active_task
-        if task is None or task.batch_id != batch_id:
-            raise RuntimeError(f"Pipeline batch {batch_id!r} is not active on stage {pp_stage_id}.")
+        task = stage.awaiting_feedback.get(batch_id)
+        if task is None:
+            raise RuntimeError(f"Pipeline batch {batch_id!r} is not awaiting feedback on stage {pp_stage_id}.")
         try:
             self.model_runner.adopt_pipeline_feedback(context, stage.spec, latents)
-            stage.complete_active()
+            stage.complete_feedback(batch_id)
         except BaseException:
-            if stage.active_task is not None and stage.active_task.batch_id == batch_id:
-                stage.fail_active()
+            if batch_id in stage.awaiting_feedback:
+                stage.fail_feedback(batch_id)
             raise
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.STEP_COMPLETED, task, pp_stage_id))
 
