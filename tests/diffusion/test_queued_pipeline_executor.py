@@ -66,6 +66,26 @@ def test_submission_failure_does_not_issue_authorization(executor) -> None:
     executor.collective_rpc.assert_not_called()
 
 
+def test_multiproc_cleanup_failure_preserves_first_worker_error(mocker) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._ensure_open = mocker.Mock()
+    worker_error = RuntimeError("rank 1: activation metadata rejected")
+    executor.collective_rpc = mocker.Mock(side_effect=worker_error)
+    executor._is_failed = False
+    executor._failure_callbacks = []
+    executor.shutdown = mocker.Mock(side_effect=RuntimeError("worker shutdown failed"))
+    failure_callback = mocker.Mock()
+    executor._failure_callbacks.append(failure_callback)
+
+    with pytest.raises(RuntimeError, match="activation metadata rejected") as exc_info:
+        executor.submit_pipeline_batch("task", {0: "stage-0", 1: "stage-1"})
+
+    assert exc_info.value is worker_error
+    assert executor._queued_control_failure is worker_error
+    executor.shutdown.assert_called_once()
+    failure_callback.assert_called_once()
+
+
 def test_authorization_passes_rank_local_stage_ids(executor) -> None:
     executor.authorize_pipeline_batch({0: 0, 1: 1}, "batch-a")
 

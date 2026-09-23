@@ -164,6 +164,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._processes: list[mp.Process] = []
         self._closed = False
         self._is_failed = False
+        self._queued_control_failure: BaseException | None = None
         self._failure_callbacks: list[Callable[[], None]] = []
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
@@ -749,9 +750,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
     def _fail_queued_control(self, operation: str, exc: BaseException) -> None:
-        logger.error("Queued pipeline %s failed after dispatch; failing the worker group: %s", operation, exc)
+        if getattr(self, "_queued_control_failure", None) is None:
+            self._queued_control_failure = exc
+        first_failure = self._queued_control_failure
+        logger.error("Queued pipeline %s failed after dispatch; failing the worker group: %s", operation, first_failure)
         self._is_failed = True
-        self.shutdown()
+        try:
+            self.shutdown()
+        except BaseException:
+            logger.exception(
+                "Worker-group cleanup failed after queued pipeline failure; preserving the original failure: %s",
+                first_failure,
+            )
         for callback in self._failure_callbacks:
             try:
                 callback()
