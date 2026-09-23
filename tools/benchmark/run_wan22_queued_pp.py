@@ -75,8 +75,9 @@ def _install_worker_trace_hooks() -> None:
             return
 
         @functools.wraps(original)
-        def traced(worker: Any, offer: Any, *args: Any, **kwargs: Any) -> Any:
+        def traced(worker: Any, transfer: Any, *args: Any, **kwargs: Any) -> Any:
             started_ns = time.monotonic_ns()
+            offer = getattr(transfer, "offer", transfer)
             common = {
                 "kind": "transfer_control",
                 "method": method_name,
