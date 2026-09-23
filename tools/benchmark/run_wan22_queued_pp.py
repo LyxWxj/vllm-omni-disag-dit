@@ -89,7 +89,7 @@ def _install_worker_trace_hooks() -> None:
             }
             _write_worker_event(worker, {**common, "phase": "enter", "timestamp_ns": started_ns})
             try:
-                result = original(worker, offer, *args, **kwargs)
+                result = original(worker, transfer, *args, **kwargs)
             except BaseException as exc:
                 _write_worker_event(
                     worker,
