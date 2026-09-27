@@ -835,11 +835,16 @@ class TestWorkerProcRpcRankStatus:
 
     def test_execute_rpc_returns_rank_status_envelope(self, monkeypatch):
         proc = self._make_worker_proc()
+        control_group = object()
 
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(
+            diffusion_worker_module, "get_world_group", lambda: SimpleNamespace(cpu_group=control_group)
+        )
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda *, group: 2)
 
-        def _all_gather_object(out, local):
+        def _all_gather_object(out, local, *, group):
+            assert group is control_group
             out[0] = local
             out[1] = {
                 "rank": 1,
@@ -869,6 +874,25 @@ class TestWorkerProcRpcRankStatus:
         assert result["rank_statuses"][0]["rank"] == 0
         assert result["rank_statuses"][1]["rank"] == 1
         assert result["rank_statuses"][1]["ok"] is False
+
+    def test_rank_status_gather_uses_global_cpu_control_group(self, monkeypatch):
+        proc = self._make_worker_proc()
+        control_group = object()
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            diffusion_worker_module, "get_world_group", lambda: SimpleNamespace(cpu_group=control_group)
+        )
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda *, group: 2)
+
+        def _all_gather_object(out, local, *, group):
+            assert group is control_group
+            out[:] = [local, {"rank": 1, "ok": True}]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", _all_gather_object)
+
+        statuses = proc._gather_rpc_rank_statuses({"rank": 0, "ok": True})
+
+        assert statuses == [{"rank": 0, "ok": True}, {"rank": 1, "ok": True}]
 
     def test_execute_rpc_local_exception_is_reported_in_envelope(self, monkeypatch):
         proc = self._make_worker_proc()

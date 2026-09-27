@@ -19,6 +19,7 @@ import traceback
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -61,6 +62,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_hsdp_replicate_group,
     get_pp_group,
     get_sp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
@@ -138,8 +140,9 @@ def _cleanup_after_execution_error(exc: Exception) -> None:
 def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
-    values: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(values, value)
+    control_group = get_world_group().cpu_group
+    values: list[Any] = [None] * dist.get_world_size(group=control_group)
+    dist.all_gather_object(values, value, group=control_group)
     return values
 
 
@@ -307,6 +310,8 @@ class DiffusionWorker:
             PipelineEdgeKind.ACTIVATION: deque(),
             PipelineEdgeKind.FEEDBACK: deque(),
         }
+        self._pipeline_finalization_futures: dict[str, Future[BatchRunnerOutput]] = {}
+        self._pipeline_finalization_executor: ThreadPoolExecutor | None = None
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -1320,6 +1325,9 @@ class DiffusionWorker:
         context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
         if context is None:
             raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
+        finalization = getattr(self, "_pipeline_finalization_futures", {}).get(batch_id)
+        if finalization is not None and not finalization.done():
+            finalization.result()
         self.model_runner.cancel_pipeline_batch(pp_stage_id, batch_id)
         if not stage.cancel(batch_id):
             raise RuntimeError(f"Pipeline batch {batch_id!r} was not cancellable on stage {pp_stage_id}.")
@@ -1341,27 +1349,53 @@ class DiffusionWorker:
             raise RuntimeError("Cannot release a pipeline batch with retained receive ownership.")
         context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
         stage.retire(batch_id)
+        if stage.spec.is_first and hasattr(self, "_pipeline_finalization_futures"):
+            self._pipeline_finalization_futures.pop(batch_id, None)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id))
 
     def finalize_pipeline_batch(
         self,
         pp_stage_id: int | dict[int, int],
         batch_id: str,
-    ) -> BatchRunnerOutput | None:
-        """Decode only on the first logical stage; peers participate in status agreement."""
+    ) -> str | None:
+        """Submit output-owner decode in the background and return its batch handle."""
         if isinstance(pp_stage_id, dict):
             pp_stage_id = self._select_rank_value(pp_stage_id)
 
-        def finalize_local() -> BatchRunnerOutput | None:
-            stage = self._require_pipeline_stage(pp_stage_id)
-            context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
-            if context is None:
-                raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
-            if not stage.spec.is_first:
-                return None
-            return self.model_runner.finalize_pipeline_batch(context, stage.spec)
+        stage = self._require_pipeline_stage(pp_stage_id)
+        context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
+        if context is None:
+            raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
+        if not stage.spec.is_first:
+            return None
+        if not hasattr(self, "_pipeline_finalization_futures"):
+            self._pipeline_finalization_futures = {}
+        if not hasattr(self, "_pipeline_finalization_executor"):
+            self._pipeline_finalization_executor = None
+        if batch_id not in self._pipeline_finalization_futures:
+            if self._pipeline_finalization_executor is None:
+                self._pipeline_finalization_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"WanFinalDecode-rank{self.rank}",
+                )
 
-        return _run_and_agree_rank_status("queued pipeline final decode", finalize_local)
+            def finalize() -> BatchRunnerOutput:
+                device = getattr(self, "device", None)
+                if device is not None:
+                    current_omni_platform.set_device(device)
+                return self.model_runner.finalize_pipeline_batch(context, stage.spec)
+
+            self._pipeline_finalization_futures[batch_id] = self._pipeline_finalization_executor.submit(finalize)
+        return batch_id
+
+    def poll_pipeline_finalization(self, batch_id: str) -> BatchRunnerOutput | None:
+        """Return a completed decode result without blocking the Worker RPC loop."""
+        future = self._pipeline_finalization_futures.get(batch_id)
+        if future is None:
+            raise KeyError(f"Unknown queued pipeline finalization {batch_id!r}.")
+        if not future.done():
+            return None
+        return future.result()
 
     def release_pipeline_batch_all_ranks(
         self,
@@ -1772,6 +1806,9 @@ class DiffusionWorker:
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
         try:
+            if getattr(self, "_pipeline_finalization_executor", None) is not None:
+                self._pipeline_finalization_executor.shutdown(wait=True, cancel_futures=False)
+                self._pipeline_finalization_executor = None
             if self.model_runner is not None:
                 mgr = getattr(self.model_runner, "kv_transfer_manager", None)
                 try:
@@ -2048,9 +2085,10 @@ class WorkerProc:
         if not torch.distributed.is_initialized():
             return [status]
 
-        world_size = torch.distributed.get_world_size()
+        control_group = get_world_group().cpu_group
+        world_size = torch.distributed.get_world_size(group=control_group)
         statuses: list[dict[str, Any] | None] = [None] * world_size
-        torch.distributed.all_gather_object(statuses, status)
+        torch.distributed.all_gather_object(statuses, status, group=control_group)
         missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
         if missing_ranks:
             logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)

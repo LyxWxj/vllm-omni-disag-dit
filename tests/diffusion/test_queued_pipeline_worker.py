@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +14,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineTransferGrant,
     PipelineTransferOffer,
 )
+from vllm_omni.diffusion.worker import diffusion_worker as diffusion_worker_module
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineEvent,
@@ -60,6 +63,10 @@ class _Runner:
         context.status = PipelineTaskStatus.COMPLETED
         return torch.tensor([7.0])
 
+    def finalize_pipeline_batch(self, context, spec):
+        del context, spec
+        return "decoded-output"
+
     def adopt_pipeline_feedback(self, context, spec, latents):
         del spec
         self.feedback_adoptions += 1
@@ -101,6 +108,84 @@ def _spec(stage_id: int) -> PipelineStageSpec:
         is_first=stage_id == 0,
         is_last=stage_id == 1,
     )
+
+
+def test_worker_metadata_agreement_uses_global_cpu_control_group(mocker) -> None:
+    control_group = object()
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.dist.is_available", return_value=True)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.dist.is_initialized", return_value=True)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.get_world_group",
+        return_value=SimpleNamespace(cpu_group=control_group),
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.dist.get_world_size",
+        return_value=2,
+    )
+
+    def gather(values, value, *, group):
+        assert group is control_group
+        values[:] = [value, (True, "peer")]
+
+    gather_mock = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.dist.all_gather_object",
+        side_effect=gather,
+    )
+
+    assert diffusion_worker_module._all_gather_rank_values((True, "local")) == [
+        (True, "local"),
+        (True, "peer"),
+    ]
+    gather_mock.assert_called_once()
+
+
+@pytest.mark.parametrize(("stage_id", "expected"), [(0, "decoded-output"), (1, None)])
+def test_final_decode_runs_only_on_output_owner_without_rank_collective(mocker, stage_id, expected) -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(stage_id))
+    worker.model_runner.pipeline_batch_contexts[(stage_id, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    agreement = mocker.patch.object(
+        diffusion_worker_module,
+        "_run_and_agree_rank_status",
+        side_effect=AssertionError("output decode must not gather with peer ranks"),
+    )
+
+    result = worker.finalize_pipeline_batch(stage_id, task.batch_id)
+    if stage_id == 0:
+        result = worker.poll_pipeline_finalization(result)
+
+    assert result == expected
+    agreement.assert_not_called()
+
+
+def test_final_decode_submission_is_nonblocking_and_pollable() -> None:
+    worker = _worker()
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_finalize(_context, _spec):
+        started.set()
+        release.wait(timeout=2)
+        return "decoded-output"
+
+    worker.model_runner.finalize_pipeline_batch = delayed_finalize
+    handle = worker.finalize_pipeline_batch(0, task.batch_id)
+    assert started.wait(timeout=1)
+    assert worker.poll_pipeline_finalization(handle) is None
+
+    release.set()
+    result = None
+    for _ in range(100):
+        result = worker.poll_pipeline_finalization(handle)
+        if result is not None:
+            break
+        time.sleep(0.001)
+    assert result == "decoded-output"
+    worker._pipeline_finalization_executor.shutdown(wait=True)
 
 
 def _initialize_worker_transports(worker, rank: int, mocker):

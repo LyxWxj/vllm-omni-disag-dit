@@ -1231,8 +1231,9 @@ class Wan22Pipeline(
         """Decode the final request-local Wan latents."""
         if state.latents is None:
             raise ValueError(f"Wan request {state.request_id} has no latents to decode.")
-        self._current_timestep = None
-        if current_omni_platform.is_available():
+        if not kwargs.get("queued_pipeline", False):
+            self._current_timestep = None
+        if current_omni_platform.is_available() and not kwargs.get("queued_pipeline", False):
             current_omni_platform.empty_cache()
 
         state.latents = self._materialize_latents(state.latents)

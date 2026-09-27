@@ -247,16 +247,28 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         pp_stage_id: dict[int, int],
         batch_id: str,
         output_rank: int,
-    ) -> BaseRunnerOutput:
+    ) -> str:
         try:
-            result = self.collective_rpc(
+            result = self._queued_control_rpc(
                 "finalize_pipeline_batch",
                 args=(pp_stage_id, batch_id),
-                unique_reply_rank=output_rank,
-                exec_all_ranks=True,
             )
-            if not isinstance(result, BaseRunnerOutput):
-                raise RuntimeError("Queued pipeline final decode returned an invalid output.")
+            if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], str):
+                raise RuntimeError("Queued final decode submission returned an invalid handle.")
+            return result[0]
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def poll_pipeline_finalization(self, batch_id: str, output_rank: int) -> BaseRunnerOutput | None:
+        try:
+            result = self.collective_rpc(
+                "poll_pipeline_finalization",
+                args=(batch_id,),
+                unique_reply_rank=output_rank,
+            )
+            if result is not None and not isinstance(result, BaseRunnerOutput):
+                raise RuntimeError("Queued final decode poll returned an invalid output.")
             return result
         except BaseException:
             self._mark_failed()

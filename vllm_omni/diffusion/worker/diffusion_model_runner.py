@@ -1301,7 +1301,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     denoise_step_idx=context.task.step_index,
                 ),
             ):
-                result = self.pipeline.post_decode(state)
+                result = self.pipeline.post_decode(state, queued_pipeline=True)
             if not isinstance(result, DiffusionOutput):
                 raise RuntimeError("Pipeline final decode produced no DiffusionOutput.")
             result = self._prepare_output_for_transport(result, state.sampling)

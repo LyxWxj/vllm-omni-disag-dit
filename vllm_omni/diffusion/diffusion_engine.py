@@ -250,6 +250,7 @@ class _QueuedPipelineBatch:
     stage_physical_ranks: dict[int, int]
     finalizing_request_ids: frozenset[str] = frozenset()
     decoded_output: BatchRunnerOutput | None = None
+    finalization_handle: str | None = None
     release_acknowledged: bool = False
     cleanup_completed_request_ids: set[str] = field(default_factory=set)
     scheduler_completed_request_ids: set[str] = field(default_factory=set)
@@ -863,18 +864,28 @@ class DiffusionEngine:
             batch.phase = _QueuedPipelineBatchPhase.FAILED
             raise
 
-    def _finalize_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput:
+    def _finalize_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput | None:
         if batch.phase is not _QueuedPipelineBatchPhase.FINALIZING:
             raise RuntimeError("Queued pipeline batch is not ready for final decode.")
         if batch.decoded_output is not None:
             return batch.decoded_output
         output_rank = batch.stage_physical_ranks[0]
         try:
-            output = self.executor.finalize_pipeline_batch(
-                {0: 0, 1: 1},
-                batch.task.batch_id,
-                output_rank,
-            )
+            output: BatchRunnerOutput | None
+            if batch.finalization_handle is None:
+                submitted = self.executor.finalize_pipeline_batch(
+                    {0: 0, 1: 1},
+                    batch.task.batch_id,
+                    output_rank,
+                )
+                if isinstance(submitted, str):
+                    batch.finalization_handle = submitted
+                else:
+                    output = submitted
+            if batch.finalization_handle is not None:
+                output = self.executor.poll_pipeline_finalization(batch.finalization_handle, output_rank)
+            if output is None:
+                return None
             finished = output.get_request_output(batch.task.request_ids[0])
             if finished is None or finished.result is None or finished.result.error is not None:
                 raise RuntimeError("Queued pipeline final decode returned an unsuccessful output.")
@@ -972,6 +983,8 @@ class DiffusionEngine:
         output: BatchRunnerOutput | None = None
         if batch.phase is _QueuedPipelineBatchPhase.FINALIZING:
             output = self._finalize_queued_pipeline_batch(batch)
+            if output is None:
+                return None
         if batch.phase in {
             _QueuedPipelineBatchPhase.STEP_COMMITTED,
             _QueuedPipelineBatchPhase.FINALIZING,
