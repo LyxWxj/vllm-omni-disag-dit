@@ -253,7 +253,7 @@ def test_multiproc_pp2_uses_rank_local_progress_and_readiness_reports(mocker) ->
         "exec_all_ranks": True,
         "reply_all_ranks": True,
     }
-    assert executor.collective_rpc.call_args_list[2].args == ("progress_pipeline_transfers_and_poll_events",)
+    assert executor.collective_rpc.call_args_list[2].args == ("poll_pipeline_autonomous_progress",)
     assert executor.collective_rpc.call_args_list[2].kwargs["reply_all_ranks"] is True
     assert executor.collective_rpc.call_args_list[1].kwargs == {
         "args": (grants[0],),
@@ -338,8 +338,8 @@ def test_multiproc_pp2_piggybacks_transfer_readiness_on_next_progress(mocker) ->
 
     assert [grant.offer for grant in grants] == [offer]
     assert [call.args[0] for call in executor.collective_rpc.call_args_list] == [
-        "progress_pipeline_transfers_and_poll_events",
-        "progress_pipeline_transfers_and_poll_events",
+        "poll_pipeline_autonomous_progress",
+        "poll_pipeline_autonomous_progress",
         "start_pipeline_transfer",
     ]
     assert executor.collective_rpc.call_args_list[1].kwargs["args"] == ((offer,),)
