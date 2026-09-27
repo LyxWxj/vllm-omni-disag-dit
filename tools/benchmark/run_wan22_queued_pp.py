@@ -14,6 +14,7 @@ import subprocess
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -67,7 +68,78 @@ def _tensor_bytes(value: Any) -> int:
 
 def _install_worker_trace_hooks() -> None:
     """Record task lifecycle metadata and profiler ranges inside each Worker."""
-    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerProc
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+    def local_rank() -> int:
+        import torch
+
+        return torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+
+    def trace_finalization(owner: type, method_name: str, kind: str) -> None:
+        original = getattr(owner, method_name)
+        if getattr(original, "_queued_pp_trace_hook", False):
+            return
+
+        @functools.wraps(original)
+        def traced(instance: Any, *args: Any, **kwargs: Any) -> Any:
+            started_ns = time.monotonic_ns()
+            rank = local_rank()
+            _write_worker_event(
+                SimpleNamespace(rank=rank), {"kind": kind, "phase": "enter", "timestamp_ns": started_ns}
+            )
+            try:
+                result = original(instance, *args, **kwargs)
+            except BaseException as exc:
+                _write_worker_event(
+                    SimpleNamespace(rank=rank),
+                    {
+                        "kind": kind,
+                        "phase": "error",
+                        "timestamp_ns": time.monotonic_ns(),
+                        "duration_ns": time.monotonic_ns() - started_ns,
+                        "error": str(exc),
+                    },
+                )
+                raise
+            _write_worker_event(
+                SimpleNamespace(rank=rank),
+                {
+                    "kind": kind,
+                    "phase": "return",
+                    "timestamp_ns": time.monotonic_ns(),
+                    "duration_ns": time.monotonic_ns() - started_ns,
+                },
+            )
+            return result
+
+        traced._queued_pp_trace_hook = True  # type: ignore[attr-defined]
+        setattr(owner, method_name, traced)
+
+    trace_finalization(DiffusionModelRunner, "finalize_pipeline_batch", "finalize_runner")
+    trace_finalization(Wan22Pipeline, "post_decode", "post_decode")
+
+    original_reply = WorkerProc._return_result
+
+    @functools.wraps(original_reply)
+    def traced_reply(proc: Any, output: Any, *args: Any, **kwargs: Any) -> Any:
+        if not isinstance(output, BaseRunnerOutput):
+            return original_reply(proc, output, *args, **kwargs)
+        started_ns = time.monotonic_ns()
+        result = original_reply(proc, output, *args, **kwargs)
+        _write_worker_event(
+            SimpleNamespace(rank=proc.gpu_id),
+            {
+                "kind": "finalize_rpc_reply",
+                "timestamp_ns": time.monotonic_ns(),
+                "duration_ns": time.monotonic_ns() - started_ns,
+            },
+        )
+        return result
+
+    WorkerProc._return_result = traced_reply
 
     def trace_worker_method(method_name: str) -> None:
         original = getattr(DiffusionWorker, method_name)
