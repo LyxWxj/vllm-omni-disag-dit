@@ -935,6 +935,8 @@ Profile artifacts：
 - rank-local 前：`artifacts/wan22-queued-merged-progress-profile-20260928/`
 - rank-local 后：`artifacts/wan22-queued-rank-local-profile-20260928/`
 
+两份 profile manifest 记录的远端 HEAD 也为 `a82f29b1`（pull 前）；运行时源码已同步并与提交 `69799427` 一致。Profile latency 仍只作诊断，提交边界验证见下方 clean-checkout smoke。
+
 主要剩余空泡包括 rank 1 约 741 ms 的 GPU idle gap，以及约 274 ms 的 Gloo annotation。Rank-local 优化减少了高频同步，但该长 Gloo wait 的具体调用来源仍需继续归因；trace 也不证明其中全部是纯 collective 等待。
 
 ### 非 Profiler A/B
