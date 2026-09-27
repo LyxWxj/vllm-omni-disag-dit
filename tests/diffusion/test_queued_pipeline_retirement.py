@@ -33,6 +33,33 @@ def test_final_decode_completes_scheduler_only_after_successful_output(mocker) -
     assert batch.decoded_output is output
 
 
+def test_async_final_decode_keeps_batch_finalizing_until_poll_completes(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+    batch.finalizing_request_ids = frozenset({"req-a"})
+    output = SimpleNamespace(get_request_output=lambda request_id: SimpleNamespace(result=SimpleNamespace(error=None)))
+    engine.executor.finalize_pipeline_batch.return_value = "decode-handle"
+    engine.executor.poll_pipeline_finalization.side_effect = [None, output]
+    engine.executor.release_pipeline_batch.return_value = [
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),
+    ]
+    engine.executor.cleanup_finalized_pipeline_request.return_value = [True, True]
+    engine.scheduler.complete_pipeline_request = mocker.Mock(return_value={"req-a"})
+
+    assert engine._advance_queued_pipeline_batch(batch) is None
+    assert batch.phase is _QueuedPipelineBatchPhase.FINALIZING
+    assert batch.task.batch_id in engine._queued_pipeline_batches
+    engine.scheduler.complete_pipeline_request.assert_not_called()
+
+    assert engine._advance_queued_pipeline_batch(batch) is output
+    assert engine._queued_pipeline_batches == {}
+    engine.executor.finalize_pipeline_batch.assert_called_once()
+    assert engine.executor.poll_pipeline_finalization.call_count == 2
+
+
 def test_retirement_requires_two_matching_released_events(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
