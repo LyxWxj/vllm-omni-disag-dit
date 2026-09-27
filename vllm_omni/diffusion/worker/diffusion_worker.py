@@ -1017,34 +1017,6 @@ class DiffusionWorker:
         progress.readiness = readiness
         return progress, self.poll_pipeline_events()
 
-    def background_pipeline_tick(self) -> None:
-        """Advance local work between RPCs without waiting for the peer stage."""
-        if not self.pipeline_connectors or not (
-            self.pipeline_send_tickets
-            or self.pipeline_receive_reservations
-            or any(
-                stage.pending_tasks or stage.active_task or stage.awaiting_feedback
-                for stage in self.pipeline_stages.values()
-            )
-        ):
-            return
-        progress = self.progress_pipeline_transfers()
-        if not hasattr(self, "_pipeline_background_progress"):
-            self._pipeline_background_progress = PipelineTransportProgress(rank=self.rank)
-        self._pipeline_background_progress.offers.extend(progress.offers)
-        self._pipeline_background_progress.completions.extend(progress.completions)
-
-    def poll_pipeline_autonomous_progress(
-        self,
-        pending_offers: tuple[PipelineTransferOffer, ...] = (),
-    ) -> tuple[PipelineTransportProgress, list[Any]]:
-        """Return buffered local progress and reserve credit for known offers."""
-        readiness = [(offer.identity, self.accept_pipeline_transfer_offer(offer)) for offer in pending_offers]
-        progress = getattr(self, "_pipeline_background_progress", PipelineTransportProgress(rank=self.rank))
-        progress.readiness = readiness
-        self._pipeline_background_progress = PipelineTransportProgress(rank=self.rank)
-        return progress, self.poll_pipeline_events()
-
     def _consume_ready_pipeline_message(
         self,
         edge_kind: PipelineEdgeKind,
@@ -1970,17 +1942,6 @@ class WorkerProc:
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
-        parallel = od_config.parallel_config
-        self._autonomous_pipeline_progress = (
-            od_config.mode == "queued"
-            and od_config.step_execution
-            and parallel.data_parallel_size == 1
-            and parallel.pipeline_parallel_size == 2
-            and parallel.tensor_parallel_size == 1
-            and parallel.sequence_parallel_size == 1
-            and parallel.cfg_parallel_size == 1
-        )
-        self._queued_autonomous_error: str | None = None
 
         self._async_output_queue: queue.Queue | None = None
         self._async_output_thread: threading.Thread | None = None
@@ -2237,8 +2198,6 @@ class WorkerProc:
         try:
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
-            if method == "poll_pipeline_autonomous_progress" and self._queued_autonomous_error is not None:
-                raise RuntimeError(self._queued_autonomous_error)
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
@@ -2297,11 +2256,9 @@ class WorkerProc:
             return None, False
         return result, should_reply
 
-    def recv_message(self, timeout: float | None = None) -> Any:
+    def recv_message(self) -> Any:
         """Receive one complete broadcast message without dropping overflow data."""
-        if timeout is None:
-            return self.mq.dequeue(indefinite=True)
-        return self.mq.dequeue(timeout=timeout)
+        return self.mq.dequeue(indefinite=True)
 
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
@@ -2310,16 +2267,7 @@ class WorkerProc:
         while self._running:
             msg = None
             try:
-                timeout = 0.001 if getattr(self, "_autonomous_pipeline_progress", False) else None
-                msg = self.recv_message(timeout=timeout)
-            except (TimeoutError, zmq.error.Again):
-                if getattr(self, "_autonomous_pipeline_progress", False) and self._queued_autonomous_error is None:
-                    try:
-                        self.worker.execute_method("background_pipeline_tick")
-                    except Exception as exc:
-                        logger.exception("Worker %s autonomous pipeline progress failed", self.gpu_id)
-                        self._queued_autonomous_error = f"Autonomous pipeline progress failed: {exc}"
-                continue
+                msg = self.recv_message()
             except Exception:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()

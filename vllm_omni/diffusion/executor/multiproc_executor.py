@@ -817,9 +817,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             and len(getattr(self, "_result_mqs", ())) == 2
         )
 
-    def uses_autonomous_pipeline_progress(self) -> bool:
-        return self._uses_rank_local_pp_rpc()
-
     def _queued_rank_local_rpc(
         self,
         method: str,
@@ -1065,7 +1062,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             rank_local = self._uses_rank_local_pp_rpc()
             pending_offers = tuple(coordinator.pending_readiness_offers()) if rank_local else ()
             if rank_local:
-                result = self._queued_rank_local_rpc("poll_pipeline_autonomous_progress", args=(pending_offers,))
+                result = self._queued_rank_local_rpc(
+                    "progress_pipeline_transfers_and_poll_events", args=(pending_offers,)
+                )
             else:
                 result = self._queued_control_rpc("progress_pipeline_transfers_and_poll_events_all_ranks")
             worker_progress, worker_events = normalize_pipeline_transport_snapshot(result, coordinator.endpoint_ranks)

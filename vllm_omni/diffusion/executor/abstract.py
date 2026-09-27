@@ -273,9 +273,6 @@ class DiffusionExecutor(ABC):
     def progress_pipeline(self) -> Any:
         raise NotImplementedError("queued pipeline progress is not wired for this executor")
 
-    def uses_autonomous_pipeline_progress(self) -> bool:
-        return False
-
     def pipeline_stage_physical_ranks(self) -> dict[int, int]:
         raise NotImplementedError("queued pipeline topology is not wired for this executor")
 

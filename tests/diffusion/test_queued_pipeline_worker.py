@@ -16,7 +16,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineTransportProgress,
 )
 from vllm_omni.diffusion.worker import diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerProc
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineEvent,
     PipelineEventType,
@@ -153,80 +153,6 @@ def test_rank_local_progress_snapshot_reserves_pending_offer_before_progress(moc
     assert reported.readiness == [(offer.identity, True)]
     accept.assert_called_once_with(offer)
     local_progress.assert_called_once_with()
-
-
-def test_autonomous_progress_buffers_offers_until_engine_poll(mocker) -> None:
-    worker = _worker()
-    worker.rank = 0
-    worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION] = object()
-    worker.pipeline_send_tickets[("batch-a",)] = object()
-    offer = PipelineTransferOffer(
-        batch_id="batch-a",
-        step_index=0,
-        epoch=1,
-        branch="conditional",
-        edge_kind=PipelineEdgeKind.ACTIVATION,
-        src_rank=0,
-        dst_rank=1,
-    )
-    mocker.patch.object(
-        worker, "progress_pipeline_transfers", return_value=PipelineTransportProgress(rank=0, offers=[offer])
-    )
-    poll_events = mocker.patch.object(worker, "poll_pipeline_events", return_value=[])
-
-    worker.background_pipeline_tick()
-    progress, events = worker.poll_pipeline_autonomous_progress()
-    next_progress, _ = worker.poll_pipeline_autonomous_progress()
-
-    assert progress.offers == [offer]
-    assert events == []
-    assert next_progress.offers == []
-    assert poll_events.call_count == 2
-
-
-def test_worker_proc_advances_queued_stage_between_rpcs(mocker) -> None:
-    proc = object.__new__(WorkerProc)
-    proc.gpu_id = 0
-    proc._running = True
-    proc._autonomous_pipeline_progress = True
-    proc._queued_autonomous_error = None
-    proc.wake_event = None
-    proc.mq = mocker.Mock()
-    proc.mq.dequeue.side_effect = [TimeoutError(), {"type": "shutdown"}]
-    proc.worker = mocker.Mock()
-
-    proc._worker_busy_loop()
-
-    proc.worker.execute_method.assert_called_once_with("background_pipeline_tick")
-    assert proc._queued_autonomous_error is None
-
-
-def test_worker_proc_reports_autonomous_progress_failure_on_next_poll(mocker) -> None:
-    proc = object.__new__(WorkerProc)
-    proc.gpu_id = 0
-    proc._running = True
-    proc._autonomous_pipeline_progress = True
-    proc._queued_autonomous_error = None
-    proc.wake_event = None
-    proc.mq = mocker.Mock()
-    proc.mq.dequeue.side_effect = [TimeoutError(), TimeoutError(), {"type": "shutdown"}]
-    proc.worker = mocker.Mock()
-    proc.worker.execute_method.side_effect = RuntimeError("stage failed")
-
-    proc._worker_busy_loop()
-
-    assert proc.worker.execute_method.call_count == 1
-    assert "stage failed" in proc._queued_autonomous_error
-    proc.result_mq = object()
-    with pytest.raises(RuntimeError, match="stage failed"):
-        proc._execute_rpc(
-            {
-                "method": "poll_pipeline_autonomous_progress",
-                "exec_all_ranks": True,
-                "reply_all_ranks": True,
-                "output_rank": 0,
-            }
-        )
 
 
 def _task(batch_id: str = "batch-a", *, epoch: int = 2) -> PipelineTask:

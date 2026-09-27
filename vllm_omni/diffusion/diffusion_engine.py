@@ -81,7 +81,6 @@ logger = init_logger(__name__)
 _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
 _QUEUED_FINALIZATION_POLL_INTERVAL_S = 0.005
-_QUEUED_AUTONOMOUS_POLL_INTERVAL_S = 0.002
 
 
 def _async_output_timeout() -> float:
@@ -1307,13 +1306,6 @@ class DiffusionEngine:
                 if self._queued_pipeline_waits_on_finalization():
                     with self._cv:
                         self._cv.wait(timeout=_QUEUED_FINALIZATION_POLL_INTERVAL_S)
-                elif (
-                    not events_by_batch
-                    and self._queued_pipeline_batches
-                    and self.executor.uses_autonomous_pipeline_progress()
-                ):
-                    with self._cv:
-                        self._cv.wait(timeout=_QUEUED_AUTONOMOUS_POLL_INTERVAL_S)
                 continue
 
             try:
