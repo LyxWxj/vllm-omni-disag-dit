@@ -977,3 +977,40 @@ canhazgpu run --gpus 2 -- \
 ```
 
 此 A/B 只比较相邻 queued 实现，不是 static-vs-queued，也不是与理想流水线的比较；三次重复支持该优化方向有收益，但仍不足以给出跨环境的稳定性能承诺。Rank 1 的 `transport_progress` 在一个 rank-local 非 profiler 样本中仍超过 1,000 次，说明 Engine/Worker 仍有大量无进展轮询；继续降低这些空轮询和残余 stage idle 是下一项工作。
+
+## 14. 2026-09-28：控制面收缩与自主推进实验
+
+### 保留的控制面改动
+
+提交 `e922fc20c` 进一步减少 PP=2、DP=1、TP/SP/CFG=1 的 Worker 控制同步：
+
+- `submit_pipeline_batch()`、`authorize_pipeline_batch()`、grant start 和 batch release-readiness 由 Executor 收齐两个 rank 的本地 RPC 结果；grant start 仍有 30 s 超时与失败关闭。其他拓扑保留原有 all-rank 协议。
+- 下一轮 rank-local progress snapshot 顺带检查已有 transfer offer 的 sender ticket 和 receiver credit，Worker 实际保留 receive credit；只有两个 endpoint 均报告 ready 后，Executor 才发 validated grant。新生成的 offer 在下一轮检查。生产热路径因此不再为每个 offer 单独发 readiness RPC。
+- stage 0 在 `edge_buffer_slots > 1` 时可在同一次 progress 中填满可用的 activation send credit，同时保留 FIFO 与 ticket ownership。Engine 仍需等两 rank 的 progress RPC 都返回，此改动没有实现独立的异步 1F1B。
+- 每轮 progress 的高频 INFO 日志降为 DEBUG，并仅每 100 个 scheduler round 记录一次摘要。
+
+本地与远端 focused CPU 测试均为 272 passed；Ruff 与 `git diff --check` 通过。以下是相同模型、4 请求、512x512x16、8 steps、seed 42 的单次无 profiler 结果，不作为稳定性能提升结论：
+
+| 提交与配置 | Makespan (ms) | 吞吐 (req/s) | Mean latency (ms) | P50 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| `e922fc20c`, slots=1, inflight=2 | 5873 | 0.681 | 4266 | 3372 |
+| `e922fc20c`, slots=2, inflight=4 | 5362 | 0.746 | 4368 | 4043 |
+
+两次四个 decoded SHA-256 均与第 13 节列出的对应请求完全一致。较深的队列在本次样本中缩短 makespan，但改变了 admission 深度和请求完成顺序，且均未做重复测量；不能把这 511 ms 差异归因于单一代码改动。结果与 Worker events 已下载到本地 `artifacts/wan22-queued-control-e922fc20-slots1/` 和 `artifacts/wan22-queued-control-e922fc20-slots2/`。后者仍约有 2,200 个 scheduler round，说明控制面轮询和 rank-wide progress barrier 仍在。
+
+### 已撤回的 Worker 自主轮询
+
+提交 `8765ab326` 曾让各 Worker 在两次 RPC 之间自主调用本地 `progress_pipeline_transfers()`，Engine 只轮询缓冲的 metadata；`188846028` 随后尝试用 stage CUDA event 阻止本地 forward 过早提交。这两个实验都完成了全部请求，输出 SHA-256 与保留版本一致，但性能明显退化：
+
+| 实验 | Makespan (ms) | 吞吐 (req/s) | 末两个 `post_decode()` 耗时 (ms) |
+| --- | ---: | ---: | ---: |
+| 自主轮询 `8765ab326` | 27539 | 0.145 | 11261、12069 |
+| 加入 CUDA completion gate `188846028` | 27144 | 0.147 | 12235、10721 |
+
+对比之下，同配置的 `e922fc20c` makespan 为 5362 ms。无 profiler Worker event 显示，自主轮询版本的 32 次 stage-0 forward 在约 2.8 s 内完成；长尾发生在最终 `post_decode()`，不是 denoise forward 或 P2P offer 发布。轻量 marker 进一步确认慢在 `post_decode()` 调用内，而不是结果 RPC 的 SHM 封装。`post_decode()` 包含 latent materialization 和 VAE decode；尚未单独证明是 GPU 排队、内存压力、VAE 内部同步还是线程竞争。CUDA completion gate 没有解决退化，因此不能把原因归结为缺少该 gate。
+
+这两项自主推进改动已通过 `d22cfbda`、`db977e78` 撤回，保留 `e922fc20c` 的控制面改动。诊断目录已下载到 `artifacts/wan22-queued-autonomous-8765ab32-slots2/`、`artifacts/wan22-queued-autonomous-diagnostic-8765ab32/` 和 `artifacts/wan22-queued-device-gate-18884602/`；均是无 profiler 运行。
+
+### 后续架构方向
+
+不应再把 `WorkerProc` 的 RPC 队列超时当作 stage clock。下一版需要真正的 per-rank progress/event 通道：Worker StageEngine 在自身的 bounded device-work、edge credit 和接收事件满足条件时推进；Executor 按 rank 异步收取 metadata，并只在 transfer 两端确认、完整 step commit 和 retirement 处聚合。Engine 应在 event 到达时处理状态转换，而不是每几毫秒重跑一次 `scheduler.schedule()`。同时必须给最终 decode 独立的可观测资源边界，明确它与尚未退休的 DiT device work、CUDA stream、内存预算和结果输出的关系，再决定是否可与 stage progress 并行。验收必须同时要求四请求输出一致、无长尾 VAE 回退、两 rank 的 stage 实际重叠以及端到端吞吐收益；单纯减少 RPC/collective 次数不够。
