@@ -8,6 +8,7 @@ import concurrent.futures
 import copy
 import dataclasses
 import inspect
+import logging
 import os
 import queue
 import threading
@@ -641,10 +642,8 @@ class DiffusionEngine:
         )
 
     def _collect_queued_pipeline_events(self) -> dict[str, list[PipelineEvent]]:
-        logger.info(
-            "Queued pipeline progress begin: retained=%s",
-            sorted(self._queued_pipeline_batches),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Queued pipeline progress begin: retained=%s", sorted(self._queued_pipeline_batches))
         self.executor.progress_pipeline()
         events = self.executor.poll_pipeline_events()
         grouped: dict[str, list[PipelineEvent]] = {}
@@ -653,10 +652,10 @@ class DiffusionEngine:
             if not isinstance(event, PipelineEvent) or event.task.batch_id not in known_batches:
                 raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
             grouped.setdefault(event.task.batch_id, []).append(event)
-        logger.info(
-            "Queued pipeline progress end: events=%s",
-            {batch_id: len(batch_events) for batch_id, batch_events in grouped.items()},
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Queued pipeline progress end: events=%s", {batch_id: len(items) for batch_id, items in grouped.items()}
+            )
         return grouped
 
     def _has_queued_pipeline_work(self) -> bool:
@@ -1227,16 +1226,18 @@ class DiffusionEngine:
 
             if self.od_config.mode == "queued":
                 queued_round += 1
-                logger.info(
-                    "Queued pipeline scheduler round=%d step_id=%s new=%s cached=%s waiting=%s running=%s retained=%s",
-                    queued_round,
-                    sched_output.step_id,
-                    [request.request_id for request in sched_output.scheduled_new_reqs],
-                    list(sched_output.scheduled_cached_reqs.request_ids),
-                    sched_output.num_waiting_reqs,
-                    sched_output.num_running_reqs,
-                    sorted(self._queued_pipeline_batches),
-                )
+                if queued_round == 1 or queued_round % 100 == 0:
+                    logger.info(
+                        "Queued pipeline scheduler round=%d step_id=%s new=%s cached=%s waiting=%s running=%s "
+                        "retained=%s",
+                        queued_round,
+                        sched_output.step_id,
+                        [request.request_id for request in sched_output.scheduled_new_reqs],
+                        list(sched_output.scheduled_cached_reqs.request_ids),
+                        sched_output.num_waiting_reqs,
+                        sched_output.num_running_reqs,
+                        sorted(self._queued_pipeline_batches),
+                    )
                 handled_request_ids: set[str] = set()
                 task_outputs = self._split_queued_scheduler_output(sched_output)
                 admitted_outputs: list[Any] = []

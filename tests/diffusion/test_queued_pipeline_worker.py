@@ -132,6 +132,29 @@ def test_rank_local_progress_snapshot_does_not_enter_collective(mocker) -> None:
     gather.assert_not_called()
 
 
+def test_rank_local_progress_snapshot_reserves_pending_offer_before_progress(mocker) -> None:
+    worker = _worker()
+    progress = PipelineTransportProgress(rank=worker.rank)
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    accept = mocker.patch.object(worker, "accept_pipeline_transfer_offer", return_value=True)
+    local_progress = mocker.patch.object(worker, "progress_pipeline_transfers", return_value=progress)
+    mocker.patch.object(worker, "poll_pipeline_events", return_value=[])
+
+    reported, _ = worker.progress_pipeline_transfers_and_poll_events((offer,))
+
+    assert reported.readiness == [(offer.identity, True)]
+    accept.assert_called_once_with(offer)
+    local_progress.assert_called_once_with()
+
+
 def _task(batch_id: str = "batch-a", *, epoch: int = 2) -> PipelineTask:
     return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=epoch)
 
@@ -920,8 +943,8 @@ def test_two_batch_progress_runs_stage0_b_while_stage1_consumes_a(mocker) -> Non
         "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_available",
         return_value=False,
     )
-    first.initialize_pipeline_transports(max_slots=2)
-    last.initialize_pipeline_transports(max_slots=2)
+    first.initialize_pipeline_transports(max_slots=1)
+    last.initialize_pipeline_transports(max_slots=1)
 
     batch_a = _task("batch-a")
     batch_b = PipelineTask(batch_id="batch-b", request_ids=("req-b",), step_index=0, epoch=3)
@@ -973,6 +996,25 @@ def test_two_batch_progress_runs_stage0_b_while_stage1_consumes_a(mocker) -> Non
     assert first.pipeline_stages[0].terminal_statuses[batch_a.batch_id] is PipelineTaskStatus.COMPLETED
     assert first.pipeline_stages[0].terminal_statuses[batch_b.batch_id] is PipelineTaskStatus.COMPLETED
     assert last.pipeline_stages[1].terminal_statuses[batch_b.batch_id] is PipelineTaskStatus.COMPLETED
+
+
+def test_stage0_progress_fills_available_activation_credits(mocker) -> None:
+    worker = _worker()
+    worker.rank = 0
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=_PPGroup(0))
+    worker.initialize_pipeline_transports(max_slots=2)
+    first = _task("batch-a")
+    second = PipelineTask(batch_id="batch-b", request_ids=("req-b",), step_index=0, epoch=3)
+    worker.model_runner.state_cache["req-b"] = object()
+    for task in (first, second):
+        worker.enqueue_pipeline_batch(task, _spec(0))
+        worker.authorize_pipeline_batch(0, task.batch_id)
+
+    progress = worker.progress_pipeline_transfers()
+
+    assert [offer.batch_id for offer in progress.offers] == [first.batch_id, second.batch_id]
+    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 2
+    assert worker.progress_pipeline_transfers().offers == []
 
 
 def test_release_rpc_consumes_acknowledgement_without_dropping_next_batch_event() -> None:

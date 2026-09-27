@@ -976,12 +976,16 @@ class DiffusionWorker:
         first_stage = self.pipeline_stages.get(0)
         if first_stage is not None and first_stage.spec.is_first:
             activation_connector = self._require_pipeline_connector(PipelineEdgeKind.ACTIVATION)
-            if activation_connector.send_in_use < activation_connector.max_slots:
+            while activation_connector.send_in_use < activation_connector.max_slots:
+                previous_send_in_use = activation_connector.send_in_use
                 stage_progress = self.progress_pipeline(0)
-                if stage_progress is not None:
-                    if not isinstance(stage_progress.output, PipelineTransferOffer):
-                        raise RuntimeError("first pipeline stage did not reserve an activation transfer")
-                    progress.offers.append(stage_progress.output)
+                if stage_progress is None:
+                    break
+                if not isinstance(stage_progress.output, PipelineTransferOffer):
+                    raise RuntimeError("first pipeline stage did not reserve an activation transfer")
+                if activation_connector.send_in_use <= previous_send_in_use:
+                    raise RuntimeError("first pipeline stage did not consume activation send credit")
+                progress.offers.append(stage_progress.output)
 
         for edge_kind in (PipelineEdgeKind.FEEDBACK, PipelineEdgeKind.ACTIVATION):
             connector = self._require_pipeline_connector(edge_kind)
@@ -1003,9 +1007,14 @@ class DiffusionWorker:
 
         return _run_and_gather_rank_values("queued pipeline progress snapshot", progress_and_poll)
 
-    def progress_pipeline_transfers_and_poll_events(self) -> tuple[PipelineTransportProgress, list[Any]]:
+    def progress_pipeline_transfers_and_poll_events(
+        self,
+        pending_offers: tuple[PipelineTransferOffer, ...] = (),
+    ) -> tuple[PipelineTransportProgress, list[Any]]:
         """Advance one local Worker and return only its progress and events."""
+        readiness = [(offer.identity, self.accept_pipeline_transfer_offer(offer)) for offer in pending_offers]
         progress = self.progress_pipeline_transfers()
+        progress.readiness = readiness
         return progress, self.poll_pipeline_events()
 
     def _consume_ready_pipeline_message(

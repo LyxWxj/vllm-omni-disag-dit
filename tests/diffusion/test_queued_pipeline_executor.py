@@ -234,7 +234,7 @@ def test_multiproc_pp2_uses_rank_local_progress_and_readiness_reports(mocker) ->
     )
     executor.collective_rpc.side_effect = [
         [{"rank": 0, "ready": True}, {"rank": 1, "ready": True}],
-        [True],
+        [True, True],
         [
             (PipelineTransportProgress(rank=0), ["rank-0-event"]),
             (PipelineTransportProgress(rank=1), ["rank-1-event"]),
@@ -255,6 +255,137 @@ def test_multiproc_pp2_uses_rank_local_progress_and_readiness_reports(mocker) ->
     }
     assert executor.collective_rpc.call_args_list[2].args == ("progress_pipeline_transfers_and_poll_events",)
     assert executor.collective_rpc.call_args_list[2].kwargs["reply_all_ranks"] is True
+    assert executor.collective_rpc.call_args_list[1].kwargs == {
+        "args": (grants[0],),
+        "timeout": PIPELINE_GRANT_START_TIMEOUT_S,
+        "exec_all_ranks": True,
+        "reply_all_ranks": True,
+    }
+
+
+def test_multiproc_pp2_uses_rank_local_submit_authorize_and_release_readiness(mocker) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._ensure_open = mocker.Mock()
+    executor.collective_rpc = mocker.Mock(
+        side_effect=[["accepted-0", "accepted-1"], ["authorized-0", "authorized-1"], [True, False]]
+    )
+    executor._is_failed = False
+    executor.od_config = SimpleNamespace(
+        step_execution=True,
+        num_gpus=2,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+            cfg_parallel_size=1,
+        ),
+    )
+    executor._result_mqs = [object(), object()]
+
+    assert executor.submit_pipeline_batch("task", {0: "stage-0", 1: "stage-1"}) == ["accepted-0", "accepted-1"]
+    assert executor.authorize_pipeline_batch({0: 0, 1: 1}, "batch-a") == ["authorized-0", "authorized-1"]
+    assert executor.pipeline_batch_release_ready({0: 0, 1: 1}, "batch-a") is False
+    assert [call.args[0] for call in executor.collective_rpc.call_args_list] == [
+        "enqueue_pipeline_batch",
+        "authorize_pipeline_batch",
+        "pipeline_batch_release_ready",
+    ]
+    assert all(call.kwargs["reply_all_ranks"] is True for call in executor.collective_rpc.call_args_list)
+
+
+def test_multiproc_pp2_piggybacks_transfer_readiness_on_next_progress(mocker) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._ensure_open = mocker.Mock()
+    executor.collective_rpc = mocker.Mock(return_value=_topology_reports())
+    executor._is_failed = False
+    executor._failure_callbacks = []
+    executor.shutdown = mocker.Mock()
+    executor.od_config = SimpleNamespace(
+        step_execution=True,
+        num_gpus=2,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+            cfg_parallel_size=1,
+        ),
+    )
+    executor._result_mqs = [object(), object()]
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    executor.collective_rpc.reset_mock()
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    executor.collective_rpc.side_effect = [
+        [(PipelineTransportProgress(rank=0, offers=[offer]), []), (PipelineTransportProgress(rank=1), [])],
+        [
+            (PipelineTransportProgress(rank=0, readiness=[(offer.identity, True)]), []),
+            (PipelineTransportProgress(rank=1, readiness=[(offer.identity, True)]), []),
+        ],
+        [True, True],
+    ]
+
+    assert executor.progress_pipeline().grants == []
+    grants = executor.progress_pipeline().grants
+
+    assert [grant.offer for grant in grants] == [offer]
+    assert [call.args[0] for call in executor.collective_rpc.call_args_list] == [
+        "progress_pipeline_transfers_and_poll_events",
+        "progress_pipeline_transfers_and_poll_events",
+        "start_pipeline_transfer",
+    ]
+    assert executor.collective_rpc.call_args_list[1].kwargs["args"] == ((offer,),)
+
+
+def test_multiproc_pp2_rejects_incomplete_piggyback_readiness(mocker) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._ensure_open = mocker.Mock()
+    executor.collective_rpc = mocker.Mock(return_value=_topology_reports())
+    executor._is_failed = False
+    executor._failure_callbacks = []
+    executor.shutdown = mocker.Mock()
+    executor.od_config = SimpleNamespace(
+        step_execution=True,
+        num_gpus=2,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+            cfg_parallel_size=1,
+        ),
+    )
+    executor._result_mqs = [object(), object()]
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    executor._pipeline_transfer_coordinator.offer(offer)
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.return_value = [
+        (PipelineTransportProgress(rank=0, readiness=[(offer.identity, True)]), []),
+        (PipelineTransportProgress(rank=1), []),
+    ]
+
+    with pytest.raises(RuntimeError, match="did not cover pending transfer offers"):
+        executor.progress_pipeline()
+
+    assert executor._is_failed
+    executor.collective_rpc.assert_called_once()
 
 
 def test_rank_local_readiness_requires_exact_endpoint_coverage(mocker) -> None:

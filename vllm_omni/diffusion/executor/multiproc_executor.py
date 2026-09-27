@@ -840,6 +840,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
+        if self._uses_rank_local_pp_rpc():
+            return self._queued_rank_local_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
         return self._queued_control_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
 
     def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
@@ -905,6 +907,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return result
 
     def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
+        if self._uses_rank_local_pp_rpc():
+            try:
+                reports = self._queued_rank_local_rpc("pipeline_batch_release_ready", args=(pp_stage_id, batch_id))
+                if len(reports) != 2 or any(type(report) is not bool for report in reports):
+                    raise RuntimeError("Queued pipeline retirement readiness returned invalid rank-local results.")
+                return all(reports)
+            except BaseException as exc:
+                if not self._is_failed:
+                    self._fail_queued_control("pipeline batch release readiness", exc)
+                raise
         result = self._queued_control_rpc(
             "pipeline_batch_release_ready_all_ranks",
             args=(pp_stage_id, batch_id),
@@ -925,6 +937,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return result
 
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
+        if self._uses_rank_local_pp_rpc():
+            return self._queued_rank_local_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
         return self._queued_control_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
 
     def poll_pipeline_events(self) -> list[Any]:
@@ -1024,11 +1038,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         coordinator = self._pipeline_transfer_coordinator
         grants = coordinator.grant_ready()
         for grant in grants:
-            self._queued_control_rpc(
-                "start_pipeline_transfer",
-                args=(grant,),
-                timeout=PIPELINE_GRANT_START_TIMEOUT_S,
-            )
+            if self._uses_rank_local_pp_rpc():
+                reports = self._queued_rank_local_rpc(
+                    "start_pipeline_transfer", args=(grant,), timeout=PIPELINE_GRANT_START_TIMEOUT_S
+                )
+                if len(reports) != 2 or any(report is not True for report in reports):
+                    error = RuntimeError("Pipeline grant start did not succeed on both endpoints.")
+                    self._fail_queued_control("pipeline grant start", error)
+                    raise error
+            else:
+                self._queued_control_rpc(
+                    "start_pipeline_transfer",
+                    args=(grant,),
+                    timeout=PIPELINE_GRANT_START_TIMEOUT_S,
+                )
         return grants
 
     def progress_pipeline(self) -> PipelineCoordinatorProgress:
@@ -1036,8 +1059,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
         try:
-            if self._uses_rank_local_pp_rpc():
-                result = self._queued_rank_local_rpc("progress_pipeline_transfers_and_poll_events")
+            rank_local = self._uses_rank_local_pp_rpc()
+            pending_offers = tuple(coordinator.pending_readiness_offers()) if rank_local else ()
+            if rank_local:
+                result = self._queued_rank_local_rpc(
+                    "progress_pipeline_transfers_and_poll_events", args=(pending_offers,)
+                )
             else:
                 result = self._queued_control_rpc("progress_pipeline_transfers_and_poll_events_all_ranks")
             worker_progress, worker_events = normalize_pipeline_transport_snapshot(result, coordinator.endpoint_ranks)
@@ -1052,7 +1079,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 for offer in rank_progress.offers:
                     coordinator.offer(offer)
                     self._pipeline_pending_readiness[offer.identity] = offer
-            progress.grants.extend(self._retry_pipeline_transfer_readiness())
+            if rank_local:
+                expected_ids = {offer.identity for offer in pending_offers}
+                for rank_progress in worker_progress:
+                    reported_ids = [identity for identity, _ in rank_progress.readiness]
+                    if len(reported_ids) != len(expected_ids) or set(reported_ids) != expected_ids:
+                        raise RuntimeError("Pipeline progress readiness did not cover pending transfer offers.")
+                for offer in pending_offers:
+                    reports = [
+                        {"rank": item.rank, "ready": dict(item.readiness)[offer.identity]} for item in worker_progress
+                    ]
+                    if normalize_pipeline_transfer_readiness_reports(reports, coordinator.endpoint_ranks):
+                        coordinator.mark_receive_ready(offer.identity)
+                        self._pipeline_pending_readiness.pop(offer.identity, None)
+                progress.grants.extend(self._start_ready_pipeline_transfers())
+            else:
+                progress.grants.extend(self._retry_pipeline_transfer_readiness())
             return progress
         except BaseException as exc:
             if not self._is_failed:

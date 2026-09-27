@@ -78,6 +78,7 @@ class PipelineTransportProgress:
     rank: int
     offers: list[PipelineTransferOffer] = field(default_factory=list)
     completions: list[PipelineEndpointCompletion] = field(default_factory=list)
+    readiness: list[tuple[tuple[Any, ...], bool]] = field(default_factory=list)
 
 
 @dataclass
