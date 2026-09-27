@@ -903,6 +903,14 @@ class DiffusionEngine:
         }:
             raise RuntimeError("Queued pipeline batch is not ready for retirement.")
         if not batch.release_acknowledged:
+            # Finalization can complete without another scheduler progress
+            # round. Give Workers one transport-only tick so completed device
+            # consumer events release their receive leases before the context
+            # ownership check below. This does not poll Worker events, so it
+            # cannot consume the shared event snapshot for another batch.
+            self.executor.progress_pipeline()
+            if not self.executor.pipeline_batch_release_ready({0: 0, 1: 1}, batch.task.batch_id):
+                return
             events = self.executor.release_pipeline_batch({0: 0, 1: 1}, batch.task.batch_id)
             if not isinstance(events, list) or len(events) != 2:
                 raise RuntimeError("Queued pipeline retirement did not acknowledge both stages.")
@@ -991,6 +999,8 @@ class DiffusionEngine:
             _QueuedPipelineBatchPhase.CANCELLING,
         }:
             self._retire_queued_pipeline_batch(batch)
+            if not batch.release_acknowledged:
+                return None
         return output
 
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:

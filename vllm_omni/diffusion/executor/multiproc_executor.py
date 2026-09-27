@@ -855,6 +855,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result[0]
         return result
 
+    def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
+        result = self._queued_control_rpc(
+            "pipeline_batch_release_ready_all_ranks",
+            args=(pp_stage_id, batch_id),
+        )
+        while isinstance(result, list) and len(result) == 1:
+            result = result[0]
+        if type(result) is not bool:
+            raise RuntimeError("Queued pipeline retirement readiness returned an invalid result.")
+        return result
+
     def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
         result = self._queued_control_rpc(
             "cleanup_finalized_pipeline_request_all_ranks",

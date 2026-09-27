@@ -1353,6 +1353,32 @@ class DiffusionWorker:
             self._pipeline_finalization_futures.pop(batch_id, None)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id))
 
+    def pipeline_batch_release_ready(self, pp_stage_id: int | dict[int, int], batch_id: str) -> bool:
+        """Check whether a terminal batch has no retained transport ownership."""
+        if isinstance(pp_stage_id, dict):
+            pp_stage_id = self._select_rank_value(pp_stage_id)
+        stage = self._require_pipeline_stage(pp_stage_id)
+        if batch_id not in stage.terminal_statuses:
+            raise RuntimeError(f"Pipeline batch {batch_id!r} is not terminal on stage {pp_stage_id}.")
+        return not any(
+            identity[0] == batch_id
+            for identity in (*self.pipeline_send_tickets, *self.pipeline_receive_reservations)
+        )
+
+    def pipeline_batch_release_ready_all_ranks(
+        self,
+        pp_stage_id: int | dict[int, int],
+        batch_id: str,
+    ) -> bool:
+        """Agree on release readiness without mutating batch ownership."""
+        results = _run_and_gather_rank_values(
+            "queued pipeline batch release readiness",
+            lambda: self.pipeline_batch_release_ready(pp_stage_id, batch_id),
+        )
+        if not all(type(result) is bool for result in results):
+            raise RuntimeError("queued pipeline batch release readiness returned invalid reports")
+        return all(results)
+
     def finalize_pipeline_batch(
         self,
         pp_stage_id: int | dict[int, int],

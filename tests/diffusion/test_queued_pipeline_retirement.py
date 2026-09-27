@@ -65,6 +65,7 @@ def test_retirement_requires_two_matching_released_events(mocker) -> None:
     engine = _engine(mocker, scheduler_output)
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
+    engine.executor.reset_mock()
     engine.executor.release_pipeline_batch.return_value = [
         PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
         PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),
@@ -73,6 +74,42 @@ def test_retirement_requires_two_matching_released_events(mocker) -> None:
     engine._retire_queued_pipeline_batch(batch)
 
     assert engine._queued_pipeline_batches == {}
+
+
+def test_retirement_ticks_transport_before_releasing_context(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
+    engine.executor.reset_mock()
+    engine.executor.release_pipeline_batch.return_value = [
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),
+    ]
+
+    engine._retire_queued_pipeline_batch(batch)
+
+    assert engine.executor.method_calls[:2] == [
+        mocker.call.progress_pipeline(),
+        mocker.call.pipeline_batch_release_ready({0: 0, 1: 1}, batch.task.batch_id),
+    ]
+    assert engine.executor.method_calls[2] == mocker.call.release_pipeline_batch({0: 0, 1: 1}, batch.task.batch_id)
+
+
+def test_retirement_keeps_finalizing_batch_until_receive_ownership_retires(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+    batch.decoded_output = object()
+    batch.finalizing_request_ids = frozenset({"req-a"})
+    engine.executor.pipeline_batch_release_ready.return_value = False
+
+    engine._retire_queued_pipeline_batch(batch)
+
+    assert not batch.release_acknowledged
+    assert batch.task.batch_id in engine._queued_pipeline_batches
+    engine.executor.release_pipeline_batch.assert_not_called()
 
 
 def test_final_retirement_cleans_persistent_worker_state(mocker) -> None:

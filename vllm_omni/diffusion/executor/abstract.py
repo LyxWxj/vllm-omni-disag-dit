@@ -205,6 +205,9 @@ class DiffusionExecutor(ABC):
     def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
         raise NotImplementedError("queued pipeline retirement is not wired for this executor")
 
+    def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
+        raise NotImplementedError("queued pipeline retirement readiness is not wired for this executor")
+
     def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
         raise NotImplementedError("queued finalized-request cleanup is not wired for this executor")
 

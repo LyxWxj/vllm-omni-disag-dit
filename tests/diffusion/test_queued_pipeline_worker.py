@@ -653,11 +653,13 @@ def test_first_stage_release_waits_for_feedback_receive_lease(mocker) -> None:
     assert len(messages) == 1
     worker.complete_pipeline_feedback(0, task.batch_id, messages[0].payload["latents"])
 
+    assert not worker.pipeline_batch_release_ready(0, task.batch_id)
     with pytest.raises(RuntimeError, match="retained receive ownership"):
         worker.release_pipeline_batch(0, task.batch_id)
     assert (0, task.batch_id) in worker.model_runner.pipeline_batch_contexts
 
     worker.release_pipeline_received(PipelineEdgeKind.FEEDBACK, messages[0])
+    assert worker.pipeline_batch_release_ready(0, task.batch_id)
     assert worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
 
 
