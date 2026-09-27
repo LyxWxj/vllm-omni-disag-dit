@@ -810,30 +810,6 @@ class DiffusionWorker:
         return self._pipeline_receive_consumers
 
     @property
-    def pipeline_stage_device_events(self) -> dict[int, Any]:
-        if not hasattr(self, "_pipeline_stage_device_events"):
-            self._pipeline_stage_device_events = {}
-        return self._pipeline_stage_device_events
-
-    def _pipeline_stage_device_ready(self, stage_id: int) -> bool:
-        event = self.pipeline_stage_device_events.get(stage_id)
-        if event is None:
-            return True
-        if any(consumer_event is event for _, _, consumer_event in self.pipeline_receive_consumers.values()):
-            return False
-        if not event.query():
-            return False
-        self.pipeline_stage_device_events.pop(stage_id)
-        return True
-
-    def _record_pipeline_stage_device_event(self, stage_id: int) -> None:
-        event = current_omni_platform.record_device_event()
-        if event is None and current_omni_platform.is_available():
-            raise RuntimeError("failed to record pipeline stage device completion event")
-        if event is not None:
-            self.pipeline_stage_device_events[stage_id] = event
-
-    @property
     def pipeline_pending_received(self) -> dict[PipelineEdgeKind, deque[PipelineMessage]]:
         if not hasattr(self, "_pipeline_pending_received"):
             self._pipeline_pending_received = {
@@ -1000,10 +976,7 @@ class DiffusionWorker:
         first_stage = self.pipeline_stages.get(0)
         if first_stage is not None and first_stage.spec.is_first:
             activation_connector = self._require_pipeline_connector(PipelineEdgeKind.ACTIVATION)
-            while (
-                activation_connector.send_in_use < activation_connector.max_slots
-                and self._pipeline_stage_device_ready(0)
-            ):
+            while activation_connector.send_in_use < activation_connector.max_slots:
                 previous_send_in_use = activation_connector.send_in_use
                 stage_progress = self.progress_pipeline(0)
                 if stage_progress is None:
@@ -1012,7 +985,6 @@ class DiffusionWorker:
                     raise RuntimeError("first pipeline stage did not reserve an activation transfer")
                 if activation_connector.send_in_use <= previous_send_in_use:
                     raise RuntimeError("first pipeline stage did not consume activation send credit")
-                self._record_pipeline_stage_device_event(0)
                 progress.offers.append(stage_progress.output)
 
         for edge_kind in (PipelineEdgeKind.FEEDBACK, PipelineEdgeKind.ACTIVATION):
@@ -1050,7 +1022,6 @@ class DiffusionWorker:
         if not self.pipeline_connectors or not (
             self.pipeline_send_tickets
             or self.pipeline_receive_reservations
-            or self.pipeline_stage_device_events
             or any(
                 stage.pending_tasks or stage.active_task or stage.awaiting_feedback
                 for stage in self.pipeline_stages.values()
@@ -1116,9 +1087,6 @@ class DiffusionWorker:
                 _PIPELINE_CONSUMER_EVENT_FAILED,
             )
             raise RuntimeError("failed to record pipeline receive consumer completion event")
-        if consumer_event is not None:
-            stage_id = 1 if edge_kind is PipelineEdgeKind.ACTIVATION else 0
-            self.pipeline_stage_device_events[stage_id] = consumer_event
         self.pipeline_receive_consumers[reservation] = (edge_kind, message, consumer_event)
 
     def _cancelled_pipeline_message_context(
@@ -1139,8 +1107,6 @@ class DiffusionWorker:
     ) -> bool:
         stage_id = 1 if edge_kind is PipelineEdgeKind.ACTIVATION else 0
         stage = self._require_pipeline_stage(stage_id)
-        if not self._pipeline_stage_device_ready(stage_id):
-            return False
         if edge_kind is PipelineEdgeKind.FEEDBACK:
             task = stage.awaiting_feedback.get(message.batch_id)
             if task is None:
@@ -1170,10 +1136,7 @@ class DiffusionWorker:
                 continue
             if event is not None and not event.query():
                 continue
-            stage_id = 1 if edge_kind is PipelineEdgeKind.ACTIVATION else 0
             self.release_pipeline_received(edge_kind, message)
-            if event is not None and self.pipeline_stage_device_events.get(stage_id) is event:
-                self.pipeline_stage_device_events.pop(stage_id)
             self.pipeline_receive_consumers.pop(identity)
             progress.completions.append(PipelineEndpointCompletion(identity=identity, rank=self.rank))
 

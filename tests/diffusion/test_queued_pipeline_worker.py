@@ -1091,29 +1091,6 @@ def test_stage0_progress_fills_available_activation_credits(mocker) -> None:
     assert worker.progress_pipeline_transfers().offers == []
 
 
-def test_stage0_waits_for_device_completion_before_next_forward(mocker) -> None:
-    worker = _worker()
-    worker.rank = 0
-    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=_PPGroup(0))
-    event = mocker.Mock()
-    event.query.side_effect = [False, False, True]
-    mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
-        return_value=event,
-    )
-    worker.initialize_pipeline_transports(max_slots=2)
-    first = _task("batch-a")
-    second = PipelineTask(batch_id="batch-b", request_ids=("req-b",), step_index=0, epoch=3)
-    worker.model_runner.state_cache["req-b"] = object()
-    for task in (first, second):
-        worker.enqueue_pipeline_batch(task, _spec(0))
-        worker.authorize_pipeline_batch(0, task.batch_id)
-
-    assert [offer.batch_id for offer in worker.progress_pipeline_transfers().offers] == [first.batch_id]
-    assert worker.progress_pipeline_transfers().offers == []
-    assert [offer.batch_id for offer in worker.progress_pipeline_transfers().offers] == [second.batch_id]
-
-
 def test_release_rpc_consumes_acknowledgement_without_dropping_next_batch_event() -> None:
     worker = _worker()
     first = _task("batch-a")
