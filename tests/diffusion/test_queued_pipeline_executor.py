@@ -9,6 +9,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
     PipelineEndpointCompletion,
+    PipelineTransferCoordinator,
     PipelineTransferOffer,
     PipelineTransportProgress,
 )
@@ -112,6 +113,7 @@ def test_prepare_pipeline_requests_requires_matching_all_rank_reports(executor) 
     executor.collective_rpc.assert_called_once_with(
         "prepare_pipeline_requests_all_ranks",
         args=(scheduler_output,),
+        exec_all_ranks=True,
     )
 
 
@@ -173,7 +175,125 @@ def test_event_poll_uses_all_rank_gather_and_flattens_reply(executor) -> None:
     executor.collective_rpc.return_value = [["rank-0-event", "rank-1-event"]]
 
     assert executor.poll_pipeline_events() == ["rank-0-event", "rank-1-event"]
-    executor.collective_rpc.assert_called_once_with("poll_pipeline_events_all_ranks")
+    executor.collective_rpc.assert_called_once_with("poll_pipeline_events_all_ranks", exec_all_ranks=True)
+
+
+def test_progress_snapshot_supplies_events_without_a_second_worker_rpc(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    executor.collective_rpc.reset_mock()
+    expected_events = ["rank-0-event", "rank-1-event"]
+    executor.collective_rpc.return_value = [
+        [
+            (PipelineTransportProgress(rank=0), expected_events[:1]),
+            (PipelineTransportProgress(rank=1), expected_events[1:]),
+        ]
+    ]
+
+    executor.progress_pipeline()
+
+    assert executor.poll_pipeline_events() == expected_events
+    executor.collective_rpc.assert_called_once_with(
+        "progress_pipeline_transfers_and_poll_events_all_ranks",
+        args=(),
+        exec_all_ranks=True,
+    )
+
+
+def test_multiproc_pp2_uses_rank_local_progress_and_readiness_reports(mocker) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._ensure_open = mocker.Mock()
+    executor.collective_rpc = mocker.Mock()
+    executor._is_failed = False
+    executor._failure_callbacks = []
+    executor.shutdown = mocker.Mock()
+    executor.od_config = SimpleNamespace(
+        step_execution=True,
+        num_gpus=2,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+            cfg_parallel_size=1,
+        ),
+    )
+    executor._result_mqs = [object(), object()]
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    executor.collective_rpc.reset_mock()
+
+    offer = PipelineTransferOffer(
+        batch_id="batch-local",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    executor.collective_rpc.side_effect = [
+        [{"rank": 0, "ready": True}, {"rank": 1, "ready": True}],
+        [True],
+        [
+            (PipelineTransportProgress(rank=0), ["rank-0-event"]),
+            (PipelineTransportProgress(rank=1), ["rank-1-event"]),
+        ],
+    ]
+
+    grants = executor.coordinate_pipeline_transfer(offer)
+    executor.progress_pipeline()
+
+    assert len(grants) == 1
+    assert executor.poll_pipeline_events() == ["rank-0-event", "rank-1-event"]
+    assert executor.collective_rpc.call_args_list[0].args == ("accept_pipeline_transfer_offer_rank_local",)
+    assert executor.collective_rpc.call_args_list[0].kwargs == {
+        "args": (offer,),
+        "timeout": None,
+        "exec_all_ranks": True,
+        "reply_all_ranks": True,
+    }
+    assert executor.collective_rpc.call_args_list[2].args == ("progress_pipeline_transfers_and_poll_events",)
+    assert executor.collective_rpc.call_args_list[2].kwargs["reply_all_ranks"] is True
+
+
+def test_rank_local_readiness_requires_exact_endpoint_coverage(mocker) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._ensure_open = mocker.Mock()
+    executor.collective_rpc = mocker.Mock(return_value=[{"rank": 0, "ready": True}])
+    executor._is_failed = False
+    executor._failure_callbacks = []
+    executor.shutdown = mocker.Mock()
+    executor.od_config = SimpleNamespace(
+        step_execution=True,
+        num_gpus=2,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+            cfg_parallel_size=1,
+        ),
+    )
+    executor._result_mqs = [object(), object()]
+    executor._pipeline_transfer_coordinator = PipelineTransferCoordinator(
+        activation_edges={(0, 1)}, feedback_edges={(1, 0)}
+    )
+    executor._pipeline_pending_readiness = {}
+    offer = PipelineTransferOffer(
+        batch_id="batch-local",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+
+    with pytest.raises(RuntimeError, match="does not cover every configured endpoint"):
+        executor.coordinate_pipeline_transfer(offer)
+
+    assert executor._is_failed
 
 
 def test_cancellation_uses_all_rank_gather_and_flattens_reply(executor) -> None:
@@ -186,6 +306,7 @@ def test_cancellation_uses_all_rank_gather_and_flattens_reply(executor) -> None:
     executor.collective_rpc.assert_called_once_with(
         "cancel_pipeline_requests_all_ranks",
         args=([("req-a", 3)],),
+        exec_all_ranks=True,
     )
 
 
@@ -193,7 +314,11 @@ def test_drain_aggregates_nonzero_rank_events(executor) -> None:
     executor.collective_rpc.return_value = [["rank-0-released", "rank-1-released"]]
 
     assert executor.drain_pipeline(deadline=3.0) == ["rank-0-released", "rank-1-released"]
-    executor.collective_rpc.assert_called_once_with("drain_pipeline_all_ranks", args=(3.0,))
+    executor.collective_rpc.assert_called_once_with(
+        "drain_pipeline_all_ranks",
+        args=(3.0,),
+        exec_all_ranks=True,
+    )
 
 
 def test_executor_coordinates_ready_offer_and_dispatches_grant(executor) -> None:
@@ -216,7 +341,7 @@ def test_executor_coordinates_ready_offer_and_dispatches_grant(executor) -> None
     assert grants[0].offer is offer
     assert executor.collective_rpc.call_count == 2
     assert executor.collective_rpc.call_args_list[0].args == ("accept_pipeline_transfer_offer_all_ranks",)
-    assert executor.collective_rpc.call_args_list[0].kwargs == {"args": (offer,)}
+    assert executor.collective_rpc.call_args_list[0].kwargs == {"args": (offer,), "exec_all_ranks": True}
     assert executor.collective_rpc.call_args_list[1].args == ("start_pipeline_transfer",)
     assert executor.collective_rpc.call_args_list[1].kwargs == {
         "args": (grants[0],),
@@ -246,7 +371,7 @@ def test_executor_defers_offer_until_receive_credit_is_available(executor) -> No
 
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.side_effect = [
-        [[PipelineTransportProgress(rank=0), PipelineTransportProgress(rank=1)]],
+        [[(PipelineTransportProgress(rank=0), []), (PipelineTransportProgress(rank=1), [])]],
         [True],
         [True],
     ]
@@ -277,7 +402,11 @@ def test_executor_readiness_rejection_never_dispatches_grant(executor) -> None:
     with pytest.raises(RuntimeError, match="sender reservation missing"):
         executor.coordinate_pipeline_transfer(offer)
 
-    executor.collective_rpc.assert_called_once_with("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+    executor.collective_rpc.assert_called_once_with(
+        "accept_pipeline_transfer_offer_all_ranks",
+        args=(offer,),
+        exec_all_ranks=True,
+    )
     assert executor._is_failed
 
 
@@ -317,14 +446,20 @@ def test_progress_retires_endpoints_before_granting_reverse_rank_offer(executor)
     executor.collective_rpc.side_effect = [
         [
             [
-                PipelineTransportProgress(
-                    rank=1,
-                    offers=[feedback],
-                    completions=[PipelineEndpointCompletion(activation.identity, 1)],
+                (
+                    PipelineTransportProgress(
+                        rank=1,
+                        offers=[feedback],
+                        completions=[PipelineEndpointCompletion(activation.identity, 1)],
+                    ),
+                    [],
                 ),
-                PipelineTransportProgress(
-                    rank=0,
-                    completions=[PipelineEndpointCompletion(activation.identity, 0)],
+                (
+                    PipelineTransportProgress(
+                        rank=0,
+                        completions=[PipelineEndpointCompletion(activation.identity, 0)],
+                    ),
+                    [],
                 ),
             ]
         ],
@@ -338,7 +473,7 @@ def test_progress_retires_endpoints_before_granting_reverse_rank_offer(executor)
     assert len(progress.grants) == 1
     assert progress.grants[0].offer is feedback
     assert activation_grant.completed_ranks == {0, 1}
-    assert executor.collective_rpc.call_args_list[0].args == ("progress_pipeline_transfers_all_ranks",)
+    assert executor.collective_rpc.call_args_list[0].args == ("progress_pipeline_transfers_and_poll_events_all_ranks",)
     assert executor.collective_rpc.call_args_list[1].args == ("accept_pipeline_transfer_offer_all_ranks",)
     assert executor.collective_rpc.call_args_list[2].args == ("start_pipeline_transfer",)
 
@@ -373,13 +508,19 @@ def test_progress_retries_ready_offer_after_active_edge_completes(executor) -> N
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.side_effect = [
         [
-            PipelineTransportProgress(
-                rank=0,
-                completions=[PipelineEndpointCompletion(activation.identity, 0)],
+            (
+                PipelineTransportProgress(
+                    rank=0,
+                    completions=[PipelineEndpointCompletion(activation.identity, 0)],
+                ),
+                [],
             ),
-            PipelineTransportProgress(
-                rank=1,
-                completions=[PipelineEndpointCompletion(activation.identity, 1)],
+            (
+                PipelineTransportProgress(
+                    rank=1,
+                    completions=[PipelineEndpointCompletion(activation.identity, 1)],
+                ),
+                [],
             ),
         ],
         [True],
@@ -399,11 +540,14 @@ def test_progress_invalid_completion_fails_executor_closed(executor) -> None:
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.return_value = [
         [
-            PipelineTransportProgress(
-                rank=0,
-                completions=[PipelineEndpointCompletion(("unknown",), 0)],
+            (
+                PipelineTransportProgress(
+                    rank=0,
+                    completions=[PipelineEndpointCompletion(("unknown",), 0)],
+                ),
+                [],
             ),
-            PipelineTransportProgress(rank=1),
+            (PipelineTransportProgress(rank=1), []),
         ]
     ]
 
@@ -417,7 +561,7 @@ def test_progress_invalid_completion_fails_executor_closed(executor) -> None:
     "reports",
     [
         pytest.param([], id="empty"),
-        pytest.param([PipelineTransportProgress(rank=0)], id="missing-rank"),
+        pytest.param([(PipelineTransportProgress(rank=0), [])], id="missing-rank"),
     ],
 )
 def test_progress_rejects_incomplete_rank_coverage(executor, reports) -> None:

@@ -34,7 +34,8 @@ from vllm_omni.diffusion.executor.abstract import (
     DiffusionExecutor,
     normalize_pipeline_preparation_reports,
     normalize_pipeline_transfer_readiness,
-    normalize_pipeline_transport_progress,
+    normalize_pipeline_transfer_readiness_reports,
+    normalize_pipeline_transport_snapshot,
     validate_pipeline_topology_reports,
 )
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
@@ -783,9 +784,57 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             kwargs: dict[str, Any] = {"args": args}
             if timeout is not None:
                 kwargs["timeout"] = timeout
-            if exec_all_ranks:
+            # Queued *_all_ranks Worker methods already gather local results
+            # and failures over the control group. With one DP replica, let
+            # the DP primary return that aggregate directly instead of doing
+            # a second status all-gather in _execute_rpc.
+            worker_aggregated = (
+                method.endswith("_all_ranks")
+                and getattr(
+                    getattr(getattr(self, "od_config", None), "parallel_config", None),
+                    "data_parallel_size",
+                    1,
+                )
+                == 1
+            )
+            if exec_all_ranks or worker_aggregated:
                 kwargs["exec_all_ranks"] = True
             return self.collective_rpc(method, **kwargs)
+        except BaseException as exc:
+            self._fail_queued_control(method, exc)
+            raise
+
+    def _uses_rank_local_pp_rpc(self) -> bool:
+        config = getattr(self, "od_config", None)
+        parallel = getattr(config, "parallel_config", None)
+        return (
+            getattr(config, "step_execution", False)
+            and getattr(parallel, "data_parallel_size", 1) == 1
+            and getattr(parallel, "pipeline_parallel_size", 1) == 2
+            and getattr(parallel, "tensor_parallel_size", 1) == 1
+            and getattr(parallel, "sequence_parallel_size", 1) == 1
+            and getattr(parallel, "cfg_parallel_size", 1) == 1
+            and len(getattr(self, "_result_mqs", ())) == 2
+        )
+
+    def _queued_rank_local_rpc(
+        self,
+        method: str,
+        *,
+        args: tuple = (),
+        timeout: float | None = None,
+    ) -> list[Any]:
+        if self._is_failed:
+            raise EngineDeadError()
+        self._ensure_open()
+        try:
+            return self.collective_rpc(
+                method,
+                args=args,
+                timeout=timeout,
+                exec_all_ranks=True,
+                reply_all_ranks=True,
+            )
         except BaseException as exc:
             self._fail_queued_control(method, exc)
             raise
@@ -880,7 +929,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def poll_pipeline_events(self) -> list[Any]:
         self._ensure_open()
-        result = self.collective_rpc("poll_pipeline_events_all_ranks")
+        cached_events = getattr(self, "_pipeline_cached_events", None)
+        if cached_events is not None:
+            self._pipeline_cached_events = None
+            return cached_events
+        result = self.collective_rpc("poll_pipeline_events_all_ranks", exec_all_ranks=True)
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
             return result[0]
         return result if isinstance(result, list) else [result]
@@ -890,6 +943,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         result = self.collective_rpc(
             "cancel_pipeline_requests_all_ranks",
             args=(request_generations,),
+            exec_all_ranks=True,
         )
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
             return result[0]
@@ -897,7 +951,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def drain_pipeline(self, deadline: float | None = None) -> Any:
         self._ensure_open()
-        result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,))
+        result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,), exec_all_ranks=True)
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
             return result[0]
         return result
@@ -934,20 +988,37 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def _retry_pipeline_transfer_readiness(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
-        attempted: set[tuple[Any, ...]] = set()
-        while True:
-            candidates = [offer for offer in coordinator.pending_readiness_offers() if offer.identity not in attempted]
-            if not candidates:
-                break
-            for offer in candidates:
-                attempted.add(offer.identity)
-                ready = normalize_pipeline_transfer_readiness(
-                    self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
-                )
-                if ready:
-                    coordinator.mark_receive_ready(offer.identity)
-                    self._pipeline_pending_readiness.pop(offer.identity, None)
-        return self._start_ready_pipeline_transfers()
+        try:
+            attempted: set[tuple[Any, ...]] = set()
+            while True:
+                candidates = [
+                    offer for offer in coordinator.pending_readiness_offers() if offer.identity not in attempted
+                ]
+                if not candidates:
+                    break
+                for offer in candidates:
+                    attempted.add(offer.identity)
+                    if self._uses_rank_local_pp_rpc():
+                        readiness_reports = self._queued_rank_local_rpc(
+                            "accept_pipeline_transfer_offer_rank_local",
+                            args=(offer,),
+                        )
+                        ready = normalize_pipeline_transfer_readiness_reports(
+                            readiness_reports,
+                            coordinator.endpoint_ranks,
+                        )
+                    else:
+                        ready = normalize_pipeline_transfer_readiness(
+                            self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+                        )
+                    if ready:
+                        coordinator.mark_receive_ready(offer.identity)
+                        self._pipeline_pending_readiness.pop(offer.identity, None)
+            return self._start_ready_pipeline_transfers()
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline transfer readiness", exc)
+            raise
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
@@ -965,8 +1036,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
         try:
-            result = self._queued_control_rpc("progress_pipeline_transfers_all_ranks")
-            worker_progress = normalize_pipeline_transport_progress(result, coordinator.endpoint_ranks)
+            if self._uses_rank_local_pp_rpc():
+                result = self._queued_rank_local_rpc("progress_pipeline_transfers_and_poll_events")
+            else:
+                result = self._queued_control_rpc("progress_pipeline_transfers_and_poll_events_all_ranks")
+            worker_progress, worker_events = normalize_pipeline_transport_snapshot(result, coordinator.endpoint_ranks)
+            cached_events = getattr(self, "_pipeline_cached_events", None)
+            self._pipeline_cached_events = (cached_events or []) + worker_events
             progress = PipelineCoordinatorProgress()
             for rank_progress in worker_progress:
                 for completion in rank_progress.completions:
@@ -1020,18 +1096,27 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
         exec_all_ranks: bool = False,
+        reply_all_ranks: bool = False,
     ) -> Any:
         self._ensure_open()
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        multi_rank_reply = unique_reply_rank is None and exec_all_ranks
+        if reply_all_ranks and (
+            unique_reply_rank is not None
+            or not exec_all_ranks
+            or not self.od_config.step_execution
+            or getattr(self.od_config.parallel_config, "data_parallel_size", 1) != 1
+        ):
+            raise ValueError("reply_all_ranks requires step execution, all-rank dispatch, and one DP replica")
+
+        multi_rank_reply = unique_reply_rank is None and exec_all_ranks and not reply_all_ranks
         execute_all_ranks = unique_reply_rank is None or exec_all_ranks
         # Status aggregation is for control-plane RPCs, where rank 0 sends
         # one envelope representing every rank. DP request concurrency needs
         # one independent reply per DP primary instead.
-        collect_rank_status = unique_reply_rank is None and not multi_rank_reply
+        collect_rank_status = unique_reply_rank is None and not multi_rank_reply and not reply_all_ranks
         rpc_request = {
             "type": "rpc",
             "method": method,
@@ -1040,6 +1125,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "output_rank": None if multi_rank_reply else (unique_reply_rank if unique_reply_rank is not None else 0),
             "exec_all_ranks": execute_all_ranks,
             "collect_rank_status": collect_rank_status,
+            "reply_all_ranks": reply_all_ranks,
         }
 
         # ── Path 1: async execute_model / execute_model_batch ──
@@ -1080,14 +1166,43 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # - unique_reply_rank=None + exec_all_ranks=True: all DP ranks reply
             #   (N responses, one per DP worker).
             # - Otherwise: 1 response (only rank 0 or specified rank)
-            if unique_reply_rank is None and exec_all_ranks:
+            if reply_all_ranks:
+                num_responses = len(self._result_mqs)
+                if num_responses != self.od_config.num_gpus:
+                    raise RuntimeError(
+                        "Rank-local queued RPC requires one result queue per Worker; "
+                        f"found {num_responses} queues for {self.od_config.num_gpus} Workers"
+                    )
+            elif unique_reply_rank is None and exec_all_ranks:
                 dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
                 num_responses = max(1, dp_size)
             else:
                 num_responses = 1
 
             responses: list = []
-            if unique_reply_rank is None and exec_all_ranks and num_responses > 1:
+            if reply_all_ranks:
+                rank_local_results: list[Any] = []
+                rank_errors: list[str] = []
+                for worker_id, result_mq in enumerate(self._result_mqs):
+                    response = self._dequeue_one_with_failure_polling(deadline, method, result_mq)
+                    response = self._validate_wave_id(response, wave_id, deadline, method, result_mq)
+                    if (
+                        not isinstance(response, dict)
+                        or response.get("rank_local_rpc") is not True
+                        or response.get("worker_id") != worker_id
+                    ):
+                        rank_errors.append(f"worker {worker_id} returned a malformed rank-local RPC response")
+                        continue
+                    if response.get("status") == "error":
+                        rank_errors.append(f"worker {worker_id}: {response.get('error', 'unknown error')}")
+                    elif response.get("status") == "ok":
+                        rank_local_results.append(response.get("result"))
+                    else:
+                        rank_errors.append(f"worker {worker_id} returned an invalid rank-local RPC status")
+                if rank_errors:
+                    raise RuntimeError(f"Rank-local RPC '{method}' failed: " + "; ".join(rank_errors))
+                responses = rank_local_results
+            elif unique_reply_rank is None and exec_all_ranks and num_responses > 1:
                 # DP multi-concurrency: collect num_responses replies, sort by dp_rank.
                 result_mqs: list[MessageQueue | None] = [None] * num_responses
                 if self.od_config.step_execution:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -105,19 +106,20 @@ class ForwardContext:
         pass
 
 
-_forward_context: ForwardContext | None = None
+_forward_context: ContextVar[ForwardContext | None] = ContextVar("omni_diffusion_forward_context", default=None)
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    forward_context = _forward_context.get()
+    assert forward_context is not None, (
         "Forward context is not set. Please use `set_forward_context` to set the forward context."
     )
-    return _forward_context
+    return forward_context
 
 
 def is_forward_context_available() -> bool:
-    return _forward_context is not None
+    return _forward_context.get() is not None
 
 
 def build_local_sp_padding_mask(
@@ -197,13 +199,11 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = forward_context
+    token = _forward_context.set(forward_context)
     try:
         yield
     finally:
-        _forward_context = prev_context
+        _forward_context.reset(token)
 
 
 @contextmanager
@@ -256,27 +256,29 @@ def override_paged_kv_adapter(adapter: Any | None):
     only replaces one opaque field while its prepared native metadata is live.
     """
 
-    if _forward_context is None:
+    forward_context = _forward_context.get()
+    if forward_context is None:
         # Unit-level adapter users can prepare/activate metadata without an
         # Omni model forward context.  In that case there is nothing to
         # override and the adapter's explicit ``forward`` API remains usable.
         yield
         return
 
-    previous = _forward_context.paged_kv_adapter
-    _forward_context.paged_kv_adapter = adapter
+    previous = forward_context.paged_kv_adapter
+    forward_context.paged_kv_adapter = adapter
     try:
         yield
     finally:
-        _forward_context.paged_kv_adapter = previous
+        forward_context.paged_kv_adapter = previous
 
 
 def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
-    if _forward_context is not None:
-        _forward_context.denoise_step_idx = step_idx
+    forward_context = _forward_context.get()
+    if forward_context is not None:
+        forward_context.denoise_step_idx = step_idx
         if step_idx is not None:
-            paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
+            paged_kv_runtime = getattr(forward_context, "paged_kv_runtime", None)
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
                 ensure_active(step_idx)
@@ -289,8 +291,9 @@ def set_forward_context_denoise_timestep(timestep: float | None) -> None:
     denoise loop can publish it directly instead of going through
     :meth:`DenoiseProgressMixin.record_denoise_step`.
     """
-    if _forward_context is not None:
-        _forward_context.denoise_timestep = None if timestep is None else float(timestep)
+    forward_context = _forward_context.get()
+    if forward_context is not None:
+        forward_context.denoise_timestep = None if timestep is None else float(timestep)
 
 
 def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
@@ -299,8 +302,9 @@ def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
     Denoise loops publish it so tail-fallback gates (e.g. ``end_step`` in
     RAINFUSION_ATTN) know when the final denoise steps begin.
     """
-    if _forward_context is not None:
-        _forward_context.total_denoise_steps = total_steps
+    forward_context = _forward_context.get()
+    if forward_context is not None:
+        forward_context.total_denoise_steps = total_steps
 
 
 class DenoiseProgressMixin:
@@ -313,18 +317,18 @@ class DenoiseProgressMixin:
         total_steps: int | None = None,
     ) -> None:
         set_forward_context_denoise_step_idx(step_idx)
-        if _forward_context is not None:
-            _forward_context.total_denoise_steps = total_steps
-        if _forward_context is None:
+        forward_context = _forward_context.get()
+        if forward_context is None:
             return
+        forward_context.total_denoise_steps = total_steps
         if normalized_timestep is not None:
-            _forward_context.denoise_timestep = float(normalized_timestep)
+            forward_context.denoise_timestep = float(normalized_timestep)
             return
         if timestep is None:
             return
         scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
         ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
-        _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
+        forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
@@ -334,5 +338,6 @@ def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
     transformer can read the reference latent from request scope instead of
     module instance state.
     """
-    if _forward_context is not None:
-        _forward_context.ref_latent = ref_latent
+    forward_context = _forward_context.get()
+    if forward_context is not None:
+        forward_context.ref_latent = ref_latent

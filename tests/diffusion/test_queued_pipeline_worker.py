@@ -13,6 +13,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
     PipelineTransferGrant,
     PipelineTransferOffer,
+    PipelineTransportProgress,
 )
 from vllm_omni.diffusion.worker import diffusion_worker as diffusion_worker_module
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
@@ -95,6 +96,40 @@ def _worker() -> DiffusionWorker:
     worker.model_runner = _Runner()
     worker._pipeline_stages = {}
     return worker
+
+
+def test_progress_snapshot_gathers_local_progress_and_events_once(mocker) -> None:
+    worker = _worker()
+    progress = PipelineTransportProgress(rank=worker.rank)
+    events = [object()]
+    calls: list[str] = []
+    worker.progress_pipeline_transfers = mocker.Mock(return_value=progress)
+    worker.poll_pipeline_events = mocker.Mock(return_value=events)
+
+    def gather(operation, func):
+        calls.append(operation)
+        return [func()]
+
+    mocker.patch.object(diffusion_worker_module, "_run_and_gather_rank_values", side_effect=gather)
+
+    assert worker.progress_pipeline_transfers_and_poll_events_all_ranks() == [(progress, events)]
+    assert calls == ["queued pipeline progress snapshot"]
+    worker.progress_pipeline_transfers.assert_called_once_with()
+    worker.poll_pipeline_events.assert_called_once_with()
+
+
+def test_rank_local_progress_snapshot_does_not_enter_collective(mocker) -> None:
+    worker = _worker()
+    progress = PipelineTransportProgress(rank=worker.rank)
+    events = [object()]
+    worker.progress_pipeline_transfers = mocker.Mock(return_value=progress)
+    worker.poll_pipeline_events = mocker.Mock(return_value=events)
+    gather = mocker.patch.object(diffusion_worker_module, "_run_and_gather_rank_values")
+
+    assert worker.progress_pipeline_transfers_and_poll_events() == (progress, events)
+    worker.progress_pipeline_transfers.assert_called_once_with()
+    worker.poll_pipeline_events.assert_called_once_with()
+    gather.assert_not_called()
 
 
 def _task(batch_id: str = "batch-a", *, epoch: int = 2) -> PipelineTask:

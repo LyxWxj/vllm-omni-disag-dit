@@ -32,18 +32,50 @@ def validate_pipeline_topology_reports(
         raise ValueError("pipeline topology reports do not cover every configured endpoint")
 
 
-def normalize_pipeline_transport_progress(
+def normalize_pipeline_transport_snapshot(
     result: Any,
     expected_ranks: frozenset[int],
-) -> list[PipelineTransportProgress]:
+) -> tuple[list[PipelineTransportProgress], list[Any]]:
+    """Validate the rank-local progress and event snapshot returned by one RPC."""
     while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
         result = result[0]
-    if not isinstance(result, list) or not all(isinstance(item, PipelineTransportProgress) for item in result):
-        raise RuntimeError("Workers returned invalid pipeline transport progress")
-    reporting_ranks = [item.rank for item in result]
+    if not isinstance(result, list):
+        raise RuntimeError("Workers returned invalid pipeline transport snapshot")
+
+    progresses: list[PipelineTransportProgress] = []
+    events: list[Any] = []
+    for item in result:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], PipelineTransportProgress)
+            or not isinstance(item[1], list)
+        ):
+            raise RuntimeError("Workers returned invalid pipeline transport snapshot")
+        progresses.append(item[0])
+        events.extend(item[1])
+
+    reporting_ranks = [item.rank for item in progresses]
     if len(reporting_ranks) != len(expected_ranks) or set(reporting_ranks) != expected_ranks:
-        raise RuntimeError("pipeline transport progress does not cover every configured endpoint")
-    return result
+        raise RuntimeError("pipeline transport snapshot does not cover every configured endpoint")
+    return progresses, events
+
+
+def normalize_pipeline_transfer_readiness_reports(
+    result: Any,
+    expected_ranks: frozenset[int],
+) -> bool:
+    """Require one valid readiness report from every configured PP rank."""
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers returned invalid pipeline transfer readiness reports")
+    ranks = [item.get("rank") for item in result]
+    if len(ranks) != len(expected_ranks) or set(ranks) != expected_ranks:
+        raise RuntimeError("pipeline transfer readiness does not cover every configured endpoint")
+    if any(type(item.get("ready")) is not bool for item in result):
+        raise RuntimeError("Workers returned invalid pipeline transfer readiness reports")
+    return all(item["ready"] for item in result)
 
 
 def normalize_pipeline_transfer_readiness(result: Any) -> bool:

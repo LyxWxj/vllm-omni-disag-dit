@@ -28,6 +28,7 @@ class _QueuedPipeline:
         self.denoise_calls = 0
         self.scheduler_calls = 0
         self.forward_context_seen = None
+        self.scheduler_forward_context_seen = None
 
     def prepare_encode(self, state) -> None:
         del state
@@ -57,6 +58,7 @@ class _QueuedPipeline:
         return SimpleNamespace(tensors={"hidden_states": input_batch.latents + 1})
 
     def step_scheduler_pipeline_stage(self, state, noise_pred) -> None:
+        self.scheduler_forward_context_seen = get_forward_context()
         self.scheduler_calls += 1
         state.latents = state.latents + noise_pred
         state.step_index += 1
@@ -330,6 +332,10 @@ def test_last_stage_executes_and_updates_scheduler_exactly_once() -> None:
     torch.testing.assert_close(result, torch.ones_like(state.latents))
     torch.testing.assert_close(feedback, torch.ones_like(feedback))
     assert runner.pipeline.scheduler_calls == 1
+    assert runner.pipeline.scheduler_forward_context_seen is not None
+    assert runner.pipeline.scheduler_forward_context_seen.vllm_config is runner.vllm_config
+    assert runner.pipeline.scheduler_forward_context_seen.omni_diffusion_config is runner.od_config
+    assert runner.pipeline.scheduler_forward_context_seen.denoise_step_idx == 0
     assert state.step_index == 1
     assert context.status is PipelineTaskStatus.COMPLETED
     assert runner.release_pipeline_batch(1, "batch-a") is context

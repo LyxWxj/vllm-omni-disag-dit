@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1277,6 +1279,31 @@ def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
         ("ir_op_priority_exit", None),
         ("set_current_vllm_config_exit", vllm_config),
     ]
+
+
+def test_forward_context_isolated_between_worker_and_decode_threads() -> None:
+    from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+
+    worker_config = object()
+    decode_config = object()
+    decode_entered = Event()
+    release_decode = Event()
+
+    def decode_thread() -> object:
+        with set_forward_context(omni_diffusion_config=decode_config):
+            decode_entered.set()
+            assert release_decode.wait(timeout=5)
+            return get_forward_context().omni_diffusion_config
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with set_forward_context(omni_diffusion_config=worker_config):
+            future = executor.submit(decode_thread)
+            try:
+                assert decode_entered.wait(timeout=5)
+                assert get_forward_context().omni_diffusion_config is worker_config
+            finally:
+                release_decode.set()
+            assert future.result(timeout=5) is decode_config
 
 
 @pytest.mark.core_model

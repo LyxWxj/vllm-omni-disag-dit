@@ -1235,7 +1235,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         state = context.states[0]
         try:
             self._validate_pipeline_context_progress(context)
-            with self._pipeline_inference_context():
+            kv_backend = getattr(self, "diffusion_kv_backend", None)
+            paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
+            with (
+                self._pipeline_inference_context(),
+                set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata={},
+                    paged_kv_runtime=paged_kv_runtime,
+                    denoise_step_idx=context.task.step_index,
+                ),
+            ):
                 self.pipeline.step_scheduler_pipeline_stage(state, context.result)
                 if state.latents is None:
                     raise RuntimeError("Pipeline numerical completion produced no latents.")

@@ -79,6 +79,7 @@ logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
+_QUEUED_FINALIZATION_POLL_INTERVAL_S = 0.005
 
 
 def _async_output_timeout() -> float:
@@ -661,6 +662,16 @@ class DiffusionEngine:
     def _has_queued_pipeline_work(self) -> bool:
         """Return whether retained queued ownership still needs an Engine round."""
         return self.od_config.mode == "queued" and bool(self._queued_pipeline_batches)
+
+    def _queued_pipeline_waits_on_finalization(self) -> bool:
+        """Avoid spinning while every retained batch waits on background decode."""
+        batches = tuple(self._queued_pipeline_batches.values())
+        if not batches or not any(getattr(batch, "finalization_handle", None) is not None for batch in batches):
+            return False
+        return all(
+            batch.phase in {_QueuedPipelineBatchPhase.FINALIZING, _QueuedPipelineBatchPhase.CANCELLING}
+            for batch in batches
+        )
 
     def _handle_queued_progress_snapshot_failure(
         self,
@@ -1291,6 +1302,9 @@ class DiffusionEngine:
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
                 self._advance_unhandled_queued_batches(handled_request_ids, events_by_batch)
+                if self._queued_pipeline_waits_on_finalization():
+                    with self._cv:
+                        self._cv.wait(timeout=_QUEUED_FINALIZATION_POLL_INTERVAL_S)
                 continue
 
             try:

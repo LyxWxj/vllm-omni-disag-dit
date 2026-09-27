@@ -40,7 +40,7 @@ from vllm_omni.diffusion.executor.abstract import (
     DiffusionExecutor,
     normalize_pipeline_preparation_reports,
     normalize_pipeline_transfer_readiness,
-    normalize_pipeline_transport_progress,
+    normalize_pipeline_transport_snapshot,
     validate_pipeline_topology_reports,
 )
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -211,7 +211,8 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             kwargs: dict[str, Any] = {"args": args}
             if timeout is not None:
                 kwargs["timeout"] = timeout
-            if exec_all_ranks:
+            worker_aggregated = method.endswith("_all_ranks")
+            if exec_all_ranks or worker_aggregated:
                 kwargs["exec_all_ranks"] = True
             return self.collective_rpc(method, **kwargs)
         except BaseException:
@@ -305,7 +306,11 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
     def poll_pipeline_events(self) -> list[Any]:
         self._ensure_open()
-        result = self.collective_rpc("poll_pipeline_events_all_ranks")
+        cached_events = getattr(self, "_pipeline_cached_events", None)
+        if cached_events is not None:
+            self._pipeline_cached_events = None
+            return cached_events
+        result = self.collective_rpc("poll_pipeline_events_all_ranks", exec_all_ranks=True)
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
             return result[0]
         return result if isinstance(result, list) else [result]
@@ -315,6 +320,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         result = self.collective_rpc(
             "cancel_pipeline_requests_all_ranks",
             args=(request_generations,),
+            exec_all_ranks=True,
         )
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
             return result[0]
@@ -322,7 +328,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
     def drain_pipeline(self, deadline: float | None = None) -> Any:
         self._ensure_open()
-        result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,))
+        result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,), exec_all_ranks=True)
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
             return result[0]
         return result
@@ -359,20 +365,26 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
     def _retry_pipeline_transfer_readiness(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
-        attempted: set[tuple[Any, ...]] = set()
-        while True:
-            candidates = [offer for offer in coordinator.pending_readiness_offers() if offer.identity not in attempted]
-            if not candidates:
-                break
-            for offer in candidates:
-                attempted.add(offer.identity)
-                ready = normalize_pipeline_transfer_readiness(
-                    self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
-                )
-                if ready:
-                    coordinator.mark_receive_ready(offer.identity)
-                    self._pipeline_pending_readiness.pop(offer.identity, None)
-        return self._start_ready_pipeline_transfers()
+        try:
+            attempted: set[tuple[Any, ...]] = set()
+            while True:
+                candidates = [
+                    offer for offer in coordinator.pending_readiness_offers() if offer.identity not in attempted
+                ]
+                if not candidates:
+                    break
+                for offer in candidates:
+                    attempted.add(offer.identity)
+                    ready = normalize_pipeline_transfer_readiness(
+                        self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+                    )
+                    if ready:
+                        coordinator.mark_receive_ready(offer.identity)
+                        self._pipeline_pending_readiness.pop(offer.identity, None)
+            return self._start_ready_pipeline_transfers()
+        except BaseException:
+            self._mark_failed()
+            raise
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
@@ -390,8 +402,10 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
         try:
-            result = self._queued_control_rpc("progress_pipeline_transfers_all_ranks")
-            worker_progress = normalize_pipeline_transport_progress(result, coordinator.endpoint_ranks)
+            result = self._queued_control_rpc("progress_pipeline_transfers_and_poll_events_all_ranks")
+            worker_progress, worker_events = normalize_pipeline_transport_snapshot(result, coordinator.endpoint_ranks)
+            cached_events = getattr(self, "_pipeline_cached_events", None)
+            self._pipeline_cached_events = (cached_events or []) + worker_events
             progress = PipelineCoordinatorProgress()
             for rank_progress in worker_progress:
                 for completion in rank_progress.completions:

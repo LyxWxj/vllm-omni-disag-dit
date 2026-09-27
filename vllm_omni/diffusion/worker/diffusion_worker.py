@@ -923,6 +923,10 @@ class DiffusionWorker:
             raise RuntimeError("pipeline transfer readiness did not report both endpoints")
         return all(endpoint_results.values())
 
+    def accept_pipeline_transfer_offer_rank_local(self, offer: PipelineTransferOffer) -> dict[str, Any]:
+        """Report this Worker's readiness without an in-Worker rank collective."""
+        return {"rank": self.rank, "ready": self.accept_pipeline_transfer_offer(offer)}
+
     def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
         """Start only this Worker's endpoint after the Executor grants it."""
         offer = grant.offer
@@ -988,12 +992,21 @@ class DiffusionWorker:
         self._release_completed_pipeline_consumers(progress)
         return progress
 
-    def progress_pipeline_transfers_all_ranks(self) -> list[PipelineTransportProgress]:
-        """Advance each Worker once and gather metadata-only progress records."""
-        return _run_and_gather_rank_values(
-            "queued pipeline transport progress",
-            self.progress_pipeline_transfers,
-        )
+    def progress_pipeline_transfers_and_poll_events_all_ranks(
+        self,
+    ) -> list[tuple[PipelineTransportProgress, list[Any]]]:
+        """Advance each Worker and collect its events in the same rank agreement."""
+
+        def progress_and_poll() -> tuple[PipelineTransportProgress, list[Any]]:
+            progress = self.progress_pipeline_transfers()
+            return progress, self.poll_pipeline_events()
+
+        return _run_and_gather_rank_values("queued pipeline progress snapshot", progress_and_poll)
+
+    def progress_pipeline_transfers_and_poll_events(self) -> tuple[PipelineTransportProgress, list[Any]]:
+        """Advance one local Worker and return only its progress and events."""
+        progress = self.progress_pipeline_transfers()
+        return progress, self.poll_pipeline_events()
 
     def _consume_ready_pipeline_message(
         self,
@@ -1361,8 +1374,7 @@ class DiffusionWorker:
         if batch_id not in stage.terminal_statuses:
             raise RuntimeError(f"Pipeline batch {batch_id!r} is not terminal on stage {pp_stage_id}.")
         return not any(
-            identity[0] == batch_id
-            for identity in (*self.pipeline_send_tickets, *self.pipeline_receive_reservations)
+            identity[0] == batch_id for identity in (*self.pipeline_send_tickets, *self.pipeline_receive_reservations)
         )
 
     def pipeline_batch_release_ready_all_ranks(
@@ -2128,16 +2140,21 @@ class WorkerProc:
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
         collect_rank_status = rpc_request.get("collect_rank_status", False)
+        reply_all_ranks = rpc_request.get("reply_all_ranks", False)
         wave_id = rpc_request.get("wave_id")
 
         if collect_rank_status and not exec_all_ranks:
             raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")
+        if reply_all_ranks and not exec_all_ranks:
+            raise ValueError("reply_all_ranks requires exec_all_ranks=True")
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
         # For DP multi-concurrency (output_rank=None), only the primary rank
         # within each DP replica should reply.  This prevents SP/TP/CFG/PP
         # ranks from enqueuing extra replies that the executor doesn't drain.
-        if output_rank is None and exec_all_ranks:
+        if reply_all_ranks:
+            should_reply = self.result_mq is not None
+        elif output_rank is None and exec_all_ranks:
             from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
             from vllm_omni.diffusion.distributed.parallel_state import (
@@ -2206,6 +2223,18 @@ class WorkerProc:
                 )
             return None, False
 
+        if reply_all_ranks:
+            return (
+                {
+                    "rank_local_rpc": True,
+                    "worker_id": self.gpu_id,
+                    "status": "ok",
+                    "result": result,
+                    "wave_id": wave_id,
+                },
+                should_reply,
+            )
+
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
         if not should_reply:
@@ -2269,6 +2298,7 @@ class WorkerProc:
                     # that compete with the expected responder's message.
                     output_rank = msg.get("output_rank")
                     exec_all_ranks = msg.get("exec_all_ranks", False)
+                    reply_all_ranks = msg.get("reply_all_ranks", False)
                     wave_id = msg.get("wave_id")
                     if self.result_mq is not None:
                         if rpc_id is not None:
@@ -2280,6 +2310,16 @@ class WorkerProc:
                                     rpc_id=rpc_id,
                                     error=error,
                                 )
+                            )
+                        elif reply_all_ranks:
+                            self._return_result(
+                                {
+                                    "rank_local_rpc": True,
+                                    "worker_id": self.gpu_id,
+                                    "status": "error",
+                                    "error": error,
+                                    "wave_id": wave_id,
+                                }
                             )
                         elif output_rank is None and exec_all_ranks:
                             # DP multi-concurrency: primary ranks reply, tagged

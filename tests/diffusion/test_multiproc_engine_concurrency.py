@@ -782,6 +782,29 @@ class TestSerialEngineOperations:
         assert control_rpc["exec_all_ranks"] is True
         assert control_rpc["collect_rank_status"] is True
 
+    @pytest.mark.parametrize(
+        ("data_parallel_size", "expected_exec_all_ranks"),
+        [(1, True), (2, False)],
+    )
+    def test_worker_aggregated_queued_rpc_avoids_duplicate_status_gather(
+        self,
+        monkeypatch,
+        data_parallel_size: int,
+        expected_exec_all_ranks: bool,
+    ) -> None:
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config.parallel_config = SimpleNamespace(data_parallel_size=data_parallel_size)
+        collective_rpc = Mock(return_value=[])
+        monkeypatch.setattr(executor, "collective_rpc", collective_rpc)
+
+        executor._queued_control_rpc("progress_pipeline_transfers_all_ranks")
+
+        collective_rpc.assert_called_once_with(
+            "progress_pipeline_transfers_all_ranks",
+            args=(),
+            **({"exec_all_ranks": True} if expected_exec_all_ranks else {}),
+        )
+
     def test_serial_add_req_then_collective_rpc(self):
         engine, _, req_q, res_q = _make_engine()
         wt = _start_worker(req_q, res_q, count=2)
@@ -990,6 +1013,37 @@ class TestWorkerProcRpcRankStatus:
         assert should_reply is True
         assert result is payload
 
+    def test_execute_rpc_returns_rank_local_result_without_collective(self, monkeypatch, mocker):
+        proc = self._make_worker_proc()
+        payload = {"rank": 0, "ready": True}
+        proc.worker.execute_method = Mock(return_value=payload)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        gather = mocker.Mock(side_effect=AssertionError("rank-local replies must not gather"))
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "accept_pipeline_transfer_offer_rank_local",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+                "reply_all_ranks": True,
+                "collect_rank_status": False,
+                "wave_id": 11,
+            }
+        )
+
+        assert should_reply is True
+        assert result == {
+            "rank_local_rpc": True,
+            "worker_id": 0,
+            "status": "ok",
+            "result": payload,
+            "wave_id": 11,
+        }
+        gather.assert_not_called()
+
     def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
         proc = self._make_worker_proc()
 
@@ -1049,6 +1103,53 @@ class TestMultiprocExecutorRaisesEngineDeadError:
                 unique_reply_rank=0,
                 exec_all_ranks=True,
             )
+
+    def _rank_local_executor(self, mocker):
+        executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(
+            num_gpus=2,
+            step_execution=True,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+        )
+        executor._closed = False
+        executor._is_failed = False
+        executor._broadcast_mq = SimpleNamespace(enqueue=mocker.Mock())
+        executor._result_mqs = [object(), object()]
+        executor._result_mq = executor._result_mqs[0]
+        executor._rpc_wave_id = 0
+        executor._dequeue_one_with_failure_polling = mocker.Mock()
+        return executor
+
+    def test_rank_local_rpc_collects_every_worker_reply(self, mocker):
+        executor = self._rank_local_executor(mocker)
+        executor._dequeue_one_with_failure_polling.side_effect = [
+            {"rank_local_rpc": True, "worker_id": 0, "status": "ok", "result": "rank0", "wave_id": 1},
+            {"rank_local_rpc": True, "worker_id": 1, "status": "ok", "result": "rank1", "wave_id": 1},
+        ]
+
+        result = executor.collective_rpc("local_progress", exec_all_ranks=True, reply_all_ranks=True)
+
+        assert result == ["rank0", "rank1"]
+        assert executor._broadcast_mq.enqueue.call_args.args[0]["reply_all_ranks"] is True
+        assert executor._dequeue_one_with_failure_polling.call_count == 2
+
+    def test_rank_local_rpc_drains_all_replies_before_reporting_worker_failure(self, mocker):
+        executor = self._rank_local_executor(mocker)
+        executor._dequeue_one_with_failure_polling.side_effect = [
+            {
+                "rank_local_rpc": True,
+                "worker_id": 0,
+                "status": "error",
+                "error": "rank zero failed",
+                "wave_id": 1,
+            },
+            {"rank_local_rpc": True, "worker_id": 1, "status": "ok", "result": "rank1", "wave_id": 1},
+        ]
+
+        with pytest.raises(RuntimeError, match="worker 0: rank zero failed"):
+            executor.collective_rpc("local_progress", exec_all_ranks=True, reply_all_ranks=True)
+
+        assert executor._dequeue_one_with_failure_polling.call_count == 2
 
     def test_collective_rpc_raises_mid_dequeue_when_is_failed(self):
         """Worker dies while we are polling the dequeue loop."""
