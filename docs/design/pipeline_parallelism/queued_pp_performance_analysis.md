@@ -960,6 +960,8 @@ acb20bd3b9061f4fcf1069b6c03a44cb60d7533e40568214153bc9d9dd32bcf5
 - rank-local 前：`artifacts/wan22-queued-merged-progress-noprof-20260928-r1/`、`-r2/`、`-r3/`
 - rank-local 后：`artifacts/wan22-queued-rank-local-noprof-20260928-r1/`、`-r2/`、`-r3/`
 
+上述六份 manifest 的 `git_revision` 仍记录远端 checkout 基线 `a82f29b1`，因为测量发生在 push/pull 前的远端工作树。与运行相关的源码文件当时已逐一与最终提交内容校验一致；输出哈希也全部一致。随后在 clean checkout 的提交 `69799427` 上又做了一次独立 smoke，该样本不计入上表三次统计：makespan 5.826 s、吞吐 0.687 req/s、mean latency 4217 ms、P50 3330 ms、P95 5826 ms，4 个 decoded hash 相同。其 artifact 位于 `artifacts/wan22-queued-committed-smoke-20260928/`。
+
 复现命令模板：
 
 ```bash
