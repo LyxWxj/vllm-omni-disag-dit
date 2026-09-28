@@ -3,8 +3,8 @@
 
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -97,6 +97,7 @@ def _worker() -> DiffusionWorker:
     worker._pipeline_stages = {}
     worker._pipeline_finalization_device_events = {}
     worker._pipeline_finalization_published = set()
+    worker._pipeline_finalization_stream = None
     return worker
 
 
@@ -247,6 +248,57 @@ def test_final_decode_submission_is_nonblocking_and_pollable() -> None:
         time.sleep(0.001)
     assert result == "decoded-output"
     worker._pipeline_finalization_executor.shutdown(wait=True)
+
+
+def test_final_decode_uses_a_dedicated_cuda_stream(mocker) -> None:
+    worker = _worker()
+    worker.device = torch.device("cuda", 0)
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    stream = mocker.Mock()
+    source_stream = object()
+    event = object()
+    inside_stream = threading.Event()
+
+    @contextmanager
+    def stream_context(actual_stream):
+        assert actual_stream is stream
+        inside_stream.set()
+        yield
+
+    finalize = mocker.patch.object(
+        worker.model_runner,
+        "finalize_pipeline_batch",
+        side_effect=lambda *_args: "decoded-output" if inside_stream.is_set() else pytest.fail("stream not active"),
+    )
+    create_stream = mocker.patch.object(diffusion_worker_module.torch.cuda, "Stream", return_value=stream)
+    enter_stream = mocker.patch.object(diffusion_worker_module.torch.cuda, "stream", side_effect=stream_context)
+    current_stream = mocker.patch.object(
+        diffusion_worker_module.torch.cuda, "current_stream", return_value=source_stream
+    )
+    set_device = mocker.patch.object(diffusion_worker_module.current_omni_platform, "set_device")
+    record_event = mocker.patch.object(
+        diffusion_worker_module.current_omni_platform,
+        "record_device_event",
+        return_value=event,
+    )
+    mocker.patch.object(diffusion_worker_module.current_omni_platform, "is_available", return_value=False)
+
+    worker.finalize_pipeline_batch(0, task.batch_id)
+    try:
+        assert worker._pipeline_finalization_futures[task.batch_id].result(timeout=1) == "decoded-output"
+    finally:
+        worker._pipeline_finalization_executor.shutdown(wait=True)
+
+    create_stream.assert_called_once_with(device=worker.device)
+    current_stream.assert_called_once_with(worker.device)
+    stream.wait_stream.assert_called_once_with(source_stream)
+    enter_stream.assert_called_once_with(stream)
+    set_device.assert_called_once_with(worker.device)
+    finalize.assert_called_once()
+    record_event.assert_called_once_with()
+    assert worker._pipeline_finalization_device_events[task.batch_id] is event
 
 
 def _initialize_worker_transports(worker, rank: int, mocker):
@@ -635,7 +687,7 @@ def test_first_stage_progress_reserves_activation_without_returning_tensors(mock
     group = _PPGroup(0)
     mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
     worker.initialize_pipeline_transports()
-    worker.model_runner.execute_pipeline_stage = Mock(
+    worker.model_runner.execute_pipeline_stage = mocker.Mock(
         return_value=SimpleNamespace(tensors={"hidden_states": torch.tensor([3.0])})
     )
     task = _task()
@@ -1053,7 +1105,7 @@ def test_worker_holds_receive_lease_until_consumer_event_completes(mocker) -> No
     receiver = _worker()
     receiver.rank = 1
     group = _PPGroup(1)
-    event = Mock()
+    event = mocker.Mock()
     event.query.side_effect = [False, True]
     mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
     mocker.patch(
@@ -1088,7 +1140,7 @@ def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> 
     receiver = _worker()
     receiver.rank = 1
     group = _PPGroup(1)
-    event = Mock()
+    event = mocker.Mock()
     event.query.side_effect = [False, True]
     record_event = mocker.patch(
         "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",

@@ -318,6 +318,7 @@ class DiffusionWorker:
         self._pipeline_finalization_executor: ThreadPoolExecutor | None = None
         self._pipeline_finalization_published: set[str] = set()
         self._pipeline_finalization_device_events: dict[str, Any] = {}
+        self._pipeline_finalization_stream: torch.Stream | None = None
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -1519,8 +1520,15 @@ class DiffusionWorker:
                 device = getattr(self, "device", None)
                 if device is not None:
                     current_omni_platform.set_device(device)
-                result = self.model_runner.finalize_pipeline_batch(context, stage.spec)
-                device_event = current_omni_platform.record_device_event()
+                stream_context = nullcontext()
+                if device is not None and torch.device(device).type == "cuda":
+                    if self._pipeline_finalization_stream is None:
+                        self._pipeline_finalization_stream = torch.cuda.Stream(device=device)
+                    self._pipeline_finalization_stream.wait_stream(torch.cuda.current_stream(device))
+                    stream_context = torch.cuda.stream(self._pipeline_finalization_stream)
+                with stream_context:
+                    result = self.model_runner.finalize_pipeline_batch(context, stage.spec)
+                    device_event = current_omni_platform.record_device_event()
                 if device_event is None and current_omni_platform.is_available():
                     current_omni_platform.synchronize()
                 self._pipeline_finalization_device_events[batch_id] = device_event
