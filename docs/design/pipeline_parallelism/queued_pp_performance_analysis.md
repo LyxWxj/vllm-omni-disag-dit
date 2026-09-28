@@ -1014,3 +1014,9 @@ canhazgpu run --gpus 2 -- \
 ### 后续架构方向
 
 不应再把 `WorkerProc` 的 RPC 队列超时当作 stage clock。下一版需要真正的 per-rank progress/event 通道：Worker StageEngine 在自身的 bounded device-work、edge credit 和接收事件满足条件时推进；Executor 按 rank 异步收取 metadata，并只在 transfer 两端确认、完整 step commit 和 retirement 处聚合。Engine 应在 event 到达时处理状态转换，而不是每几毫秒重跑一次 `scheduler.schedule()`。同时必须给最终 decode 独立的可观测资源边界，明确它与尚未退休的 DiT device work、CUDA stream、内存预算和结果输出的关系，再决定是否可与 stage progress 并行。验收必须同时要求四请求输出一致、无长尾 VAE 回退、两 rank 的 stage 实际重叠以及端到端吞吐收益；单纯减少 RPC/collective 次数不够。
+
+## 15. 2026-09-28：跳过已持有请求的空 Scheduler 快照
+
+提交 `4cd49a28a` 让 `StepScheduler` 只读判断是否还有未被 queued batch 持有的 running request、可接纳的 waiting request 或待清理的 finished ID。若当前请求均由 retained batch 持有且 queued 容量已满，Engine 直接处理共享 transport/event snapshot 和 retained batch，不再反复调用 `schedule()`、复制 cached descriptors、递增无实际 admission 的 scheduler step ID。batch 退休后，下一轮恢复正常调度；等待队列指标仍从 Scheduler 当前状态读取。Worker progress、P2P grant、最终 decode 和 retirement 时序均未改变。
+
+本地相关 CPU 测试 377 passed；远端新增路径的定向 CPU 测试 59 passed；Ruff 和 `git diff --check` 通过。两卡无 profiler 验证任务已通过 `canhazgpu` 提交，但因 GPU 0 被另一用户的预约占用，排队超过 5 分钟后取消，未运行模型。因此目前只有控制路径正确性证据，没有这一改动的 GPU 端到端性能结果，也不能声称它减少了实际 transport RPC 数量或 stage idle。下一次两卡可用时应使用第 13 节的固定四请求命令，在 `slots=2/inflight=4` 下与 `e922fc20c` 的 5362 ms 单样本和四个 SHA-256 比对；性能判断仍需重复样本。
