@@ -888,12 +888,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return results
 
     def _start_async_pipeline_progress(self, pending_offers: tuple[Any, ...]) -> None:
+        readiness_reports = getattr(self, "_pipeline_readiness_reports", {})
         for worker_id in range(len(self._pipeline_result_mqs)):
             if worker_id not in self._pipeline_progress_pending:
+                worker_offers = tuple(
+                    offer
+                    for offer in pending_offers
+                    if readiness_reports.get(offer.identity, {}).get(worker_id) is not True
+                )
                 self._queue_pipeline_worker_rpc(
                     worker_id,
                     "progress_pipeline_transfers_and_poll_events",
-                    (pending_offers,),
+                    (worker_offers,),
                 )
 
     def _queued_rank_local_rpc(
@@ -1151,7 +1157,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     result = self._poll_pipeline_worker_results(timeout=0.005)
                 async_rank_results = result
                 result = [item for _, item in async_rank_results]
-                self._start_async_pipeline_progress(pending_offers)
             elif rank_local:
                 result = self._queued_rank_local_rpc(
                     "progress_pipeline_transfers_and_poll_events", args=(pending_offers,)
@@ -1208,6 +1213,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         if normalize_pipeline_transfer_readiness_reports(reports, coordinator.endpoint_ranks):
                             coordinator.mark_receive_ready(offer.identity)
                             self._pipeline_pending_readiness.pop(offer.identity, None)
+                if self._uses_async_pipeline_rpc():
+                    self._start_async_pipeline_progress(pending_offers)
                 progress.grants.extend(self._start_ready_pipeline_transfers())
             else:
                 progress.grants.extend(self._retry_pipeline_transfer_readiness())

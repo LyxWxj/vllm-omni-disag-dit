@@ -457,6 +457,36 @@ def test_multiproc_pp2_async_progress_collects_one_rank_without_waiting_for_peer
     assert len(executor._pipeline_command_mqs[1].messages) == 1
 
 
+def test_multiproc_async_progress_does_not_repeat_ready_offer_on_one_rank() -> None:
+    class _CommandQueue:
+        def __init__(self):
+            self.messages = []
+
+        def enqueue(self, message):
+            self.messages.append(message)
+
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._pipeline_command_mqs = [_CommandQueue(), _CommandQueue()]
+    executor._pipeline_result_mqs = [object(), object()]
+    executor._pipeline_progress_pending = set()
+    executor._pipeline_progress_id = 0
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    executor._pipeline_readiness_reports = {offer.identity: {0: True}}
+
+    executor._start_async_pipeline_progress((offer,))
+
+    assert executor._pipeline_command_mqs[0].messages[0]["args"] == ((),)
+    assert executor._pipeline_command_mqs[1].messages[0]["args"] == ((offer,),)
+
+
 def test_rank_local_readiness_requires_exact_endpoint_coverage(mocker) -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor._ensure_open = mocker.Mock()
