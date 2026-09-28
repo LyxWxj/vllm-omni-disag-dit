@@ -1019,4 +1019,11 @@ canhazgpu run --gpus 2 -- \
 
 提交 `4cd49a28a` 让 `StepScheduler` 只读判断是否还有未被 queued batch 持有的 running request、可接纳的 waiting request 或待清理的 finished ID。若当前请求均由 retained batch 持有且 queued 容量已满，Engine 直接处理共享 transport/event snapshot 和 retained batch，不再反复调用 `schedule()`、复制 cached descriptors、递增无实际 admission 的 scheduler step ID。batch 退休后，下一轮恢复正常调度；等待队列指标仍从 Scheduler 当前状态读取。Worker progress、P2P grant、最终 decode 和 retirement 时序均未改变。
 
-本地相关 CPU 测试 377 passed；远端新增路径的定向 CPU 测试 59 passed；Ruff 和 `git diff --check` 通过。两卡无 profiler 验证任务已通过 `canhazgpu` 提交，但因 GPU 0 被另一用户的预约占用，排队超过 5 分钟后取消，未运行模型。因此目前只有控制路径正确性证据，没有这一改动的 GPU 端到端性能结果，也不能声称它减少了实际 transport RPC 数量或 stage idle。下一次两卡可用时应使用第 13 节的固定四请求命令，在 `slots=2/inflight=4` 下与 `e922fc20c` 的 5362 ms 单样本和四个 SHA-256 比对；性能判断仍需重复样本。
+本地相关 CPU 测试 377 passed；远端新增路径的定向 CPU 测试 59 passed；Ruff 和 `git diff --check` 通过。首次两卡预约因 GPU 0 被另一用户占用，排队超过 5 分钟后取消。两卡随后可用时，通过 `canhazgpu` 在远端 clean checkout `4d87f547` 上运行一次无 profiler 固定 workload：`max_num_seqs=2`、`max_inflight_batches=4`、`edge_buffer_slots=2`、4 请求、512x512x16、8 steps、seeds 42-45。四个请求全部完成，四个 decoded SHA-256 与 `e922fc20c` 对应请求完全一致。
+
+| 同配置单次运行 | Makespan (ms) | 吞吐 (req/s) | Mean latency (ms) | P50 (ms) | 最后一个 batch ID |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `e922fc20c` | 5362 | 0.746 | 4368 | 4043 | `pp-31-767` |
+| `4d87f547` | 5641 | 0.709 | 4630 | 4287 | `pp-31-30` |
+
+batch ID 的末尾字段来自 scheduler step ID，说明空 Scheduler 快照显著减少；但 rank-0 Worker event 文件反而从 3169 条增加到 3434 条，transport progress RPC 仍频繁发生。本次没有测到端到端性能改善，单次样本间的 279 ms 差异也不足以证明稳定回退。该改动主要清理 Engine 的重复调度开销；下一项真正影响流水线空泡的工作仍是按 rank 独立推进 progress、降低空 transport polling，并限制最终 decode 与其他 device work 的资源竞争。新结果和 Worker events 已下载到本地 `artifacts/wan22-queued-scheduler-skip-4d87f547/`。
