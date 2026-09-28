@@ -1752,11 +1752,14 @@ class AsyncOutputKind(Enum):
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
+    * ``PIPELINE_FINALIZED`` — queued PP final decode is ready for Engine
+      retirement via ``async_output_id``
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
+    PIPELINE_FINALIZED = "pipeline_finalized"
 
 
 @dataclass

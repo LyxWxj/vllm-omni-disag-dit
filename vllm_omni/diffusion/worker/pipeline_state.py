@@ -80,6 +80,27 @@ class PipelineEvent:
 
 
 @dataclass(frozen=True)
+class PipelineWorkerUpdate:
+    """Sparse stage update; finalization payloads are split before process IPC."""
+
+    worker_id: int
+    progress: Any
+    events: tuple[PipelineEvent, ...]
+    finalizations: tuple[PipelineFinalizationUpdate, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PipelineFinalizationUpdate:
+    """Output-owner decode completion routed through the asynchronous output path."""
+
+    batch_id: str
+    output: Any | None = None
+    error: str | None = None
+    device_event: Any | None = None
+
+
+@dataclass(frozen=True)
 class PipelineProgress:
     """One bounded Worker progress result and its local tensor payload."""
 

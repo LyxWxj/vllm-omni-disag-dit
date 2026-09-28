@@ -364,8 +364,12 @@ def test_busy_loop_skips_scheduler_for_owned_queued_work(mocker) -> None:
 
     engine.scheduler.schedule.assert_not_called()
     assert engine._scheduler_num_waiting_reqs == 1
-    engine.scheduler.has_queued_admission_candidate.assert_called_once_with(
-        {"req-a"}, admission_capacity_available=True
+    assert engine.scheduler.has_queued_admission_candidate.call_count == 2
+    engine.scheduler.has_queued_admission_candidate.assert_has_calls(
+        [
+            mocker.call({"req-a"}, admission_capacity_available=True),
+            mocker.call({"req-a"}, admission_capacity_available=True),
+        ]
     )
     engine._collect_queued_pipeline_events.assert_called_once_with()
     engine._advance_unhandled_queued_batches.assert_called_once_with(set(), {})

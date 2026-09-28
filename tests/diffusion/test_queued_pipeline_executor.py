@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import queue
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +18,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
 from vllm_omni.diffusion.executor.abstract import PIPELINE_GRANT_START_TIMEOUT_S
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
+from vllm_omni.diffusion.worker.pipeline_state import PipelineWorkerUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -198,6 +201,38 @@ def test_progress_snapshot_supplies_events_without_a_second_worker_rpc(executor)
         args=(),
         exec_all_ranks=True,
     )
+
+
+def test_autonomous_progress_bounds_each_workers_update_share(mocker) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._pipeline_update_error = None
+    executor._pipeline_update_lock = threading.Lock()
+    executor._pipeline_update_cursor = 0
+    executor._pipeline_update_buffers = {0: queue.Queue(), 1: queue.Queue()}
+    executor._pipeline_cached_events = []
+    executor._pipeline_pending_readiness = {}
+    coordinator = mocker.Mock()
+    coordinator.endpoint_ranks = frozenset({0, 1})
+    coordinator.complete.return_value = True
+    executor._retry_pipeline_transfer_readiness = mocker.Mock(return_value=[])
+
+    for index in range(40):
+        progress = PipelineTransportProgress(
+            rank=0,
+            completions=[PipelineEndpointCompletion(identity=("rank-0", index), rank=0)],
+        )
+        executor._pipeline_update_buffers[0].put(PipelineWorkerUpdate(0, progress, ()))
+    progress = PipelineTransportProgress(
+        rank=1,
+        completions=[PipelineEndpointCompletion(identity=("rank-1", 0), rank=1)],
+    )
+    executor._pipeline_update_buffers[1].put(PipelineWorkerUpdate(1, progress, ()))
+
+    snapshot = executor._progress_autonomous_pipeline_stages(coordinator)
+
+    assert len(snapshot.completed) == 33
+    assert executor._pipeline_update_buffers[0].qsize() == 8
+    assert executor._pipeline_update_buffers[1].empty()
 
 
 def test_multiproc_pp2_uses_rank_local_progress_and_readiness_reports(mocker) -> None:

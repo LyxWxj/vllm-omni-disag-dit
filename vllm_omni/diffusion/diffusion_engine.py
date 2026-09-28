@@ -444,6 +444,13 @@ class DiffusionEngine:
         self._queued_reserved_bytes = 0
         self._queued_stage_buffer_budget_bytes: int | None = None
         self._queued_pipeline_epoch = 0
+        set_update_callback = getattr(self.executor, "set_pipeline_update_callback", None)
+        if callable(set_update_callback):
+            set_update_callback(self._notify_queued_pipeline_update)
+
+    def _notify_queued_pipeline_update(self) -> None:
+        with self._cv:
+            self._cv.notify_all()
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -1218,6 +1225,7 @@ class DiffusionEngine:
                     and not self._has_queued_pipeline_work()
                     and self._rpc_queue.empty()
                     and self.abort_queue.empty()
+                    and not bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
                     and not self.stop_event.is_set()
                 ):
                     self._cv.wait(timeout=1.0)
@@ -1226,6 +1234,15 @@ class DiffusionEngine:
                     break
 
                 if not self.scheduler.has_requests() and not self._has_queued_pipeline_work():
+                    if bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)()):
+                        try:
+                            self.executor.progress_pipeline()
+                            orphan_events = self.executor.poll_pipeline_events()
+                            if orphan_events:
+                                raise RuntimeError("Queued pipeline Worker returned events without Engine ownership.")
+                        except Exception:
+                            logger.exception("Queued pipeline Worker update arrived without retained Engine ownership")
+                            break
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
@@ -1289,8 +1306,10 @@ class DiffusionEngine:
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
                 try:
-                    should_progress = bool(admitted_outputs) or self._has_unhandled_authorized_queued_batch(
-                        handled_request_ids
+                    should_progress = (
+                        bool(admitted_outputs)
+                        or self._has_unhandled_authorized_queued_batch(handled_request_ids)
+                        or bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
                     )
                     events_by_batch = self._collect_queued_pipeline_events() if should_progress else {}
                 except Exception as exc:
@@ -1321,9 +1340,31 @@ class DiffusionEngine:
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
                 self._advance_unhandled_queued_batches(handled_request_ids, events_by_batch)
-                if self._queued_pipeline_waits_on_finalization():
+                waiting_on_finalization = self._queued_pipeline_waits_on_finalization()
+                should_wait_for_update = (
+                    self._has_queued_pipeline_work()
+                    and self._queued_pipeline_can_advance_without_schedule()
+                    and not bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
+                    and not any(
+                        batch.failure is not None or batch.abort_requested
+                        for batch in self._queued_pipeline_batches.values()
+                    )
+                )
+                if waiting_on_finalization or should_wait_for_update:
                     with self._cv:
-                        self._cv.wait(timeout=_QUEUED_FINALIZATION_POLL_INTERVAL_S)
+                        timeout = (
+                            _QUEUED_FINALIZATION_POLL_INTERVAL_S
+                            if waiting_on_finalization
+                            and not getattr(self.executor, "uses_autonomous_pipeline_stages", lambda: False)()
+                            else None
+                        )
+                        if (
+                            not self.stop_event.is_set()
+                            and self._rpc_queue.empty()
+                            and self.abort_queue.empty()
+                            and not bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
+                        ):
+                            self._cv.wait(timeout=timeout)
                 continue
 
             try:

@@ -96,14 +96,17 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.pipeline_stage_engine import PipelineStageEngine
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineEvent,
     PipelineEventType,
+    PipelineFinalizationUpdate,
     PipelineProgress,
     PipelineStageSpec,
     PipelineStageState,
     PipelineTask,
     PipelineTaskStatus,
+    PipelineWorkerUpdate,
 )
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -313,6 +316,8 @@ class DiffusionWorker:
         }
         self._pipeline_finalization_futures: dict[str, Future[BatchRunnerOutput]] = {}
         self._pipeline_finalization_executor: ThreadPoolExecutor | None = None
+        self._pipeline_finalization_published: set[str] = set()
+        self._pipeline_finalization_device_events: dict[str, Any] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -974,20 +979,6 @@ class DiffusionWorker:
 
         self._release_completed_pipeline_consumers(progress)
 
-        first_stage = self.pipeline_stages.get(0)
-        if first_stage is not None and first_stage.spec.is_first:
-            activation_connector = self._require_pipeline_connector(PipelineEdgeKind.ACTIVATION)
-            while activation_connector.send_in_use < activation_connector.max_slots:
-                previous_send_in_use = activation_connector.send_in_use
-                stage_progress = self.progress_pipeline(0)
-                if stage_progress is None:
-                    break
-                if not isinstance(stage_progress.output, PipelineTransferOffer):
-                    raise RuntimeError("first pipeline stage did not reserve an activation transfer")
-                if activation_connector.send_in_use <= previous_send_in_use:
-                    raise RuntimeError("first pipeline stage did not consume activation send credit")
-                progress.offers.append(stage_progress.output)
-
         for edge_kind in (PipelineEdgeKind.FEEDBACK, PipelineEdgeKind.ACTIVATION):
             connector = self._require_pipeline_connector(edge_kind)
             for message in connector.poll_received(limit=1):
@@ -995,7 +986,93 @@ class DiffusionWorker:
             self._consume_ready_pipeline_message(edge_kind, progress)
 
         self._release_completed_pipeline_consumers(progress)
+
+        first_stage = self.pipeline_stages.get(0)
+        if first_stage is not None and first_stage.spec.is_first:
+            activation_connector = self._require_pipeline_connector(PipelineEdgeKind.ACTIVATION)
+            if activation_connector.send_in_use < activation_connector.max_slots:
+                stage_progress = self.progress_pipeline(0)
+                if stage_progress is not None:
+                    if not isinstance(stage_progress.output, PipelineTransferOffer):
+                        raise RuntimeError("first pipeline stage did not reserve an activation transfer")
+                    progress.offers.append(stage_progress.output)
         return progress
+
+    def pipeline_stage_engine_tick(self) -> PipelineWorkerUpdate | None:
+        """Advance one Worker-local turn and publish only meaningful metadata."""
+        if set(self.pipeline_connectors) != {
+            PipelineEdgeKind.ACTIVATION,
+            PipelineEdgeKind.FEEDBACK,
+        }:
+            return None
+        progress = self.progress_pipeline_transfers()
+        events = tuple(self.poll_pipeline_events())
+        finalizations = self._collect_completed_pipeline_finalizations()
+        if not (progress.offers or progress.completions or events or finalizations):
+            return None
+        return PipelineWorkerUpdate(
+            worker_id=self.rank,
+            progress=progress,
+            events=events,
+            finalizations=finalizations,
+        )
+
+    def pipeline_stage_engine_needs_progress(self) -> bool:
+        """Whether local transport polling or an admitted task can make progress."""
+        if set(self.pipeline_connectors) != {
+            PipelineEdgeKind.ACTIVATION,
+            PipelineEdgeKind.FEEDBACK,
+        }:
+            return False
+        if self.pipeline_receive_consumers:
+            return True
+        if any(
+            batch_id not in self._pipeline_finalization_published for batch_id in self._pipeline_finalization_futures
+        ):
+            return True
+        for connector in self.pipeline_connectors.values():
+            transport = connector.transport
+            if transport is not None and transport.has_outstanding_operations:
+                return True
+        for edge_kind, messages in self.pipeline_pending_received.items():
+            if any(
+                self._cancelled_pipeline_message_context(edge_kind, message) is not None
+                or self._pipeline_message_is_runnable(edge_kind, message)
+                for message in messages
+            ):
+                return True
+        return self._pipeline_stage_engine_has_runnable_forward()
+
+    def _collect_completed_pipeline_finalizations(self) -> tuple[PipelineFinalizationUpdate, ...]:
+        updates: list[PipelineFinalizationUpdate] = []
+        for batch_id, future in self._pipeline_finalization_futures.items():
+            if batch_id in self._pipeline_finalization_published or not future.done():
+                continue
+            self._pipeline_finalization_published.add(batch_id)
+            try:
+                updates.append(
+                    PipelineFinalizationUpdate(
+                        batch_id=batch_id,
+                        output=future.result(),
+                        device_event=self._pipeline_finalization_device_events.get(batch_id),
+                    )
+                )
+            except BaseException as exc:
+                updates.append(
+                    PipelineFinalizationUpdate(
+                        batch_id=batch_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+        return tuple(updates)
+
+    def _pipeline_stage_engine_has_runnable_forward(self) -> bool:
+        stage = self.pipeline_stages.get(0)
+        if stage is None or stage.active_task is not None or not stage.pending_tasks:
+            return False
+        task = stage.pending_tasks[0]
+        connector = self.pipeline_connectors[PipelineEdgeKind.ACTIVATION]
+        return task.batch_id in stage.authorized_batches and connector.send_in_use < connector.max_slots
 
     def progress_pipeline_transfers_and_poll_events_all_ranks(
         self,
@@ -1039,6 +1116,10 @@ class DiffusionWorker:
             return
         reservation = self._find_pipeline_receive_reservation(edge_kind, message)
         if edge_kind is PipelineEdgeKind.ACTIVATION:
+            # Only consume work when its feedback can be retained.
+            feedback_connector = self._require_pipeline_connector(PipelineEdgeKind.FEEDBACK)
+            if feedback_connector.send_in_use >= feedback_connector.max_slots:
+                return
             stage_progress = self.progress_pipeline(
                 1,
                 intermediate_tensors=IntermediateTensors(message.payload),
@@ -1092,7 +1173,10 @@ class DiffusionWorker:
         if head.batch_id != message.batch_id:
             return False
         self._validate_pipeline_message_task_identity(head, message)
-        return message.batch_id in stage.authorized_batches
+        if message.batch_id not in stage.authorized_batches:
+            return False
+        feedback_connector = self._require_pipeline_connector(PipelineEdgeKind.FEEDBACK)
+        return feedback_connector.send_in_use < feedback_connector.max_slots
 
     @staticmethod
     def _validate_pipeline_message_task_identity(task: PipelineTask, message: PipelineMessage) -> None:
@@ -1374,6 +1458,8 @@ class DiffusionWorker:
         stage.retire(batch_id)
         if stage.spec.is_first and hasattr(self, "_pipeline_finalization_futures"):
             self._pipeline_finalization_futures.pop(batch_id, None)
+            self._pipeline_finalization_published.discard(batch_id)
+            self._pipeline_finalization_device_events.pop(batch_id, None)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id))
 
     def pipeline_batch_release_ready(self, pp_stage_id: int | dict[int, int], batch_id: str) -> bool:
@@ -1406,7 +1492,7 @@ class DiffusionWorker:
         pp_stage_id: int | dict[int, int],
         batch_id: str,
     ) -> str | None:
-        """Submit output-owner decode in the background and return its batch handle."""
+        """Submit output-owner decode to the bounded finalization executor."""
         if isinstance(pp_stage_id, dict):
             pp_stage_id = self._select_rank_value(pp_stage_id)
 
@@ -1434,6 +1520,10 @@ class DiffusionWorker:
                 if device is not None:
                     current_omni_platform.set_device(device)
                 result = self.model_runner.finalize_pipeline_batch(context, stage.spec)
+                device_event = current_omni_platform.record_device_event()
+                if device_event is None and current_omni_platform.is_available():
+                    current_omni_platform.synchronize()
+                self._pipeline_finalization_device_events[batch_id] = device_event
                 logger.info(
                     "Queued pipeline final decode finished batch=%s elapsed_ms=%.3f",
                     batch_id,
@@ -1862,7 +1952,7 @@ class DiffusionWorker:
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
         try:
-            if getattr(self, "_pipeline_finalization_executor", None) is not None:
+            if self._pipeline_finalization_executor is not None:
                 self._pipeline_finalization_executor.shutdown(wait=True, cancel_futures=False)
                 self._pipeline_finalization_executor = None
             if self.model_runner is not None:
@@ -1961,7 +2051,25 @@ class WorkerProc:
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
-        if not self.od_config.step_execution:
+        self._stage_engine: PipelineStageEngine | None = None
+        parallel = self.od_config.parallel_config
+        if (
+            self.od_config.mode == "queued"
+            and self.od_config.step_execution
+            and parallel.data_parallel_size == 1
+            and parallel.pipeline_parallel_size == 2
+            and parallel.tensor_parallel_size == 1
+            and parallel.sequence_parallel_size == 1
+            and parallel.cfg_parallel_size == 1
+        ):
+            worker_device = getattr(self.worker.worker, "device", None)
+            self._stage_engine = PipelineStageEngine(
+                worker=self.worker,
+                worker_id=gpu_id,
+                device=worker_device,
+                publish_update=self._publish_pipeline_update,
+            )
+        if not self.od_config.step_execution or self._stage_engine is not None:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1997,6 +2105,48 @@ class WorkerProc:
         """Serialize writes to the single-writer result queue."""
         with self._result_mq_lock:
             self.result_mq.enqueue(msg)
+
+    def _publish_pipeline_update(self, update: PipelineWorkerUpdate) -> None:
+        for finalization in update.finalizations:
+            if finalization.error is not None:
+                self._enqueue_result(
+                    AsyncDiffusionOutput(
+                        kind=AsyncOutputKind.PIPELINE_FINALIZED,
+                        async_output_id=finalization.batch_id,
+                        error=finalization.error,
+                    )
+                )
+            elif finalization.output is not None:
+                self._queue_pipeline_finalization_output(
+                    finalization.batch_id,
+                    finalization.output,
+                    finalization.device_event,
+                )
+
+        if update.error is not None:
+            self._enqueue_result(update)
+            return
+        if update.progress is None:
+            return
+        if not (update.progress.offers or update.progress.completions or update.events or update.error):
+            return
+        self._enqueue_result(
+            PipelineWorkerUpdate(
+                worker_id=update.worker_id,
+                progress=update.progress,
+                events=update.events,
+                error=update.error,
+            )
+        )
+
+    def _queue_pipeline_finalization_output(self, batch_id: str, output: Any, gpu_event: Any | None) -> None:
+        if self._async_output_queue is None:
+            raise RuntimeError("Queued pipeline finalization output queue is not initialized")
+        if gpu_event is None:
+            gpu_event = current_omni_platform.record_device_event()
+        with self._async_output_done:
+            self._async_output_pending += 1
+        self._async_output_queue.put((output, batch_id, gpu_event, AsyncOutputKind.PIPELINE_FINALIZED))
 
     def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""
@@ -2049,7 +2199,11 @@ class WorkerProc:
             item = self._async_output_queue.get()
             if item is None:
                 break
-            output, async_output_id, gpu_event = item
+            if len(item) == 3:
+                output, async_output_id, gpu_event = item
+                output_kind = AsyncOutputKind.OUTPUT_READY
+            else:
+                output, async_output_id, gpu_event, output_kind = item
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
@@ -2060,9 +2214,10 @@ class WorkerProc:
 
                 self._enqueue_result(
                     AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
+                        kind=output_kind,
                         async_output_id=async_output_id,
-                        output=output,
+                        output=output if output_kind is AsyncOutputKind.OUTPUT_READY else None,
+                        result=output if output_kind is AsyncOutputKind.PIPELINE_FINALIZED else None,
                     )
                 )
             except Exception:
@@ -2072,14 +2227,14 @@ class WorkerProc:
                 )
                 self._enqueue_result(
                     AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
+                        kind=output_kind,
                         async_output_id=async_output_id,
                         error="Background D2H/SHM packing failed",
                     )
                 )
             finally:
                 with self._async_output_done:
-                    # Clamped: only items enqueued by _return_result are counted.
+                    # Clamped: only explicit output-queue submissions are counted.
                     self._async_output_pending = max(0, self._async_output_pending - 1)
                     self._async_output_done.notify_all()
 
@@ -2096,7 +2251,7 @@ class WorkerProc:
         if not drained:
             logger.warning(
                 "Worker %d: %d async output(s) still in flight after %.1fs; "
-                "releasing device memory now may drop OUTPUT_READY messages",
+                "releasing device memory now may drop async output messages",
                 self.gpu_id,
                 pending,
                 timeout,
@@ -2106,6 +2261,10 @@ class WorkerProc:
     def shutdown(self) -> None:
         """Stop background work and release worker-owned IPC resources."""
         self._running = False
+
+        if self._stage_engine is not None:
+            self._stage_engine.shutdown()
+            self._stage_engine = None
 
         if self._async_output_queue is not None:
             self._async_output_queue.put(None)
@@ -2208,7 +2367,10 @@ class WorkerProc:
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            if self._stage_engine is not None:
+                result = self._stage_engine.call(method, *args, **kwargs)
+            else:
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(
@@ -2291,14 +2453,27 @@ class WorkerProc:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
-            if isinstance(msg, dict) and msg.get("type") == "sleep":
+            if isinstance(msg, dict) and msg.get("type") == "pipeline_wake":
+                if self._stage_engine is not None:
+                    self._stage_engine.notify_progress()
+            elif isinstance(msg, dict) and msg.get("type") == "sleep":
                 self.drain_async_outputs()
                 task = OmniSleepTask(level=msg.get("level", 2), task_id=msg.get("task_id", "local"))
-                ack = self.worker.handle_sleep_task(task)
+                ack = (
+                    self._stage_engine.call("handle_sleep_task", task)
+                    if self._stage_engine is not None
+                    else self.worker.handle_sleep_task(task)
+                )
                 self._return_result(ack)
             elif isinstance(msg, dict) and msg.get("type") == "wake_up":
                 task = OmniWakeTask(tags=msg.get("tags"), task_id=msg.get("task_id", "local"))
-                ack = self.worker.handle_wake_task(task)
+                ack = (
+                    self._stage_engine.call("handle_wake_task", task)
+                    if self._stage_engine is not None
+                    else self.worker.handle_wake_task(task)
+                )
+                if self._stage_engine is not None:
+                    self._stage_engine.notify_progress()
                 self._return_result(ack)
             # Route message based on type
             elif isinstance(msg, dict) and msg.get("type") == "rpc":
@@ -2385,7 +2560,10 @@ class WorkerProc:
             else:
                 # Handle direct generation requests.
                 try:
-                    output = self.worker.execute_model(msg, self.od_config)
+                    if self._stage_engine is not None:
+                        output = self._stage_engine.call("execute_model", msg, self.od_config)
+                    else:
+                        output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:
                     logger.error(
                         f"Error executing forward in event loop: {e}",
