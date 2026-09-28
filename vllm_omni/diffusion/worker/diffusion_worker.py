@@ -15,6 +15,7 @@ import queue
 import signal
 import sys
 import threading
+import time
 import traceback
 import uuid
 from collections import deque
@@ -1427,10 +1428,18 @@ class DiffusionWorker:
                 )
 
             def finalize() -> BatchRunnerOutput:
+                started_at = time.perf_counter()
+                logger.info("Queued pipeline final decode started batch=%s", batch_id)
                 device = getattr(self, "device", None)
                 if device is not None:
                     current_omni_platform.set_device(device)
-                return self.model_runner.finalize_pipeline_batch(context, stage.spec)
+                result = self.model_runner.finalize_pipeline_batch(context, stage.spec)
+                logger.info(
+                    "Queued pipeline final decode finished batch=%s elapsed_ms=%.3f",
+                    batch_id,
+                    (time.perf_counter() - started_at) * 1000,
+                )
+                return result
 
             self._pipeline_finalization_futures[batch_id] = self._pipeline_finalization_executor.submit(finalize)
         return batch_id
@@ -2331,7 +2340,14 @@ class WorkerProc:
                     rpc_id = msg.get("rpc_id")
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
+                        reply_start = time.perf_counter()
                         self._return_result(result, rpc_id=rpc_id, pipeline_reply=msg.get("pipeline_reply", False))
+                        if msg.get("method") == "poll_pipeline_finalization" and result is not None:
+                            logger.info(
+                                "Queued pipeline final decode reply packed batch=%s elapsed_ms=%.3f",
+                                msg.get("args", (None,))[0],
+                                (time.perf_counter() - reply_start) * 1000,
+                            )
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)

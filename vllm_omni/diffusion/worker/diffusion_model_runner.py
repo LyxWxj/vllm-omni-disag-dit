@@ -1303,6 +1303,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not state.request_denoise_completed:
             raise RuntimeError("Pipeline request has not completed its denoise schedule.")
         try:
+            decode_start = time.perf_counter()
             with (
                 self._pipeline_inference_context(),
                 set_forward_context(
@@ -1313,9 +1314,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 ),
             ):
                 result = self.pipeline.post_decode(state, queued_pipeline=True)
+            decode_ms = (time.perf_counter() - decode_start) * 1000
             if not isinstance(result, DiffusionOutput):
                 raise RuntimeError("Pipeline final decode produced no DiffusionOutput.")
+            transport_start = time.perf_counter()
             result = self._prepare_output_for_transport(result, state.sampling)
+            transport_ms = (time.perf_counter() - transport_start) * 1000
+            logger.info(
+                "Queued pipeline finalization batch=%s decode_ms=%.3f transport_prepare_ms=%.3f",
+                context.task.batch_id,
+                decode_ms,
+                transport_ms,
+            )
             self._attach_stepwise_metadata(state, result)
             return BatchRunnerOutput.from_list(
                 [

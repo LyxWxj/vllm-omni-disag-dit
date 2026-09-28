@@ -211,6 +211,7 @@ def test_final_decode_runs_only_on_output_owner_without_rank_collective(mocker, 
 
     result = worker.finalize_pipeline_batch(stage_id, task.batch_id)
     if stage_id == 0:
+        worker._pipeline_finalization_futures[task.batch_id].result(timeout=1)
         result = worker.poll_pipeline_finalization(result)
 
     assert result == expected
