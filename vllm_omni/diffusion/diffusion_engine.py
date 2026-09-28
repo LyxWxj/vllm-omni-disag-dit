@@ -81,6 +81,7 @@ logger = init_logger(__name__)
 _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
 _QUEUED_FINALIZATION_POLL_INTERVAL_S = 0.005
+_QUEUED_ADMISSION_PROGRESS_WAIT_S = 0.05
 
 
 def _async_output_timeout() -> float:
@@ -664,6 +665,35 @@ class DiffusionEngine:
                 "Queued pipeline progress end: events=%s", {batch_id: len(items) for batch_id, items in grouped.items()}
             )
         return grouped
+
+    def _progress_autonomous_updates_between_admissions(self) -> None:
+        """Give completed Worker turns a control-plane slot between admissions."""
+        uses_autonomous = getattr(self.executor, "uses_autonomous_pipeline_stages", None)
+        updates_pending = getattr(self.executor, "pipeline_updates_pending", None)
+        if not callable(uses_autonomous) or uses_autonomous() is not True or not callable(updates_pending):
+            return
+
+        def has_pending_updates() -> bool:
+            return updates_pending() is True
+
+        if not has_pending_updates():
+
+            def should_wake() -> bool:
+                stop_event = getattr(self, "stop_event", None)
+                rpc_queue = getattr(self, "_rpc_queue", None)
+                abort_queue = getattr(self, "abort_queue", None)
+                return (
+                    has_pending_updates()
+                    or (stop_event is not None and stop_event.is_set())
+                    or (rpc_queue is not None and not rpc_queue.empty())
+                    or (abort_queue is not None and not abort_queue.empty())
+                )
+
+            with self._cv:
+                self._cv.wait_for(should_wake, timeout=_QUEUED_ADMISSION_PROGRESS_WAIT_S)
+
+        if has_pending_updates():
+            self.executor.progress_pipeline()
 
     def _has_queued_pipeline_work(self) -> bool:
         """Return whether retained queued ownership still needs an Engine round."""
@@ -1276,11 +1306,14 @@ class DiffusionEngine:
                 handled_request_ids: set[str] = set()
                 task_outputs = self._split_queued_scheduler_output(sched_output) if sched_output is not None else []
                 admitted_outputs: list[Any] = []
+                admission_progress_failed = False
                 for output_index, task_output in enumerate(task_outputs):
+                    admitted = False
                     try:
                         self._run_queued_pipeline_iteration(task_output, submit_only=True)
                         admitted_outputs.append(task_output)
                         handled_request_ids.update(task_output.scheduled_request_ids)
+                        admitted = True
                     except _QueuedAdmissionDeferredError:
                         deferred_outputs = task_outputs[output_index:]
                         self._defer_queued_admission_tail(deferred_outputs)
@@ -1305,6 +1338,20 @@ class DiffusionEngine:
                                 break
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
+                    if admitted and output_index + 1 < len(task_outputs):
+                        try:
+                            self._progress_autonomous_updates_between_admissions()
+                        except Exception as exc:
+                            self._defer_queued_admission_tail(task_outputs[output_index + 1 :])
+                            self._handle_queued_progress_snapshot_failure(
+                                admitted_outputs,
+                                handled_request_ids,
+                                exc,
+                            )
+                            admission_progress_failed = True
+                            break
+                if admission_progress_failed:
+                    continue
                 try:
                     should_progress = (
                         bool(admitted_outputs)

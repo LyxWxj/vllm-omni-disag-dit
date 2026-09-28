@@ -375,6 +375,81 @@ def test_busy_loop_skips_scheduler_for_owned_queued_work(mocker) -> None:
     engine._advance_unhandled_queued_batches.assert_called_once_with(set(), {})
 
 
+def test_busy_loop_progresses_worker_update_between_admissions(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    engine.od_config.mode = "queued"
+    engine.stop_event = threading.Event()
+    engine._cv = threading.Condition()
+    engine._rpc_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    first = _scheduler_output("req-a").scheduled_new_reqs[0]
+    second = _scheduler_output("req-b").scheduled_new_reqs[0]
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=8,
+        scheduled_new_reqs=[first, second],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+    engine.scheduler.has_requests = mocker.Mock(return_value=True)
+    engine.scheduler.schedule = mocker.Mock(return_value=scheduler_output)
+    engine._wait_for_admission_if_needed_locked = mocker.Mock()
+    engine._process_aborts_queue = mocker.Mock()
+    engine._process_rpc_queue = mocker.Mock()
+    engine.executor.uses_autonomous_pipeline_stages.return_value = True
+    engine.executor.pipeline_updates_pending.return_value = True
+    order: list[str] = []
+    engine.executor.progress_pipeline.side_effect = lambda: order.append("progress")
+    engine.executor.poll_pipeline_events.return_value = []
+
+    def run_iteration(output, *, submit_only=False, pipeline_events=None):
+        request_id = output.scheduled_request_ids[0]
+        order.append(f"{'admit' if submit_only else 'advance'}:{request_id}")
+
+    engine._run_queued_pipeline_iteration = mocker.Mock(side_effect=run_iteration)
+    engine._advance_unhandled_queued_batches = mocker.Mock(side_effect=lambda *_args: engine.stop_event.set())
+
+    engine._busy_loop()
+
+    assert order.index("progress") < order.index("admit:req-b")
+    assert order[:3] == ["admit:req-a", "progress", "admit:req-b"]
+    engine.executor.poll_pipeline_events.assert_called_once_with()
+
+
+def test_admission_progress_wait_wakes_for_worker_update(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine._cv = threading.Condition()
+    engine.stop_event = threading.Event()
+    engine._rpc_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    engine.executor.uses_autonomous_pipeline_stages.return_value = True
+    update_ready = threading.Event()
+    engine.executor.pipeline_updates_pending.side_effect = update_ready.is_set
+    wait_started = threading.Event()
+    wait_for = engine._cv.wait_for
+
+    def observe_wait(predicate, timeout=None):
+        wait_started.set()
+        return wait_for(predicate, timeout=timeout)
+
+    mocker.patch.object(engine._cv, "wait_for", side_effect=observe_wait)
+
+    def publish_update():
+        assert wait_started.wait(timeout=1)
+        with engine._cv:
+            update_ready.set()
+            engine._cv.notify_all()
+
+    publisher = threading.Thread(target=publish_update)
+    publisher.start()
+    engine._progress_autonomous_updates_between_admissions()
+    publisher.join(timeout=1)
+
+    assert not publisher.is_alive()
+    engine.executor.progress_pipeline.assert_called_once_with()
+
+
 def test_busy_loop_progresses_cached_retained_batch_after_deferred_new_tail(mocker) -> None:
     engine = _engine(mocker, _scheduler_output("req-a"))
     engine.od_config.mode = "queued"
