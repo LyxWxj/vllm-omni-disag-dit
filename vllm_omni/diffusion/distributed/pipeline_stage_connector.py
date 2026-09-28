@@ -88,7 +88,7 @@ class PipelineCoordinatorProgress:
 
 
 class PipelineTransferCoordinator:
-    """FIFO grants with endpoint exclusivity only during metadata startup."""
+    """FIFO control-plane grants for matched P2P endpoint readiness."""
 
     def __init__(
         self,
@@ -109,9 +109,8 @@ class PipelineTransferCoordinator:
         self._offer_ids: set[tuple[Any, ...]] = set()
         self._ready_ids: set[tuple[Any, ...]] = set()
         self._grants: dict[tuple[Any, ...], PipelineTransferGrant] = {}
-        self._started_ids: set[tuple[Any, ...]] = set()
         self._completed_ids: set[tuple[Any, ...]] = set()
-        self._starting_ranks: set[int] = set()
+        self._busy_ranks: set[int] = set()
         self._next_edge = PipelineEdgeKind.FEEDBACK
         self._edge_cursor = {
             PipelineEdgeKind.ACTIVATION: 0,
@@ -175,7 +174,7 @@ class PipelineTransferCoordinator:
                     candidate = queue[0]
                     if candidate.identity not in self._ready_ids:
                         continue
-                    if candidate.src_rank in self._starting_ranks or candidate.dst_rank in self._starting_ranks:
+                    if candidate.src_rank in self._busy_ranks or candidate.dst_rank in self._busy_ranks:
                         continue
                     selected = candidate
                     self._edge_cursor[edge_kind] = (edge_index + 1) % len(edge_keys)
@@ -191,10 +190,7 @@ class PipelineTransferCoordinator:
             self._ready_ids.remove(identity)
             grant = PipelineTransferGrant(offer=offer)
             self._grants[identity] = grant
-            # Serialize blocking Gloo metadata exchange. mark_started() frees
-            # these ranks after both endpoint RPCs return; payload Works stay
-            # tracked in _grants until both consumers complete.
-            self._starting_ranks.update((offer.src_rank, offer.dst_rank))
+            self._busy_ranks.update((offer.src_rank, offer.dst_rank))
             grants.append(grant)
             self._next_edge = (
                 PipelineEdgeKind.ACTIVATION
@@ -203,25 +199,10 @@ class PipelineTransferCoordinator:
             )
         return grants
 
-    def mark_started(self, identity: tuple[Any, ...]) -> None:
-        """Release launch-time endpoint locks after both blocking handshakes return."""
-        grant = self._grants.get(identity)
-        if grant is None:
-            raise KeyError("unknown pipeline transfer grant")
-        if identity in self._started_ids:
-            raise ValueError("pipeline transfer grant was already started")
-        endpoints = {grant.offer.src_rank, grant.offer.dst_rank}
-        if not endpoints.issubset(self._starting_ranks):
-            raise RuntimeError("pipeline transfer startup does not own both endpoint locks")
-        self._started_ids.add(identity)
-        self._starting_ranks.difference_update(endpoints)
-
     def complete(self, identity: tuple[Any, ...], rank: int) -> bool:
         grant = self._grants.get(identity)
         if grant is None:
             raise KeyError("unknown pipeline transfer grant")
-        if identity not in self._started_ids:
-            raise RuntimeError("pipeline transfer completed before both endpoints started")
         if rank not in {grant.offer.src_rank, grant.offer.dst_rank}:
             raise ValueError("completion rank is not a transfer endpoint")
         if rank in grant.completed_ranks:
@@ -230,8 +211,8 @@ class PipelineTransferCoordinator:
         if grant.completed_ranks != {grant.offer.src_rank, grant.offer.dst_rank}:
             return False
         self._grants.pop(identity)
-        self._started_ids.remove(identity)
         self._completed_ids.add(identity)
+        self._busy_ranks.difference_update((grant.offer.src_rank, grant.offer.dst_rank))
         return True
 
     def snapshot(self) -> dict[str, Any]:
@@ -240,7 +221,7 @@ class PipelineTransferCoordinator:
             "ready": len(self._ready_ids),
             "grants": len(self._grants),
             "completed": len(self._completed_ids),
-            "starting_ranks": tuple(sorted(self._starting_ranks)),
+            "busy_ranks": tuple(sorted(self._busy_ranks)),
         }
 
     @staticmethod

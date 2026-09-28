@@ -388,17 +388,14 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
-        started: list[Any] = []
-        while grants := coordinator.grant_ready():
-            for grant in grants:
-                self._queued_control_rpc(
-                    "start_pipeline_transfer",
-                    args=(grant,),
-                    timeout=PIPELINE_GRANT_START_TIMEOUT_S,
-                )
-                coordinator.mark_started(grant.offer.identity)
-                started.append(grant)
-        return started
+        grants = coordinator.grant_ready()
+        for grant in grants:
+            self._queued_control_rpc(
+                "start_pipeline_transfer",
+                args=(grant,),
+                timeout=PIPELINE_GRANT_START_TIMEOUT_S,
+            )
+        return grants
 
     def progress_pipeline(self) -> PipelineCoordinatorProgress:
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
