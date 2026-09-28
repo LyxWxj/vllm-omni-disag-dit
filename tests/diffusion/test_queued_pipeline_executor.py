@@ -388,6 +388,75 @@ def test_multiproc_pp2_rejects_incomplete_piggyback_readiness(mocker) -> None:
     executor.collective_rpc.assert_called_once()
 
 
+def test_multiproc_pp2_async_progress_collects_one_rank_without_waiting_for_peer(mocker) -> None:
+    class _CommandQueue:
+        def __init__(self):
+            self.messages = []
+
+        def enqueue(self, message):
+            self.messages.append(message)
+
+    class _ResultQueue:
+        def __init__(self):
+            self.responses = []
+
+        def dequeue(self, timeout=None):
+            del timeout
+            if not self.responses:
+                raise TimeoutError
+            return self.responses.pop(0)
+
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor._ensure_open = mocker.Mock()
+    executor._is_failed = False
+    executor._failure_callbacks = []
+    executor.shutdown = mocker.Mock()
+    executor.od_config = SimpleNamespace(
+        step_execution=True,
+        num_gpus=2,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+            cfg_parallel_size=1,
+        ),
+    )
+    executor._result_mqs = [object(), object()]
+    executor._pipeline_command_mqs = [_CommandQueue(), _CommandQueue()]
+    executor._pipeline_result_mqs = [_ResultQueue(), _ResultQueue()]
+    executor._pipeline_progress_pending = set()
+    executor._pipeline_progress_id = 0
+    executor._pipeline_transfer_coordinator = PipelineTransferCoordinator(
+        activation_edges={(0, 1)}, feedback_edges={(1, 0)}
+    )
+    executor._pipeline_pending_readiness = {}
+    executor._pipeline_cached_events = []
+
+    first = executor.progress_pipeline()
+    assert first.completed == []
+    assert executor._pipeline_progress_pending == {0, 1}
+    assert len(executor._pipeline_command_mqs[0].messages) == 1
+    assert len(executor._pipeline_command_mqs[1].messages) == 1
+
+    executor._pipeline_result_mqs[0].responses.append(
+        {
+            "pipeline_reply": True,
+            "worker_id": 0,
+            "status": "ok",
+            "pipeline_id": "1",
+            "result": (PipelineTransportProgress(rank=0), ["rank-0-event"]),
+        }
+    )
+    second = executor.progress_pipeline()
+
+    assert second.completed == []
+    assert executor._pipeline_progress_pending == {0, 1}
+    assert executor.poll_pipeline_events() == ["rank-0-event"]
+    assert len(executor._pipeline_command_mqs[0].messages) == 2
+    assert len(executor._pipeline_command_mqs[1].messages) == 1
+
+
 def test_rank_local_readiness_requires_exact_endpoint_coverage(mocker) -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor._ensure_open = mocker.Mock()

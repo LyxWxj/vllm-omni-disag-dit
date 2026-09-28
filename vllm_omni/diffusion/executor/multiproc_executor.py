@@ -97,6 +97,7 @@ class _ExecutorShutdownCleaner:
     broadcast_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    pipeline_command_mqs: list[MessageQueue] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __call__(self) -> None:
@@ -120,6 +121,14 @@ class _ExecutorShutdownCleaner:
                 logger.warning("Failed to send shutdown signal: %s", exc)
             finally:
                 self.broadcast_mq = None
+
+        if self.pipeline_command_mqs:
+            for command_mq in self.pipeline_command_mqs:
+                try:
+                    command_mq.shutdown()
+                except Exception:
+                    logger.exception("Failed to close a pipeline command queue")
+            self.pipeline_command_mqs = None
 
         if self.processes:
             alive = [proc for proc in self.processes if proc.is_alive()]
@@ -170,6 +179,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
         self._rpc_wave_id: int = 0
+        self._pipeline_result_mqs: list[MessageQueue] = []
+        self._pipeline_progress_pending: set[int] = set()
+        self._pipeline_progress_id: int = 0
+        self._pipeline_progress_offers: dict[int, tuple[Any, ...]] = {}
+        self._pipeline_readiness_reports: dict[tuple[Any, ...], dict[int, bool]] = {}
 
         num_workers = cast(int, self.od_config.num_gpus)
         self.wake_events = [mp.Event() for _ in range(num_workers)]
@@ -178,11 +192,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         broadcast_handle = self._broadcast_mq.export_handle()
 
         # Launch workers
-        processes, result_handles = self._launch_workers(broadcast_handle, self.wake_events)
+        processes, result_handles, pipeline_result_handles = self._launch_workers(broadcast_handle, self.wake_events)
         self._processes = processes
 
         shutdown_cleaner = _ExecutorShutdownCleaner(
             broadcast_mq=self._broadcast_mq,
+            pipeline_command_mqs=getattr(self, "_pipeline_command_mqs", None),
             num_workers=num_workers,
             processes=self._processes,
         )
@@ -192,6 +207,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         try:
             self._result_mqs = [self._init_result_queue(handle) for handle in result_handles]
             self._result_mq = self._result_mqs[0]
+            self._pipeline_result_mqs = [self._init_result_queue(handle) for handle in pipeline_result_handles]
         except Exception:
             self.shutdown()
             raise
@@ -210,6 +226,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # When pumps are active they are the sole readers of the worker result
         # queues; non-async messages are placed here for collective_rpc().
         self._sync_result_buffer: queue.Queue = queue.Queue()
+        self._pipeline_progress_pending: set[int] = set()
+        self._pipeline_progress_id = 0
+        self._pipeline_progress_offers = {}
+        self._pipeline_readiness_reports = {}
         if not self.od_config.step_execution:
             self._start_result_pump()
 
@@ -359,7 +379,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self,
         broadcast_handle: Handle,
         wake_events: list[Event],
-    ) -> tuple[list[mp.Process], list[Handle]]:
+    ) -> tuple[list[mp.Process], list[Handle], list[Handle]]:
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -370,6 +390,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         set_multiprocessing_worker_envs()
         mp.set_start_method("spawn", force=True)
         processes = []
+        self._pipeline_command_mqs = [
+            MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0]) for _ in range(num_gpus)
+        ]
+        pipeline_command_handles = [mq.export_handle() for mq in self._pipeline_command_mqs]
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
         worker_extension_cls = od_config.worker_extension_cls
@@ -389,6 +413,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    pipeline_command_handles[i],
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
@@ -402,6 +427,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         # Wait for all workers to be ready
         result_handles: list[Handle] = []
+        pipeline_result_handles: list[Handle] = []
         for writer in scheduler_pipe_writers:
             writer.close()
 
@@ -421,12 +447,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if result_handle is None:
                 raise RuntimeError(f"Rank {i} did not provide a result queue handle")
             result_handles.append(result_handle)
+            pipeline_result_handle = data.get("pipeline_result_handle")
+            if pipeline_result_handle is None:
+                raise RuntimeError(f"Rank {i} did not provide a pipeline result queue handle")
+            pipeline_result_handles.append(pipeline_result_handle)
 
             reader.close()
 
         logger.debug("All workers are ready")
 
-        return processes, result_handles
+        return processes, result_handles, pipeline_result_handles
 
     @property
     def is_dead(self) -> bool:
@@ -817,6 +847,55 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             and len(getattr(self, "_result_mqs", ())) == 2
         )
 
+    def _uses_async_pipeline_rpc(self) -> bool:
+        return self._uses_rank_local_pp_rpc() and bool(getattr(self, "_pipeline_result_mqs", ()))
+
+    def _queue_pipeline_worker_rpc(self, worker_id: int, method: str, args: tuple[Any, ...]) -> str:
+        self._pipeline_progress_id += 1
+        pipeline_id = str(self._pipeline_progress_id)
+        request = {
+            "type": "rpc",
+            "method": method,
+            "args": args,
+            "kwargs": {},
+            "exec_all_ranks": True,
+            "output_rank": worker_id,
+            "pipeline_reply": True,
+            "pipeline_id": pipeline_id,
+        }
+        progress_offers = getattr(self, "_pipeline_progress_offers", None)
+        if progress_offers is None:
+            progress_offers = self._pipeline_progress_offers = {}
+        self._pipeline_command_mqs[worker_id].enqueue(request)
+        self._pipeline_progress_pending.add(worker_id)
+        progress_offers[worker_id] = args[0] if method.startswith("progress_pipeline") else ()
+        return pipeline_id
+
+    def _poll_pipeline_worker_results(self, timeout: float = 0.0) -> list[Any]:
+        results: list[Any] = []
+        for worker_id in tuple(self._pipeline_progress_pending):
+            try:
+                response = self._pipeline_result_mqs[worker_id].dequeue(timeout=timeout)
+            except (TimeoutError, zmq.error.Again):
+                continue
+            if not isinstance(response, dict) or response.get("pipeline_reply") is not True:
+                raise RuntimeError(f"Worker {worker_id} returned an invalid asynchronous pipeline response")
+            self._pipeline_progress_pending.remove(worker_id)
+            self._pipeline_progress_offers.pop(worker_id, None)
+            if response.get("status") == "error":
+                raise RuntimeError(f"Worker {worker_id}: {response.get('error', 'unknown pipeline error')}")
+            results.append((worker_id, response.get("result")))
+        return results
+
+    def _start_async_pipeline_progress(self, pending_offers: tuple[Any, ...]) -> None:
+        for worker_id in range(len(self._pipeline_result_mqs)):
+            if worker_id not in self._pipeline_progress_pending:
+                self._queue_pipeline_worker_rpc(
+                    worker_id,
+                    "progress_pipeline_transfers_and_poll_events",
+                    (pending_offers,),
+                )
+
     def _queued_rank_local_rpc(
         self,
         method: str,
@@ -943,6 +1022,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def poll_pipeline_events(self) -> list[Any]:
         self._ensure_open()
+        if self._uses_async_pipeline_rpc():
+            cached_events = getattr(self, "_pipeline_cached_events", None) or []
+            self._pipeline_cached_events = []
+            return cached_events
         cached_events = getattr(self, "_pipeline_cached_events", None)
         if cached_events is not None:
             self._pipeline_cached_events = None
@@ -1061,13 +1144,25 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         try:
             rank_local = self._uses_rank_local_pp_rpc()
             pending_offers = tuple(coordinator.pending_readiness_offers()) if rank_local else ()
-            if rank_local:
+            if rank_local and self._uses_async_pipeline_rpc():
+                self._start_async_pipeline_progress(pending_offers)
+                result = self._poll_pipeline_worker_results(timeout=0.001)
+                if not result and self._pipeline_progress_pending:
+                    result = self._poll_pipeline_worker_results(timeout=0.005)
+                async_rank_results = result
+                result = [item for _, item in async_rank_results]
+                self._start_async_pipeline_progress(pending_offers)
+            elif rank_local:
                 result = self._queued_rank_local_rpc(
                     "progress_pipeline_transfers_and_poll_events", args=(pending_offers,)
                 )
             else:
                 result = self._queued_control_rpc("progress_pipeline_transfers_and_poll_events_all_ranks")
-            worker_progress, worker_events = normalize_pipeline_transport_snapshot(result, coordinator.endpoint_ranks)
+            worker_progress, worker_events = normalize_pipeline_transport_snapshot(
+                result,
+                coordinator.endpoint_ranks,
+                require_complete=not (rank_local and self._uses_async_pipeline_rpc()),
+            )
             cached_events = getattr(self, "_pipeline_cached_events", None)
             self._pipeline_cached_events = (cached_events or []) + worker_events
             progress = PipelineCoordinatorProgress()
@@ -1080,18 +1175,39 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     coordinator.offer(offer)
                     self._pipeline_pending_readiness[offer.identity] = offer
             if rank_local:
-                expected_ids = {offer.identity for offer in pending_offers}
-                for rank_progress in worker_progress:
-                    reported_ids = [identity for identity, _ in rank_progress.readiness]
-                    if len(reported_ids) != len(expected_ids) or set(reported_ids) != expected_ids:
-                        raise RuntimeError("Pipeline progress readiness did not cover pending transfer offers.")
-                for offer in pending_offers:
-                    reports = [
-                        {"rank": item.rank, "ready": dict(item.readiness)[offer.identity]} for item in worker_progress
-                    ]
-                    if normalize_pipeline_transfer_readiness_reports(reports, coordinator.endpoint_ranks):
-                        coordinator.mark_receive_ready(offer.identity)
-                        self._pipeline_pending_readiness.pop(offer.identity, None)
+                if self._uses_async_pipeline_rpc():
+                    readiness_reports = getattr(self, "_pipeline_readiness_reports", None)
+                    if readiness_reports is None:
+                        readiness_reports = self._pipeline_readiness_reports = {}
+                    for _, item in async_rank_results:
+                        rank_progress = item[0]
+                        for identity, ready in rank_progress.readiness:
+                            readiness_reports.setdefault(identity, {})[rank_progress.rank] = ready
+                    for identity, reports in list(readiness_reports.items()):
+                        if set(reports) != set(coordinator.endpoint_ranks):
+                            continue
+                        if normalize_pipeline_transfer_readiness_reports(
+                            [{"rank": rank, "ready": ready} for rank, ready in reports.items()],
+                            coordinator.endpoint_ranks,
+                        ):
+                            coordinator.mark_receive_ready(identity)
+                            self._pipeline_pending_readiness.pop(identity, None)
+                        readiness_reports.pop(identity, None)
+                else:
+                    expected_ids = {offer.identity for offer in pending_offers}
+                    for rank_progress in worker_progress:
+                        reported_ids = [identity for identity, _ in rank_progress.readiness]
+                        if len(reported_ids) != len(expected_ids) or set(reported_ids) != expected_ids:
+                            raise RuntimeError("Pipeline progress readiness did not cover pending transfer offers.")
+                    complete_readiness = {item.rank for item in worker_progress} == set(coordinator.endpoint_ranks)
+                    for offer in pending_offers if complete_readiness else ():
+                        reports = [
+                            {"rank": item.rank, "ready": dict(item.readiness)[offer.identity]}
+                            for item in worker_progress
+                        ]
+                        if normalize_pipeline_transfer_readiness_reports(reports, coordinator.endpoint_ranks):
+                            coordinator.mark_receive_ready(offer.identity)
+                            self._pipeline_pending_readiness.pop(offer.identity, None)
                 progress.grants.extend(self._start_ready_pipeline_transfers())
             else:
                 progress.grants.extend(self._retry_pipeline_transfer_readiness())
@@ -1489,6 +1605,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._broadcast_mq = None
             self._result_mq = None
             self._result_mqs = []
+            self._pipeline_result_mqs = []
+            self._pipeline_progress_pending = set()
+            self._pipeline_progress_offers = {}
+            self._pipeline_readiness_reports = {}
             self._result_pump_threads = []
             with self._futures_lock:
                 for fut in self._rpc_futures.values():

@@ -35,6 +35,8 @@ def validate_pipeline_topology_reports(
 def normalize_pipeline_transport_snapshot(
     result: Any,
     expected_ranks: frozenset[int],
+    *,
+    require_complete: bool = True,
 ) -> tuple[list[PipelineTransportProgress], list[Any]]:
     """Validate the rank-local progress and event snapshot returned by one RPC."""
     while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
@@ -56,7 +58,9 @@ def normalize_pipeline_transport_snapshot(
         events.extend(item[1])
 
     reporting_ranks = [item.rank for item in progresses]
-    if len(reporting_ranks) != len(expected_ranks) or set(reporting_ranks) != expected_ranks:
+    if len(set(reporting_ranks)) != len(reporting_ranks) or not set(reporting_ranks).issubset(expected_ranks):
+        raise RuntimeError("pipeline transport snapshot contains invalid endpoint reports")
+    if require_complete and (len(reporting_ranks) != len(expected_ranks) or set(reporting_ranks) != expected_ranks):
         raise RuntimeError("pipeline transport snapshot does not cover every configured endpoint")
     return progresses, events
 

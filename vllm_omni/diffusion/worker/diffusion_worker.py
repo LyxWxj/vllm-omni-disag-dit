@@ -1913,6 +1913,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
+        pipeline_command_handle,
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
@@ -1926,6 +1927,7 @@ class WorkerProc:
 
         # Initialize MessageQueue reader from handle
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
+        self.pipeline_command_mq = MessageQueue.create_from_handle(pipeline_command_handle, 0)
 
         self.result_mq = None
         self.result_mq_handle = None
@@ -1935,6 +1937,8 @@ class WorkerProc:
         # This supports DP multi-concurrency where all ranks reply independently.
         self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
         self.result_mq_handle = self.result_mq.export_handle()
+        self.pipeline_result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+        self.pipeline_result_mq_handle = self.pipeline_result_mq.export_handle()
         logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
@@ -1989,7 +1993,10 @@ class WorkerProc:
         with self._result_mq_lock:
             self.result_mq.enqueue(msg)
 
-    def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
+    def _enqueue_pipeline_result(self, msg: Any) -> None:
+        self.pipeline_result_mq.enqueue(msg)
+
+    def _return_result(self, output: Any, rpc_id: str | None = None, *, pipeline_reply: bool = False) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is None:
             return
@@ -2010,6 +2017,10 @@ class WorkerProc:
                 async_output_id=async_output_id,
             )
             self._enqueue_result(msg)
+            return
+
+        if pipeline_reply:
+            self._enqueue_pipeline_result(output)
             return
 
         # Sync path (original, or async fallback).
@@ -2114,6 +2125,9 @@ class WorkerProc:
             if self.mq is not None:
                 self.mq.shutdown()
                 self.mq = None
+            if self.pipeline_command_mq is not None:
+                self.pipeline_command_mq.shutdown()
+                self.pipeline_command_mq = None
 
             # The worker creates this queue's shared-memory ring buffer.
             # Dropping the final creator reference invokes
@@ -2127,6 +2141,9 @@ class WorkerProc:
                 result_mq.shutdown()
                 del result_mq
                 gc.collect()
+            if getattr(self, "pipeline_result_mq", None) is not None:
+                self.pipeline_result_mq.shutdown()
+                self.pipeline_result_mq = None
 
     def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
         if not torch.distributed.is_initialized():
@@ -2244,6 +2261,18 @@ class WorkerProc:
                 should_reply,
             )
 
+        if rpc_request.get("pipeline_reply"):
+            return (
+                {
+                    "pipeline_reply": True,
+                    "worker_id": self.gpu_id,
+                    "status": "ok",
+                    "result": result,
+                    "pipeline_id": rpc_request.get("pipeline_id"),
+                },
+                should_reply,
+            )
+
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
         if not should_reply:
@@ -2256,9 +2285,11 @@ class WorkerProc:
             return None, False
         return result, should_reply
 
-    def recv_message(self) -> Any:
+    def recv_message(self, *, pipeline: bool = False) -> Any:
         """Receive one complete broadcast message without dropping overflow data."""
-        return self.mq.dequeue(indefinite=True)
+        if pipeline:
+            return self.pipeline_command_mq.dequeue(timeout=0.001)
+        return self.mq.dequeue(timeout=0.001)
 
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
@@ -2267,7 +2298,10 @@ class WorkerProc:
         while self._running:
             msg = None
             try:
-                msg = self.recv_message()
+                try:
+                    msg = self.recv_message()
+                except (TimeoutError, zmq.error.Again):
+                    msg = self.recv_message(pipeline=True)
             except Exception:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()
@@ -2297,7 +2331,7 @@ class WorkerProc:
                     rpc_id = msg.get("rpc_id")
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
-                        self._return_result(result, rpc_id=rpc_id)
+                        self._return_result(result, rpc_id=rpc_id, pipeline_reply=msg.get("pipeline_reply", False))
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)
@@ -2308,6 +2342,7 @@ class WorkerProc:
                     output_rank = msg.get("output_rank")
                     exec_all_ranks = msg.get("exec_all_ranks", False)
                     reply_all_ranks = msg.get("reply_all_ranks", False)
+                    pipeline_reply = msg.get("pipeline_reply", False)
                     wave_id = msg.get("wave_id")
                     if self.result_mq is not None:
                         if rpc_id is not None:
@@ -2328,6 +2363,16 @@ class WorkerProc:
                                     "status": "error",
                                     "error": error,
                                     "wave_id": wave_id,
+                                }
+                            )
+                        elif pipeline_reply:
+                            self._enqueue_pipeline_result(
+                                {
+                                    "pipeline_reply": True,
+                                    "worker_id": self.gpu_id,
+                                    "status": "error",
+                                    "error": error,
+                                    "pipeline_id": msg.get("pipeline_id"),
                                 }
                             )
                         elif output_rank is None and exec_all_ranks:
@@ -2392,6 +2437,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
+        pipeline_command_handle,
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
@@ -2425,6 +2471,7 @@ class WorkerProc:
                 od_config,
                 gpu_id=rank,
                 broadcast_handle=broadcast_handle,
+                pipeline_command_handle=pipeline_command_handle,
                 wake_event=wake_event,
                 worker_extension_cls=worker_extension_cls,
                 custom_pipeline_args=custom_pipeline_args,
@@ -2434,6 +2481,7 @@ class WorkerProc:
                 {
                     "status": "ready",
                     "result_handle": worker_proc.result_mq_handle,
+                    "pipeline_result_handle": worker_proc.pipeline_result_mq_handle,
                 }
             )
             worker_proc._worker_busy_loop()
