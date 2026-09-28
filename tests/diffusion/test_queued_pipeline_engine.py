@@ -48,7 +48,7 @@ def _engine(mocker, scheduler_output: DiffusionSchedulerOutput) -> DiffusionEngi
     engine.executor = mocker.Mock()
     engine.executor.pipeline_stage_physical_ranks.return_value = {0: 0, 1: 1}
     engine.executor.pipeline_stage_memory_budget_bytes.return_value = 1 << 30
-    engine.od_config = SimpleNamespace(max_inflight_batches=2)
+    engine.od_config = SimpleNamespace(mode="queued", max_inflight_batches=2)
     engine._queued_pipeline_batches = {}
     engine._queued_reserved_bytes = 0
     engine._queued_stage_buffer_budget_bytes = None
@@ -231,6 +231,21 @@ def test_unhandled_retained_batches_progress_independently(mocker) -> None:
     engine._advance_unhandled_queued_batches({"req-a"})
 
     advance.assert_called_once_with(second, pipeline_events=None)
+
+
+def test_finalizing_batch_does_not_sleep_while_other_requests_are_schedulable(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    batch = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+    batch.finalization_handle = "decode-handle"
+    engine.scheduler.has_queued_admission_candidate = mocker.Mock(return_value=True)
+    engine.executor.pipeline_updates_pending.return_value = False
+
+    assert engine._queued_pipeline_waits_on_finalization()
+    assert not engine._should_wait_for_queued_pipeline_update()
+
+    engine.scheduler.has_queued_admission_candidate.return_value = False
+    assert engine._should_wait_for_queued_pipeline_update()
 
 
 def test_shared_progress_delivers_events_to_retained_batch(mocker) -> None:

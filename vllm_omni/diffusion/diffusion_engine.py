@@ -736,6 +736,16 @@ class DiffusionEngine:
             for batch in batches
         )
 
+    def _should_wait_for_queued_pipeline_update(self) -> bool:
+        """Wait only when retained work has no scheduler candidate to advance."""
+        if not self._has_queued_pipeline_work() or not self._queued_pipeline_can_advance_without_schedule():
+            return False
+        if bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)()):
+            return False
+        return not any(
+            batch.failure is not None or batch.abort_requested for batch in self._queued_pipeline_batches.values()
+        )
+
     def _handle_queued_progress_snapshot_failure(
         self,
         admitted_outputs: list[Any],
@@ -1400,16 +1410,7 @@ class DiffusionEngine:
                             self._handle_queued_iteration_failure(task_output, exc)
                 self._advance_unhandled_queued_batches(handled_request_ids, events_by_batch)
                 waiting_on_finalization = self._queued_pipeline_waits_on_finalization()
-                should_wait_for_update = (
-                    self._has_queued_pipeline_work()
-                    and self._queued_pipeline_can_advance_without_schedule()
-                    and not bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
-                    and not any(
-                        batch.failure is not None or batch.abort_requested
-                        for batch in self._queued_pipeline_batches.values()
-                    )
-                )
-                if waiting_on_finalization or should_wait_for_update:
+                if self._should_wait_for_queued_pipeline_update():
                     with self._cv:
                         timeout = (
                             _QUEUED_FINALIZATION_POLL_INTERVAL_S
