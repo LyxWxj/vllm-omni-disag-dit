@@ -332,6 +332,45 @@ def test_busy_loop_progresses_retained_batch_when_scheduler_snapshot_is_empty(mo
     engine._advance_unhandled_queued_batches.assert_called_once_with(set(), {})
 
 
+def test_busy_loop_skips_scheduler_for_owned_queued_work(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output("req-a"))
+    engine.od_config.mode = "queued"
+    engine.stop_event = threading.Event()
+    engine._cv = threading.Condition()
+    engine._rpc_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    retained = SimpleNamespace(
+        phase=_QueuedPipelineBatchPhase.AUTHORIZED,
+        failure=None,
+        abort_requested=False,
+        task=SimpleNamespace(request_ids=("req-a",)),
+    )
+    engine._queued_pipeline_batches = {"retained": retained}
+    engine.scheduler.has_requests = mocker.Mock(return_value=True)
+    engine.scheduler.has_queued_admission_candidate = mocker.Mock(return_value=False)
+    engine.scheduler.num_waiting_requests = mocker.Mock(return_value=1)
+    engine.scheduler.schedule = mocker.Mock(side_effect=AssertionError("owned work must not be rescheduled"))
+    engine._process_aborts_queue = mocker.Mock()
+    engine._process_rpc_queue = mocker.Mock()
+    engine._advance_unhandled_queued_batches = mocker.Mock()
+
+    def collect_once():
+        engine.stop_event.set()
+        return {}
+
+    engine._collect_queued_pipeline_events = mocker.Mock(side_effect=collect_once)
+
+    engine._busy_loop()
+
+    engine.scheduler.schedule.assert_not_called()
+    assert engine._scheduler_num_waiting_reqs == 1
+    engine.scheduler.has_queued_admission_candidate.assert_called_once_with(
+        {"req-a"}, admission_capacity_available=True
+    )
+    engine._collect_queued_pipeline_events.assert_called_once_with()
+    engine._advance_unhandled_queued_batches.assert_called_once_with(set(), {})
+
+
 def test_busy_loop_progresses_cached_retained_batch_after_deferred_new_tail(mocker) -> None:
     engine = _engine(mocker, _scheduler_output("req-a"))
     engine.od_config.mode = "queued"

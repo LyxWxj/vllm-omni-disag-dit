@@ -662,6 +662,21 @@ class DiffusionEngine:
         """Return whether retained queued ownership still needs an Engine round."""
         return self.od_config.mode == "queued" and bool(self._queued_pipeline_batches)
 
+    def _queued_pipeline_can_advance_without_schedule(self) -> bool:
+        if not self._queued_pipeline_batches:
+            return False
+        has_candidate = getattr(self.scheduler, "has_queued_admission_candidate", None)
+        if not callable(has_candidate):
+            return False
+        owned_request_ids = {
+            request_id for batch in self._queued_pipeline_batches.values() for request_id in batch.task.request_ids
+        }
+        budget = self._queued_stage_buffer_budget_bytes
+        admission_capacity_available = len(self._queued_pipeline_batches) < int(
+            self.od_config.max_inflight_batches
+        ) and (budget is None or self._queued_reserved_bytes < budget)
+        return not has_candidate(owned_request_ids, admission_capacity_available=admission_capacity_available)
+
     def _queued_pipeline_waits_on_finalization(self) -> bool:
         """Avoid spinning while every retained batch waits on background decode."""
         batches = tuple(self._queued_pipeline_batches.values())
@@ -1214,19 +1229,22 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                if self.scheduler.has_requests():
-                    self._wait_for_admission_if_needed_locked()
+                if self.od_config.mode == "queued" and self._queued_pipeline_can_advance_without_schedule():
+                    sched_output = None
+                    self._scheduler_num_waiting_reqs = self.scheduler.num_waiting_requests()
+                else:
+                    if self.scheduler.has_requests():
+                        self._wait_for_admission_if_needed_locked()
+                    sched_output = self.scheduler.schedule()
+                    self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
-                sched_output = self.scheduler.schedule()
-                self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
-
-            if sched_output.is_empty and self.od_config.mode != "queued":
+            if self.od_config.mode != "queued" and sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
                 continue
 
             if self.od_config.mode == "queued":
                 queued_round += 1
-                if queued_round == 1 or queued_round % 100 == 0:
+                if sched_output is not None and (queued_round == 1 or queued_round % 100 == 0):
                     logger.info(
                         "Queued pipeline scheduler round=%d step_id=%s new=%s cached=%s waiting=%s running=%s "
                         "retained=%s",
@@ -1239,7 +1257,7 @@ class DiffusionEngine:
                         sorted(self._queued_pipeline_batches),
                     )
                 handled_request_ids: set[str] = set()
-                task_outputs = self._split_queued_scheduler_output(sched_output)
+                task_outputs = self._split_queued_scheduler_output(sched_output) if sched_output is not None else []
                 admitted_outputs: list[Any] = []
                 for output_index, task_output in enumerate(task_outputs):
                     try:

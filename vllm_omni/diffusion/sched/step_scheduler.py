@@ -76,6 +76,22 @@ class StepScheduler(BaseScheduler):
             ]
         return scheduler_output
 
+    def has_queued_admission_candidate(
+        self,
+        owned_request_ids: set[str],
+        *,
+        admission_capacity_available: bool,
+    ) -> bool:
+        """Whether another scheduler pass can select work beyond retained batches."""
+        if self._finished_req_ids:
+            return True
+        if any(
+            request_id not in owned_request_ids and request_id not in self._pipeline_finalizing
+            for request_id in self._running
+        ):
+            return True
+        return admission_capacity_available and bool(self._waiting) and len(self._running) < self.max_num_running_reqs
+
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
         if not scheduled_request_ids:

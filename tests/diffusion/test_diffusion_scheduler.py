@@ -1525,6 +1525,31 @@ class TestStepScheduler:
         assert self.scheduler.get_request_state(finalizing_id).status is DiffusionRequestStatus.RUNNING
         assert self.scheduler.get_request_state(waiting_id).status is DiffusionRequestStatus.WAITING
 
+    def test_queued_admission_query_skips_owned_work_and_resumes_after_retirement(self) -> None:
+        self.scheduler.max_num_running_reqs = 2
+        first_id = self.scheduler.add_request(_make_step_request("queued-owned", num_inference_steps=2))
+        second_id = self.scheduler.add_request(_make_step_request("queued-waiting", num_inference_steps=2))
+        self.scheduler.schedule()
+
+        assert not self.scheduler.has_queued_admission_candidate(
+            {first_id, second_id}, admission_capacity_available=True
+        )
+        assert self.scheduler.has_queued_admission_candidate({first_id}, admission_capacity_available=True)
+
+        self.scheduler.preempt_request(second_id)
+        assert not self.scheduler.has_queued_admission_candidate({first_id}, admission_capacity_available=False)
+        assert self.scheduler.has_queued_admission_candidate({first_id}, admission_capacity_available=True)
+
+        self.scheduler.finish_requests(first_id, DiffusionRequestStatus.FINISHED_COMPLETED)
+        assert self.scheduler.has_queued_admission_candidate(set(), admission_capacity_available=True)
+
+    def test_queued_admission_query_keeps_finalizing_request_unscheduled(self) -> None:
+        request_id = self.scheduler.add_request(_make_step_request("queued-finalizing", num_inference_steps=1))
+        output = self.scheduler.schedule()
+        self.scheduler.commit_pipeline_step(output, {request_id: 1})
+
+        assert not self.scheduler.has_queued_admission_candidate({request_id}, admission_capacity_available=True)
+
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=2))
         req_id_b = self.scheduler.add_request(_make_step_request("b", num_inference_steps=2))
