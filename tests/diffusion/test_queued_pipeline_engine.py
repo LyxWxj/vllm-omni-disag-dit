@@ -398,9 +398,15 @@ def test_busy_loop_progresses_worker_update_between_admissions(mocker) -> None:
     engine._process_aborts_queue = mocker.Mock()
     engine._process_rpc_queue = mocker.Mock()
     engine.executor.uses_autonomous_pipeline_stages.return_value = True
-    engine.executor.pipeline_updates_pending.return_value = True
+    update_pending = [True]
+    engine.executor.pipeline_updates_pending.side_effect = lambda: update_pending[0]
     order: list[str] = []
-    engine.executor.progress_pipeline.side_effect = lambda: order.append("progress")
+
+    def progress_pipeline():
+        order.append("progress")
+        update_pending[0] = False
+
+    engine.executor.progress_pipeline.side_effect = progress_pipeline
     engine.executor.poll_pipeline_events.return_value = []
 
     def run_iteration(output, *, submit_only=False, pipeline_events=None):
@@ -426,6 +432,7 @@ def test_admission_progress_wait_wakes_for_worker_update(mocker) -> None:
     engine.executor.uses_autonomous_pipeline_stages.return_value = True
     update_ready = threading.Event()
     engine.executor.pipeline_updates_pending.side_effect = update_ready.is_set
+    engine.executor.progress_pipeline.side_effect = update_ready.clear
     wait_started = threading.Event()
     wait_for = engine._cv.wait_for
 
@@ -448,6 +455,30 @@ def test_admission_progress_wait_wakes_for_worker_update(mocker) -> None:
 
     assert not publisher.is_alive()
     engine.executor.progress_pipeline.assert_called_once_with()
+
+
+def test_admission_progress_drains_fast_followup_worker_update(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine._cv = threading.Condition()
+    engine.stop_event = threading.Event()
+    engine._rpc_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    engine.executor.uses_autonomous_pipeline_stages.return_value = True
+    update_pending = [True]
+    engine.executor.pipeline_updates_pending.side_effect = lambda: update_pending[0]
+    progress_calls = 0
+
+    def progress_pipeline():
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls == 2:
+            update_pending[0] = False
+
+    engine.executor.progress_pipeline.side_effect = progress_pipeline
+
+    engine._progress_autonomous_updates_between_admissions()
+
+    assert progress_calls == 2
 
 
 def test_busy_loop_progresses_cached_retained_batch_after_deferred_new_tail(mocker) -> None:

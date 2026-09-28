@@ -82,6 +82,7 @@ _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
 _QUEUED_FINALIZATION_POLL_INTERVAL_S = 0.005
 _QUEUED_ADMISSION_PROGRESS_WAIT_S = 0.05
+_QUEUED_ADMISSION_PROGRESS_DRAIN_S = 0.012
 
 
 def _async_output_timeout() -> float:
@@ -676,7 +677,9 @@ class DiffusionEngine:
         def has_pending_updates() -> bool:
             return updates_pending() is True
 
-        if not has_pending_updates():
+        def wait_for_update(timeout: float) -> bool:
+            if has_pending_updates():
+                return True
 
             def should_wake() -> bool:
                 stop_event = getattr(self, "stop_event", None)
@@ -690,9 +693,18 @@ class DiffusionEngine:
                 )
 
             with self._cv:
-                self._cv.wait_for(should_wake, timeout=_QUEUED_ADMISSION_PROGRESS_WAIT_S)
+                self._cv.wait_for(should_wake, timeout=timeout)
+            return has_pending_updates()
 
-        if has_pending_updates():
+        if not wait_for_update(_QUEUED_ADMISSION_PROGRESS_WAIT_S):
+            return
+
+        self.executor.progress_pipeline()
+        drain_deadline = time.monotonic() + _QUEUED_ADMISSION_PROGRESS_DRAIN_S
+        while time.monotonic() < drain_deadline:
+            remaining = drain_deadline - time.monotonic()
+            if not wait_for_update(remaining):
+                break
             self.executor.progress_pipeline()
 
     def _has_queued_pipeline_work(self) -> bool:
