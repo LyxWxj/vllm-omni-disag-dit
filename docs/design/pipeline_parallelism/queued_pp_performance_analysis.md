@@ -1027,3 +1027,22 @@ canhazgpu run --gpus 2 -- \
 | `4d87f547` | 5641 | 0.709 | 4630 | 4287 | `pp-31-30` |
 
 batch ID 的末尾字段来自 scheduler step ID，说明空 Scheduler 快照显著减少；但 rank-0 Worker event 文件反而从 3169 条增加到 3434 条，transport progress RPC 仍频繁发生。本次没有测到端到端性能改善，单次样本间的 279 ms 差异也不足以证明稳定回退。该改动主要清理 Engine 的重复调度开销；下一项真正影响流水线空泡的工作仍是按 rank 独立推进 progress、降低空 transport polling，并限制最终 decode 与其他 device work 的资源竞争。新结果和 Worker events 已下载到本地 `artifacts/wan22-queued-scheduler-skip-4d87f547/`。
+
+## 16. 2026-09-28：独立 rank progress 通道实验及撤回
+
+提交 `4975e968f` 至 `cf8279f62` 曾为每个 PP Worker 增加独立 command/result MessageQueue，使 Executor 可分别收取两个 rank 的 progress。两次 readiness 修复后，PP=2、4 请求、512x512x16、8 steps、seed 42-45 均完成，四个 decoded SHA-256 与第 13 节完全一致；但非 profiler 单次结果相对第 15 节固定 workload 明显退化：
+
+| 实现 | Makespan (ms) | 吞吐 (req/s) | Mean latency (ms) | 最终 `post_decode()` |
+| --- | ---: | ---: | ---: | --- |
+| 保留基线 `4d87f547` | 5641 | 0.709 | 4630 | 未单独计时 |
+| 独立通道 `cf8279f62` | 52857 | 0.076 | 39374 | 未单独计时 |
+| 加轻量时间戳 `0f99e1db4` | 63157 | 0.063 | 44513 | 22786、12416、12251、12537 ms |
+| 阻塞双 reader `c1457e7b6` | 124959 | 0.032 | 120524 | 400、379、378、379 ms |
+
+`0f99e1db4` 的 finalization 日志把长尾定位在 `post_decode()` 调用内，媒体准备均小于 1 ms，最终回复打包约 43-56 ms。新通道以 1 ms 超时交替读取两条本地 MessageQueue；其默认读取后 1 秒 spin 窗口可能持续占用 Worker 的 CPU/GIL，与后台 VAE decode 线程竞争。此判断受到阻塞双 reader 实验中 decode 降至约 0.4 s 的支持，但两次实现同时改变了消息调度，不能把差异全部归因于 spin。
+
+阻塞双 reader 使用完整消息读取，消除了短超时可能丢失 overflow payload 标记的风险，但总时长进一步恶化。该运行中 rank 0、rank 1 的 Worker event 文件分别只有 567、12387 行；rank 0 progress 严重落后，说明有界合并队列/广播优先级没有形成公平且及时的两阶段推进。四个输出仍逐请求一致，但正确性不等于可接受的流水线性能。
+
+这两种独立通道实现均已撤回，保留 finalization 的轻量时间戳与异步测试的确定性等待；**撤回后的版本尚未重新进行 GPU 性能测量**。非 profiler manifest、Worker events 和完整日志位于 `artifacts/wan22-queued-async-cf8279f6/`、`artifacts/wan22-queued-finalize-timing-0f99e1db/`、`artifacts/wan22-queued-finalize-timing-0f99e1db.log`、`artifacts/wan22-queued-blocking-readers-c1457e7b/` 和对应 `.log`。以上均为单次实验，不能用来声明稳定的性能倍率。
+
+下一版不应继续在 `WorkerProc` 的两个 SHM MessageQueue 上做短超时轮询，也不应仅靠优先队列合并两个持续活跃的 command stream。需要在控制面先明确每个 rank 的待处理 progress 数量、backpressure、公平性及 finalization 资源边界，再以可观测的 StageEngine 事件驱动推进；验收同时检查每个 rank 的 progress/event 数、最终 decode 耗时、输出哈希和端到端吞吐。
