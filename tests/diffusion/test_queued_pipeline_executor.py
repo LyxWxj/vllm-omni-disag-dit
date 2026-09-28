@@ -644,7 +644,7 @@ def test_progress_retires_endpoints_before_granting_reverse_rank_offer(executor)
     assert executor.collective_rpc.call_args_list[2].args == ("start_pipeline_transfer",)
 
 
-def test_progress_retries_ready_offer_after_active_edge_completes(executor) -> None:
+def test_executor_starts_ready_feedback_while_activation_payload_is_in_flight(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
     executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
     activation = PipelineTransferOffer(
@@ -657,7 +657,9 @@ def test_progress_retries_ready_offer_after_active_edge_completes(executor) -> N
         dst_rank=1,
     )
     executor.collective_rpc.return_value = [True]
-    executor.coordinate_pipeline_transfer(activation)
+    activation_grants = executor.coordinate_pipeline_transfer(activation)
+    assert len(activation_grants) == 1
+
     feedback = PipelineTransferOffer(
         batch_id="batch-a",
         step_index=0,
@@ -667,37 +669,44 @@ def test_progress_retries_ready_offer_after_active_edge_completes(executor) -> N
         src_rank=1,
         dst_rank=0,
     )
-    coordinator = executor._pipeline_transfer_coordinator
-    coordinator.offer(feedback)
-    coordinator.mark_receive_ready(feedback.identity)
-    assert coordinator.grant_ready() == []
     executor.collective_rpc.reset_mock()
-    executor.collective_rpc.side_effect = [
-        [
-            (
-                PipelineTransportProgress(
-                    rank=0,
-                    completions=[PipelineEndpointCompletion(activation.identity, 0)],
-                ),
-                [],
-            ),
-            (
-                PipelineTransportProgress(
-                    rank=1,
-                    completions=[PipelineEndpointCompletion(activation.identity, 1)],
-                ),
-                [],
-            ),
-        ],
-        [True],
+    executor.collective_rpc.return_value = [True]
+
+    feedback_grants = executor.coordinate_pipeline_transfer(feedback)
+
+    assert len(feedback_grants) == 1
+    assert feedback_grants[0].offer is feedback
+    assert activation_grants[0].completed_ranks == set()
+    assert executor._pipeline_transfer_coordinator.snapshot()["grants"] == 2
+    assert executor._pipeline_transfer_coordinator.snapshot()["starting_ranks"] == ()
+    assert [call.args[0] for call in executor.collective_rpc.call_args_list] == [
+        "accept_pipeline_transfer_offer_all_ranks",
+        "start_pipeline_transfer",
     ]
 
-    progress = executor.progress_pipeline()
 
-    assert progress.completed == [activation.identity]
-    assert len(progress.grants) == 1
-    assert progress.grants[0].offer is feedback
-    assert executor.collective_rpc.call_args_list[1].args == ("start_pipeline_transfer",)
+def test_partial_transfer_start_failure_keeps_launch_lock(executor) -> None:
+    executor.collective_rpc.return_value = _topology_reports()
+    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
+    executor.collective_rpc.reset_mock()
+    executor.collective_rpc.side_effect = [[True], RuntimeError("rank 1 failed to start transfer")]
+    offer = PipelineTransferOffer(
+        batch_id="batch-a",
+        step_index=0,
+        epoch=1,
+        branch="conditional",
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+
+    with pytest.raises(RuntimeError, match="rank 1 failed to start transfer"):
+        executor.coordinate_pipeline_transfer(offer)
+
+    snapshot = executor._pipeline_transfer_coordinator.snapshot()
+    assert snapshot["grants"] == 1
+    assert snapshot["starting_ranks"] == (0, 1)
+    assert executor._is_failed
 
 
 def test_progress_invalid_completion_fails_executor_closed(executor) -> None:

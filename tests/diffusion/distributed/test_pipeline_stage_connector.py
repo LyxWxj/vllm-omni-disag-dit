@@ -57,7 +57,7 @@ def test_transfer_requires_offer_and_receive_readiness() -> None:
         "ready": 0,
         "grants": 1,
         "completed": 0,
-        "busy_ranks": (0, 1),
+        "starting_ranks": (0, 1),
     }
 
 
@@ -136,7 +136,7 @@ def test_disjoint_endpoints_can_receive_multiple_grants() -> None:
     assert [grant.offer for grant in coordinator.grant_ready(limit=2)] == [first, second]
 
 
-def test_shared_endpoint_remains_busy_until_both_sides_complete() -> None:
+def test_shared_endpoints_can_launch_opposite_edges_before_completion() -> None:
     coordinator = _coordinator()
     first = _offer("batch-a", src_rank=0, dst_rank=1)
     second = _offer(
@@ -149,13 +149,22 @@ def test_shared_endpoint_remains_busy_until_both_sides_complete() -> None:
         coordinator.offer(offer)
         coordinator.mark_receive_ready(offer.identity)
 
-    granted = coordinator.grant_ready()[0].offer
-    blocked = second if granted is first else first
+    first_grant = coordinator.grant_ready()[0]
     assert coordinator.grant_ready() == []
-    assert not coordinator.complete(granted.identity, granted.src_rank)
+    coordinator.mark_started(first_grant.offer.identity)
+
+    second_grant = coordinator.grant_ready()[0]
+    assert second_grant.offer is not first_grant.offer
+    coordinator.mark_started(second_grant.offer.identity)
+    assert coordinator.snapshot()["grants"] == 2
+    assert coordinator.snapshot()["starting_ranks"] == ()
+
+    assert not coordinator.complete(first_grant.offer.identity, first_grant.offer.src_rank)
     assert coordinator.grant_ready() == []
-    assert coordinator.complete(granted.identity, granted.dst_rank)
-    assert coordinator.grant_ready()[0].offer is blocked
+    assert coordinator.complete(first_grant.offer.identity, first_grant.offer.dst_rank)
+    assert coordinator.snapshot()["grants"] == 1
+    assert not coordinator.complete(second_grant.offer.identity, second_grant.offer.dst_rank)
+    assert coordinator.complete(second_grant.offer.identity, second_grant.offer.src_rank)
 
 
 def test_transfer_rejects_reversed_activation_direction() -> None:
@@ -181,7 +190,10 @@ def test_transfer_identity_rejects_replay_and_duplicate_completion() -> None:
     with pytest.raises(ValueError, match="duplicate.*offer"):
         coordinator.offer(_offer("batch-a"))
     coordinator.mark_receive_ready(offer.identity)
-    coordinator.grant_ready()
+    grant = coordinator.grant_ready()[0]
+    with pytest.raises(RuntimeError, match="before both endpoints started"):
+        coordinator.complete(offer.identity, 0)
+    coordinator.mark_started(grant.offer.identity)
     assert not coordinator.complete(offer.identity, 0)
     with pytest.raises(ValueError, match="duplicate.*completion"):
         coordinator.complete(offer.identity, 0)

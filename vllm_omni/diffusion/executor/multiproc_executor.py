@@ -1145,23 +1145,26 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
-        grants = coordinator.grant_ready()
-        for grant in grants:
-            if self._uses_rank_local_pp_rpc():
-                reports = self._queued_rank_local_rpc(
-                    "start_pipeline_transfer", args=(grant,), timeout=PIPELINE_GRANT_START_TIMEOUT_S
-                )
-                if len(reports) != 2 or any(report is not True for report in reports):
-                    error = RuntimeError("Pipeline grant start did not succeed on both endpoints.")
-                    self._fail_queued_control("pipeline grant start", error)
-                    raise error
-            else:
-                self._queued_control_rpc(
-                    "start_pipeline_transfer",
-                    args=(grant,),
-                    timeout=PIPELINE_GRANT_START_TIMEOUT_S,
-                )
-        return grants
+        started: list[Any] = []
+        while grants := coordinator.grant_ready():
+            for grant in grants:
+                if self._uses_rank_local_pp_rpc():
+                    reports = self._queued_rank_local_rpc(
+                        "start_pipeline_transfer", args=(grant,), timeout=PIPELINE_GRANT_START_TIMEOUT_S
+                    )
+                    if len(reports) != 2 or any(report is not True for report in reports):
+                        error = RuntimeError("Pipeline grant start did not succeed on both endpoints.")
+                        self._fail_queued_control("pipeline grant start", error)
+                        raise error
+                else:
+                    self._queued_control_rpc(
+                        "start_pipeline_transfer",
+                        args=(grant,),
+                        timeout=PIPELINE_GRANT_START_TIMEOUT_S,
+                    )
+                coordinator.mark_started(grant.offer.identity)
+                started.append(grant)
+        return started
 
     def progress_pipeline(self) -> PipelineCoordinatorProgress:
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
