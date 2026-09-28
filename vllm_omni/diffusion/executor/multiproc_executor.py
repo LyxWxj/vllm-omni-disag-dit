@@ -1214,7 +1214,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             coordinator.mark_receive_ready(offer.identity)
                             self._pipeline_pending_readiness.pop(offer.identity, None)
                 if self._uses_async_pipeline_rpc():
-                    self._start_async_pipeline_progress(pending_offers)
+                    self._start_async_pipeline_progress(tuple(coordinator.pending_readiness_offers()))
                 progress.grants.extend(self._start_ready_pipeline_transfers())
             else:
                 progress.grants.extend(self._retry_pipeline_transfer_readiness())
