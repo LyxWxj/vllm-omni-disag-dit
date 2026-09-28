@@ -9,6 +9,7 @@ to DiffusionModelRunner.
 """
 
 import gc
+import itertools
 import multiprocessing as mp
 import os
 import queue
@@ -1937,6 +1938,14 @@ class WorkerProc:
         # Initialize MessageQueue reader from handle
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
         self.pipeline_command_mq = MessageQueue.create_from_handle(pipeline_command_handle, 0)
+        if od_config.mode == "queued":
+            # Queued progress polls both readers frequently. The default
+            # one-second SHM spin window would starve background VAE decode.
+            self.mq._spin_condition.busy_loop_s = 0
+            self.pipeline_command_mq._spin_condition.busy_loop_s = 0
+        self._control_messages: queue.PriorityQueue[tuple[int, int, Any]] = queue.PriorityQueue(maxsize=2)
+        self._control_message_sequence = itertools.count()
+        self._control_reader_threads: list[threading.Thread] = []
 
         self.result_mq = None
         self.result_mq_handle = None
@@ -2137,6 +2146,8 @@ class WorkerProc:
             if self.pipeline_command_mq is not None:
                 self.pipeline_command_mq.shutdown()
                 self.pipeline_command_mq = None
+            for reader_thread in getattr(self, "_control_reader_threads", ()):
+                reader_thread.join(timeout=1)
 
             # The worker creates this queue's shared-memory ring buffer.
             # Dropping the final creator reference invokes
@@ -2296,21 +2307,56 @@ class WorkerProc:
 
     def recv_message(self, *, pipeline: bool = False) -> Any:
         """Receive one complete broadcast message without dropping overflow data."""
-        if pipeline:
-            return self.pipeline_command_mq.dequeue(timeout=0.001)
-        return self.mq.dequeue(timeout=0.001)
+        reader = self.pipeline_command_mq if pipeline else self.mq
+        return reader.dequeue(indefinite=True)
+
+    def _control_reader_loop(self, *, pipeline: bool) -> None:
+        priority = 1 if pipeline else 0
+        while self._running:
+            try:
+                message = self.recv_message(pipeline=pipeline)
+            except Exception as exc:
+                if self._running:
+                    message = {"type": "control_reader_error", "error": str(exc)}
+                else:
+                    return
+            while self._running:
+                try:
+                    self._control_messages.put((priority, next(self._control_message_sequence), message), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            if isinstance(message, dict) and message.get("type") == "control_reader_error":
+                return
+
+    def _start_control_readers(self) -> None:
+        for pipeline in (False, True):
+            reader_thread = threading.Thread(
+                target=self._control_reader_loop,
+                kwargs={"pipeline": pipeline},
+                daemon=True,
+                name=f"PipelineControlReader-{self.gpu_id}-{int(pipeline)}",
+            )
+            self._control_reader_threads.append(reader_thread)
+            reader_thread.start()
 
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
+        has_pipeline_reader = getattr(self, "pipeline_command_mq", None) is not None
+        if has_pipeline_reader:
+            self._start_control_readers()
 
         while self._running:
             msg = None
             try:
-                try:
+                if has_pipeline_reader:
+                    try:
+                        _, _, msg = self._control_messages.get(timeout=0.1)
+                    except queue.Empty as exc:
+                        raise TimeoutError from exc
+                else:
                     msg = self.recv_message()
-                except (TimeoutError, zmq.error.Again):
-                    msg = self.recv_message(pipeline=True)
             except Exception:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()
@@ -2320,6 +2366,9 @@ class WorkerProc:
                     continue
             if msg is None:
                 continue
+
+            if isinstance(msg, dict) and msg.get("type") == "control_reader_error":
+                raise RuntimeError(f"Worker control message reader failed: {msg['error']}")
 
             if msg is None or len(msg) == 0:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
