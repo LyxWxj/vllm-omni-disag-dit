@@ -438,46 +438,18 @@ def test_busy_loop_progresses_worker_update_between_admissions(mocker) -> None:
     engine.executor.poll_pipeline_events.assert_called_once_with()
 
 
-def test_admission_progress_wait_wakes_for_worker_update(mocker) -> None:
+def test_admission_progress_does_not_wait_for_future_worker_update(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
-    engine._cv = threading.Condition()
-    engine.stop_event = threading.Event()
-    engine._rpc_queue = queue.Queue()
-    engine.abort_queue = queue.Queue()
     engine.executor.uses_autonomous_pipeline_stages.return_value = True
-    update_ready = threading.Event()
-    engine.executor.pipeline_updates_pending.side_effect = update_ready.is_set
-    engine.executor.progress_pipeline.side_effect = update_ready.clear
-    wait_started = threading.Event()
-    wait_for = engine._cv.wait_for
+    engine.executor.pipeline_updates_pending.return_value = False
 
-    def observe_wait(predicate, timeout=None):
-        wait_started.set()
-        return wait_for(predicate, timeout=timeout)
-
-    mocker.patch.object(engine._cv, "wait_for", side_effect=observe_wait)
-
-    def publish_update():
-        assert wait_started.wait(timeout=1)
-        with engine._cv:
-            update_ready.set()
-            engine._cv.notify_all()
-
-    publisher = threading.Thread(target=publish_update)
-    publisher.start()
     engine._progress_autonomous_updates_between_admissions()
-    publisher.join(timeout=1)
 
-    assert not publisher.is_alive()
-    engine.executor.progress_pipeline.assert_called_once_with()
+    engine.executor.progress_pipeline.assert_not_called()
 
 
 def test_admission_progress_drains_fast_followup_worker_update(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
-    engine._cv = threading.Condition()
-    engine.stop_event = threading.Event()
-    engine._rpc_queue = queue.Queue()
-    engine.abort_queue = queue.Queue()
     engine.executor.uses_autonomous_pipeline_stages.return_value = True
     update_pending = [True]
     engine.executor.pipeline_updates_pending.side_effect = lambda: update_pending[0]

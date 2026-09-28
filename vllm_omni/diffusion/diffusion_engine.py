@@ -81,7 +81,6 @@ logger = init_logger(__name__)
 _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
 _QUEUED_FINALIZATION_POLL_INTERVAL_S = 0.005
-_QUEUED_ADMISSION_PROGRESS_WAIT_S = 0.05
 _QUEUED_ADMISSION_PROGRESS_DRAIN_S = 0.012
 
 
@@ -668,43 +667,17 @@ class DiffusionEngine:
         return grouped
 
     def _progress_autonomous_updates_between_admissions(self) -> None:
-        """Give completed Worker turns a control-plane slot between admissions."""
+        """Drain already-published Worker updates without delaying admission."""
         uses_autonomous = getattr(self.executor, "uses_autonomous_pipeline_stages", None)
         updates_pending = getattr(self.executor, "pipeline_updates_pending", None)
         if not callable(uses_autonomous) or uses_autonomous() is not True or not callable(updates_pending):
             return
 
-        def has_pending_updates() -> bool:
-            return updates_pending() is True
-
-        def wait_for_update(timeout: float) -> bool:
-            if has_pending_updates():
-                return True
-
-            def should_wake() -> bool:
-                stop_event = getattr(self, "stop_event", None)
-                rpc_queue = getattr(self, "_rpc_queue", None)
-                abort_queue = getattr(self, "abort_queue", None)
-                return (
-                    has_pending_updates()
-                    or (stop_event is not None and stop_event.is_set())
-                    or (rpc_queue is not None and not rpc_queue.empty())
-                    or (abort_queue is not None and not abort_queue.empty())
-                )
-
-            with self._cv:
-                self._cv.wait_for(should_wake, timeout=timeout)
-            return has_pending_updates()
-
-        if not wait_for_update(_QUEUED_ADMISSION_PROGRESS_WAIT_S):
+        if not updates_pending():
             return
 
-        self.executor.progress_pipeline()
         drain_deadline = time.monotonic() + _QUEUED_ADMISSION_PROGRESS_DRAIN_S
-        while time.monotonic() < drain_deadline:
-            remaining = drain_deadline - time.monotonic()
-            if not wait_for_update(remaining):
-                break
+        while updates_pending() and time.monotonic() < drain_deadline:
             self.executor.progress_pipeline()
 
     def _has_queued_pipeline_work(self) -> bool:
