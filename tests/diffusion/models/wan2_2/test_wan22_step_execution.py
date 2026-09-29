@@ -79,6 +79,9 @@ class _PPGroup:
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         return self._broadcast_fn(tensor, src)
 
+    def broadcast_tensor_dict(self, tensor_dict: dict[str, object] | None, src: int = 0):
+        return self._broadcast_fn(tensor_dict, src)
+
 
 class _UnpickleableWork:
     def __init__(self) -> None:
@@ -264,7 +267,7 @@ def test_prepare_encode_preserves_supplied_latents(monkeypatch) -> None:
 @pytest.mark.parametrize("seed", [7, None], ids=["seeded", "unseeded"])
 def test_prepare_encode_broadcasts_stage_zero_initial_latents(monkeypatch, seed) -> None:
     _patch_scheduler(monkeypatch)
-    source_latents: list[torch.Tensor] = []
+    source_state: list[dict[str, object]] = []
 
     def gather_statuses(statuses, local_status, *, group) -> None:
         del local_status, group
@@ -275,10 +278,13 @@ def test_prepare_encode_broadcasts_stage_zero_initial_latents(monkeypatch, seed)
     monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 2)
     first_pipeline = _pipeline()
 
-    def first_broadcast(tensor: torch.Tensor, src: int) -> torch.Tensor:
+    def first_broadcast(tensor_dict: dict[str, object] | None, src: int):
         assert src == 0
-        source_latents.append(tensor.clone())
-        return tensor
+        assert tensor_dict is not None
+        source_state.append(
+            {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in tensor_dict.items()}
+        )
+        return tensor_dict
 
     monkeypatch.setattr(wan22_module, "get_pp_group", lambda: _PPGroup(True, first_broadcast))
     first = _state(request_id="first", seed=seed)
@@ -286,18 +292,22 @@ def test_prepare_encode_broadcasts_stage_zero_initial_latents(monkeypatch, seed)
 
     last_pipeline = _pipeline()
     last_pipeline.prepare_latents = lambda **_kwargs: pytest.fail("non-first rank must not sample initial latents")
+    last_pipeline.encode_prompt = lambda **_kwargs: pytest.fail("non-first rank must reuse broadcast conditioning")
 
-    def last_broadcast(tensor: torch.Tensor, src: int) -> torch.Tensor:
+    def last_broadcast(tensor_dict: dict[str, object] | None, src: int):
         assert src == 0
-        tensor.copy_(source_latents[0])
-        return tensor
+        assert tensor_dict is None
+        return {
+            key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in source_state[0].items()
+        }
 
     monkeypatch.setattr(wan22_module, "get_pp_group", lambda: _PPGroup(False, last_broadcast))
     last = _state(request_id="last", seed=seed)
     last_pipeline.prepare_encode(last)
 
     torch.testing.assert_close(last.latents, first.latents)
-    assert len(source_latents) == 1
+    torch.testing.assert_close(last.prompt_embeds, first.prompt_embeds)
+    assert len(source_state) == 1
 
 
 @pytest.mark.parametrize("is_first_rank", [True, False], ids=["first-rank", "non-first-rank"])

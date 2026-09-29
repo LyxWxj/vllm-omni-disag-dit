@@ -40,6 +40,9 @@ def executor(request, mocker):
     instance._is_failed = False
     instance._failure_callbacks = []
     instance.shutdown = mocker.Mock()
+    instance._futures_lock = threading.RLock()
+    instance._pipeline_retired_finalization_ids = set()
+    instance._pipeline_finalization_submitted_ids = set()
     return instance
 
 
@@ -96,6 +99,17 @@ def test_authorization_passes_rank_local_stage_ids(executor) -> None:
     executor.collective_rpc.assert_called_once_with(
         "authorize_pipeline_batch",
         args=({0: 0, 1: 1}, "batch-a"),
+    )
+
+
+def test_final_decode_rpc_passes_selected_physical_output_rank(executor) -> None:
+    executor.collective_rpc.return_value = ["batch-a"]
+
+    assert executor.finalize_pipeline_batch({0: 2, 1: 3}, "batch-a", output_rank=3) == "batch-a"
+
+    executor.collective_rpc.assert_called_once_with(
+        "finalize_pipeline_batch",
+        args=({0: 2, 1: 3}, "batch-a", 3),
     )
 
 

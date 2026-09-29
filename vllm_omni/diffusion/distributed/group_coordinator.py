@@ -384,16 +384,20 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
-        src = self.ranks[src]
+        src_rank = self.ranks[src]
 
         rank = self.rank
-        if rank == src:
+        if rank == src_rank:
             metadata_list: list[tuple[Any, Any]] = []
             assert isinstance(tensor_dict, dict), f"Expecting a dictionary, got {type(tensor_dict)}"
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
+            # broadcast_object() takes a rank local to this coordinator.  Do
+            # not pass the physical rank here: PP groups may be mapped to
+            # ranks such as (2, 3), where the physical value is not a valid
+            # local source index.
             self.broadcast_object(metadata_list, src=src)
             async_handles = []
             for tensor in tensor_list:
@@ -402,10 +406,10 @@ class GroupCoordinator:
                     continue
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
-                    handle = torch.distributed.broadcast(tensor, src=src, group=metadata_group, async_op=True)
+                    handle = torch.distributed.broadcast(tensor, src=src_rank, group=metadata_group, async_op=True)
                 else:
                     # use group for GPU tensors
-                    handle = torch.distributed.broadcast(tensor, src=src, group=group, async_op=True)
+                    handle = torch.distributed.broadcast(tensor, src=src_rank, group=group, async_op=True)
                 async_handles.append(handle)
             for async_handle in async_handles:
                 async_handle.wait()
@@ -423,10 +427,10 @@ class GroupCoordinator:
                         continue
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
-                        handle = torch.distributed.broadcast(tensor, src=src, group=metadata_group, async_op=True)
+                        handle = torch.distributed.broadcast(tensor, src=src_rank, group=metadata_group, async_op=True)
                     else:
                         # use group for GPU tensors
-                        handle = torch.distributed.broadcast(tensor, src=src, group=group, async_op=True)
+                        handle = torch.distributed.broadcast(tensor, src=src_rank, group=group, async_op=True)
                     async_handles.append(handle)
                     _update_nested_dict(tensor_dict, key, tensor)
                 else:
@@ -645,6 +649,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        # Keep the same optional shared-memory broadcaster contract as the
+        # base GroupCoordinator.  Pipeline PP uses broadcast_tensor_dict for
+        # request conditioning; its metadata path delegates to
+        # broadcast_object, which must be valid even when SHM is disabled.
+        self.shm_broadcaster = None
         self.cpu_groups = []
         self.device_groups = []
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:

@@ -3,6 +3,7 @@
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -16,13 +17,16 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineTransportProgress,
 )
 from vllm_omni.diffusion.worker import diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerProc
+from vllm_omni.diffusion.worker.pipeline_stage_engine import PipelineStageEngine
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineEvent,
     PipelineEventType,
+    PipelineFinalizationUpdate,
     PipelineStageSpec,
     PipelineTask,
     PipelineTaskStatus,
+    PipelineWorkerUpdate,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -35,6 +39,8 @@ class _Runner:
         self.preparation_error: Exception | None = None
         self.execution_error: Exception | None = None
         self.feedback_adoptions = 0
+        self.distributed_vae_enabled = False
+        self.intermediate_tensors = []
 
     def prepare_pipeline_batch(self, task, spec, states):
         if self.preparation_error is not None:
@@ -50,7 +56,7 @@ class _Runner:
         return context
 
     def execute_pipeline_stage(self, context, spec, intermediate_tensors):
-        del intermediate_tensors
+        self.intermediate_tensors.append(intermediate_tensors)
         if self.execution_error is not None:
             context.status = PipelineTaskStatus.FAILED
             raise self.execution_error
@@ -64,9 +70,18 @@ class _Runner:
         context.status = PipelineTaskStatus.COMPLETED
         return torch.tensor([7.0])
 
-    def finalize_pipeline_batch(self, context, spec):
+    def finalize_pipeline_batch(self, context, spec, output_owner=None):
+        del context
+        if self.distributed_vae_enabled:
+            return "decoded-output" if spec.is_first else None
+        return "decoded-output" if output_owner else None
+
+    def pipeline_has_distributed_vae(self):
+        return self.distributed_vae_enabled
+
+    def validate_pipeline_finalization(self, context, spec):
         del context, spec
-        return "decoded-output"
+        return SimpleNamespace(latents=torch.zeros(1))
 
     def adopt_pipeline_feedback(self, context, spec, latents):
         del spec
@@ -94,6 +109,7 @@ def _worker() -> DiffusionWorker:
     worker = object.__new__(DiffusionWorker)
     worker.rank = 4
     worker.model_runner = _Runner()
+    worker.od_config = SimpleNamespace(parallel_config=SimpleNamespace(vae_patch_parallel_size=1))
     worker._pipeline_stages = {}
     worker._pipeline_finalization_device_events = {}
     worker._pipeline_finalization_published = set()
@@ -221,6 +237,234 @@ def test_final_decode_runs_only_on_output_owner_without_rank_collective(mocker, 
     agreement.assert_not_called()
 
 
+def test_final_decode_runs_on_non_output_stage_for_distributed_vae(mocker) -> None:
+    worker = _worker()
+    worker.rank = 1
+    worker.od_config.parallel_config.vae_patch_parallel_size = 2
+    worker.model_runner.distributed_vae_enabled = True
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(1))
+    worker.model_runner.pipeline_batch_contexts[(1, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    mocker.patch.object(diffusion_worker_module, "get_pp_group", return_value=SimpleNamespace(ranks=[0, 1]))
+
+    def gather(_operation, callback):
+        local_report = callback()
+        return [local_report, {**local_report, "rank": 0, "pp_stage_id": 0}]
+
+    mocker.patch.object(diffusion_worker_module, "_run_and_gather_rank_values", side_effect=gather)
+
+    handle = worker.finalize_pipeline_batch(1, task.batch_id)
+    try:
+        assert handle == task.batch_id
+        assert worker._pipeline_finalization_futures[task.batch_id].result(timeout=1) is None
+    finally:
+        worker._pipeline_finalization_executor.shutdown(wait=True)
+
+
+def test_final_decode_runs_on_selected_non_first_stage(mocker) -> None:
+    worker = _worker()
+    worker.rank = 1
+    task = _task("rank-one-output")
+    worker.enqueue_pipeline_batch(task, _spec(1))
+    worker.model_runner.pipeline_batch_contexts[(1, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    mocker.patch.object(diffusion_worker_module, "get_pp_group", return_value=SimpleNamespace(ranks=[0, 1]))
+    finalize = mocker.spy(worker.model_runner, "finalize_pipeline_batch")
+
+    handle = worker.finalize_pipeline_batch(1, task.batch_id, output_rank=1)
+    try:
+        assert handle == task.batch_id
+        assert worker._pipeline_finalization_futures[task.batch_id].result(timeout=1) == "decoded-output"
+    finally:
+        worker._pipeline_finalization_executor.shutdown(wait=True)
+
+    finalize.assert_called_once()
+    assert finalize.call_args.kwargs["output_owner"] is True
+
+
+def test_distributed_vae_finalization_rejects_rank_mismatch_before_launch(mocker) -> None:
+    worker = _worker()
+    worker.rank = 0
+    worker.model_runner.distributed_vae_enabled = True
+    worker.od_config = SimpleNamespace(parallel_config=SimpleNamespace(vae_patch_parallel_size=2))
+    task = _task()
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    mocker.patch.object(diffusion_worker_module, "get_pp_group", return_value=SimpleNamespace(ranks=[0, 1]))
+
+    def gather(_operation, callback):
+        local_report = callback()
+        return [local_report, {**local_report, "rank": 1, "pp_stage_id": 1, "shape": (2,)}]
+
+    mocker.patch.object(diffusion_worker_module, "_run_and_gather_rank_values", side_effect=gather)
+
+    with pytest.raises(RuntimeError, match="readiness did not match"):
+        worker.finalize_pipeline_batch(0, task.batch_id)
+
+    assert not getattr(worker, "_pipeline_finalization_futures", {})
+
+
+def test_distributed_vae_finalization_accepts_nonzero_physical_ranks(mocker) -> None:
+    worker = _worker()
+    worker.rank = 3
+    worker.od_config.parallel_config.vae_patch_parallel_size = 2
+    worker.model_runner.distributed_vae_enabled = True
+    task = _task("nonzero-pp-ranks")
+    worker.enqueue_pipeline_batch(task, _spec(1))
+    worker.model_runner.pipeline_batch_contexts[(1, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    mocker.patch.object(diffusion_worker_module, "get_pp_group", return_value=SimpleNamespace(ranks=[2, 3]))
+
+    def gather(_operation, callback):
+        local_report = callback()
+        return [local_report, {**local_report, "rank": 2, "pp_stage_id": 0}]
+
+    mocker.patch.object(diffusion_worker_module, "_run_and_gather_rank_values", side_effect=gather)
+
+    handle = worker.finalize_pipeline_batch(1, task.batch_id)
+    try:
+        assert handle == task.batch_id
+        assert worker._pipeline_finalization_futures[task.batch_id].result(timeout=1) is None
+    finally:
+        worker._pipeline_finalization_executor.shutdown(wait=True)
+
+
+def test_non_output_finalization_publishes_completion_metadata(mocker) -> None:
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc._enqueue_result = mocker.Mock()
+    finalization = PipelineFinalizationUpdate(batch_id="batch-a")
+    update = PipelineWorkerUpdate(
+        worker_id=4,
+        progress=PipelineTransportProgress(rank=4),
+        events=(),
+        finalizations=(finalization,),
+    )
+
+    worker_proc._publish_pipeline_update(update)
+
+    worker_proc._enqueue_result.assert_called_once()
+    published = worker_proc._enqueue_result.call_args.args[0]
+    assert isinstance(published, PipelineWorkerUpdate)
+    assert published.finalizations == (finalization,)
+
+
+def test_selected_non_first_finalization_publishes_its_output(mocker) -> None:
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc._enqueue_result = mocker.Mock()
+    worker_proc._queue_pipeline_finalization_output = mocker.Mock()
+    output = object()
+    device_event = object()
+    finalization = PipelineFinalizationUpdate(batch_id="batch-b", output=output, device_event=device_event)
+    update = PipelineWorkerUpdate(
+        worker_id=1,
+        progress=PipelineTransportProgress(rank=1),
+        events=(),
+        finalizations=(finalization,),
+    )
+
+    worker_proc._publish_pipeline_update(update)
+
+    worker_proc._queue_pipeline_finalization_output.assert_called_once_with("batch-b", output, device_event)
+
+
+def test_request_preparation_rpc_does_not_block_stage_engine_progress() -> None:
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    tick_count = 0
+    tick_lock = threading.Lock()
+
+    class _WorkerWrapper:
+        worker = SimpleNamespace(device=None)
+
+        def execute_method(self, method, *args, **kwargs):
+            nonlocal tick_count
+            if method == "pipeline_stage_engine_tick":
+                with tick_lock:
+                    tick_count += 1
+                return None
+            if method == "pipeline_stage_engine_needs_progress":
+                return True
+            if method == "prepare_pipeline_requests_all_ranks":
+                preparation_started.set()
+                assert release_preparation.wait(timeout=2)
+                return [{"rank": 0, "request_ids": ("req-a",)}]
+            raise AssertionError(f"unexpected Worker method: {method}")
+
+    wrapper = _WorkerWrapper()
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc.worker = wrapper
+    worker_proc.gpu_id = 0
+    worker_proc.result_mq = object()
+    worker_proc._pipeline_prepare_executor = ThreadPoolExecutor(max_workers=1)
+    worker_proc._stage_engine = PipelineStageEngine(
+        wrapper,
+        worker_id=0,
+        device=None,
+        publish_update=lambda _update: None,
+    )
+    rpc_results: list[object] = []
+    rpc_errors: list[BaseException] = []
+    rpc_request = {
+        "method": "prepare_pipeline_requests_all_ranks",
+        "args": (),
+        "kwargs": {},
+        "output_rank": 0,
+        "exec_all_ranks": True,
+        "collect_rank_status": False,
+        "reply_all_ranks": False,
+        "wave_id": 1,
+    }
+
+    def invoke_rpc() -> None:
+        try:
+            rpc_results.append(worker_proc._execute_rpc(rpc_request))
+        except BaseException as exc:
+            rpc_errors.append(exc)
+
+    rpc_thread = threading.Thread(target=invoke_rpc)
+    try:
+        worker_proc._stage_engine.notify_progress()
+        rpc_thread.start()
+        assert preparation_started.wait(timeout=1)
+        with tick_lock:
+            ticks_before = tick_count
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with tick_lock:
+                if tick_count > ticks_before:
+                    break
+            time.sleep(0.001)
+        with tick_lock:
+            assert tick_count > ticks_before
+
+        release_preparation.set()
+        rpc_thread.join(timeout=1)
+        assert not rpc_thread.is_alive()
+        assert rpc_errors == []
+        assert rpc_results == [([{"rank": 0, "request_ids": ("req-a",)}], True)]
+    finally:
+        release_preparation.set()
+        rpc_thread.join(timeout=1)
+        worker_proc._pipeline_prepare_executor.shutdown(wait=True)
+        worker_proc._stage_engine.shutdown()
+
+
+def test_release_readiness_waits_for_local_distributed_vae_decode(mocker) -> None:
+    worker = _worker()
+    task = _task()
+    stage = worker._pipeline_stage(_spec(1))
+    stage.enqueue(task)
+    stage.authorize(task.batch_id)
+    stage.start_next()
+    stage.complete_active()
+    finalization = mocker.Mock()
+    finalization.done.return_value = False
+    worker._pipeline_finalization_futures = {task.batch_id: finalization}
+
+    assert not worker.pipeline_batch_release_ready(1, task.batch_id)
+
+    finalization.done.return_value = True
+    assert worker.pipeline_batch_release_ready(1, task.batch_id)
+
+
 def test_final_decode_submission_is_nonblocking_and_pollable() -> None:
     worker = _worker()
     task = _task()
@@ -229,7 +473,7 @@ def test_final_decode_submission_is_nonblocking_and_pollable() -> None:
     started = threading.Event()
     release = threading.Event()
 
-    def delayed_finalize(_context, _spec):
+    def delayed_finalize(_context, _spec, **_kwargs):
         started.set()
         release.wait(timeout=2)
         return "decoded-output"
@@ -270,7 +514,9 @@ def test_final_decode_uses_a_dedicated_cuda_stream(mocker) -> None:
     finalize = mocker.patch.object(
         worker.model_runner,
         "finalize_pipeline_batch",
-        side_effect=lambda *_args: "decoded-output" if inside_stream.is_set() else pytest.fail("stream not active"),
+        side_effect=lambda *_args, **_kwargs: (
+            "decoded-output" if inside_stream.is_set() else pytest.fail("stream not active")
+        ),
     )
     create_stream = mocker.patch.object(diffusion_worker_module.torch.cuda, "Stream", return_value=stream)
     enter_stream = mocker.patch.object(diffusion_worker_module.torch.cuda, "stream", side_effect=stream_context)
@@ -1136,6 +1382,42 @@ def test_worker_holds_receive_lease_until_consumer_event_completes(mocker) -> No
     assert offer.identity not in receiver.pipeline_receive_reservations
 
 
+def test_activation_handoff_clones_transport_payload_before_forward(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    source_tensor = torch.tensor([4.0])
+    group.receive_payload = {"hidden_states": source_tensor}
+    event = mocker.Mock()
+    event.query.return_value = True
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
+        return_value=event,
+    )
+    receiver.initialize_pipeline_transports()
+    task = _task()
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    receiver.authorize_pipeline_batch(1, task.batch_id)
+    offer = PipelineTransferOffer(
+        batch_id=task.batch_id,
+        step_index=task.step_index,
+        epoch=task.epoch,
+        branch=task.branch,
+        edge_kind=PipelineEdgeKind.ACTIVATION,
+        src_rank=0,
+        dst_rank=1,
+    )
+    receiver.accept_pipeline_transfer_offer(offer)
+    receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
+
+    receiver.progress_pipeline_transfers()
+
+    handed_off = receiver.model_runner.intermediate_tensors[0].tensors["hidden_states"]
+    assert torch.equal(handed_off, source_tensor)
+    assert handed_off.data_ptr() != source_tensor.data_ptr()
+
+
 def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> None:
     receiver = _worker()
     receiver.rank = 1
@@ -1343,7 +1625,7 @@ def test_accelerator_consumer_event_failure_retains_receive_ownership(mocker) ->
 
     assert offer.identity in receiver.pipeline_receive_reservations
     assert offer.identity in receiver.pipeline_receive_consumers
-    assert receiver.pipeline_stages[1].terminal_statuses[task.batch_id] is PipelineTaskStatus.COMPLETED
-    later = receiver.progress_pipeline_transfers()
-    assert later.completions == []
+    assert task.batch_id not in receiver.pipeline_stages[1].terminal_statuses
+    assert receiver.model_runner.pipeline_batch_contexts[(1, task.batch_id)].status is PipelineTaskStatus.PENDING
+    assert receiver.pipeline_pending_received[PipelineEdgeKind.ACTIVATION]
     assert offer.identity in receiver.pipeline_receive_reservations

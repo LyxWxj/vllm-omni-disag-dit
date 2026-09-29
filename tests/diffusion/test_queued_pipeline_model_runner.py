@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.pipeline_state import (
@@ -199,6 +201,61 @@ def test_prepare_pipeline_requests_agrees_and_rolls_back_metadata_install_failur
     assert runner.input_batch is None
     assert runner.pipeline.prepare_calls == 0
     assert runner.pipeline.denoise_calls == 0
+
+
+def test_non_output_stage_joins_distributed_vae_finalization(mocker) -> None:
+    runner = _runner()
+    state = _state()
+    runner.pipeline.vae = SimpleNamespace(is_distributed_enabled=lambda: True)
+    runner.pipeline.post_decode = mocker.Mock(return_value=DiffusionOutput())
+    task = _task("distributed-decode")
+    spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
+    context = runner.prepare_pipeline_batch(task, spec, [state])
+    state.step_index = 2
+    context.status = PipelineTaskStatus.COMPLETED
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_model_runner.set_forward_context",
+        return_value=nullcontext(),
+    )
+
+    output = runner.finalize_pipeline_batch(context, spec)
+
+    assert output is None
+    runner.pipeline.post_decode.assert_called_once_with(state, queued_pipeline=True)
+
+
+def test_assigned_non_first_output_stage_can_decode_locally(mocker) -> None:
+    runner = _runner()
+    state = _state()
+    runner.pipeline.vae = SimpleNamespace(is_distributed_enabled=lambda: False)
+    runner.pipeline.post_decode = mocker.Mock(return_value=DiffusionOutput())
+    task = _task("rank-one-output")
+    spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
+    context = runner.prepare_pipeline_batch(task, spec, [state])
+    state.step_index = 2
+    context.status = PipelineTaskStatus.COMPLETED
+    mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_model_runner.set_forward_context",
+        return_value=nullcontext(),
+    )
+    prepare_output = mocker.patch.object(
+        runner, "_prepare_output_for_transport", side_effect=lambda output, _params: output
+    )
+    attach_metadata = mocker.patch.object(runner, "_attach_stepwise_metadata")
+
+    def post_decode(*args, **kwargs):
+        assert runner.pipeline._queued_pipeline_decode_owner is True
+        assert kwargs == {"queued_pipeline": True}
+        return DiffusionOutput()
+
+    runner.pipeline.post_decode.side_effect = post_decode
+    output = runner.finalize_pipeline_batch(context, spec, output_owner=True)
+
+    assert output is not None
+    assert output.get_request_output("req-a").result is not None
+    assert runner.pipeline._queued_pipeline_decode_owner is False
+    prepare_output.assert_called_once()
+    attach_metadata.assert_called_once()
 
 
 def test_prepare_pipeline_requests_agrees_before_encode_on_generator_failure(mocker) -> None:

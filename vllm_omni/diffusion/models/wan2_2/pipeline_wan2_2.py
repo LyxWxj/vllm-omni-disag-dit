@@ -923,27 +923,43 @@ class Wan22Pipeline(
             boundary_ratio = 0.875
         dtype = self._step_model_dtype()
         num_outputs = sampling.num_outputs_per_prompt or 1
-        prompt_embeds, negative_prompt_embeds = self._prepare_prompt_conditioning(
-            prompt=prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt=negative_prompt,
-            negative_prompt_embeds=negative_prompt_embeds,
-            do_classifier_free_guidance=do_true_cfg,
-            num_outputs_per_prompt=num_outputs,
-            num_prompts=1,
-            max_sequence_length=sampling.max_sequence_length or 512,
-            height=height,
-            width=width,
-            guidance_high=guidance_high,
-            boundary_ratio=boundary_ratio,
-            dtype=dtype,
-        )
+        num_prompts = len(prompt) if isinstance(prompt, list) else 1
+        if prompt_embeds is None:
+            latent_batch_size = num_prompts * num_outputs
+        elif prompt_embeds.ndim == 2:
+            latent_batch_size = num_outputs
+        elif prompt_embeds.ndim == 3:
+            latent_batch_size = prompt_embeds.shape[0] * num_outputs
+        else:
+            raise ValueError("Wan prompt_embeds must be a 2D or 3D tensor.")
+
+        conditioning_owner = pp_group is None or pp_group.is_first_rank
+        if conditioning_owner:
+            prompt_embeds, negative_prompt_embeds = self._prepare_prompt_conditioning(
+                prompt=prompt,
+                prompt_embeds=prompt_embeds,
+                negative_prompt=negative_prompt,
+                negative_prompt_embeds=negative_prompt_embeds,
+                do_classifier_free_guidance=do_true_cfg,
+                num_outputs_per_prompt=num_outputs,
+                num_prompts=num_prompts,
+                max_sequence_length=sampling.max_sequence_length or 512,
+                height=height,
+                width=width,
+                guidance_high=guidance_high,
+                boundary_ratio=boundary_ratio,
+                dtype=dtype,
+            )
+            latent_batch_size = prompt_embeds.shape[0]
+        else:
+            prompt_embeds = None
+            negative_prompt_embeds = None
 
         num_steps = 40 if sampling.num_inference_steps is None else sampling.num_inference_steps
         scheduler, timesteps, _, _ = self._prepare_request_scheduler(sampling, num_steps)
 
         latents = self._prepare_step_latents(
-            batch_size=prompt_embeds.shape[0],
+            batch_size=latent_batch_size,
             num_channels_latents=self.transformer_config.in_channels,
             height=height,
             width=width,
@@ -961,12 +977,6 @@ class Wan22Pipeline(
         state.step_index = 0
         state.scheduler = scheduler
         state.do_true_cfg = do_true_cfg
-        state.txt_seq_lens = [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
-        state.negative_txt_seq_lens = (
-            [int(negative_prompt_embeds.shape[1])] * int(negative_prompt_embeds.shape[0])
-            if negative_prompt_embeds is not None
-            else None
-        )
         state.extra.update(
             {
                 "wan_boundary_timestep": boundary_ratio * scheduler.config.num_train_timesteps,
@@ -994,6 +1004,14 @@ class Wan22Pipeline(
         if pp_group is None:
             if local_error is not None:
                 raise local_error
+            if state.prompt_embeds is None or state.latents is None:
+                raise RuntimeError("Wan step preparation completed without conditioning or latents.")
+            state.txt_seq_lens = [int(state.prompt_embeds.shape[1])] * int(state.prompt_embeds.shape[0])
+            state.negative_txt_seq_lens = (
+                [int(state.negative_prompt_embeds.shape[1])] * int(state.negative_prompt_embeds.shape[0])
+                if state.negative_prompt_embeds is not None
+                else None
+            )
             return state
 
         local_status = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
@@ -1011,7 +1029,27 @@ class Wan22Pipeline(
 
         if state.latents is None:
             raise RuntimeError("Wan step preparation completed without latents.")
-        state.latents = pp_group.broadcast(state.latents, src=0)
+        broadcast_state = pp_group.broadcast_tensor_dict(
+            {
+                "prompt_embeds": state.prompt_embeds,
+                "negative_prompt_embeds": state.negative_prompt_embeds,
+                "latents": state.latents,
+            }
+            if pp_group.is_first_rank
+            else None,
+            src=0,
+        )
+        if broadcast_state is None:
+            raise RuntimeError("Wan step preparation broadcast returned no rank-local state.")
+        state.prompt_embeds = broadcast_state["prompt_embeds"]
+        state.negative_prompt_embeds = broadcast_state["negative_prompt_embeds"]
+        state.latents = broadcast_state["latents"]
+        state.txt_seq_lens = [int(state.prompt_embeds.shape[1])] * int(state.prompt_embeds.shape[0])
+        state.negative_txt_seq_lens = (
+            [int(state.negative_prompt_embeds.shape[1])] * int(state.negative_prompt_embeds.shape[0])
+            if state.negative_prompt_embeds is not None
+            else None
+        )
         return state
 
     def denoise_step(

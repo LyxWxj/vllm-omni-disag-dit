@@ -214,6 +214,34 @@ def _install_worker_trace_hooks() -> None:
     progress_transfers._queued_pp_trace_hook = True  # type: ignore[attr-defined]
     DiffusionWorker.progress_pipeline_transfers = progress_transfers
 
+    original_finalize = DiffusionWorker.finalize_pipeline_batch
+
+    @functools.wraps(original_finalize)
+    def trace_finalization_submit(
+        worker: Any,
+        pp_stage_id: Any,
+        batch_id: str,
+        output_rank: int | None = None,
+    ) -> Any:
+        result = original_finalize(worker, pp_stage_id, batch_id, output_rank)
+        _write_worker_event(
+            worker,
+            {
+                "timestamp_ns": time.monotonic_ns(),
+                "kind": "finalization_submit",
+                "physical_rank": worker.rank,
+                "pp_stage_id": worker._select_rank_value(pp_stage_id) if isinstance(pp_stage_id, dict) else pp_stage_id,
+                "batch_id": batch_id,
+                "output_rank": output_rank,
+                "local_owner": worker.rank == output_rank,
+                "handle_created": result is not None,
+            },
+        )
+        return result
+
+    trace_finalization_submit._queued_pp_trace_hook = True  # type: ignore[attr-defined]
+    DiffusionWorker.finalize_pipeline_batch = trace_finalization_submit
+
 
 _install_worker_trace_hooks()
 
@@ -226,6 +254,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=2)
     parser.add_argument("--max-inflight-batches", type=int, default=2)
     parser.add_argument("--edge-buffer-slots", type=int, default=1)
+    parser.add_argument("--vae-patch-parallel-size", type=int, default=1)
     parser.add_argument("--request-count", type=int, default=4)
     parser.add_argument("--arrival-interval-ms", type=float, default=0.0)
     parser.add_argument("--height", type=int, default=256)
@@ -328,6 +357,7 @@ async def _run(args: argparse.Namespace) -> int:
         "mode": args.mode,
         "max_inflight_batches": args.max_inflight_batches,
         "edge_buffer_slots": args.edge_buffer_slots,
+        "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enforce_eager": True,
     }
     if args.profile:
@@ -351,6 +381,7 @@ async def _run(args: argparse.Namespace) -> int:
             "max_num_seqs": args.max_num_seqs,
             "max_inflight_batches": args.max_inflight_batches,
             "edge_buffer_slots": args.edge_buffer_slots,
+            "vae_patch_parallel_size": args.vae_patch_parallel_size,
             "request_count": args.request_count,
             "arrival_interval_ms": args.arrival_interval_ms,
             "dimensions": [args.num_frames, args.height, args.width],

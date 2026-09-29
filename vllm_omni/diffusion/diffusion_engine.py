@@ -254,6 +254,7 @@ class _QueuedPipelineBatch:
     finalizing_request_ids: frozenset[str] = frozenset()
     decoded_output: BatchRunnerOutput | None = None
     finalization_handle: str | None = None
+    finalization_output_rank: int | None = None
     release_acknowledged: bool = False
     cleanup_completed_request_ids: set[str] = field(default_factory=set)
     scheduler_completed_request_ids: set[str] = field(default_factory=set)
@@ -700,14 +701,44 @@ class DiffusionEngine:
         return not has_candidate(owned_request_ids, admission_capacity_available=admission_capacity_available)
 
     def _queued_pipeline_waits_on_finalization(self) -> bool:
-        """Avoid spinning while every retained batch waits on background decode."""
+        """Avoid spinning while every retained batch is completing finalization."""
         batches = tuple(self._queued_pipeline_batches.values())
-        if not batches or not any(getattr(batch, "finalization_handle", None) is not None for batch in batches):
+        if not batches or not any(batch.phase is _QueuedPipelineBatchPhase.FINALIZING for batch in batches):
             return False
         return all(
             batch.phase in {_QueuedPipelineBatchPhase.FINALIZING, _QueuedPipelineBatchPhase.CANCELLING}
             for batch in batches
         )
+
+    def _queued_pipeline_uses_distributed_vae(self) -> bool:
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        return int(getattr(parallel_config, "vae_patch_parallel_size", 1) or 1) > 1
+
+    def _select_queued_pipeline_output_rank(self, batch: _QueuedPipelineBatch) -> int:
+        if self._queued_pipeline_uses_distributed_vae():
+            return batch.stage_physical_ranks[0]
+
+        ranks = [batch.stage_physical_ranks[stage_id] for stage_id in (0, 1)]
+        outstanding = dict.fromkeys(ranks, 0)
+        for candidate in self._queued_pipeline_batches.values():
+            if (
+                candidate is batch
+                or candidate.phase is not _QueuedPipelineBatchPhase.FINALIZING
+                or candidate.finalization_handle is None
+                or candidate.decoded_output is not None
+                or candidate.finalization_output_rank not in outstanding
+            ):
+                continue
+            outstanding[candidate.finalization_output_rank] += 1
+
+        minimum = min(outstanding.values())
+        last_rank = getattr(self, "_queued_pipeline_last_finalization_rank", None)
+        if last_rank in ranks:
+            offset = (ranks.index(last_rank) + 1) % len(ranks)
+            ranks = ranks[offset:] + ranks[:offset]
+        selected = next(rank for rank in ranks if outstanding[rank] == minimum)
+        self._queued_pipeline_last_finalization_rank = selected
+        return selected
 
     def _should_wait_for_queued_pipeline_update(self) -> bool:
         """Wait only when retained work has no scheduler candidate to advance."""
@@ -926,10 +957,13 @@ class DiffusionEngine:
             raise RuntimeError("Queued pipeline batch is not ready for final decode.")
         if batch.decoded_output is not None:
             return batch.decoded_output
-        output_rank = batch.stage_physical_ranks[0]
         try:
             output: BatchRunnerOutput | None
             if batch.finalization_handle is None:
+                if not self.executor.pipeline_batch_release_ready({0: 0, 1: 1}, batch.task.batch_id):
+                    return None
+                output_rank = self._select_queued_pipeline_output_rank(batch)
+                batch.finalization_output_rank = output_rank
                 submitted = self.executor.finalize_pipeline_batch(
                     {0: 0, 1: 1},
                     batch.task.batch_id,
@@ -939,6 +973,10 @@ class DiffusionEngine:
                     batch.finalization_handle = submitted
                 else:
                     output = submitted
+            else:
+                output_rank = batch.finalization_output_rank
+                if output_rank is None:
+                    raise RuntimeError("Queued finalization handle has no output owner rank.")
             if batch.finalization_handle is not None:
                 output = self.executor.poll_pipeline_finalization(batch.finalization_handle, output_rank)
             if output is None:

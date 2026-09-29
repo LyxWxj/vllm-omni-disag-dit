@@ -56,8 +56,47 @@ def test_async_final_decode_keeps_batch_finalizing_until_poll_completes(mocker) 
 
     assert engine._advance_queued_pipeline_batch(batch) is output
     assert engine._queued_pipeline_batches == {}
-    engine.executor.finalize_pipeline_batch.assert_called_once()
+    engine.executor.finalize_pipeline_batch.assert_called_once_with(
+        {0: 0, 1: 1}, batch.task.batch_id, batch.stage_physical_ranks[0]
+    )
     assert engine.executor.poll_pipeline_finalization.call_count == 2
+
+
+def test_distributed_vae_decode_waits_until_step_transfers_retire(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.od_config.parallel_config = SimpleNamespace(vae_patch_parallel_size=2)
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+    batch.finalizing_request_ids = frozenset({"req-a"})
+    engine.executor.pipeline_batch_release_ready.side_effect = [False, True]
+    engine.executor.finalize_pipeline_batch.return_value = "decode-handle"
+    engine.executor.poll_pipeline_finalization.return_value = None
+
+    assert engine._finalize_queued_pipeline_batch(batch) is None
+    assert batch.finalization_handle is None
+    engine.executor.finalize_pipeline_batch.assert_not_called()
+
+    assert engine._finalize_queued_pipeline_batch(batch) is None
+    assert batch.finalization_handle == "decode-handle"
+    engine.executor.finalize_pipeline_batch.assert_called_once_with(
+        {0: 0, 1: 1}, batch.task.batch_id, batch.stage_physical_ranks[0]
+    )
+
+
+def test_local_final_decode_balances_outstanding_requests_across_stages(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    second_output = _scheduler_output("req-b")
+    second_output.step_id = 8
+    second = engine._submit_queued_pipeline_batch(second_output)
+    first.phase = second.phase = _QueuedPipelineBatchPhase.FINALIZING
+
+    assert engine._select_queued_pipeline_output_rank(first) == 0
+    first.finalization_output_rank = 0
+    first.finalization_handle = "decode-a"
+
+    assert engine._select_queued_pipeline_output_rank(second) == 1
 
 
 def test_retirement_requires_two_matching_released_events(mocker) -> None:

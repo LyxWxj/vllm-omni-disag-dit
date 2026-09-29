@@ -128,6 +128,7 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
+_PIPELINE_PREPARATION_METHODS = frozenset({"prepare_pipeline_requests_all_ranks"})
 _PIPELINE_CONSUMER_EVENT_FAILED = object()
 
 
@@ -314,7 +315,7 @@ class DiffusionWorker:
             PipelineEdgeKind.ACTIVATION: deque(),
             PipelineEdgeKind.FEEDBACK: deque(),
         }
-        self._pipeline_finalization_futures: dict[str, Future[BatchRunnerOutput]] = {}
+        self._pipeline_finalization_futures: dict[str, Future[BatchRunnerOutput | None]] = {}
         self._pipeline_finalization_executor: ThreadPoolExecutor | None = None
         self._pipeline_finalization_published: set[str] = set()
         self._pipeline_finalization_device_events: dict[str, Any] = {}
@@ -1031,6 +1032,12 @@ class DiffusionWorker:
             batch_id not in self._pipeline_finalization_published for batch_id in self._pipeline_finalization_futures
         ):
             return True
+        for batch_id, future in self._pipeline_finalization_futures.items():
+            if not future.done():
+                continue
+            event = self._pipeline_finalization_device_events.get(batch_id)
+            if event is not None and callable(getattr(event, "query", None)) and not event.query():
+                return True
         for connector in self.pipeline_connectors.values():
             transport = connector.transport
             if transport is not None and transport.has_outstanding_operations:
@@ -1049,16 +1056,21 @@ class DiffusionWorker:
         for batch_id, future in self._pipeline_finalization_futures.items():
             if batch_id in self._pipeline_finalization_published or not future.done():
                 continue
-            self._pipeline_finalization_published.add(batch_id)
             try:
+                output = future.result()
+                device_event = self._pipeline_finalization_device_events.get(batch_id)
+                if output is None and device_event is not None and not device_event.query():
+                    continue
+                self._pipeline_finalization_published.add(batch_id)
                 updates.append(
                     PipelineFinalizationUpdate(
                         batch_id=batch_id,
-                        output=future.result(),
-                        device_event=self._pipeline_finalization_device_events.get(batch_id),
+                        output=output,
+                        device_event=device_event,
                     )
                 )
             except BaseException as exc:
+                self._pipeline_finalization_published.add(batch_id)
                 updates.append(
                     PipelineFinalizationUpdate(
                         batch_id=batch_id,
@@ -1117,24 +1129,16 @@ class DiffusionWorker:
             return
         reservation = self._find_pipeline_receive_reservation(edge_kind, message)
         if edge_kind is PipelineEdgeKind.ACTIVATION:
-            # Only consume work when its feedback can be retained.
+            # Do not consume or clone an activation unless its feedback
+            # reservation can be created in the same turn.
             feedback_connector = self._require_pipeline_connector(PipelineEdgeKind.FEEDBACK)
             if feedback_connector.send_in_use >= feedback_connector.max_slots:
                 return
-            stage_progress = self.progress_pipeline(
-                1,
-                intermediate_tensors=IntermediateTensors(message.payload),
-            )
-            if stage_progress is None or not isinstance(stage_progress.output, PipelineTransferOffer):
-                raise RuntimeError("runnable pipeline activation made no local stage progress")
-            progress.offers.append(stage_progress.output)
-        else:
-            latents = message.payload.get("latents") if isinstance(message.payload, dict) else None
-            if not isinstance(latents, torch.Tensor):
-                raise RuntimeError("pipeline feedback message has no latent tensor")
-            self.complete_pipeline_feedback(0, message.batch_id, latents)
+        # P2P receive buffers are owned by the transport until this handoff
+        # copy completes.  Copy before invoking model code so the receive
+        # lease can be released while the stage forward remains in flight.
+        handoff_payload = self._clone_pipeline_payload(message.payload)
         consumer_event = current_omni_platform.record_device_event()
-        pending.popleft()
         if consumer_event is None and current_omni_platform.is_available():
             self.pipeline_receive_consumers[reservation] = (
                 edge_kind,
@@ -1142,7 +1146,34 @@ class DiffusionWorker:
                 _PIPELINE_CONSUMER_EVENT_FAILED,
             )
             raise RuntimeError("failed to record pipeline receive consumer completion event")
+        if edge_kind is PipelineEdgeKind.ACTIVATION:
+            stage_progress = self.progress_pipeline(
+                1,
+                intermediate_tensors=IntermediateTensors(handoff_payload),
+            )
+            if stage_progress is None or not isinstance(stage_progress.output, PipelineTransferOffer):
+                raise RuntimeError("runnable pipeline activation made no local stage progress")
+            progress.offers.append(stage_progress.output)
+        else:
+            latents = handoff_payload.get("latents") if isinstance(handoff_payload, dict) else None
+            if not isinstance(latents, torch.Tensor):
+                raise RuntimeError("pipeline feedback message has no latent tensor")
+            self.complete_pipeline_feedback(0, message.batch_id, latents)
+        pending.popleft()
         self.pipeline_receive_consumers[reservation] = (edge_kind, message, consumer_event)
+
+    @staticmethod
+    def _clone_pipeline_payload(payload: Any) -> Any:
+        """Move received tensors out of the transport-owned receive buffer."""
+        if isinstance(payload, torch.Tensor):
+            return payload.clone()
+        if isinstance(payload, dict):
+            return {key: DiffusionWorker._clone_pipeline_payload(value) for key, value in payload.items()}
+        if isinstance(payload, tuple):
+            return tuple(DiffusionWorker._clone_pipeline_payload(value) for value in payload)
+        if isinstance(payload, list):
+            return [DiffusionWorker._clone_pipeline_payload(value) for value in payload]
+        return payload
 
     def _cancelled_pipeline_message_context(
         self,
@@ -1457,7 +1488,7 @@ class DiffusionWorker:
             raise RuntimeError("Cannot release a pipeline batch with retained receive ownership.")
         context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
         stage.retire(batch_id)
-        if stage.spec.is_first and hasattr(self, "_pipeline_finalization_futures"):
+        if hasattr(self, "_pipeline_finalization_futures") and batch_id in self._pipeline_finalization_futures:
             self._pipeline_finalization_futures.pop(batch_id, None)
             self._pipeline_finalization_published.discard(batch_id)
             self._pipeline_finalization_device_events.pop(batch_id, None)
@@ -1470,6 +1501,12 @@ class DiffusionWorker:
         stage = self._require_pipeline_stage(pp_stage_id)
         if batch_id not in stage.terminal_statuses:
             raise RuntimeError(f"Pipeline batch {batch_id!r} is not terminal on stage {pp_stage_id}.")
+        finalization = getattr(self, "_pipeline_finalization_futures", {}).get(batch_id)
+        if finalization is not None and not finalization.done():
+            return False
+        device_event = getattr(self, "_pipeline_finalization_device_events", {}).get(batch_id)
+        if device_event is not None and callable(getattr(device_event, "query", None)) and not device_event.query():
+            return False
         return not any(
             identity[0] == batch_id for identity in (*self.pipeline_send_tickets, *self.pipeline_receive_reservations)
         )
@@ -1492,17 +1529,80 @@ class DiffusionWorker:
         self,
         pp_stage_id: int | dict[int, int],
         batch_id: str,
+        output_rank: int | None = None,
     ) -> str | None:
-        """Submit output-owner decode to the bounded finalization executor."""
+        """Submit local decode on its selected owner or join distributed VAE decode."""
         if isinstance(pp_stage_id, dict):
             pp_stage_id = self._select_rank_value(pp_stage_id)
 
-        stage = self._require_pipeline_stage(pp_stage_id)
-        context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
-        if context is None:
-            raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
-        if not stage.spec.is_first:
-            return None
+        parallel = getattr(self.od_config, "parallel_config", None)
+        distributed_vae_requested = int(getattr(parallel, "vae_patch_parallel_size", 1) or 1) > 1
+        if distributed_vae_requested:
+            local: dict[str, Any] = {}
+            pp_group = get_pp_group()
+            expected_stage_ranks = dict(enumerate(pp_group.ranks))
+            if output_rank is None:
+                output_rank = expected_stage_ranks[0]
+            if output_rank != expected_stage_ranks[0]:
+                raise ValueError("distributed VAE finalization output must stay on the first PP stage")
+
+            def validate_local_decode() -> dict[str, Any]:
+                stage = self._require_pipeline_stage(pp_stage_id)
+                context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
+                if context is None:
+                    raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
+                state = self.model_runner.validate_pipeline_finalization(context, stage.spec)
+                if not self.model_runner.pipeline_has_distributed_vae():
+                    raise RuntimeError("distributed VAE decode was requested but is not enabled locally")
+                local.update(stage=stage, context=context)
+                return {
+                    "rank": self.rank,
+                    "pp_stage_id": stage.spec.pp_stage_id,
+                    "batch_id": batch_id,
+                    "shape": tuple(state.latents.shape),
+                    "dtype": str(state.latents.dtype),
+                }
+
+            reports = _run_and_gather_rank_values(
+                "queued distributed VAE finalization readiness",
+                validate_local_decode,
+            )
+            reports_are_mappings = all(isinstance(report, dict) for report in reports)
+            reported_stage_ranks = (
+                {report.get("pp_stage_id"): report.get("rank") for report in reports} if reports_are_mappings else {}
+            )
+            if (
+                len(reports) != len(expected_stage_ranks)
+                or reported_stage_ranks != expected_stage_ranks
+                or any(report.get("batch_id") != batch_id for report in reports if isinstance(report, dict))
+                or not reports_are_mappings
+                or len({(report.get("shape"), report.get("dtype")) for report in reports if isinstance(report, dict)})
+                != 1
+            ):
+                raise RuntimeError("distributed VAE finalization readiness did not match across PP ranks")
+            stage = local["stage"]
+            context = local["context"]
+            should_finalize = True
+            return_handle = True
+        else:
+            stage = self._require_pipeline_stage(pp_stage_id)
+            context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
+            if context is None:
+                raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
+            self.model_runner.validate_pipeline_finalization(context, stage.spec)
+            if output_rank is None:
+                should_finalize = stage.spec.is_first
+                return_handle = should_finalize
+                output_rank = self.rank if should_finalize else None
+            else:
+                pp_group = get_pp_group()
+                if type(output_rank) is not int or output_rank not in pp_group.ranks:
+                    raise ValueError("queued finalization output rank must belong to the PP group")
+                should_finalize = self.rank == output_rank
+                return_handle = True
+        if not should_finalize:
+            return batch_id if return_handle else None
+
         if not hasattr(self, "_pipeline_finalization_futures"):
             self._pipeline_finalization_futures = {}
         if not hasattr(self, "_pipeline_finalization_executor"):
@@ -1514,7 +1614,7 @@ class DiffusionWorker:
                     thread_name_prefix=f"WanFinalDecode-rank{self.rank}",
                 )
 
-            def finalize() -> BatchRunnerOutput:
+            def finalize() -> BatchRunnerOutput | None:
                 started_at = time.perf_counter()
                 logger.info("Queued pipeline final decode started batch=%s", batch_id)
                 device = getattr(self, "device", None)
@@ -1527,9 +1627,22 @@ class DiffusionWorker:
                     self._pipeline_finalization_stream.wait_stream(torch.cuda.current_stream(device))
                     stream_context = torch.cuda.stream(self._pipeline_finalization_stream)
                 with stream_context:
-                    result = self.model_runner.finalize_pipeline_batch(context, stage.spec)
+                    result = self.model_runner.finalize_pipeline_batch(
+                        context,
+                        stage.spec,
+                        output_owner=self.rank == output_rank,
+                    )
                     device_event = current_omni_platform.record_device_event()
-                if device_event is None and current_omni_platform.is_available():
+                # A missing native event on an accelerator still needs a
+                # synchronous completion barrier before the result is
+                # published.  CPU test workers do not have a device and the
+                # unspecified platform intentionally has no synchronize().
+                if (
+                    device_event is None
+                    and device is not None
+                    and torch.device(device).type != "cpu"
+                    and current_omni_platform.is_available()
+                ):
                     current_omni_platform.synchronize()
                 self._pipeline_finalization_device_events[batch_id] = device_event
                 logger.info(
@@ -1540,7 +1653,7 @@ class DiffusionWorker:
                 return result
 
             self._pipeline_finalization_futures[batch_id] = self._pipeline_finalization_executor.submit(finalize)
-        return batch_id
+        return batch_id if return_handle else None
 
     def poll_pipeline_finalization(self, batch_id: str) -> BatchRunnerOutput | None:
         """Return a completed decode result without blocking the Worker RPC loop."""
@@ -2060,6 +2173,7 @@ class WorkerProc:
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
         self._stage_engine: PipelineStageEngine | None = None
+        self._pipeline_prepare_executor: ThreadPoolExecutor | None = None
         parallel = self.od_config.parallel_config
         if (
             self.od_config.mode == "queued"
@@ -2076,6 +2190,10 @@ class WorkerProc:
                 worker_id=gpu_id,
                 device=worker_device,
                 publish_update=self._publish_pipeline_update,
+            )
+            self._pipeline_prepare_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"DiffusionPipelinePrep-rank{gpu_id}",
             )
         if not self.od_config.step_execution or self._stage_engine is not None:
             self._async_output_queue = queue.Queue()
@@ -2115,6 +2233,10 @@ class WorkerProc:
             self.result_mq.enqueue(msg)
 
     def _publish_pipeline_update(self, update: PipelineWorkerUpdate) -> None:
+        finalization_updates = tuple(
+            PipelineFinalizationUpdate(batch_id=finalization.batch_id, error=finalization.error)
+            for finalization in update.finalizations
+        )
         for finalization in update.finalizations:
             if finalization.error is not None:
                 self._enqueue_result(
@@ -2136,13 +2258,20 @@ class WorkerProc:
             return
         if update.progress is None:
             return
-        if not (update.progress.offers or update.progress.completions or update.events or update.error):
+        if not (
+            update.progress.offers
+            or update.progress.completions
+            or update.events
+            or update.error
+            or finalization_updates
+        ):
             return
         self._enqueue_result(
             PipelineWorkerUpdate(
                 worker_id=update.worker_id,
                 progress=update.progress,
                 events=update.events,
+                finalizations=finalization_updates,
                 error=update.error,
             )
         )
@@ -2270,6 +2399,10 @@ class WorkerProc:
         """Stop background work and release worker-owned IPC resources."""
         self._running = False
 
+        if self._pipeline_prepare_executor is not None:
+            self._pipeline_prepare_executor.shutdown(wait=True, cancel_futures=True)
+            self._pipeline_prepare_executor = None
+
         if self._stage_engine is not None:
             self._stage_engine.shutdown()
             self._stage_engine = None
@@ -2375,7 +2508,20 @@ class WorkerProc:
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
-            if self._stage_engine is not None:
+            pipeline = getattr(getattr(self.worker, "worker", None), "pipeline", None)
+            profiler_enabled = bool(getattr(pipeline, "enable_diffusion_pipeline_profiler", False))
+            if self._stage_engine is not None and method in _PIPELINE_PREPARATION_METHODS and not profiler_enabled:
+                if self._pipeline_prepare_executor is None:
+                    raise RuntimeError("Queued pipeline preparation executor is not initialized")
+
+                def prepare_pipeline_request() -> Any:
+                    device = getattr(getattr(self.worker, "worker", None), "device", None)
+                    if device is not None:
+                        current_omni_platform.set_device(device)
+                    return self.worker.execute_method(method, *args, **kwargs)
+
+                result = self._pipeline_prepare_executor.submit(prepare_pipeline_request).result()
+            elif self._stage_engine is not None:
                 result = self._stage_engine.call(method, *args, **kwargs)
             else:
                 result = self.worker.execute_method(method, *args, **kwargs)

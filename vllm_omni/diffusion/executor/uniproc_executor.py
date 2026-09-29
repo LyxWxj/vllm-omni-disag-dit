@@ -252,7 +252,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         try:
             result = self._queued_control_rpc(
                 "finalize_pipeline_batch",
-                args=(pp_stage_id, batch_id),
+                args=(pp_stage_id, batch_id, output_rank),
             )
             if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], str):
                 raise RuntimeError("Queued final decode submission returned an invalid handle.")

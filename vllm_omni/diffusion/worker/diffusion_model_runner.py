@@ -1288,35 +1288,67 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             raise
         context.status = PipelineTaskStatus.COMPLETED
 
-    def finalize_pipeline_batch(
+    def pipeline_has_distributed_vae(self) -> bool:
+        vae = getattr(self.pipeline, "vae", None)
+        is_distributed_enabled = getattr(vae, "is_distributed_enabled", None)
+        return callable(is_distributed_enabled) and bool(is_distributed_enabled())
+
+    def validate_pipeline_finalization(
         self,
         context: PipelineBatchContext,
         pp_stage_spec: PipelineStageSpec,
-    ) -> BatchRunnerOutput:
-        """Decode a completed request on the first-stage output owner."""
+    ) -> StepRequestState:
         self._require_pipeline_context(context, pp_stage_spec)
-        if not pp_stage_spec.is_first:
-            raise ValueError("Only the first pipeline stage can finalize queued output.")
         if context.status is not PipelineTaskStatus.COMPLETED:
             raise RuntimeError("Pipeline batch must be completed before final decode.")
         state = context.states[0]
         if not state.request_denoise_completed:
             raise RuntimeError("Pipeline request has not completed its denoise schedule.")
+        if state.latents is None:
+            raise RuntimeError("Pipeline final decode has no latents to decode.")
+        return state
+
+    def finalize_pipeline_batch(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+        output_owner: bool | None = None,
+    ) -> BatchRunnerOutput | None:
+        """Decode on the assigned output owner, joining distributed VAE work when enabled."""
+        state = self.validate_pipeline_finalization(context, pp_stage_spec)
+        distributed_vae = self.pipeline_has_distributed_vae()
+        if output_owner is None:
+            output_owner = pp_stage_spec.is_first
+        if type(output_owner) is not bool:
+            raise TypeError("queued pipeline output_owner must be a bool")
+        if not output_owner and not distributed_vae:
+            raise ValueError("Only the assigned output owner can finalize queued output.")
+
+        decode_owner_override = output_owner and not pp_stage_spec.is_first and not distributed_vae
+        previous_decode_owner = getattr(self.pipeline, "_queued_pipeline_decode_owner", False)
         try:
             decode_start = time.perf_counter()
-            with (
-                self._pipeline_inference_context(),
-                set_forward_context(
-                    vllm_config=self.vllm_config,
-                    omni_diffusion_config=self.od_config,
-                    attn_metadata={},
-                    denoise_step_idx=context.task.step_index,
-                ),
-            ):
-                result = self.pipeline.post_decode(state, queued_pipeline=True)
+            if decode_owner_override:
+                self.pipeline._queued_pipeline_decode_owner = True
+            try:
+                with (
+                    self._pipeline_inference_context(),
+                    set_forward_context(
+                        vllm_config=self.vllm_config,
+                        omni_diffusion_config=self.od_config,
+                        attn_metadata={},
+                        denoise_step_idx=context.task.step_index,
+                    ),
+                ):
+                    result = self.pipeline.post_decode(state, queued_pipeline=True)
+            finally:
+                if decode_owner_override:
+                    self.pipeline._queued_pipeline_decode_owner = previous_decode_owner
             decode_ms = (time.perf_counter() - decode_start) * 1000
             if not isinstance(result, DiffusionOutput):
                 raise RuntimeError("Pipeline final decode produced no DiffusionOutput.")
+            if distributed_vae and not pp_stage_spec.is_first:
+                return None
             transport_start = time.perf_counter()
             result = self._prepare_output_for_transport(result, state.sampling)
             transport_ms = (time.perf_counter() - transport_start) * 1000
