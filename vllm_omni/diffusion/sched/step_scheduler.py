@@ -92,6 +92,10 @@ class StepScheduler(BaseScheduler):
             return True
         return admission_capacity_available and bool(self._waiting) and len(self._running) < self.max_num_running_reqs
 
+    def has_queued_waiting_request(self) -> bool:
+        """Report waiting work separately from finished/cached housekeeping."""
+        return bool(self._waiting)
+
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
         if not scheduled_request_ids:

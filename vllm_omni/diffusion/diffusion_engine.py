@@ -743,7 +743,10 @@ class DiffusionEngine:
     def _should_wait_for_queued_pipeline_update(self) -> bool:
         """Wait only when retained work has no scheduler candidate to advance."""
         if not self._has_queued_pipeline_work() or not self._queued_pipeline_can_advance_without_schedule():
-            return False
+            max_inflight = int(getattr(self.od_config, "max_inflight_batches", 1))
+            has_waiting = getattr(self.scheduler, "has_queued_waiting_request", None)
+            if not callable(has_waiting) or len(self._queued_pipeline_batches) < max_inflight or not has_waiting():
+                return False
         if bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)()):
             return False
         return not any(
