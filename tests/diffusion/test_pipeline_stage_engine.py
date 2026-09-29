@@ -48,6 +48,20 @@ def test_stage_engine_waits_for_executor_wake_after_rpc() -> None:
         engine.shutdown()
 
 
+def test_stage_engine_submit_returns_before_command_completion() -> None:
+    worker = _StageWorker()
+    updates: list[PipelineWorkerUpdate] = []
+    engine = PipelineStageEngine(worker, worker_id=0, device=None, publish_update=updates.append)
+    try:
+        engine.submit("rpc", "accepted")
+        deadline = time.monotonic() + 1
+        while engine._commands.qsize() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert not updates
+    finally:
+        engine.shutdown()
+
+
 def test_stage_engine_fails_queued_rpc_after_local_progress_failure() -> None:
     worker = _StageWorker(fail_tick=True)
     updates: list[PipelineWorkerUpdate] = []

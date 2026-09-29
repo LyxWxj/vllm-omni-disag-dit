@@ -2545,6 +2545,9 @@ class WorkerProc:
                     return self.worker.execute_method(method, *args, **kwargs)
 
                 result = preparation_executor.submit(prepare_pipeline_request).result()
+            elif stage_engine is not None and method == "start_pipeline_transfer":
+                stage_engine.submit(method, *args, **kwargs)
+                result = True
             elif stage_engine is not None:
                 result = stage_engine.call(method, *args, **kwargs)
             else:

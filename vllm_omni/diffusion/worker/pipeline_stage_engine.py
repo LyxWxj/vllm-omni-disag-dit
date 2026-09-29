@@ -74,6 +74,38 @@ class PipelineStageEngine:
                 raise RuntimeError("Pipeline StageEngine command queue is full") from exc
         return result.result()
 
+    def submit(self, method: str, *args: Any, **kwargs: Any) -> None:
+        """Queue a command and return once it is owned by the StageEngine."""
+        result: Future[Any] = Future()
+        with self._state_lock:
+            if self._closed.is_set():
+                raise RuntimeError("Pipeline StageEngine is closed")
+            if self._fatal_error is not None:
+                raise RuntimeError("Pipeline StageEngine failed") from self._fatal_error
+            try:
+                self._commands.put_nowait(_StageCommand(method, args, kwargs, result))
+            except queue.Full as exc:
+                raise RuntimeError("Pipeline StageEngine command queue is full") from exc
+
+        def report_failure(completed: Future[Any]) -> None:
+            try:
+                completed.result()
+            except BaseException as exc:
+                try:
+                    self._publish_update(
+                        PipelineWorkerUpdate(
+                            worker_id=self._worker_id,
+                            progress=None,
+                            events=(),
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to publish asynchronous StageEngine command failure")
+
+        result.add_done_callback(report_failure)
+        self.notify_progress()
+
     def shutdown(self, timeout: float = 10.0) -> None:
         with self._state_lock:
             if self._closed.is_set():
