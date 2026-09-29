@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 
 _COMMAND_QUEUE_CAPACITY = 64
 _INITIAL_PROGRESS_INTERVAL_S = 0.001
-_MAX_PROGRESS_INTERVAL_S = 0.008
+# Transport Work completion is polled non-blockingly.  Keep the first poll
+# responsive after a command/update, then back off far enough that a long
+# device transfer does not turn the StageEngine into a host-side spin loop.
+_MAX_PROGRESS_INTERVAL_S = 0.016
 
 
 @dataclass
