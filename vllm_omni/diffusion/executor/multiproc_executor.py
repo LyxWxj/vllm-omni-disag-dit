@@ -34,6 +34,7 @@ from vllm_omni.diffusion.executor.abstract import (
     DiffusionExecutor,
     normalize_pipeline_preparation_reports,
     normalize_pipeline_transfer_readiness,
+    normalize_pipeline_transfer_readiness_batch_reports,
     normalize_pipeline_transfer_readiness_reports,
     normalize_pipeline_transport_snapshot,
     validate_pipeline_topology_reports,
@@ -223,6 +224,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pipeline_update_error: BaseException | None = None
         self._pipeline_update_lock = threading.Lock()
         self._pipeline_update_callback: Callable[[], None] | None = None
+        self._pipeline_progress_lock = threading.Lock()
+        self._collective_rpc_lock = threading.RLock()
         if not self.od_config.step_execution or self._uses_autonomous_pipeline_stages():
             self._start_result_pump()
 
@@ -316,7 +319,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if remaining <= 0:
                     raise TimeoutError(f"RPC call to {method} timed out.")
                 chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
-            if self._pump_running:
+            if getattr(self, "_pump_running", False):
                 if self._uses_autonomous_pipeline_stages():
                     target = result_mq if result_mq is not None else self._result_mq
                     result_buffers = getattr(self, "_sync_result_buffers", {})
@@ -335,7 +338,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     raise RuntimeError("Result queue is closed")
                 try:
                     return queue_to_read.dequeue(timeout=chunk_timeout)
-                except (TimeoutError, zmq.error.Again):
+                except (TimeoutError, queue.Empty, zmq.error.Again):
                     if self._is_failed:
                         raise EngineDeadError()
                     continue
@@ -1119,6 +1122,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 ]
                 if not candidates:
                     break
+                if self._uses_autonomous_pipeline_stages() and self._uses_rank_local_pp_rpc():
+                    candidate_ids = frozenset(offer.identity for offer in candidates)
+                    readiness_reports = self._queued_rank_local_rpc(
+                        "accept_pipeline_transfer_offers_rank_local",
+                        args=(tuple(candidates),),
+                    )
+                    ready_by_identity = normalize_pipeline_transfer_readiness_batch_reports(
+                        readiness_reports,
+                        coordinator.endpoint_ranks,
+                        candidate_ids,
+                    )
+                    for offer in candidates:
+                        attempted.add(offer.identity)
+                        if ready_by_identity[offer.identity]:
+                            coordinator.mark_receive_ready(offer.identity)
+                            self._pipeline_pending_readiness.pop(offer.identity, None)
+                    continue
                 for offer in candidates:
                     attempted.add(offer.identity)
                     if self._uses_rank_local_pp_rpc():
@@ -1145,7 +1165,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
-        grants = coordinator.grant_ready()
+        grant_limit = max(1, len(coordinator.endpoint_ranks) // 2)
+        grants = coordinator.grant_ready(limit=grant_limit)
         for grant in grants:
             if self._uses_rank_local_pp_rpc():
                 reports = self._queued_rank_local_rpc(
@@ -1164,6 +1185,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return grants
 
     def progress_pipeline(self) -> PipelineCoordinatorProgress:
+        progress_lock = getattr(self, "_pipeline_progress_lock", None)
+        if progress_lock is None:
+            progress_lock = threading.Lock()
+            self._pipeline_progress_lock = progress_lock
+        with progress_lock:
+            return self._progress_pipeline_unlocked()
+
+    def _progress_pipeline_unlocked(self) -> PipelineCoordinatorProgress:
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
@@ -1307,6 +1336,31 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
+        reply_all_ranks: bool = False,
+    ) -> Any:
+        rpc_lock = getattr(self, "_collective_rpc_lock", None)
+        if rpc_lock is None:
+            rpc_lock = threading.RLock()
+            self._collective_rpc_lock = rpc_lock
+        with rpc_lock:
+            return self._collective_rpc_unlocked(
+                method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                unique_reply_rank=unique_reply_rank,
+                exec_all_ranks=exec_all_ranks,
+                reply_all_ranks=reply_all_ranks,
+            )
+
+    def _collective_rpc_unlocked(
         self,
         method: str,
         timeout: float | None = None,

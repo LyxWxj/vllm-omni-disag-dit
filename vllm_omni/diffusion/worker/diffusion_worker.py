@@ -906,9 +906,12 @@ class DiffusionWorker:
         else:
             if offer.identity in self.pipeline_receive_reservations:
                 raise ValueError("pipeline receive credit is already reserved for this transfer")
+            if offer.identity in self.pipeline_receive_consumers:
+                raise ValueError("pipeline receive transfer is still owned by its stage consumer")
             reserved = sum(edge_kind is offer.edge_kind for edge_kind in self.pipeline_receive_reservations.values())
-            # Reservations span accepted offer through consumer release, so a
-            # published lease is already represented here.
+            # The reservation covers the transport receive slot only. Once a
+            # message is handed to the stage, its tensor remains tracked by a
+            # separate compute lease and no longer blocks another receive.
             if reserved >= connector.max_slots:
                 return False
             self.pipeline_receive_reservations[offer.identity] = offer.edge_kind
@@ -934,6 +937,19 @@ class DiffusionWorker:
     def accept_pipeline_transfer_offer_rank_local(self, offer: PipelineTransferOffer) -> dict[str, Any]:
         """Report this Worker's readiness without an in-Worker rank collective."""
         return {"rank": self.rank, "ready": self.accept_pipeline_transfer_offer(offer)}
+
+    def accept_pipeline_transfer_offers_rank_local(
+        self,
+        offers: tuple[PipelineTransferOffer, ...] | list[PipelineTransferOffer],
+    ) -> dict[str, Any]:
+        """Report readiness for a batch of offers in one rank-local RPC."""
+        if not isinstance(offers, (tuple, list)):
+            raise TypeError("pipeline transfer offers must be a tuple or list")
+        readiness = [
+            (offer.identity, self.accept_pipeline_transfer_offer(offer))
+            for offer in offers
+        ]
+        return {"rank": self.rank, "readiness": readiness}
 
     def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
         """Start only this Worker's endpoint after the Executor grants it."""
@@ -1134,10 +1150,35 @@ class DiffusionWorker:
             feedback_connector = self._require_pipeline_connector(PipelineEdgeKind.FEEDBACK)
             if feedback_connector.send_in_use >= feedback_connector.max_slots:
                 return
-        # P2P receive buffers are owned by the transport until this handoff
-        # copy completes.  Copy before invoking model code so the receive
-        # lease can be released while the stage forward remains in flight.
-        handoff_payload = self._clone_pipeline_payload(message.payload)
+        # The transport work is already complete when this message is
+        # returned by poll_received(). Release only that ownership now so the
+        # next transfer can use the bounded communication slot. Keep the
+        # message in pipeline_receive_consumers as a separate compute lease;
+        # its tensor remains alive until the stage has consumed it.
+        self.release_pipeline_received(edge_kind, message)
+        progress.completions.append(PipelineEndpointCompletion(identity=reservation, rank=self.rank))
+        try:
+            if edge_kind is PipelineEdgeKind.ACTIVATION:
+                stage_progress = self.progress_pipeline(
+                    1,
+                    intermediate_tensors=IntermediateTensors(message.payload),
+                )
+                if stage_progress is None or not isinstance(stage_progress.output, PipelineTransferOffer):
+                    raise RuntimeError("runnable pipeline activation made no local stage progress")
+                progress.offers.append(stage_progress.output)
+            else:
+                latents = message.payload.get("latents") if isinstance(message.payload, dict) else None
+                if not isinstance(latents, torch.Tensor):
+                    raise RuntimeError("pipeline feedback message has no latent tensor")
+                self.complete_pipeline_feedback(0, message.batch_id, latents)
+        except BaseException:
+            self.pipeline_receive_consumers[reservation] = (
+                edge_kind,
+                message,
+                _PIPELINE_CONSUMER_EVENT_FAILED,
+            )
+            raise
+        pending.popleft()
         consumer_event = current_omni_platform.record_device_event()
         if consumer_event is None and current_omni_platform.is_available():
             self.pipeline_receive_consumers[reservation] = (
@@ -1146,34 +1187,7 @@ class DiffusionWorker:
                 _PIPELINE_CONSUMER_EVENT_FAILED,
             )
             raise RuntimeError("failed to record pipeline receive consumer completion event")
-        if edge_kind is PipelineEdgeKind.ACTIVATION:
-            stage_progress = self.progress_pipeline(
-                1,
-                intermediate_tensors=IntermediateTensors(handoff_payload),
-            )
-            if stage_progress is None or not isinstance(stage_progress.output, PipelineTransferOffer):
-                raise RuntimeError("runnable pipeline activation made no local stage progress")
-            progress.offers.append(stage_progress.output)
-        else:
-            latents = handoff_payload.get("latents") if isinstance(handoff_payload, dict) else None
-            if not isinstance(latents, torch.Tensor):
-                raise RuntimeError("pipeline feedback message has no latent tensor")
-            self.complete_pipeline_feedback(0, message.batch_id, latents)
-        pending.popleft()
         self.pipeline_receive_consumers[reservation] = (edge_kind, message, consumer_event)
-
-    @staticmethod
-    def _clone_pipeline_payload(payload: Any) -> Any:
-        """Move received tensors out of the transport-owned receive buffer."""
-        if isinstance(payload, torch.Tensor):
-            return payload.clone()
-        if isinstance(payload, dict):
-            return {key: DiffusionWorker._clone_pipeline_payload(value) for key, value in payload.items()}
-        if isinstance(payload, tuple):
-            return tuple(DiffusionWorker._clone_pipeline_payload(value) for value in payload)
-        if isinstance(payload, list):
-            return [DiffusionWorker._clone_pipeline_payload(value) for value in payload]
-        return payload
 
     def _cancelled_pipeline_message_context(
         self,
@@ -1225,9 +1239,7 @@ class DiffusionWorker:
                 continue
             if event is not None and not event.query():
                 continue
-            self.release_pipeline_received(edge_kind, message)
             self.pipeline_receive_consumers.pop(identity)
-            progress.completions.append(PipelineEndpointCompletion(identity=identity, rank=self.rank))
 
     def _find_pipeline_receive_reservation(
         self,
@@ -1486,6 +1498,9 @@ class DiffusionWorker:
         retained_receives = [identity for identity in self.pipeline_receive_reservations if identity[0] == batch_id]
         if retained_receives:
             raise RuntimeError("Cannot release a pipeline batch with retained receive ownership.")
+        retained_consumers = [identity for identity in self.pipeline_receive_consumers if identity[0] == batch_id]
+        if retained_consumers:
+            raise RuntimeError("Cannot release a pipeline batch with active receive consumers.")
         context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
         stage.retire(batch_id)
         if hasattr(self, "_pipeline_finalization_futures") and batch_id in self._pipeline_finalization_futures:
@@ -1508,7 +1523,12 @@ class DiffusionWorker:
         if device_event is not None and callable(getattr(device_event, "query", None)) and not device_event.query():
             return False
         return not any(
-            identity[0] == batch_id for identity in (*self.pipeline_send_tickets, *self.pipeline_receive_reservations)
+            identity[0] == batch_id
+            for identity in (
+                *self.pipeline_send_tickets,
+                *self.pipeline_receive_reservations,
+                *self.pipeline_receive_consumers,
+            )
         )
 
     def pipeline_batch_release_ready_all_ranks(
@@ -1787,6 +1807,8 @@ class DiffusionWorker:
             raise RuntimeError("cannot drain pipeline with retained send tickets")
         if self.pipeline_receive_reservations:
             raise RuntimeError("cannot drain pipeline with reserved receive credit")
+        if self.pipeline_receive_consumers:
+            raise RuntimeError("cannot drain pipeline with active receive consumers")
         busy_connectors = {
             edge_kind.value: health
             for edge_kind, connector in self.pipeline_connectors.items()
@@ -2510,8 +2532,10 @@ class WorkerProc:
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             pipeline = getattr(getattr(self.worker, "worker", None), "pipeline", None)
             profiler_enabled = bool(getattr(pipeline, "enable_diffusion_pipeline_profiler", False))
-            if self._stage_engine is not None and method in _PIPELINE_PREPARATION_METHODS and not profiler_enabled:
-                if self._pipeline_prepare_executor is None:
+            stage_engine = getattr(self, "_stage_engine", None)
+            preparation_executor = getattr(self, "_pipeline_prepare_executor", None)
+            if stage_engine is not None and method in _PIPELINE_PREPARATION_METHODS and not profiler_enabled:
+                if preparation_executor is None:
                     raise RuntimeError("Queued pipeline preparation executor is not initialized")
 
                 def prepare_pipeline_request() -> Any:
@@ -2520,9 +2544,9 @@ class WorkerProc:
                         current_omni_platform.set_device(device)
                     return self.worker.execute_method(method, *args, **kwargs)
 
-                result = self._pipeline_prepare_executor.submit(prepare_pipeline_request).result()
-            elif self._stage_engine is not None:
-                result = self._stage_engine.call(method, *args, **kwargs)
+                result = preparation_executor.submit(prepare_pipeline_request).result()
+            elif stage_engine is not None:
+                result = stage_engine.call(method, *args, **kwargs)
             else:
                 result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:

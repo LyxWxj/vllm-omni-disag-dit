@@ -86,6 +86,43 @@ def normalize_pipeline_transfer_readiness(result: Any) -> bool:
     return result
 
 
+def normalize_pipeline_transfer_readiness_batch_reports(
+    result: Any,
+    expected_ranks: frozenset[int],
+    expected_identities: frozenset[tuple[Any, ...]],
+) -> dict[tuple[Any, ...], bool]:
+    """Validate one rank-local readiness report covering several offers."""
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+    ranks = [item.get("rank") for item in result]
+    if len(ranks) != len(expected_ranks) or set(ranks) != expected_ranks:
+        raise RuntimeError("batched pipeline transfer readiness does not cover every configured endpoint")
+
+    reports: list[dict[tuple[Any, ...], bool]] = []
+    for item in result:
+        entries = item.get("readiness")
+        if not isinstance(entries, (list, tuple)):
+            raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+        local: dict[tuple[Any, ...], bool] = {}
+        for entry in entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+            identity, ready = entry
+            if not isinstance(identity, tuple) or identity in local or type(ready) is not bool:
+                raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+            local[identity] = ready
+        if set(local) != expected_identities or len(local) != len(expected_identities):
+            raise RuntimeError("batched pipeline transfer readiness does not cover every pending offer")
+        reports.append(local)
+
+    return {
+        identity: all(report[identity] for report in reports)
+        for identity in expected_identities
+    }
+
+
 def normalize_pipeline_preparation_reports(
     result: Any,
     expected_ranks: frozenset[int],
