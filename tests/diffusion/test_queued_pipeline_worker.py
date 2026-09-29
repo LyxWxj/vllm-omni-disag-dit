@@ -375,6 +375,23 @@ def test_non_output_finalization_publishes_completion_metadata(mocker) -> None:
     assert published.finalizations == (finalization,)
 
 
+def test_worker_proc_publishes_readiness_only_updates(mocker) -> None:
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc._enqueue_result = mocker.Mock()
+    identity = ("batch-a", 0, 2, "conditional", PipelineEdgeKind.ACTIVATION, 0, 1)
+    update = PipelineWorkerUpdate(
+        worker_id=1,
+        progress=PipelineTransportProgress(rank=1, readiness=[(identity, True)]),
+        events=(),
+    )
+
+    worker_proc._publish_pipeline_update(update)
+
+    worker_proc._enqueue_result.assert_called_once()
+    published = worker_proc._enqueue_result.call_args.args[0]
+    assert published.progress.readiness == [(identity, True)]
+
+
 def test_selected_non_first_finalization_publishes_its_output(mocker) -> None:
     worker_proc = object.__new__(WorkerProc)
     worker_proc._enqueue_result = mocker.Mock()
@@ -919,6 +936,63 @@ class _PPGroup:
     def irecv_tensor_dict(self, src):
         self.recv_calls.append(src)
         return self.receive_payload, [], []
+
+
+def test_stage_engine_tick_reserves_authorized_activation_before_offer(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    receiver._pipeline_finalization_futures = {}
+    receiver.initialize_pipeline_transports(max_slots=1)
+    task = _task("pre-ready-activation")
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    receiver.authorize_pipeline_batch(1, task.batch_id)
+
+    update = receiver.pipeline_stage_engine_tick()
+
+    offer = receiver._make_pipeline_transfer_offer(task, PipelineEdgeKind.ACTIVATION)
+    assert update is not None
+    assert update.progress.readiness == [(offer.identity, True)]
+    assert offer.identity in receiver.pipeline_receive_reservations
+    assert receiver.accept_pipeline_transfer_offer(offer)
+
+
+def test_cancelling_before_grant_releases_speculative_receive_credit(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    receiver._pipeline_finalization_futures = {}
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=_PPGroup(1))
+    receiver.initialize_pipeline_transports(max_slots=1)
+    task = _task("cancel-pre-ready")
+    receiver.enqueue_pipeline_batch(task, _spec(1))
+    receiver.authorize_pipeline_batch(1, task.batch_id)
+    update = receiver.pipeline_stage_engine_tick()
+    assert update is not None and receiver.pipeline_receive_reservations
+
+    receiver.cancel_pipeline_batch(1, task.batch_id)
+
+    assert receiver.pipeline_receive_reservations == {}
+    assert receiver.pipeline_started_receive_ids == set()
+
+
+def test_stage_engine_tick_reserves_feedback_after_local_compute(mocker) -> None:
+    sender = _worker()
+    sender.rank = 0
+    sender._pipeline_finalization_futures = {}
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=_PPGroup(0))
+    sender.initialize_pipeline_transports(max_slots=1)
+    task = _task("pre-ready-feedback")
+    sender.enqueue_pipeline_batch(task, _spec(0))
+    sender.authorize_pipeline_batch(0, task.batch_id)
+
+    update = sender.pipeline_stage_engine_tick()
+
+    feedback = sender._make_pipeline_transfer_offer(task, PipelineEdgeKind.FEEDBACK)
+    assert update is not None
+    assert update.progress.offers[0].edge_kind is PipelineEdgeKind.ACTIVATION
+    assert update.progress.readiness == [(feedback.identity, True)]
+    assert feedback.identity in sender.pipeline_receive_reservations
 
 
 def test_worker_starts_only_matching_granted_p2p_endpoint(mocker) -> None:

@@ -61,6 +61,39 @@ def test_transfer_requires_offer_and_receive_readiness() -> None:
     }
 
 
+def test_receive_readiness_may_precede_offer_and_is_bound_to_destination() -> None:
+    coordinator = _coordinator()
+    offer = _offer("batch-pre-ready")
+
+    coordinator.mark_receive_ready(offer.identity, rank=1)
+    assert coordinator.pending_readiness_offers() == []
+    assert coordinator.snapshot()["ready"] == 1
+
+    coordinator.offer(offer)
+    assert coordinator.grant_ready()[0].offer is offer
+
+
+def test_receive_readiness_rejects_wrong_reporting_rank() -> None:
+    coordinator = _coordinator()
+    offer = _offer("batch-wrong-ready-rank")
+
+    with pytest.raises(ValueError, match="destination rank"):
+        coordinator.mark_receive_ready(offer.identity, rank=0)
+
+
+def test_cancel_batch_discards_pre_ready_identity_until_retirement() -> None:
+    coordinator = _coordinator()
+    offer = _offer("batch-cancelled")
+
+    coordinator.mark_receive_ready(offer.identity, rank=1)
+    coordinator.cancel_batch(offer.batch_id, offer.epoch)
+    assert coordinator.offer(offer) is False
+    assert coordinator.grant_ready() == []
+
+    coordinator.retire_batch(offer.batch_id, offer.epoch)
+    assert coordinator.offer(offer) is True
+
+
 def test_transfer_preserves_fifo_within_each_edge() -> None:
     coordinator = _coordinator()
     first = _offer("batch-a")

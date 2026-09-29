@@ -359,9 +359,31 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
-        coordinator.offer(offer)
-        self._pipeline_pending_readiness[offer.identity] = offer
+        if coordinator.offer(offer):
+            self._pipeline_pending_readiness[offer.identity] = offer
         return self._retry_pipeline_transfer_readiness()
+
+    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.cancel_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.retire_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
 
     def _retry_pipeline_transfer_readiness(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
@@ -413,8 +435,8 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                         progress.completed.append(completion.identity)
             for rank_progress in worker_progress:
                 for offer in rank_progress.offers:
-                    coordinator.offer(offer)
-                    self._pipeline_pending_readiness[offer.identity] = offer
+                    if coordinator.offer(offer):
+                        self._pipeline_pending_readiness[offer.identity] = offer
             progress.grants.extend(self._retry_pipeline_transfer_readiness())
             return progress
         except BaseException:

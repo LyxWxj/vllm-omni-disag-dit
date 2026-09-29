@@ -1022,6 +1022,7 @@ class DiffusionEngine:
                     "Queued pipeline retirement acknowledgements do not match topology: "
                     f"expected={expected}, actual={actual}"
                 )
+            self.executor.retire_pipeline_transfer_batch(batch.task.batch_id, batch.task.epoch)
             batch.release_acknowledged = True
         if batch.finalizing_request_ids:
             for request_id in batch.finalizing_request_ids:
@@ -1069,6 +1070,7 @@ class DiffusionEngine:
                 "Queued pipeline cancellation acknowledgements do not match topology: "
                 f"expected={expected}, actual={actual}"
             )
+        self.executor.cancel_pipeline_transfer_batch(batch.task.batch_id, batch.task.epoch)
         batch.cancelled = True
         batch.phase = _QueuedPipelineBatchPhase.CANCELLING
 

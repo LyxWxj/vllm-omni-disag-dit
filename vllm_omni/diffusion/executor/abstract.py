@@ -117,10 +117,7 @@ def normalize_pipeline_transfer_readiness_batch_reports(
             raise RuntimeError("batched pipeline transfer readiness does not cover every pending offer")
         reports.append(local)
 
-    return {
-        identity: all(report[identity] for report in reports)
-        for identity in expected_identities
-    }
+    return {identity: all(report[identity] for report in reports) for identity in expected_identities}
 
 
 def normalize_pipeline_preparation_reports(
@@ -306,6 +303,12 @@ class DiffusionExecutor(ABC):
 
     def coordinate_pipeline_transfer(self, offer: Any) -> list[Any]:
         raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
+
+    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        raise NotImplementedError("queued pipeline transfer cancellation is not wired for this executor")
+
+    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        raise NotImplementedError("queued pipeline transfer retirement is not wired for this executor")
 
     def progress_pipeline(self) -> Any:
         raise NotImplementedError("queued pipeline progress is not wired for this executor")

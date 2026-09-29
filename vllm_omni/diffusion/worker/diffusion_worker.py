@@ -308,6 +308,7 @@ class DiffusionWorker:
         self._pipeline_connectors: dict[PipelineEdgeKind, PipelineStageConnector] = {}
         self._pipeline_send_tickets: dict[tuple[Any, ...], TransferTicket] = {}
         self._pipeline_receive_reservations: dict[tuple[Any, ...], PipelineEdgeKind] = {}
+        self._pipeline_started_receive_ids: set[tuple[Any, ...]] = set()
         self._pipeline_receive_consumers: dict[
             tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]
         ] = {}
@@ -810,6 +811,12 @@ class DiffusionWorker:
         return self._pipeline_receive_reservations
 
     @property
+    def pipeline_started_receive_ids(self) -> set[tuple[Any, ...]]:
+        if not hasattr(self, "_pipeline_started_receive_ids"):
+            self._pipeline_started_receive_ids = set()
+        return self._pipeline_started_receive_ids
+
+    @property
     def pipeline_receive_consumers(
         self,
     ) -> dict[tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]]:
@@ -905,7 +912,9 @@ class DiffusionWorker:
                 raise ValueError("pipeline sender ticket identity does not match the transfer offer")
         else:
             if offer.identity in self.pipeline_receive_reservations:
-                raise ValueError("pipeline receive credit is already reserved for this transfer")
+                if self.pipeline_receive_reservations[offer.identity] is not offer.edge_kind:
+                    raise ValueError("pipeline receive reservation has a different edge kind")
+                return True
             if offer.identity in self.pipeline_receive_consumers:
                 raise ValueError("pipeline receive transfer is still owned by its stage consumer")
             reserved = sum(edge_kind is offer.edge_kind for edge_kind in self.pipeline_receive_reservations.values())
@@ -945,10 +954,7 @@ class DiffusionWorker:
         """Report readiness for a batch of offers in one rank-local RPC."""
         if not isinstance(offers, (tuple, list)):
             raise TypeError("pipeline transfer offers must be a tuple or list")
-        readiness = [
-            (offer.identity, self.accept_pipeline_transfer_offer(offer))
-            for offer in offers
-        ]
+        readiness = [(offer.identity, self.accept_pipeline_transfer_offer(offer)) for offer in offers]
         return {"rank": self.rank, "readiness": readiness}
 
     def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
@@ -965,9 +971,12 @@ class DiffusionWorker:
         else:
             if offer.identity not in self.pipeline_receive_reservations:
                 raise KeyError("pipeline transfer grant has no reserved receive credit")
+            if offer.identity in self.pipeline_started_receive_ids:
+                raise ValueError("pipeline transfer receive has already started")
             transport = connector.transport
             if not isinstance(transport, DistributedP2PTransport):
                 raise RuntimeError("pipeline destination does not use distributed P2P transport")
+            self.pipeline_started_receive_ids.add(offer.identity)
             transport.start_granted_transfer(grant)
         return True
 
@@ -1024,9 +1033,10 @@ class DiffusionWorker:
         }:
             return None
         progress = self.progress_pipeline_transfers()
+        self._reserve_expected_pipeline_receives(progress)
         events = tuple(self.poll_pipeline_events())
         finalizations = self._collect_completed_pipeline_finalizations()
-        if not (progress.offers or progress.completions or events or finalizations):
+        if not (progress.offers or progress.completions or progress.readiness or events or finalizations):
             return None
         return PipelineWorkerUpdate(
             worker_id=self.rank,
@@ -1065,7 +1075,41 @@ class DiffusionWorker:
                 for message in messages
             ):
                 return True
-        return self._pipeline_stage_engine_has_runnable_forward()
+        return self._pipeline_stage_engine_has_runnable_forward() or self._pipeline_stage_engine_has_expected_receive()
+
+    def _reserve_expected_pipeline_receives(self, progress: PipelineTransportProgress) -> None:
+        """Reserve identity-specific credit for stage work already admitted locally."""
+        candidates: list[tuple[PipelineEdgeKind, PipelineTask]] = []
+        last_stage = self.pipeline_stages.get(1)
+        if (
+            last_stage is not None
+            and last_stage.spec.is_last
+            and last_stage.active_task is None
+            and last_stage.pending_tasks
+        ):
+            task = last_stage.pending_tasks[0]
+            if task.batch_id in last_stage.authorized_batches:
+                candidates.append((PipelineEdgeKind.ACTIVATION, task))
+
+        first_stage = self.pipeline_stages.get(0)
+        if first_stage is not None and first_stage.spec.is_first:
+            candidates.extend((PipelineEdgeKind.FEEDBACK, task) for task in first_stage.awaiting_feedback.values())
+
+        for edge_kind in (PipelineEdgeKind.ACTIVATION, PipelineEdgeKind.FEEDBACK):
+            connector = self._require_pipeline_connector(edge_kind)
+            reserved = sum(kind is edge_kind for kind in self.pipeline_receive_reservations.values())
+            available = connector.max_slots - reserved
+            if available <= 0:
+                continue
+            for candidate_edge, task in candidates:
+                if candidate_edge is not edge_kind or available <= 0:
+                    continue
+                offer = self._make_pipeline_transfer_offer(task, edge_kind)
+                if offer.identity in self.pipeline_receive_reservations:
+                    continue
+                self.pipeline_receive_reservations[offer.identity] = edge_kind
+                progress.readiness.append((offer.identity, True))
+                available -= 1
 
     def _collect_completed_pipeline_finalizations(self) -> tuple[PipelineFinalizationUpdate, ...]:
         updates: list[PipelineFinalizationUpdate] = []
@@ -1102,6 +1146,29 @@ class DiffusionWorker:
         task = stage.pending_tasks[0]
         connector = self.pipeline_connectors[PipelineEdgeKind.ACTIVATION]
         return task.batch_id in stage.authorized_batches and connector.send_in_use < connector.max_slots
+
+    def _pipeline_stage_engine_has_expected_receive(self) -> bool:
+        """Keep ticking until each admitted receive identity has announced credit."""
+        stage = self.pipeline_stages.get(1)
+        if (
+            stage is not None
+            and stage.spec.is_last
+            and stage.active_task is None
+            and stage.pending_tasks
+            and stage.pending_tasks[0].batch_id in stage.authorized_batches
+        ):
+            task = stage.pending_tasks[0]
+            offer = self._make_pipeline_transfer_offer(task, PipelineEdgeKind.ACTIVATION)
+            if offer.identity not in self.pipeline_receive_reservations:
+                return True
+        stage = self.pipeline_stages.get(0)
+        if stage is not None and stage.spec.is_first:
+            return any(
+                self._make_pipeline_transfer_offer(task, PipelineEdgeKind.FEEDBACK).identity
+                not in self.pipeline_receive_reservations
+                for task in stage.awaiting_feedback.values()
+            )
+        return False
 
     def progress_pipeline_transfers_and_poll_events_all_ranks(
         self,
@@ -1271,6 +1338,7 @@ class DiffusionWorker:
             raise RuntimeError("pipeline receive reservation does not match released message")
         connector.release_received(message)
         self.pipeline_receive_reservations.pop(matching[0])
+        self.pipeline_started_receive_ids.discard(matching[0])
 
     def _require_pipeline_connector(self, edge_kind: PipelineEdgeKind) -> PipelineStageConnector:
         connector = self.pipeline_connectors.get(edge_kind)
@@ -1482,7 +1550,23 @@ class DiffusionWorker:
         self.model_runner.cancel_pipeline_batch(pp_stage_id, batch_id)
         if not stage.cancel(batch_id):
             raise RuntimeError(f"Pipeline batch {batch_id!r} was not cancellable on stage {pp_stage_id}.")
+        self._release_unstarted_pipeline_batch_transfers(context.task)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id))
+
+    def _release_unstarted_pipeline_batch_transfers(self, task: PipelineTask) -> None:
+        for identity, ticket in list(self.pipeline_send_tickets.items()):
+            if identity[0] != task.batch_id or identity[2] != task.epoch or ticket.started:
+                continue
+            connector = self._require_pipeline_connector(identity[4])
+            connector.release_send(ticket)
+            self.pipeline_send_tickets.pop(identity)
+        for identity in list(self.pipeline_receive_reservations):
+            if (
+                identity[0] == task.batch_id
+                and identity[2] == task.epoch
+                and identity not in self.pipeline_started_receive_ids
+            ):
+                self.pipeline_receive_reservations.pop(identity)
 
     def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
         """Release one terminal ModelRunner context after dependent work retires."""
@@ -2283,6 +2367,7 @@ class WorkerProc:
         if not (
             update.progress.offers
             or update.progress.completions
+            or update.progress.readiness
             or update.events
             or update.error
             or finalization_updates

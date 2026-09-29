@@ -312,17 +312,16 @@ def test_multiproc_pp2_uses_rank_local_progress_and_readiness_reports(mocker) ->
     }
 
 
-def test_multiproc_autonomous_pp2_batches_readiness_and_grant_start(mocker) -> None:
+def test_autonomous_progress_consumes_sparse_receive_readiness_before_offer(mocker) -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
-    executor._ensure_open = mocker.Mock()
-    executor.collective_rpc = mocker.Mock()
-    executor._is_failed = False
-    executor._failure_callbacks = []
-    executor.shutdown = mocker.Mock()
+    executor._pipeline_update_error = None
+    executor._pipeline_update_lock = threading.Lock()
+    executor._pipeline_update_cursor = 0
+    executor._pipeline_update_buffers = {0: queue.Queue(), 1: queue.Queue()}
+    executor._pipeline_cached_events = []
     executor.od_config = SimpleNamespace(
         mode="queued",
         step_execution=True,
-        num_gpus=2,
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             pipeline_parallel_size=2,
@@ -332,10 +331,9 @@ def test_multiproc_autonomous_pp2_batches_readiness_and_grant_start(mocker) -> N
         ),
     )
     executor._result_mqs = [object(), object()]
-    executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers({(0, 1)}, {(1, 0)})
-    executor.collective_rpc.reset_mock()
-
+    coordinator = PipelineTransferCoordinator(activation_edges={(0, 1)}, feedback_edges={(1, 0)})
+    executor._pipeline_transfer_coordinator = coordinator
+    executor._pipeline_pending_readiness = {}
     offer = PipelineTransferOffer(
         batch_id="batch-autonomous",
         step_index=0,
@@ -345,23 +343,19 @@ def test_multiproc_autonomous_pp2_batches_readiness_and_grant_start(mocker) -> N
         src_rank=0,
         dst_rank=1,
     )
-    executor.collective_rpc.side_effect = [
-        [
-            {"rank": 0, "readiness": [(offer.identity, True)]},
-            {"rank": 1, "readiness": [(offer.identity, True)]},
-        ],
-        [True, True],
-    ]
+    executor._pipeline_update_buffers[0].put(
+        PipelineWorkerUpdate(0, PipelineTransportProgress(rank=0, offers=[offer]), ())
+    )
+    executor._pipeline_update_buffers[1].put(
+        PipelineWorkerUpdate(1, PipelineTransportProgress(rank=1, readiness=[(offer.identity, True)]), ())
+    )
+    start_grants = mocker.patch.object(executor, "_start_ready_pipeline_transfers", side_effect=coordinator.grant_ready)
 
-    grants = executor.coordinate_pipeline_transfer(offer)
+    progress = executor._progress_autonomous_pipeline_stages(coordinator)
 
-    assert len(grants) == 1
-    assert [call.args[0] for call in executor.collective_rpc.call_args_list] == [
-        "accept_pipeline_transfer_offers_rank_local",
-        "start_pipeline_transfer",
-    ]
-    assert executor.collective_rpc.call_args_list[0].kwargs["args"] == ((offer,),)
-    assert executor.collective_rpc.call_args_list[1].kwargs["args"] == (grants[0],)
+    assert [grant.offer for grant in progress.grants] == [offer]
+    start_grants.assert_called_once_with()
+    assert executor._pipeline_pending_readiness == {}
 
 
 def test_multiproc_pp2_uses_rank_local_submit_authorize_and_release_readiness(mocker) -> None:

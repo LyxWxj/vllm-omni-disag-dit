@@ -108,6 +108,8 @@ class PipelineTransferCoordinator:
         }
         self._offer_ids: set[tuple[Any, ...]] = set()
         self._ready_ids: set[tuple[Any, ...]] = set()
+        self._pre_ready_ids: set[tuple[Any, ...]] = set()
+        self._cancelled_batches: set[tuple[str, int]] = set()
         self._grants: dict[tuple[Any, ...], PipelineTransferGrant] = {}
         self._completed_ids: set[tuple[Any, ...]] = set()
         self._busy_ranks: set[int] = set()
@@ -130,19 +132,73 @@ class PipelineTransferCoordinator:
         src_rank, dst_rank = next(iter(edges))
         return {0: src_rank, 1: dst_rank}
 
-    def offer(self, offer: PipelineTransferOffer) -> None:
+    def offer(self, offer: PipelineTransferOffer) -> bool:
         identity = offer.identity
         if (offer.src_rank, offer.dst_rank) not in self._valid_edges[offer.edge_kind]:
             raise ValueError("pipeline transfer offer does not match the configured edge topology")
+        if (offer.batch_id, offer.epoch) in self._cancelled_batches:
+            return False
         if identity in self._offer_ids or identity in self._grants or identity in self._completed_ids:
             raise ValueError("duplicate pipeline transfer offer")
         self._offers[(offer.edge_kind, offer.src_rank, offer.dst_rank)].append(offer)
         self._offer_ids.add(identity)
+        if identity in self._pre_ready_ids:
+            self._pre_ready_ids.remove(identity)
+            self._ready_ids.add(identity)
+        return True
 
-    def mark_receive_ready(self, identity: tuple[Any, ...]) -> None:
-        if identity not in self._offer_ids:
-            raise KeyError("unknown pipeline transfer offer")
-        self._ready_ids.add(identity)
+    def mark_receive_ready(self, identity: tuple[Any, ...], rank: int | None = None) -> None:
+        """Record destination credit, including announcements preceding an offer."""
+        offer = self._offer_from_identity(identity)
+        if (offer.src_rank, offer.dst_rank) not in self._valid_edges[offer.edge_kind]:
+            raise ValueError("pipeline receive readiness does not match the configured edge topology")
+        if rank is not None and rank != offer.dst_rank:
+            raise ValueError("pipeline receive readiness must be reported by the destination rank")
+        if (offer.batch_id, offer.epoch) in self._cancelled_batches:
+            return
+        if identity in self._grants or identity in self._completed_ids:
+            raise ValueError("pipeline receive readiness arrived after transfer grant")
+        if identity in self._ready_ids or identity in self._pre_ready_ids:
+            return
+        if identity in self._offer_ids:
+            self._ready_ids.add(identity)
+        else:
+            self._pre_ready_ids.add(identity)
+
+    def cancel_batch(self, batch_id: str, epoch: int) -> None:
+        """Discard ungranted transfers and readiness after Worker cancellation."""
+        if not batch_id or type(epoch) is not int or epoch < 0:
+            raise ValueError("invalid pipeline batch cancellation identity")
+        self._cancelled_batches.add((batch_id, epoch))
+        for edge_key, queue in self._offers.items():
+            retained = deque(offer for offer in queue if (offer.batch_id, offer.epoch) != (batch_id, epoch))
+            removed = {
+                queue_item.identity
+                for queue_item in queue
+                if (queue_item.batch_id, queue_item.epoch) == (batch_id, epoch)
+            }
+            self._offers[edge_key] = retained
+            self._offer_ids.difference_update(removed)
+            self._ready_ids.difference_update(removed)
+        self._pre_ready_ids = {
+            identity for identity in self._pre_ready_ids if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def retire_batch(self, batch_id: str, epoch: int) -> None:
+        """Drop per-batch replay state once Worker ownership has been released."""
+        if any(
+            (offer.batch_id, offer.epoch) == (batch_id, epoch) for queue in self._offers.values() for offer in queue
+        ):
+            raise RuntimeError("cannot retire pipeline batch with pending transfer offers")
+        if any((grant.offer.batch_id, grant.offer.epoch) == (batch_id, epoch) for grant in self._grants.values()):
+            raise RuntimeError("cannot retire pipeline batch with active transfer grants")
+        self._cancelled_batches.discard((batch_id, epoch))
+        self._completed_ids = {
+            identity for identity in self._completed_ids if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+        self._pre_ready_ids = {
+            identity for identity in self._pre_ready_ids if (identity[0], identity[2]) != (batch_id, epoch)
+        }
 
     def pending_readiness_offers(self) -> list[PipelineTransferOffer]:
         """Return FIFO heads whose endpoint readiness has not been confirmed."""
@@ -218,7 +274,7 @@ class PipelineTransferCoordinator:
     def snapshot(self) -> dict[str, Any]:
         return {
             "offers": sum(len(queue) for queue in self._offers.values()),
-            "ready": len(self._ready_ids),
+            "ready": len(self._ready_ids) + len(self._pre_ready_ids),
             "grants": len(self._grants),
             "completed": len(self._completed_ids),
             "busy_ranks": tuple(sorted(self._busy_ranks)),
@@ -241,6 +297,15 @@ class PipelineTransferCoordinator:
             if src_rank in endpoints or dst_rank in endpoints:
                 raise ValueError("queued PP=2 topology requires disjoint two-rank replicas")
             endpoints.update((src_rank, dst_rank))
+
+    @staticmethod
+    def _offer_from_identity(identity: tuple[Any, ...]) -> PipelineTransferOffer:
+        if not isinstance(identity, tuple) or len(identity) != 7:
+            raise ValueError("invalid pipeline transfer identity in receive readiness")
+        try:
+            return PipelineTransferOffer(*identity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid pipeline transfer identity in receive readiness") from exc
 
 
 @dataclass

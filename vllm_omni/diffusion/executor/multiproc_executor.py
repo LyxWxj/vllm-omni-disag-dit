@@ -34,7 +34,6 @@ from vllm_omni.diffusion.executor.abstract import (
     DiffusionExecutor,
     normalize_pipeline_preparation_reports,
     normalize_pipeline_transfer_readiness,
-    normalize_pipeline_transfer_readiness_batch_reports,
     normalize_pipeline_transfer_readiness_reports,
     normalize_pipeline_transport_snapshot,
     validate_pipeline_topology_reports,
@@ -1108,9 +1107,31 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
-        coordinator.offer(offer)
-        self._pipeline_pending_readiness[offer.identity] = offer
+        if coordinator.offer(offer):
+            self._pipeline_pending_readiness[offer.identity] = offer
         return self._retry_pipeline_transfer_readiness()
+
+    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.cancel_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.retire_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
 
     def _retry_pipeline_transfer_readiness(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
@@ -1122,23 +1143,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 ]
                 if not candidates:
                     break
-                if self._uses_autonomous_pipeline_stages() and self._uses_rank_local_pp_rpc():
-                    candidate_ids = frozenset(offer.identity for offer in candidates)
-                    readiness_reports = self._queued_rank_local_rpc(
-                        "accept_pipeline_transfer_offers_rank_local",
-                        args=(tuple(candidates),),
-                    )
-                    ready_by_identity = normalize_pipeline_transfer_readiness_batch_reports(
-                        readiness_reports,
-                        coordinator.endpoint_ranks,
-                        candidate_ids,
-                    )
-                    for offer in candidates:
-                        attempted.add(offer.identity)
-                        if ready_by_identity[offer.identity]:
-                            coordinator.mark_receive_ready(offer.identity)
-                            self._pipeline_pending_readiness.pop(offer.identity, None)
-                    continue
+                if self._uses_autonomous_pipeline_stages():
+                    # Autonomous Workers reserve destination credit locally and
+                    # publish it through their sparse update stream.
+                    break
                 for offer in candidates:
                     attempted.add(offer.identity)
                     if self._uses_rank_local_pp_rpc():
@@ -1281,6 +1289,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         worker_events: list[Any] = []
         saw_new_offer = False
         saw_completion = False
+        saw_readiness = False
         expected_workers = coordinator.endpoint_ranks
         for update in updates:
             if not isinstance(update, PipelineWorkerUpdate) or update.worker_id not in expected_workers:
@@ -1291,18 +1300,29 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if rank_progress is None or rank_progress.rank != update.worker_id:
                 raise RuntimeError("Pipeline StageEngine update has invalid rank-local progress")
             worker_events.extend(update.events)
+            for identity, ready in rank_progress.readiness:
+                if type(ready) is not bool:
+                    raise RuntimeError("Pipeline StageEngine published invalid receive readiness")
+                if ready:
+                    coordinator.mark_receive_ready(identity, rank=update.worker_id)
+                    self._pipeline_pending_readiness.pop(identity, None)
+                    saw_readiness = True
+
+        for update in updates:
+            rank_progress = update.progress
             for completion in rank_progress.completions:
                 if coordinator.complete(completion.identity, completion.rank):
                     progress.completed.append(completion.identity)
                 saw_completion = True
             for offer in rank_progress.offers:
-                coordinator.offer(offer)
-                self._pipeline_pending_readiness[offer.identity] = offer
-                saw_new_offer = True
+                if coordinator.offer(offer):
+                    if not self._uses_autonomous_pipeline_stages():
+                        self._pipeline_pending_readiness[offer.identity] = offer
+                    saw_new_offer = True
 
         cached_events = getattr(self, "_pipeline_cached_events", [])
         self._pipeline_cached_events = [*cached_events, *worker_events]
-        if saw_new_offer or saw_completion:
+        if saw_new_offer or saw_completion or saw_readiness:
             progress.grants.extend(self._retry_pipeline_transfer_readiness())
         return progress
 
