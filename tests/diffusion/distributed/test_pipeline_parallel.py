@@ -99,6 +99,18 @@ def test_pipeline_tensor_dict_broadcast_maps_local_source_on_physical_ranks(monk
     assert broadcasts[1][0:3] == ("tensor", 2, "cpu")
 
 
+def test_pipeline_tensor_dict_pp2_groups_follow_source_rank() -> None:
+    coordinator = object.__new__(PipelineGroupCoordinator)
+    coordinator.world_size = 2
+    coordinator.device_groups = ["device-0-1", "device-1-0"]
+    coordinator.cpu_groups = ["cpu-0-1", "cpu-1-0"]
+    coordinator.device_group = coordinator.device_groups[0]
+    coordinator.cpu_group = coordinator.cpu_groups[0]
+
+    assert coordinator._tensor_dict_comm_groups(0) == ("device-0-1", "cpu-0-1")
+    assert coordinator._tensor_dict_comm_groups(1) == ("device-1-0", "cpu-1-0")
+
+
 class SimpleScheduler:
     """Minimal diffusion-step scheduler: latents -= 0.1 * noise_pred."""
 
