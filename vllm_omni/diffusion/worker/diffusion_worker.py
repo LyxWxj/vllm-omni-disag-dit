@@ -1054,13 +1054,11 @@ class DiffusionWorker:
             return False
         if self.pipeline_receive_consumers:
             return True
-        if any(
-            batch_id not in self._pipeline_finalization_published for batch_id in self._pipeline_finalization_futures
-        ):
-            return True
         for batch_id, future in self._pipeline_finalization_futures.items():
             if not future.done():
                 continue
+            if batch_id not in self._pipeline_finalization_published:
+                return True
             event = self._pipeline_finalization_device_events.get(batch_id)
             if event is not None and callable(getattr(event, "query", None)) and not event.query():
                 return True
@@ -1756,7 +1754,11 @@ class DiffusionWorker:
                 )
                 return result
 
-            self._pipeline_finalization_futures[batch_id] = self._pipeline_finalization_executor.submit(finalize)
+            future = self._pipeline_finalization_executor.submit(finalize)
+            self._pipeline_finalization_futures[batch_id] = future
+            wake_stage_engine = getattr(self, "_pipeline_stage_engine_wake", None)
+            if callable(wake_stage_engine):
+                future.add_done_callback(lambda _completed: wake_stage_engine())
         return batch_id if return_handle else None
 
     def poll_pipeline_finalization(self, batch_id: str) -> BatchRunnerOutput | None:
@@ -2297,6 +2299,7 @@ class WorkerProc:
                 device=worker_device,
                 publish_update=self._publish_pipeline_update,
             )
+            self.worker.worker._pipeline_stage_engine_wake = self._stage_engine.notify_progress
             self._pipeline_prepare_executor = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix=f"DiffusionPipelinePrep-rank{gpu_id}",

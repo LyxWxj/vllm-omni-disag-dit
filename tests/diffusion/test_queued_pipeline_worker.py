@@ -3,7 +3,7 @@
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -538,6 +538,37 @@ def test_final_decode_submission_is_nonblocking_and_pollable() -> None:
         time.sleep(0.001)
     assert result == "decoded-output"
     worker._pipeline_finalization_executor.shutdown(wait=True)
+
+
+def test_final_decode_completion_wakes_stage_engine(mocker) -> None:
+    worker = _worker()
+    task = _task("finalize-wake")
+    worker.enqueue_pipeline_batch(task, _spec(0))
+    worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)].status = PipelineTaskStatus.COMPLETED
+    wake = mocker.Mock()
+    worker._pipeline_stage_engine_wake = wake
+
+    handle = worker.finalize_pipeline_batch(0, task.batch_id)
+    assert worker._pipeline_finalization_futures[handle].result(timeout=1) == "decoded-output"
+
+    wake.assert_called_once_with()
+    worker._pipeline_finalization_executor.shutdown(wait=True)
+
+
+def test_stage_engine_does_not_poll_running_finalization_future() -> None:
+    worker = _worker()
+    worker._pipeline_connectors = {
+        PipelineEdgeKind.ACTIVATION: SimpleNamespace(transport=None),
+        PipelineEdgeKind.FEEDBACK: SimpleNamespace(transport=None),
+    }
+    future: Future[object] = Future()
+    worker._pipeline_finalization_futures = {"batch-a": future}
+    worker._pipeline_finalization_published = set()
+
+    assert not worker.pipeline_stage_engine_needs_progress()
+
+    future.set_result(None)
+    assert worker.pipeline_stage_engine_needs_progress()
 
 
 def test_final_decode_uses_a_dedicated_cuda_stream(mocker) -> None:
