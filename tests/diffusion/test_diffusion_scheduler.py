@@ -1508,7 +1508,7 @@ class TestStepScheduler:
         assert not self.scheduler.is_pipeline_finalizing(request_id)
         assert self.scheduler.get_request_state(request_id).status is DiffusionRequestStatus.RUNNING
 
-    def test_pipeline_finalizing_request_is_not_rescheduled_or_replaced(self) -> None:
+    def test_pipeline_finalizing_request_releases_denoise_capacity(self) -> None:
         finalizing_request = _make_step_request("queued-finalizing", num_inference_steps=1)
         waiting_request = _make_step_request("queued-waiting", num_inference_steps=2)
         finalizing_id = self.scheduler.add_request(finalizing_request)
@@ -1518,12 +1518,12 @@ class TestStepScheduler:
         assert self.scheduler.commit_pipeline_step(first, {finalizing_id: 1}) == {finalizing_id}
 
         while_finalizing = self.scheduler.schedule()
-        assert while_finalizing.is_empty
-        assert while_finalizing.scheduled_request_ids == []
-        assert while_finalizing.num_running_reqs == 1
-        assert while_finalizing.num_waiting_reqs == 1
+        assert while_finalizing.scheduled_request_ids == [waiting_id]
+        assert _new_ids(while_finalizing) == [waiting_id]
+        assert while_finalizing.num_running_reqs == 2
+        assert while_finalizing.num_waiting_reqs == 0
         assert self.scheduler.get_request_state(finalizing_id).status is DiffusionRequestStatus.RUNNING
-        assert self.scheduler.get_request_state(waiting_id).status is DiffusionRequestStatus.WAITING
+        assert self.scheduler.get_request_state(waiting_id).status is DiffusionRequestStatus.RUNNING
 
     def test_queued_admission_query_skips_owned_work_and_resumes_after_retirement(self) -> None:
         self.scheduler.max_num_running_reqs = 2

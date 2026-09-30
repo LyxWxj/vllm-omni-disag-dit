@@ -94,6 +94,19 @@ def test_queued_reservation_keeps_distinct_request_ownership(mocker) -> None:
     assert len(engine._queued_pipeline_batches) == 2
 
 
+def test_finalizing_batch_releases_denoise_admission_capacity(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine.od_config.max_inflight_batches = 1
+    first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    first.phase = _QueuedPipelineBatchPhase.FINALIZING
+
+    assert engine._queued_denoise_batch_count() == 0
+    second = engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
+
+    assert second.task.request_ids == ("req-b",)
+    assert engine._queued_reserved_bytes == first.reserved_bytes + second.reserved_bytes
+
+
 def test_queued_byte_reservation_defers_after_budget_is_consumed(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
     engine._queued_stage_buffer_budget_bytes = engine._estimate_queued_request_bytes(_scheduler_output("req-a"))

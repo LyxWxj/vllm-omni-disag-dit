@@ -66,8 +66,13 @@ class StepScheduler(BaseScheduler):
         return request_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
-        """Exclude decode-owned requests while retaining their running capacity."""
-        scheduler_output = super().schedule()
+        """Schedule denoise work while decode-owned requests retain state only."""
+        original_capacity = self.max_num_running_reqs
+        self.max_num_running_reqs += len(self._pipeline_finalizing)
+        try:
+            scheduler_output = super().schedule()
+        finally:
+            self.max_num_running_reqs = original_capacity
         if self._pipeline_finalizing:
             scheduler_output.scheduled_cached_reqs.request_ids = [
                 request_id
@@ -90,7 +95,8 @@ class StepScheduler(BaseScheduler):
             for request_id in self._running
         ):
             return True
-        return admission_capacity_available and bool(self._waiting) and len(self._running) < self.max_num_running_reqs
+        active_running = len(self._running) - len(self._pipeline_finalizing)
+        return admission_capacity_available and bool(self._waiting) and active_running < self.max_num_running_reqs
 
     def has_queued_waiting_request(self) -> bool:
         """Report waiting work separately from finished/cached housekeeping."""

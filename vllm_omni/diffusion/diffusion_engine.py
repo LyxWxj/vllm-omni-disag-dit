@@ -695,10 +695,21 @@ class DiffusionEngine:
             request_id for batch in self._queued_pipeline_batches.values() for request_id in batch.task.request_ids
         }
         budget = self._queued_stage_buffer_budget_bytes
-        admission_capacity_available = len(self._queued_pipeline_batches) < int(
+        admission_capacity_available = self._queued_denoise_batch_count() < int(
             self.od_config.max_inflight_batches
         ) and (budget is None or self._queued_reserved_bytes < budget)
         return not has_candidate(owned_request_ids, admission_capacity_available=admission_capacity_available)
+
+    def _queued_denoise_batch_count(self) -> int:
+        """Count batches still occupying denoise-step capacity.
+
+        Finalizing batches retain separate tensor/output reservations, but no
+        longer occupy a model-stage denoise slot. The byte reservation remains
+        held until retirement, so this does not bypass the memory bound.
+        """
+        return sum(
+            batch.phase is not _QueuedPipelineBatchPhase.FINALIZING for batch in self._queued_pipeline_batches.values()
+        )
 
     def _queued_pipeline_waits_on_finalization(self) -> bool:
         """Avoid spinning while every retained batch is completing finalization."""
@@ -745,7 +756,7 @@ class DiffusionEngine:
         if not self._has_queued_pipeline_work() or not self._queued_pipeline_can_advance_without_schedule():
             max_inflight = int(getattr(self.od_config, "max_inflight_batches", 1))
             has_waiting = getattr(self.scheduler, "has_queued_waiting_request", None)
-            if not callable(has_waiting) or len(self._queued_pipeline_batches) < max_inflight or not has_waiting():
+            if not callable(has_waiting) or self._queued_denoise_batch_count() < max_inflight or not has_waiting():
                 return False
         if bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)()):
             return False
@@ -774,7 +785,7 @@ class DiffusionEngine:
 
     def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
         max_inflight_batches = int(getattr(self.od_config, "max_inflight_batches", 1))
-        if len(self._queued_pipeline_batches) >= max_inflight_batches:
+        if self._queued_denoise_batch_count() >= max_inflight_batches:
             raise _QueuedAdmissionDeferredError("queued pipeline admission capacity is exhausted")
         request_ids = tuple(scheduler_output.scheduled_request_ids)
         if len(request_ids) != 1:
