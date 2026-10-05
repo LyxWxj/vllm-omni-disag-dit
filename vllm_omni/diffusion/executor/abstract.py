@@ -1,20 +1,141 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from concurrent.futures import Future
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.sched.interface import CachedRequestData
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import PipelineTransportProgress
+
+PIPELINE_GRANT_START_TIMEOUT_S = 30.0
+
+
+def validate_pipeline_topology_reports(
+    result: Any,
+    activation_edge: tuple[int, int],
+) -> None:
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not result or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers did not return valid pipeline topology reports")
+    actual_activation = {tuple(item["activation_edge"]) for item in result}
+    actual_feedback = {tuple(item["feedback_edge"]) for item in result}
+    reporting_ranks = {item["rank"] for item in result}
+    feedback_edge = (activation_edge[1], activation_edge[0])
+    expected_ranks = set(activation_edge)
+    if actual_activation != {activation_edge} or actual_feedback != {feedback_edge}:
+        raise ValueError("Executor pipeline topology does not match Worker PP groups")
+    if reporting_ranks != expected_ranks:
+        raise ValueError("pipeline topology reports do not cover every configured endpoint")
+
+
+def normalize_pipeline_transport_snapshot(
+    result: Any,
+    expected_ranks: frozenset[int],
+) -> tuple[list[PipelineTransportProgress], list[Any]]:
+    """Validate the rank-local progress and event snapshot returned by one RPC."""
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list):
+        raise RuntimeError("Workers returned invalid pipeline transport snapshot")
+
+    progresses: list[PipelineTransportProgress] = []
+    events: list[Any] = []
+    for item in result:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], PipelineTransportProgress)
+            or not isinstance(item[1], list)
+        ):
+            raise RuntimeError("Workers returned invalid pipeline transport snapshot")
+        progresses.append(item[0])
+        events.extend(item[1])
+
+    reporting_ranks = [item.rank for item in progresses]
+    if len(reporting_ranks) != len(expected_ranks) or set(reporting_ranks) != expected_ranks:
+        raise RuntimeError("pipeline transport snapshot does not cover every configured endpoint")
+    return progresses, events
+
+
+def normalize_pipeline_transfer_readiness_reports(
+    result: Any,
+    expected_ranks: frozenset[int],
+) -> bool:
+    """Require one valid readiness report from every configured PP rank."""
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers returned invalid pipeline transfer readiness reports")
+    ranks = [item.get("rank") for item in result]
+    if len(ranks) != len(expected_ranks) or set(ranks) != expected_ranks:
+        raise RuntimeError("pipeline transfer readiness does not cover every configured endpoint")
+    if any(type(item.get("ready")) is not bool for item in result):
+        raise RuntimeError("Workers returned invalid pipeline transfer readiness reports")
+    return all(item["ready"] for item in result)
+
+
+def normalize_pipeline_transfer_readiness(result: Any) -> bool:
+    while isinstance(result, list) and len(result) == 1:
+        result = result[0]
+    if type(result) is not bool:
+        raise RuntimeError("Workers returned invalid pipeline transfer readiness")
+    return result
+
+
+def normalize_pipeline_transfer_readiness_batch_reports(
+    result: Any,
+    expected_ranks: frozenset[int],
+    expected_identities: frozenset[tuple[Any, ...]],
+) -> dict[tuple[Any, ...], bool]:
+    """Validate one rank-local readiness report covering several offers."""
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+    ranks = [item.get("rank") for item in result]
+    if len(ranks) != len(expected_ranks) or set(ranks) != expected_ranks:
+        raise RuntimeError("batched pipeline transfer readiness does not cover every configured endpoint")
+
+    reports: list[dict[tuple[Any, ...], bool]] = []
+    for item in result:
+        entries = item.get("readiness")
+        if not isinstance(entries, (list, tuple)):
+            raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+        local: dict[tuple[Any, ...], bool] = {}
+        for entry in entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+            identity, ready = entry
+            if not isinstance(identity, tuple) or identity in local or type(ready) is not bool:
+                raise RuntimeError("Workers returned invalid batched pipeline transfer readiness reports")
+            local[identity] = ready
+        if set(local) != expected_identities or len(local) != len(expected_identities):
+            raise RuntimeError("batched pipeline transfer readiness does not cover every pending offer")
+        reports.append(local)
+
+    return {identity: all(report[identity] for report in reports) for identity in expected_identities}
+
+
+def normalize_pipeline_preparation_reports(
+    result: Any,
+    expected_ranks: frozenset[int],
+    expected_request_ids: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+    if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+        raise RuntimeError("Workers returned invalid pipeline preparation reports")
+    reporting_ranks = [item.get("rank") for item in result]
+    if len(reporting_ranks) != len(expected_ranks) or set(reporting_ranks) != expected_ranks:
+        raise RuntimeError("pipeline preparation reports do not cover every configured endpoint")
+    if any(tuple(item.get("request_ids", ())) != expected_request_ids for item in result):
+        raise RuntimeError("pipeline preparation reports disagree on request identity")
+    return result
+
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -133,19 +254,110 @@ class DiffusionExecutor(ABC):
         """
         return None
 
-    def wait_output_ready(self, async_output_id: str) -> Future[DiffusionOutput]:
-        """Resolve deferred output; only asynchronous executors implement this."""
-        raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
+    def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
+        """Submit one queued batch to every Worker without authorizing compute."""
+        raise NotImplementedError("queued pipeline submission is not wired for this executor")
 
-    def drop_output(self, async_output_id: str) -> None:
-        """Reclaim an async output that will never be waited on (e.g. an
-        aborted request).
+    def prepare_pipeline_requests(self, scheduler_output: Any) -> Any:
+        """Prepare rank-local request state at a coordinated drained boundary."""
+        raise NotImplementedError("queued pipeline preparation is not wired for this executor")
 
-        Only executors with an async output path (result pump) cache outputs
-        that a consumer must later claim; executors without one have nothing to
-        reclaim and can keep the default no-op implementation.
-        """
-        return None
+    def finalize_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str, output_rank: int) -> str:
+        raise NotImplementedError("queued pipeline final decode is not wired for this executor")
+
+    def poll_pipeline_finalization(self, batch_id: str, output_rank: int) -> Any:
+        raise NotImplementedError("queued pipeline finalization polling is not wired for this executor")
+
+    def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
+        raise NotImplementedError("queued pipeline retirement is not wired for this executor")
+
+    def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
+        raise NotImplementedError("queued pipeline retirement readiness is not wired for this executor")
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
+        raise NotImplementedError("queued finalized-request cleanup is not wired for this executor")
+
+    def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
+        """Authorize execution after all Workers have accepted a batch."""
+        raise NotImplementedError("queued pipeline authorization is not wired for this executor")
+
+    def authorize_pipeline_batches(
+        self,
+        authorizations: list[tuple[int | dict[int, int], str]],
+    ) -> Any:
+        """Authorize several accepted batches in one Worker control call."""
+        raise NotImplementedError("queued pipeline batch authorization is not wired for this executor")
+
+    def poll_pipeline_events(self) -> list[Any]:
+        """Poll Worker-side queued progress events."""
+        raise NotImplementedError("queued pipeline event polling is not wired for this executor")
+
+    def cancel_pipeline_requests(self, request_generations: Any) -> Any:
+        """Cancel queued work while retaining resources until retirement."""
+        raise NotImplementedError("queued pipeline cancellation is not wired for this executor")
+
+    def drain_pipeline(self, deadline: float | None = None) -> Any:
+        """Drain queued transport and Worker contexts before shutdown."""
+        raise NotImplementedError("queued pipeline drain is not wired for this executor")
+
+    def initialize_pipeline_transfers(
+        self,
+        activation_edge: tuple[int, int],
+        max_slots: int = 1,
+    ) -> Any:
+        raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
+
+    def coordinate_pipeline_transfer(self, offer: Any) -> list[Any]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        if coordinator.offer(offer):
+            self._pipeline_pending_readiness[offer.identity] = offer
+        return self._retry_pipeline_transfer_readiness()
+
+    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.cancel_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.retire_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.batch_retirement_ready(batch_id, epoch)
+
+    def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
+        """Queue a granted transfer start without waiting for a Worker reply."""
+        raise NotImplementedError("queued pipeline transfer start is not wired for this executor")
+
+    def progress_pipeline(self) -> Any:
+        raise NotImplementedError("queued pipeline progress is not wired for this executor")
+
+    def pipeline_stage_physical_ranks(self) -> dict[int, int]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.stage_physical_ranks
+
+    def pipeline_stage_memory_budget_bytes(self) -> int:
+        raise NotImplementedError("queued pipeline memory budgeting is not wired for this executor")
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""
@@ -180,7 +392,7 @@ class DiffusionExecutor(ABC):
         # ranks are not silently dropped.
         self.collective_rpc("set_kv_cache_configs", args=(kv_cache_configs, resolved_max_model_len))
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> None:
+    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> None:
         """Clear request rows on every Worker after Scheduler retirement."""
 
         unique_request_ids = list(dict.fromkeys(request_ids))
@@ -190,67 +402,6 @@ class DiffusionExecutor(ABC):
             "remove_diffusion_kv_requests",
             args=(unique_request_ids,),
         )
-
-    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
-        if scheduler_output.kv_prefetch_connector_metadata is not None:
-            current = replace(
-                scheduler_output,
-                kv_transfer_request_ids=scheduler_output.kv_transfer_request_ids
-                - scheduler_output.kv_prefetch_request_ids,
-                kv_prefetch_connector_metadata=None,
-                kv_prefetch_request_ids=set(),
-            )
-            # First complete the current request on every rank. Only then
-            # submit B, preventing Mooncake from coalescing its bytes with A.
-            self.prepare_kv_for_forward(current)
-            return self.prepare_kv_for_forward(
-                replace(
-                    current,
-                    kv_connector_metadata=scheduler_output.kv_prefetch_connector_metadata,
-                    kv_transfer_request_ids=scheduler_output.kv_prefetch_request_ids,
-                    kv_required_request_ids=set(),
-                    kv_finished_request_ids=set(),
-                )
-            )
-        if (
-            scheduler_output.kv_connector_metadata is None
-            and not scheduler_output.kv_required_request_ids
-            and not scheduler_output.kv_poll_only
-        ):
-            return None
-        transfer_output = replace(
-            scheduler_output,
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            kv_prefetch_job=None,
-        )
-        outputs: list[KVConnectorOutput] = self.collective_rpc(
-            "prepare_kv_for_forward",
-            args=(transfer_output,),
-            unique_reply_rank=0,
-            exec_all_ranks=True,
-        )
-        if len(outputs) != self.od_config.num_gpus or any(output.invalid_block_ids for output in outputs):
-            # Missing ranks / invalid pages cannot establish safe ownership.
-            raise RuntimeError("Diffusion KV receive failed on one or more ranks")
-        if scheduler_output.kv_required_request_ids is not None:
-            # Prefetch workers retain completion events until retirement.
-            # Their cumulative snapshots can be intersected directly.
-            finished = set.intersection(*(set(output.finished_recving or ()) for output in outputs))
-            if not scheduler_output.kv_required_request_ids.issubset(finished):
-                raise RuntimeError("Required diffusion KV receive did not complete on every rank")
-            outputs[0].finished_recving = finished
-            return outputs[0]
-        completed = getattr(self, "_kv_receive_completed_ranks", {})
-        for rank, output in enumerate(outputs):
-            for request_id in output.finished_recving or ():
-                completed.setdefault(request_id, set()).add(rank)
-        finished = {request_id for request_id, ranks in completed.items() if len(ranks) == len(outputs)}
-        for request_id in finished:
-            del completed[request_id]
-        self._kv_receive_completed_ranks = completed
-        outputs[0].finished_recving = finished
-        return outputs[0]
 
     @abstractmethod
     def shutdown(self) -> None:

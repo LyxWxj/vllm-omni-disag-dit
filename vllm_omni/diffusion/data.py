@@ -841,8 +841,9 @@ class OmniDiffusionConfig:
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
     fa_deterministic: bool = False
 
-    # Running mode
-    # mode: ExecutionMode = ExecutionMode.INFERENCE
+    # Pipeline execution mode. ``static`` preserves the existing request and
+    # step execution paths; ``queued`` is the opt-in M2 lifecycle path.
+    mode: str = "static"
 
     # Workload type
     # workload_type: WorkloadType = WorkloadType.T2V
@@ -1108,6 +1109,12 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Queued pipeline-parallel capacity settings. These are inert in static
+    # mode and deliberately narrow in M2 until stage-local scheduling lands.
+    max_inflight_batches: int = 1
+    edge_buffer_slots: int = 1
+    stage_buffer_bytes: int | None = None
+
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 
@@ -1251,6 +1258,20 @@ class OmniDiffusionConfig:
         if self.max_model_len is not None and self.max_model_len != -1 and self.max_model_len <= 0:
             raise ValueError("max_model_len must be positive or -1")
 
+        if self.mode not in {"static", "queued"}:
+            raise ValueError(f"mode must be 'static' or 'queued', got {self.mode!r}")
+        if self.mode == "queued":
+            for name in ("max_inflight_batches", "edge_buffer_slots"):
+                value = getattr(self, name)
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            if self.stage_buffer_bytes is not None and (
+                type(self.stage_buffer_bytes) is not int or self.stage_buffer_bytes <= 0
+            ):
+                raise ValueError("stage_buffer_bytes must be a positive integer when set")
+            if not self.step_execution:
+                raise ValueError("mode='queued' requires step_execution=True")
+
         if self.omni_kv_config is None:
             self.omni_kv_config = {}
         elif isinstance(self.omni_kv_config, Mapping):
@@ -1284,7 +1305,6 @@ class OmniDiffusionConfig:
             if self.enable_sleep_mode:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
-        self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
             raise ValueError(
@@ -1317,6 +1337,9 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if self.mode == "queued" and self.parallel_config.pipeline_parallel_size != 2:
+            raise ValueError("mode='queued' currently requires pipeline_parallel_size=2")
+        self.master_port = self._resolve_master_port()
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
@@ -1896,11 +1919,14 @@ class AsyncOutputKind(Enum):
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
+    * ``PIPELINE_FINALIZED`` — queued PP final decode is ready for Engine
+      retirement via ``async_output_id``
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
+    PIPELINE_FINALIZED = "pipeline_finalized"
 
 
 @dataclass

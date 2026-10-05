@@ -1870,6 +1870,91 @@ class TestStepScheduler:
         assert request.sampling_params.step_index == 3
         assert self.scheduler.has_requests() is False
 
+    def test_pipeline_step_commit_separates_final_denoise_from_request_completion(self) -> None:
+        request = _make_step_request("queued", num_inference_steps=2)
+        request_id = self.scheduler.add_request(request)
+
+        first = self.scheduler.schedule()
+        assert self.scheduler.commit_pipeline_step(first, {request_id: 1}) == set()
+        assert request.sampling_params.step_index == 1
+        assert self.scheduler.get_request_state(request_id).status is DiffusionRequestStatus.RUNNING
+
+        second = self.scheduler.schedule()
+        assert self.scheduler.commit_pipeline_step(second, {request_id: 2}) == {request_id}
+        assert request.sampling_params.step_index == 2
+        assert self.scheduler.is_pipeline_finalizing(request_id)
+        assert self.scheduler.get_request_state(request_id).status is DiffusionRequestStatus.RUNNING
+        assert self.scheduler.has_requests() is True
+
+        with pytest.raises(RuntimeError, match="already finalizing"):
+            self.scheduler.commit_pipeline_step(second, {request_id: 3})
+
+    def test_pipeline_step_commit_rejects_stale_progress_without_mutation(self) -> None:
+        request = _make_step_request("queued-stale", num_inference_steps=3)
+        request_id = self.scheduler.add_request(request)
+        sched_output = self.scheduler.schedule()
+
+        with pytest.raises(ValueError, match="expected step 1"):
+            self.scheduler.commit_pipeline_step(sched_output, {request_id: 2})
+
+        assert request.sampling_params.step_index == 0
+        assert not self.scheduler.is_pipeline_finalizing(request_id)
+
+    def test_pipeline_step_commit_rejects_duplicate_ids_without_mutation(self) -> None:
+        request = _make_step_request("queued-duplicate", num_inference_steps=1)
+        request_id = self.scheduler.add_request(request)
+        sched_output = self.scheduler.schedule()
+        sched_output.scheduled_cached_reqs.request_ids.append(request_id)
+
+        with pytest.raises(ValueError, match="duplicate scheduled request IDs"):
+            self.scheduler.commit_pipeline_step(sched_output, {request_id: 1})
+
+        assert request.sampling_params.step_index == 0
+        assert not self.scheduler.is_pipeline_finalizing(request_id)
+        assert self.scheduler.get_request_state(request_id).status is DiffusionRequestStatus.RUNNING
+
+    def test_pipeline_finalizing_request_releases_denoise_capacity(self) -> None:
+        finalizing_request = _make_step_request("queued-finalizing", num_inference_steps=1)
+        waiting_request = _make_step_request("queued-waiting", num_inference_steps=2)
+        finalizing_id = self.scheduler.add_request(finalizing_request)
+        waiting_id = self.scheduler.add_request(waiting_request)
+        first = self.scheduler.schedule()
+
+        assert self.scheduler.commit_pipeline_step(first, {finalizing_id: 1}) == {finalizing_id}
+
+        while_finalizing = self.scheduler.schedule()
+        assert while_finalizing.scheduled_request_ids == [waiting_id]
+        assert _new_ids(while_finalizing) == [waiting_id]
+        assert while_finalizing.num_running_reqs == 2
+        assert while_finalizing.num_waiting_reqs == 0
+        assert self.scheduler.get_request_state(finalizing_id).status is DiffusionRequestStatus.RUNNING
+        assert self.scheduler.get_request_state(waiting_id).status is DiffusionRequestStatus.RUNNING
+
+    def test_queued_admission_query_skips_owned_work_and_resumes_after_retirement(self) -> None:
+        self.scheduler.max_num_running_reqs = 2
+        first_id = self.scheduler.add_request(_make_step_request("queued-owned", num_inference_steps=2))
+        second_id = self.scheduler.add_request(_make_step_request("queued-waiting", num_inference_steps=2))
+        self.scheduler.schedule()
+
+        assert not self.scheduler.has_queued_admission_candidate(
+            {first_id, second_id}, admission_capacity_available=True
+        )
+        assert self.scheduler.has_queued_admission_candidate({first_id}, admission_capacity_available=True)
+
+        self.scheduler.preempt_request(second_id)
+        assert not self.scheduler.has_queued_admission_candidate({first_id}, admission_capacity_available=False)
+        assert self.scheduler.has_queued_admission_candidate({first_id}, admission_capacity_available=True)
+
+        self.scheduler.finish_requests(first_id, DiffusionRequestStatus.FINISHED_COMPLETED)
+        assert self.scheduler.has_queued_admission_candidate(set(), admission_capacity_available=True)
+
+    def test_queued_admission_query_keeps_finalizing_request_unscheduled(self) -> None:
+        request_id = self.scheduler.add_request(_make_step_request("queued-finalizing", num_inference_steps=1))
+        output = self.scheduler.schedule()
+        self.scheduler.commit_pipeline_step(output, {request_id: 1})
+
+        assert not self.scheduler.has_queued_admission_candidate({request_id}, admission_capacity_available=True)
+
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=2))
         req_id_b = self.scheduler.add_request(_make_step_request("b", num_inference_steps=2))
@@ -2008,6 +2093,22 @@ class TestStepScheduler:
         assert _new_ids(sched_output) == [req_a]
         assert sched_output.num_running_reqs == 1
         assert sched_output.num_waiting_reqs == 1
+
+    def test_queued_pipeline_admits_incompatible_requests_as_independent_tasks(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(mode="queued", max_num_seqs=2))
+        request_a = _make_step_request("queued-a")
+        request_b = _make_step_request("queued-b")
+        request_a.batch_compatibility_key = ("shape", 512)
+        request_b.batch_compatibility_key = ("shape", 1024)
+
+        request_a_id = scheduler.add_request(request_a)
+        request_b_id = scheduler.add_request(request_b)
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [request_a_id, request_b_id]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
 
     def test_step_batch_allows_different_num_inference_steps(self) -> None:
         scheduler = StepScheduler()
@@ -2241,6 +2342,35 @@ class TestStepScheduler:
         third = self.scheduler.schedule()
         assert _cached_ids(third) == [req_id]
         assert request.sampling_params.step_index == 1
+
+    def test_defer_unprepared_request_preserves_new_request_classification(self) -> None:
+        request = _make_step_request("deferred-new", num_inference_steps=2)
+        req_id = self.scheduler.add_request(request)
+
+        first = self.scheduler.schedule()
+        assert _new_ids(first) == [req_id]
+        assert self.scheduler.defer_request(req_id) is True
+        assert self.scheduler.get_request_state(req_id).status is DiffusionRequestStatus.WAITING
+
+        retry = self.scheduler.schedule()
+        assert _new_ids(retry) == [req_id]
+        assert _cached_ids(retry) == []
+
+    def test_engine_capacity_deferral_returns_unprocessed_new_tail_in_order(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+        request_ids = [scheduler.add_request(_make_step_request(f"queued-{index}")) for index in range(4)]
+        selected = scheduler.schedule()
+        assert _new_ids(selected) == request_ids
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = scheduler
+        descriptors = engine._split_queued_scheduler_output(selected)
+        engine._defer_queued_admission_tail(descriptors[2:])
+
+        retry = scheduler.schedule()
+        assert _cached_ids(retry) == request_ids[:2]
+        assert _new_ids(retry) == request_ids[2:]
 
     @pytest.mark.parametrize(
         ("sampling_params", "expected_steps"),
