@@ -1573,6 +1573,10 @@ class DiffusionEngine:
             try:
                 runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
             except Exception as exc:
+                # Shutdown can interrupt an in-flight executor call. Exit through
+                # the loop tail so pending RPCs are failed instead of left waiting.
+                if self._closed:
+                    break
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
                 )
@@ -2320,6 +2324,10 @@ class DiffusionEngine:
         closed_output = DiffusionOutput(error="DiffusionEngine is closed.")
         for stream in pending_streams:
             self._put_queue_output(stream, closed_output)
+
+        # Interrupt remote inference before waiting for the thread blocked on Ray.
+        if self.od_config.distributed_executor_backend == "ray":
+            self.executor.shutdown()
 
         worker_thread = self.worker_thread
         if worker_thread is not None:

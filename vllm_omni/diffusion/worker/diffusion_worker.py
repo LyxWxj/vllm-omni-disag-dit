@@ -289,7 +289,9 @@ class DiffusionWorker:
         rank: int,
         od_config: OmniDiffusionConfig,
         skip_load_model: bool = False,
+        distributed_init_method: str | None = None,
     ):
+        self.distributed_init_method = distributed_init_method
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
@@ -367,15 +369,16 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
 
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        # Set environment variables for local distributed initialization.
+        if self.distributed_init_method is None:
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
         # Setup device
-        self.device = current_omni_platform.get_torch_device(rank)
+        self.device = current_omni_platform.get_torch_device(self.local_rank)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
@@ -401,7 +404,12 @@ class DiffusionWorker:
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
         ):
-            init_distributed_environment(world_size=world_size, rank=rank)
+            init_distributed_environment(
+                world_size=world_size,
+                rank=rank,
+                distributed_init_method=self.distributed_init_method or "env://",
+                local_rank=self.local_rank,
+            )
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
             parallel_config = self.od_config.parallel_config
@@ -2945,41 +2953,60 @@ class WorkerWrapperBase:
         wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        rank: int | None = None,
+        distributed_init_method: str | None = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
 
         Args:
-            gpu_id: GPU device ID
+            gpu_id: Local GPU device ID
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
-            custom_pipeline_args: Optional arguments for custom pipeline initialization
+            custom_pipeline_args: Optional arguments passed to native pipelines.
+                A ``pipeline_class`` entry triggers custom pipeline initialization.
+            rank: Global distributed rank. Defaults to ``gpu_id`` for local
+                multiprocessing.
+            distributed_init_method: Explicit rendezvous URL, or None for the
+                local launcher's environment-based rendezvous.
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
         self.base_worker_class = base_worker_class
         self.worker_extension_cls = worker_extension_cls
         self.custom_pipeline_args = custom_pipeline_args
+        self.uses_custom_pipeline = bool(custom_pipeline_args and "pipeline_class" in custom_pipeline_args)
 
         # Prepare worker class with extension support
         worker_class = self._prepare_worker_class()
 
-        # Create the actual worker instance
-        # When custom_pipeline_args is provided, skip initial model loading
-        # since re_init_pipeline will handle it. This avoids allocating memory
-        # through CuMemAllocator twice, which causes assertion failures in
-        # sleep mode.
-        self.worker = worker_class(
-            local_rank=gpu_id,
-            rank=gpu_id,
-            od_config=od_config,
-            skip_load_model=(self.custom_pipeline_args is not None),
-        )
+        # Create the actual worker instance. Only dynamic custom pipelines skip
+        # initial loading; native pipelines may also use custom_pipeline_args
+        # for model-specific component paths.
+        worker_init_kwargs: dict[str, Any] = {
+            "local_rank": gpu_id,
+            "rank": gpu_id if rank is None else rank,
+            "od_config": od_config,
+            "skip_load_model": self.uses_custom_pipeline,
+        }
+        if distributed_init_method is not None:
+            worker_init_kwargs["distributed_init_method"] = distributed_init_method
+        worker = worker_class(**worker_init_kwargs)
+        try:
+            # Re-initialize pipeline with custom pipeline if provided.
+            if self.uses_custom_pipeline:
+                worker.re_init_pipeline(self.custom_pipeline_args)
+        except Exception:
+            # The executor never receives a wrapper whose constructor raises.
+            # Unwind a successfully created worker here so its distributed
+            # groups do not poison the next inline engine initialization.
+            try:
+                worker.shutdown()
+            except Exception:
+                logger.exception("Failed to clean up worker after custom pipeline initialization failure")
+            raise
+        self.worker = worker
         self._execute_method_lock = threading.RLock()
-
-        # Re-initialize pipeline with custom pipeline if provided
-        if self.custom_pipeline_args is not None:
-            self.worker.re_init_pipeline(self.custom_pipeline_args)
 
     def _prepare_worker_class(self) -> type:
         """
