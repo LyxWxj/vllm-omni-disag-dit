@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.distributed.parallel_state import get_vae_group
 
 logger = init_logger(__name__)
 
@@ -45,8 +45,9 @@ class DistributedVaeExecutor:
     """
 
     def __init__(self):
-        # Use a dedicated process group spanning the complete worker WORLD.
-        self.group = get_world_group().device_group
+        # PP gets a dedicated communicator so asynchronous final decode cannot
+        # reorder collectives with the PP activation/feedback transport.
+        self.group = get_vae_group().device_group
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.parallel_size = 1

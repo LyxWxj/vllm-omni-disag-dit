@@ -28,11 +28,7 @@ class _StageCommand:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
     result: Future[Any]
-
-
-@dataclass
-class _StageAsyncCommand(_StageCommand):
-    """Worker command that must be followed by a progress wake-up."""
+    rearm_progress: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,13 +64,29 @@ class PipelineStageEngine:
 
     def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         result: Future[Any] = Future()
-        self._enqueue_command(_StageCommand(method, args, kwargs, result))
+        with self._state_lock:
+            if self._closed.is_set():
+                raise RuntimeError("Pipeline StageEngine is closed")
+            if self._fatal_error is not None:
+                raise RuntimeError("Pipeline StageEngine failed") from self._fatal_error
+            try:
+                self._commands.put_nowait(_StageCommand(method, args, kwargs, result))
+            except queue.Full as exc:
+                raise RuntimeError("Pipeline StageEngine command queue is full") from exc
         return result.result()
 
     def submit(self, method: str, *args: Any, **kwargs: Any) -> None:
         """Queue a command and return once it is owned by the StageEngine."""
         result: Future[Any] = Future()
-        self._enqueue_command(_StageAsyncCommand(method, args, kwargs, result))
+        with self._state_lock:
+            if self._closed.is_set():
+                raise RuntimeError("Pipeline StageEngine is closed")
+            if self._fatal_error is not None:
+                raise RuntimeError("Pipeline StageEngine failed") from self._fatal_error
+            try:
+                self._commands.put_nowait(_StageCommand(method, args, kwargs, result, rearm_progress=True))
+            except queue.Full as exc:
+                raise RuntimeError("Pipeline StageEngine command queue is full") from exc
 
         def report_failure(completed: Future[Any]) -> None:
             try:
@@ -94,17 +106,6 @@ class PipelineStageEngine:
 
         result.add_done_callback(report_failure)
         self.notify_progress()
-
-    def _enqueue_command(self, command: _StageCommand) -> None:
-        with self._state_lock:
-            if self._closed.is_set():
-                raise RuntimeError("Pipeline StageEngine is closed")
-            if self._fatal_error is not None:
-                raise RuntimeError("Pipeline StageEngine failed") from self._fatal_error
-            try:
-                self._commands.put_nowait(command)
-            except queue.Full as exc:
-                raise RuntimeError("Pipeline StageEngine command queue is full") from exc
 
     def shutdown(self, timeout: float = 10.0) -> None:
         with self._state_lock:
@@ -152,19 +153,6 @@ class PipelineStageEngine:
 
         current_omni_platform.set_device(self._device)
 
-    def _publish_fatal_error(self, error: BaseException, context: str) -> None:
-        try:
-            self._publish_update(
-                PipelineWorkerUpdate(
-                    worker_id=self._worker_id,
-                    progress=None,
-                    events=(),
-                    error=f"{type(error).__name__}: {error}",
-                )
-            )
-        except Exception:
-            logger.exception("Failed to publish Pipeline StageEngine %s", context)
-
     def _run(self) -> None:
         try:
             self._set_device()
@@ -173,7 +161,17 @@ class PipelineStageEngine:
             fatal_error = RuntimeError("Pipeline StageEngine device initialization failed")
             fatal_error.__cause__ = exc
             self._fail_pending_commands(fatal_error)
-            self._publish_fatal_error(fatal_error, "initialization failure")
+            try:
+                self._publish_update(
+                    PipelineWorkerUpdate(
+                        worker_id=self._worker_id,
+                        progress=None,
+                        events=(),
+                        error=f"{type(fatal_error).__name__}: {fatal_error}",
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to publish Pipeline StageEngine initialization failure")
             return
 
         interval = _INITIAL_PROGRESS_INTERVAL_S
@@ -202,7 +200,7 @@ class PipelineStageEngine:
                 else:
                     command.result.set_exception(error)
                 awaiting_rpc_completion = True
-                if isinstance(command, _StageAsyncCommand):
+                if command.rearm_progress:
                     self.notify_progress()
                 continue
             if isinstance(command, _StageWake):
@@ -220,7 +218,17 @@ class PipelineStageEngine:
                 fatal_error = exc
                 logger.exception("Pipeline StageEngine %s failed", self._worker_id)
                 self._fail_pending_commands(fatal_error)
-                self._publish_fatal_error(fatal_error, "failure")
+                try:
+                    self._publish_update(
+                        PipelineWorkerUpdate(
+                            worker_id=self._worker_id,
+                            progress=None,
+                            events=(),
+                            error=f"{type(fatal_error).__name__}: {fatal_error}",
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to publish Pipeline StageEngine failure")
 
             if fatal_error is not None:
                 return

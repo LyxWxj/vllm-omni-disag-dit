@@ -73,6 +73,11 @@ def test_queued_mode_accepts_multiple_inflight_batches() -> None:
     assert config.max_inflight_batches == 2
 
 
+def test_vae_patch_parallel_size_cannot_exceed_pipeline_size() -> None:
+    with pytest.raises(ValueError, match="vae_patch_parallel_size cannot exceed pipeline_parallel_size"):
+        DiffusionParallelConfig(pipeline_parallel_size=2, vae_patch_parallel_size=3)
+
+
 def test_valid_queued_contract_is_accepted_before_engine_setup(monkeypatch) -> None:
     monkeypatch.setattr(
         OmniDiffusionConfig,

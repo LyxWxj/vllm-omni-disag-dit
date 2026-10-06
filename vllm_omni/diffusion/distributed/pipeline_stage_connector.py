@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 import torch
 
-from vllm_omni.diffusion.distributed.transport_schema import split_tensor_dict
+from vllm_omni.diffusion.distributed.group_coordinator import TensorMetadata
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,27 @@ class PipelineEdgeKind(StrEnum):
 
 
 def pipeline_payload_metadata(payload: dict[str, torch.Tensor | Any]) -> tuple[tuple[str, Any], ...]:
-    metadata, _ = split_tensor_dict(payload)
+    metadata: list[tuple[str, Any]] = []
+
+    def visit(values: dict[str, torch.Tensor | Any], prefix: str = "") -> None:
+        for key, value in values.items():
+            flattened_key = prefix + key
+            if isinstance(value, torch.Tensor):
+                metadata.append(
+                    (
+                        flattened_key,
+                        TensorMetadata(value.device.type, value.dtype, tuple(value.size())),
+                    )
+                )
+            elif isinstance(value, dict):
+                if not value:
+                    metadata.append((flattened_key, value))
+                else:
+                    visit(value, flattened_key + "%")
+            else:
+                metadata.append((flattened_key, value))
+
+    visit(payload)
     return tuple(metadata)
 
 
@@ -46,7 +66,7 @@ class PipelineTransferOffer:
     edge_kind: PipelineEdgeKind
     src_rank: int
     dst_rank: int
-    payload_metadata: tuple[tuple[str, Any], ...] | None = None
+    payload_metadata: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.batch_id or self.step_index < 0 or self.epoch < 0:
@@ -98,21 +118,23 @@ class PipelineCoordinatorProgress:
 
 
 class PipelineTransferCoordinator:
-    """FIFO grants for one queued PP2 activation/feedback edge pair."""
+    """FIFO control-plane grants for matched P2P endpoint readiness."""
 
     def __init__(
         self,
         *,
-        activation_edge: tuple[int, int],
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
     ) -> None:
-        self._validate_topology(activation_edge)
-        self._edges = {
-            PipelineEdgeKind.ACTIVATION: activation_edge,
-            PipelineEdgeKind.FEEDBACK: (activation_edge[1], activation_edge[0]),
+        self._validate_topology(activation_edges, feedback_edges)
+        self._valid_edges = {
+            PipelineEdgeKind.ACTIVATION: frozenset(activation_edges),
+            PipelineEdgeKind.FEEDBACK: frozenset(feedback_edges),
         }
-        self._offers: dict[PipelineEdgeKind, deque[PipelineTransferOffer]] = {
-            PipelineEdgeKind.ACTIVATION: deque(),
-            PipelineEdgeKind.FEEDBACK: deque(),
+        self._offers: dict[tuple[PipelineEdgeKind, int, int], deque[PipelineTransferOffer]] = {
+            (edge_kind, src_rank, dst_rank): deque()
+            for edge_kind, edges in self._valid_edges.items()
+            for src_rank, dst_rank in edges
         }
         self._offer_ids: set[tuple[Any, ...]] = set()
         self._ready_ids: set[tuple[Any, ...]] = set()
@@ -120,27 +142,35 @@ class PipelineTransferCoordinator:
         self._cancelled_batches: set[tuple[str, int]] = set()
         self._grants: dict[tuple[Any, ...], PipelineTransferGrant] = {}
         self._completed_ids: set[tuple[Any, ...]] = set()
+        self._busy_ranks: set[int] = set()
         self._next_edge = PipelineEdgeKind.FEEDBACK
+        self._edge_cursor = {
+            PipelineEdgeKind.ACTIVATION: 0,
+            PipelineEdgeKind.FEEDBACK: 0,
+        }
 
     @property
     def endpoint_ranks(self) -> frozenset[int]:
-        return frozenset(self._edges[PipelineEdgeKind.ACTIVATION])
+        return frozenset(rank for edge in self._valid_edges[PipelineEdgeKind.ACTIVATION] for rank in edge)
 
     @property
     def stage_physical_ranks(self) -> dict[int, int]:
         """Return the physical rank for logical stages in the single M2 replica."""
-        src_rank, dst_rank = self._edges[PipelineEdgeKind.ACTIVATION]
+        edges = self._valid_edges[PipelineEdgeKind.ACTIVATION]
+        if len(edges) != 1:
+            raise RuntimeError("M2 Engine submission requires exactly one configured PP replica")
+        src_rank, dst_rank = next(iter(edges))
         return {0: src_rank, 1: dst_rank}
 
     def offer(self, offer: PipelineTransferOffer) -> bool:
         identity = offer.identity
-        if (offer.src_rank, offer.dst_rank) != self._edges[offer.edge_kind]:
+        if (offer.src_rank, offer.dst_rank) not in self._valid_edges[offer.edge_kind]:
             raise ValueError("pipeline transfer offer does not match the configured edge topology")
         if (offer.batch_id, offer.epoch) in self._cancelled_batches:
             return False
         if identity in self._offer_ids or identity in self._grants or identity in self._completed_ids:
             raise ValueError("duplicate pipeline transfer offer")
-        self._offers[offer.edge_kind].append(offer)
+        self._offers[(offer.edge_kind, offer.src_rank, offer.dst_rank)].append(offer)
         self._offer_ids.add(identity)
         if identity in self._pre_ready_ids:
             self._pre_ready_ids.remove(identity)
@@ -150,7 +180,7 @@ class PipelineTransferCoordinator:
     def mark_receive_ready(self, identity: tuple[Any, ...], rank: int | None = None) -> None:
         """Record destination credit, including announcements preceding an offer."""
         offer = self._offer_from_identity(identity)
-        if (offer.src_rank, offer.dst_rank) != self._edges[offer.edge_kind]:
+        if (offer.src_rank, offer.dst_rank) not in self._valid_edges[offer.edge_kind]:
             raise ValueError("pipeline receive readiness does not match the configured edge topology")
         if rank is not None and rank != offer.dst_rank:
             raise ValueError("pipeline receive readiness must be reported by the destination rank")
@@ -170,14 +200,14 @@ class PipelineTransferCoordinator:
         if not batch_id or type(epoch) is not int or epoch < 0:
             raise ValueError("invalid pipeline batch cancellation identity")
         self._cancelled_batches.add((batch_id, epoch))
-        for edge_kind, queue in self._offers.items():
+        for edge_key, queue in self._offers.items():
             retained = deque(offer for offer in queue if (offer.batch_id, offer.epoch) != (batch_id, epoch))
             removed = {
                 queue_item.identity
                 for queue_item in queue
                 if (queue_item.batch_id, queue_item.epoch) == (batch_id, epoch)
             }
-            self._offers[edge_kind] = retained
+            self._offers[edge_key] = retained
             self._offer_ids.difference_update(removed)
             self._ready_ids.difference_update(removed)
         self._pre_ready_ids = {
@@ -214,53 +244,49 @@ class PipelineTransferCoordinator:
         """Return FIFO heads whose endpoint readiness has not been confirmed."""
         return [queue[0] for queue in self._offers.values() if queue and queue[0].identity not in self._ready_ids]
 
-    def _edge_has_active_grant(self, edge_kind: PipelineEdgeKind) -> bool:
-        return any(
-            grant.offer.edge_kind is edge_kind
-            for grant in self._grants.values()
-        )
-
-    def _active_ranks(self) -> tuple[int, ...]:
-        active_ranks = {
-            rank
-            for grant in self._grants.values()
-            for rank in (grant.offer.src_rank, grant.offer.dst_rank)
-        }
-        return tuple(sorted(active_ranks))
-
     def grant_ready(self, limit: int = 1) -> list[PipelineTransferGrant]:
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be a positive integer")
         grants: list[PipelineTransferGrant] = []
         while len(grants) < limit:
-            other_edge = (
-                PipelineEdgeKind.ACTIVATION
-                if self._next_edge is PipelineEdgeKind.FEEDBACK
-                else PipelineEdgeKind.FEEDBACK
-            )
             edge_order = (
                 self._next_edge,
-                other_edge,
+                PipelineEdgeKind.ACTIVATION
+                if self._next_edge is PipelineEdgeKind.FEEDBACK
+                else PipelineEdgeKind.FEEDBACK,
             )
             selected: PipelineTransferOffer | None = None
             for edge_kind in edge_order:
-                queue = self._offers[edge_kind]
-                if not queue:
+                edge_keys = sorted(key for key in self._offers if key[0] is edge_kind)
+                if not edge_keys:
                     continue
-                candidate = queue[0]
-                if candidate.identity not in self._ready_ids or self._edge_has_active_grant(edge_kind):
-                    continue
-                selected = candidate
-                break
+                cursor = self._edge_cursor[edge_kind] % len(edge_keys)
+                for offset in range(len(edge_keys)):
+                    edge_index = (cursor + offset) % len(edge_keys)
+                    edge_key = edge_keys[edge_index]
+                    queue = self._offers[edge_key]
+                    if not queue:
+                        continue
+                    candidate = queue[0]
+                    if candidate.identity not in self._ready_ids:
+                        continue
+                    if candidate.src_rank in self._busy_ranks or candidate.dst_rank in self._busy_ranks:
+                        continue
+                    selected = candidate
+                    self._edge_cursor[edge_kind] = (edge_index + 1) % len(edge_keys)
+                    break
+                if selected is not None:
+                    break
             if selected is None:
                 break
             offer = selected
             identity = offer.identity
-            self._offers[offer.edge_kind].popleft()
+            self._offers[(offer.edge_kind, offer.src_rank, offer.dst_rank)].popleft()
             self._offer_ids.remove(identity)
             self._ready_ids.remove(identity)
             grant = PipelineTransferGrant(offer=offer)
             self._grants[identity] = grant
+            self._busy_ranks.update((offer.src_rank, offer.dst_rank))
             grants.append(grant)
             self._next_edge = (
                 PipelineEdgeKind.ACTIVATION
@@ -282,6 +308,7 @@ class PipelineTransferCoordinator:
             return False
         self._grants.pop(identity)
         self._completed_ids.add(identity)
+        self._busy_ranks.difference_update((grant.offer.src_rank, grant.offer.dst_rank))
         return True
 
     def snapshot(self) -> dict[str, Any]:
@@ -290,16 +317,26 @@ class PipelineTransferCoordinator:
             "ready": len(self._ready_ids) + len(self._pre_ready_ids),
             "grants": len(self._grants),
             "completed": len(self._completed_ids),
-            "busy_ranks": self._active_ranks(),
+            "busy_ranks": tuple(sorted(self._busy_ranks)),
         }
 
     @staticmethod
-    def _validate_topology(activation_edge: tuple[int, int]) -> None:
-        if not isinstance(activation_edge, tuple) or len(activation_edge) != 2:
-            raise ValueError("queued PP2 requires one activation edge pair")
-        src_rank, dst_rank = activation_edge
-        if src_rank < 0 or dst_rank < 0 or src_rank == dst_rank:
-            raise ValueError("pipeline topology endpoints must be distinct non-negative ranks")
+    def _validate_topology(
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
+    ) -> None:
+        if not activation_edges or not feedback_edges:
+            raise ValueError("pipeline transfer topology requires activation and feedback edges")
+        expected_feedback = {(dst, src) for src, dst in activation_edges}
+        if feedback_edges != expected_feedback:
+            raise ValueError("feedback edges must exactly reverse the activation edges")
+        endpoints: set[int] = set()
+        for src_rank, dst_rank in activation_edges:
+            if src_rank < 0 or dst_rank < 0 or src_rank == dst_rank:
+                raise ValueError("pipeline topology endpoints must be distinct non-negative ranks")
+            if src_rank in endpoints or dst_rank in endpoints:
+                raise ValueError("queued PP=2 topology requires disjoint two-rank replicas")
+            endpoints.update((src_rank, dst_rank))
 
     @staticmethod
     def _offer_from_identity(identity: tuple[Any, ...]) -> PipelineTransferOffer:
@@ -387,8 +424,6 @@ class DistributedP2PTransport:
         self._active_receive_ids: set[tuple[str, int, int, str]] = set()
         self._completed_receive_ids: set[tuple[str, int, int, str]] = set()
         self._closed = False
-        self._send_accepts_metadata = "metadata_list" in inspect.signature(group.isend_tensor_dict).parameters
-        self._receive_accepts_metadata = "metadata_list" in inspect.signature(group.irecv_tensor_dict).parameters
 
     @property
     def has_outstanding_operations(self) -> bool:
@@ -418,14 +453,17 @@ class DistributedP2PTransport:
         # backend raises after partially posting work, keep the identity active
         # so a replay cannot post an unmatched second receive.
         self._active_receive_ids.add(identity)
-        receive = self.group.irecv_tensor_dict
-        if offer.payload_metadata is not None and self._receive_accepts_metadata:
-            tensor_dict, handles, postprocess = receive(
-                src=self._src_group_rank,
-                metadata_list=offer.payload_metadata,
-            )
+        if offer.payload_metadata:
+            receive = self.group.irecv_tensor_dict
+            if "metadata_list" in inspect.signature(receive).parameters:
+                tensor_dict, handles, postprocess = receive(
+                    src=self._src_group_rank,
+                    metadata_list=offer.payload_metadata,
+                )
+            else:
+                tensor_dict, handles, postprocess = receive(src=self._src_group_rank)
         else:
-            tensor_dict, handles, postprocess = receive(src=self._src_group_rank)
+            tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(src=self._src_group_rank)
         self._pending_receives.append(
             _PendingReceive(
                 message=PipelineMessage(
@@ -441,7 +479,7 @@ class DistributedP2PTransport:
             )
         )
 
-    def _start_send(self, message: PipelineMessage, metadata_list: tuple[tuple[str, Any], ...] | None) -> None:
+    def _start_send(self, message: PipelineMessage, metadata_list: tuple[tuple[str, Any], ...]) -> None:
         self._ensure_open()
         if self.local_rank != self.src_rank:
             raise RuntimeError("only the source endpoint can send")
@@ -453,15 +491,14 @@ class DistributedP2PTransport:
         # Register before entering the blocking metadata send. Ambiguous
         # backend failure retains ownership and prevents replay.
         self._send_handles[identity] = None
-        send = self.group.isend_tensor_dict
-        if metadata_list is not None:
-            payload_metadata, _ = split_tensor_dict(message.payload)
-            if tuple(metadata_list) != tuple(payload_metadata):
-                raise ValueError("transfer offer metadata does not match the sender payload")
-        if metadata_list is not None and self._send_accepts_metadata:
-            handles = send(message.payload, dst=self._dst_group_rank, metadata_list=metadata_list)
+        if metadata_list:
+            send = self.group.isend_tensor_dict
+            if "metadata_list" in inspect.signature(send).parameters:
+                handles = send(message.payload, dst=self._dst_group_rank, metadata_list=metadata_list)
+            else:
+                handles = send(message.payload, dst=self._dst_group_rank)
         else:
-            handles = send(message.payload, dst=self._dst_group_rank)
+            handles = self.group.isend_tensor_dict(message.payload, dst=self._dst_group_rank)
         self._send_handles[identity] = list(handles)
 
     def poll(self, limit: int | None = None) -> list[PipelineMessage]:
@@ -572,13 +609,6 @@ class PipelineStageConnector:
         self._transport_pending: deque[PipelineMessage] = deque()
         self._received_leases: dict[int, PipelineMessage] = {}
         self._closed = False
-        self._transport_supports_bounded_poll = False
-        if transport is not None:
-            parameters = inspect.signature(transport.poll).parameters.values()
-            self._transport_supports_bounded_poll = any(
-                parameter.name == "limit" or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
 
     @property
     def send_in_use(self) -> int:
@@ -671,7 +701,11 @@ class PipelineStageConnector:
         available = self.max_slots - self.receive_depth - self.transport_pending
         if self.transport is not None and available > 0 and not self._transport_pending:
             poll_limit = min(limit, available)
-            if not self._transport_supports_bounded_poll:
+            parameters = inspect.signature(self.transport.poll).parameters.values()
+            supports_limit = any(
+                parameter.name == "limit" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+            )
+            if not supports_limit:
                 raise RuntimeError("pipeline transport must support bounded polling") from None
             incoming = self.transport.poll(limit=poll_limit)
             if len(incoming) > poll_limit:

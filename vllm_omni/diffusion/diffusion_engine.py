@@ -232,6 +232,7 @@ class _QueuedPipelineBatchPhase(str, Enum):
     AUTHORIZED = "authorized"
     STEP_COMPLETED = "step_completed"
     STEP_COMMITTED = "step_committed"
+    FINALIZATION_PENDING = "finalization_pending"
     FINALIZING = "finalizing"
     CANCELLING = "cancelling"
     FAILED = "failed"
@@ -267,16 +268,6 @@ class _QueuedPipelineBatch:
     request_cleanup_completed: bool = False
     reserved_bytes: int = 0
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
-
-    @property
-    def is_prepared_only(self) -> bool:
-        """Whether preparation succeeded without enqueueing a stage task."""
-        return not self.stage_enqueued
-
-    @property
-    def cancellation_pending(self) -> bool:
-        """Whether cancellation still needs to issue Worker cleanup."""
-        return not self.cancelled and not self.release_acknowledged
 
 
 class DiffusionEngine:
@@ -457,8 +448,6 @@ class DiffusionEngine:
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
         self._queued_pipeline_batches: dict[str, _QueuedPipelineBatch] = {}
-        self._queued_batch_descriptor_index: dict[int, str] = {}
-        self._queued_batch_request_steps: dict[tuple[str, int], str] = {}
         self._queued_reserved_bytes = 0
         self._queued_stage_buffer_budget_bytes: int | None = None
         self._queued_pipeline_epoch = 0
@@ -485,7 +474,8 @@ class DiffusionEngine:
             return
         if getattr(self.executor, "_pipeline_transfer_coordinator", None) is None:
             self.executor.initialize_pipeline_transfers(
-                activation_edge=(0, 1),
+                activation_edges={(0, 1)},
+                feedback_edges={(1, 0)},
                 max_slots=int(getattr(self.od_config, "edge_buffer_slots", 1)),
             )
         configured_budget = getattr(self.od_config, "stage_buffer_bytes", None)
@@ -519,10 +509,20 @@ class DiffusionEngine:
         if submit_only:
             return
         if batch.abort_requested:
-            self._cleanup_queued_terminal_batch(batch)
+            if not batch.cancelled and not batch.release_acknowledged:
+                self._cancel_queued_pipeline_batch(batch)
+            self._retire_queued_pipeline_batch(batch)
+            if batch.task.batch_id in self._queued_pipeline_batches:
+                return
+            self._emit_finished_outputs(set(batch.task.request_ids), None)
             return
         if batch.failure is not None:
-            self._cleanup_queued_terminal_batch(batch)
+            if not batch.cancelled and not batch.release_acknowledged:
+                self._cancel_queued_pipeline_batch(batch)
+            self._retire_queued_pipeline_batch(batch)
+            if batch.task.batch_id in self._queued_pipeline_batches:
+                return
+            self._finish_failed_queued_batch(batch)
             return
         if tuple(scheduler_output.scheduled_request_ids) != tuple(batch.task.request_ids):
             raise RuntimeError("queued pipeline scheduler selected a request while another batch is retained")
@@ -536,21 +536,31 @@ class DiffusionEngine:
         request_ids = tuple(scheduler_output.scheduled_request_ids)
         if len(request_ids) != 1:
             raise ValueError("Queued pipeline batch lookup requires exactly one scheduled request.")
-        descriptor_index = getattr(self, "_queued_batch_descriptor_index", {})
-        batch_id = descriptor_index.get(id(scheduler_output))
-        if batch_id is not None:
-            batch = self._queued_pipeline_batches.get(batch_id)
-            if batch is not None:
-                return batch
-            descriptor_index.pop(id(scheduler_output), None)
+        descriptor_matches = [
+            batch
+            for batch in self._queued_pipeline_batches.values()
+            if batch.scheduler_output is scheduler_output and batch.task.request_ids == request_ids
+        ]
+        if len(descriptor_matches) > 1:
+            raise RuntimeError(f"Queued pipeline descriptor {request_ids!r} has duplicate batch ownership.")
+        if descriptor_matches:
+            return descriptor_matches[0]
         request_state = self.scheduler.get_request_state(request_ids[0])
         if request_state is None:
             raise RuntimeError(f"Queued request {request_ids[0]!r} has no Scheduler state.")
         request_step = request_state.req.sampling_params.step_index
         if request_step is None:
             request_step = 0
-        batch_id = getattr(self, "_queued_batch_request_steps", {}).get((request_ids[0], request_step))
-        return None if batch_id is None else self._queued_pipeline_batches.get(batch_id)
+        matches = [
+            batch
+            for batch in self._queued_pipeline_batches.values()
+            if batch.task.request_ids == request_ids and batch.task.step_index == request_step
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Queued pipeline has duplicate ownership for request-step {request_ids!r}, step={request_step}."
+            )
+        return matches[0] if matches else None
 
     def _finish_failed_queued_batch(self, batch: _QueuedPipelineBatch) -> None:
         """Complete a failed request only after its queued ownership is retired."""
@@ -573,19 +583,6 @@ class DiffusionEngine:
         )
         self._emit_finished_outputs(set(batch.task.request_ids), runner_output)
 
-    def _cleanup_queued_terminal_batch(self, batch: _QueuedPipelineBatch) -> bool:
-        """Retry terminal cleanup and emit the result once ownership is gone."""
-        if batch.cancellation_pending:
-            self._cancel_queued_pipeline_batch(batch)
-        self._retire_queued_pipeline_batch(batch)
-        if batch.task.batch_id in self._queued_pipeline_batches:
-            return False
-        if batch.failure is not None and not batch.abort_requested:
-            self._finish_failed_queued_batch(batch)
-        else:
-            self._emit_finished_outputs(set(batch.task.request_ids), None)
-        return True
-
     def _handle_queued_iteration_failure(self, scheduler_output: Any, failure: BaseException) -> None:
         request_ids = tuple(scheduler_output.scheduled_request_ids)
         batch = self._queued_pipeline_batch_for_scheduler_output(scheduler_output)
@@ -597,7 +594,12 @@ class DiffusionEngine:
         if batch.failure is None:
             batch.failure = failure
         try:
-            self._cleanup_queued_terminal_batch(batch)
+            if not batch.cancelled and not batch.release_acknowledged:
+                self._cancel_queued_pipeline_batch(batch)
+            self._retire_queued_pipeline_batch(batch)
+            if batch.task.batch_id in self._queued_pipeline_batches:
+                return
+            self._finish_failed_queued_batch(batch)
         except Exception:
             logger.error("Queued batch cleanup is pending; retaining ownership", exc_info=True)
 
@@ -654,7 +656,12 @@ class DiffusionEngine:
                 continue
             try:
                 if batch.abort_requested:
-                    self._cleanup_queued_terminal_batch(batch)
+                    if not batch.cancelled and not batch.release_acknowledged:
+                        self._cancel_queued_pipeline_batch(batch)
+                    self._retire_queued_pipeline_batch(batch)
+                    if batch.task.batch_id in self._queued_pipeline_batches:
+                        continue
+                    self._emit_finished_outputs(set(batch.task.request_ids), None)
                     continue
                 if batch.failure is not None:
                     self._run_queued_pipeline_iteration(batch.scheduler_output)
@@ -874,20 +881,7 @@ class DiffusionEngine:
         )
         if task.batch_id in self._queued_pipeline_batches:
             raise ValueError(f"Queued pipeline batch {task.batch_id!r} already exists.")
-        descriptor_index = getattr(self, "_queued_batch_descriptor_index", None)
-        request_steps = getattr(self, "_queued_batch_request_steps", None)
-        if descriptor_index is None:
-            descriptor_index = self._queued_batch_descriptor_index = {}
-        if request_steps is None:
-            request_steps = self._queued_batch_request_steps = {}
-        request_step_key = (request_id, step_index)
-        previous_batch_id = request_steps.get(request_step_key)
-        if previous_batch_id is not None and previous_batch_id in self._queued_pipeline_batches:
-            raise RuntimeError(f"Queued request-step {request_step_key!r} already has batch ownership.")
-        request_steps.pop(request_step_key, None)
         self._queued_pipeline_batches[task.batch_id] = batch
-        descriptor_index[id(scheduler_output)] = task.batch_id
-        request_steps[request_step_key] = task.batch_id
         self._queued_reserved_bytes += reserved_bytes
         return batch
 
@@ -964,6 +958,11 @@ class DiffusionEngine:
 
     def _authorize_waiting_queued_batches(self) -> None:
         """Enqueue prepared tasks in admission order as denoise slots open."""
+        if self._queued_pipeline_uses_distributed_vae() and any(
+            batch.phase in {_QueuedPipelineBatchPhase.FINALIZATION_PENDING, _QueuedPipelineBatchPhase.FINALIZING}
+            for batch in self._queued_pipeline_batches.values()
+        ):
+            return
         available_slots = int(self.od_config.max_inflight_batches) - self._queued_denoise_batch_count()
         if available_slots <= 0:
             return
@@ -990,6 +989,26 @@ class DiffusionEngine:
             )
         for batch in batches_to_authorize:
             batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
+
+    def _distributed_vae_finalization_is_quiescent(self, batch: _QueuedPipelineBatch) -> bool:
+        """Wait until no other queued batch can issue PP collectives."""
+        if not self._queued_pipeline_uses_distributed_vae():
+            return True
+        if any(
+            candidate is not batch and candidate.phase is _QueuedPipelineBatchPhase.FINALIZING
+            for candidate in self._queued_pipeline_batches.values()
+        ):
+            return False
+        return all(
+            candidate is batch
+            or candidate.phase
+            in {
+                _QueuedPipelineBatchPhase.RESERVED,
+                _QueuedPipelineBatchPhase.PREPARED,
+                _QueuedPipelineBatchPhase.FINALIZATION_PENDING,
+            }
+            for candidate in self._queued_pipeline_batches.values()
+        )
 
     def _progress_queued_pipeline_batch(
         self,
@@ -1044,9 +1063,19 @@ class DiffusionEngine:
             if not finalizing.issubset(batch.task.request_ids):
                 raise RuntimeError("Scheduler finalized a request outside the queued pipeline batch.")
             batch.finalizing_request_ids = finalizing
-            batch.phase = (
-                _QueuedPipelineBatchPhase.FINALIZING if finalizing else _QueuedPipelineBatchPhase.STEP_COMMITTED
-            )
+            if finalizing:
+                has_active_finalization = self._queued_pipeline_uses_distributed_vae() and any(
+                    candidate.phase is _QueuedPipelineBatchPhase.FINALIZING
+                    for candidate in self._queued_pipeline_batches.values()
+                    if candidate is not batch
+                )
+                batch.phase = (
+                    _QueuedPipelineBatchPhase.FINALIZATION_PENDING
+                    if has_active_finalization
+                    else _QueuedPipelineBatchPhase.FINALIZING
+                )
+            else:
+                batch.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
             self._authorize_waiting_queued_batches()
             return finalizing
         except BaseException:
@@ -1061,6 +1090,8 @@ class DiffusionEngine:
         try:
             output: BatchRunnerOutput | None
             if batch.finalization_handle is None:
+                if not self._distributed_vae_finalization_is_quiescent(batch):
+                    return None
                 if not self.executor.pipeline_batch_release_ready(batch.stage_physical_ranks, batch.task.batch_id):
                     return None
                 output_rank = self._select_queued_pipeline_output_rank(batch)
@@ -1092,7 +1123,7 @@ class DiffusionEngine:
             raise
 
     def _retire_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
-        if batch.is_prepared_only:
+        if not batch.stage_enqueued:
             if not (batch.abort_requested or batch.failure is not None or batch.cancelled):
                 raise RuntimeError("A prepared-only queued batch cannot retire before execution.")
             if batch.request_prepared and not batch.request_cleanup_completed:
@@ -1107,7 +1138,7 @@ class DiffusionEngine:
             _QueuedPipelineBatchPhase.CANCELLING,
         }:
             raise RuntimeError("Queued pipeline batch is not ready for retirement.")
-        if not batch.is_prepared_only and not batch.release_acknowledged:
+        if batch.stage_enqueued and not batch.release_acknowledged:
             # Finalization can complete without another scheduler progress
             # round. Give Workers one transport-only tick so completed device
             # consumer events release their receive leases before the context
@@ -1133,7 +1164,7 @@ class DiffusionEngine:
                     f"expected={expected}, actual={actual}"
                 )
             batch.release_acknowledged = True
-        if not batch.is_prepared_only and not batch.transfer_retired:
+        if batch.stage_enqueued and not batch.transfer_retired:
             self.executor.progress_pipeline()
             if not self.executor.pipeline_transfer_batch_retirement_ready(batch.task.batch_id, batch.task.epoch):
                 return
@@ -1160,10 +1191,6 @@ class DiffusionEngine:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
                 batch.scheduler_completed_request_ids.add(request_id)
         self._queued_pipeline_batches.pop(batch.task.batch_id, None)
-        self._queued_batch_descriptor_index.pop(id(batch.scheduler_output), None)
-        for key, batch_id in list(self._queued_batch_request_steps.items()):
-            if batch_id == batch.task.batch_id:
-                self._queued_batch_request_steps.pop(key, None)
         self._queued_reserved_bytes -= batch.reserved_bytes
         if self._queued_reserved_bytes < 0:
             raise RuntimeError("queued pipeline byte reservation accounting underflow")
@@ -1176,7 +1203,7 @@ class DiffusionEngine:
             return
         if batch.release_acknowledged:
             return
-        if batch.is_prepared_only:
+        if not batch.stage_enqueued:
             if not batch.request_cleanup_completed:
                 cleanup = self.executor.cleanup_finalized_pipeline_request(batch.task.request_ids[0])
                 if not isinstance(cleanup, list) or len(cleanup) != 2 or not all(cleanup):
@@ -1220,6 +1247,10 @@ class DiffusionEngine:
                 return None
         if batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED:
             self._commit_queued_pipeline_step(batch)
+        if batch.phase is _QueuedPipelineBatchPhase.FINALIZATION_PENDING:
+            if not self._distributed_vae_finalization_is_quiescent(batch):
+                return None
+            batch.phase = _QueuedPipelineBatchPhase.FINALIZING
         output: BatchRunnerOutput | None = None
         if batch.phase is _QueuedPipelineBatchPhase.FINALIZING:
             output = self._finalize_queued_pipeline_batch(batch)
@@ -1573,10 +1604,6 @@ class DiffusionEngine:
             try:
                 runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
             except Exception as exc:
-                # Shutdown can interrupt an in-flight executor call. Exit through
-                # the loop tail so pending RPCs are failed instead of left waiting.
-                if self._closed:
-                    break
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
                 )
@@ -2325,10 +2352,6 @@ class DiffusionEngine:
         for stream in pending_streams:
             self._put_queue_output(stream, closed_output)
 
-        # Interrupt remote inference before waiting for the thread blocked on Ray.
-        if self.od_config.distributed_executor_backend == "ray":
-            self.executor.shutdown()
-
         worker_thread = self.worker_thread
         if worker_thread is not None:
             if worker_thread.is_alive():
@@ -2386,8 +2409,12 @@ class DiffusionEngine:
                 continue
             batch.abort_requested = True
             try:
-                if not self._cleanup_queued_terminal_batch(batch):
+                if not batch.cancelled and not batch.release_acknowledged:
+                    self._cancel_queued_pipeline_batch(batch)
+                self._retire_queued_pipeline_batch(batch)
+                if batch.task.batch_id in self._queued_pipeline_batches:
                     continue
+                self._emit_finished_outputs(set(batch.task.request_ids), None)
             except Exception:
                 logger.error("Queued abort cleanup is pending; retaining ownership", exc_info=True)
 

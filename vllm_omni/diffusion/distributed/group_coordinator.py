@@ -4,6 +4,7 @@
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
+from collections import namedtuple
 from typing import Any
 
 import torch
@@ -12,17 +13,58 @@ from torch.distributed import Backend, ProcessGroup
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
-from vllm_omni.diffusion.distributed.transport_schema import (
-    TensorMetadata,
-    split_tensor_dict,
-    update_nested_dict,
-)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 
+TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
+
+
+def _split_tensor_dict(
+    tensor_dict: dict[str, torch.Tensor | Any], prefix: str = ""
+) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
+    """Split the tensor dictionary into two parts:
+    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
+         by its metadata.
+    2. A list of tensors.
+
+    If the Tensor is nested under `tensor_dict["key1"]["key2"]`, the key of its
+    metadata will be "key1%key2".
+    """
+    metadata_list: list[tuple[str, Any]] = []
+    tensor_list = []
+    for key, value in tensor_dict.items():
+        assert "%" not in key, "Avoid having '%' in key as it is used as a separator for nested entries."
+        if isinstance(value, torch.Tensor):
+            # Note: we cannot use `value.device` here,
+            # because it contains not only the device type but also the device
+            # index (e.g. "cuda:0"). We only need the device type.
+            # receiving side will set the device index.
+            device = value.device.type
+            metadata_list.append((prefix + key, TensorMetadata(device, value.dtype, value.size())))
+            tensor_list.append(value)
+        elif isinstance(value, dict):
+            if len(value) == 0:
+                metadata_list.append((prefix + key, value))
+            inner_metadata_list, inner_tensor_list = _split_tensor_dict(value, prefix + key + "%")
+            metadata_list.extend(inner_metadata_list)
+            tensor_list.extend(inner_tensor_list)
+        else:
+            metadata_list.append((prefix + key, value))
+    return metadata_list, tensor_list
+
+
+def _update_nested_dict(nested_dict, flattened_key, value):
+    key_splits = flattened_key.split("%")
+    cur_dict = nested_dict
+    for k in key_splits[:-1]:
+        if k not in cur_dict:
+            cur_dict[k] = {}
+        cur_dict = cur_dict[k]
+    cur_dict[key_splits[-1]] = value
 
 
 class GroupCoordinator:
@@ -354,7 +396,7 @@ class GroupCoordinator:
         if rank == src_rank:
             metadata_list: list[tuple[Any, Any]] = []
             assert isinstance(tensor_dict, dict), f"Expecting a dictionary, got {type(tensor_dict)}"
-            metadata_list, tensor_list = split_tensor_dict(tensor_dict)
+            metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
@@ -387,7 +429,7 @@ class GroupCoordinator:
                     tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                     if tensor.numel() == 0:
                         # Skip broadcasting empty tensors.
-                        update_nested_dict(tensor_dict, key, tensor)
+                        _update_nested_dict(tensor_dict, key, tensor)
                         continue
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
@@ -396,9 +438,9 @@ class GroupCoordinator:
                         # use group for GPU tensors
                         handle = torch.distributed.broadcast(tensor, src=src_rank, group=group, async_op=True)
                     async_handles.append(handle)
-                    update_nested_dict(tensor_dict, key, tensor)
+                    _update_nested_dict(tensor_dict, key, tensor)
                 else:
-                    update_nested_dict(tensor_dict, key, value)
+                    _update_nested_dict(tensor_dict, key, value)
             for async_handle in async_handles:
                 async_handle.wait()
         return tensor_dict
@@ -411,8 +453,8 @@ class GroupCoordinator:
     ) -> list[torch.distributed.Work]:
         """Non-blocking send of a tensor dictionary.
 
-        Sends metadata via the Gloo CPU group when no metadata is supplied,
-        then starts a non-blocking NCCL isend for each GPU tensor. Returns the list of
+        Sends metadata via the Gloo CPU group (blocking) then starts a
+        non-blocking NCCL isend for each GPU tensor.  Returns the list of
         Work handles; the caller must call handle.wait() before the tensors
         can be safely reused or freed.
 
@@ -427,12 +469,10 @@ class GroupCoordinator:
 
         device_group, cpu_group = self._tensor_dict_comm_groups(self.rank_in_group)
 
-        payload_metadata, tensor_list = split_tensor_dict(tensor_dict)
+        payload_metadata, tensor_list = _split_tensor_dict(tensor_dict)
         if metadata_list is None:
             metadata_list = payload_metadata
             self.send_object(metadata_list, dst=dst, group=cpu_group)
-        elif tuple(metadata_list) != tuple(payload_metadata):
-            raise ValueError("tensor_dict metadata does not match the payload")
 
         handles: list[torch.distributed.Work] = []
         for tensor in tensor_list:
@@ -453,8 +493,8 @@ class GroupCoordinator:
     ) -> tuple[dict[str, torch.Tensor | Any], list[torch.distributed.Work], list]:
         """Non-blocking receive of a tensor dictionary.
 
-        Receives metadata via the Gloo CPU group when no metadata is supplied,
-        then starts a non-blocking NCCL irecv for each GPU tensor. Returns
+        Receives metadata via the Gloo CPU group (blocking) then starts a
+        non-blocking NCCL irecv for each GPU tensor.  Returns
         ``(tensor_dict, comm_handles, comm_postprocess)`` matching the
         interface expected by ``AsyncIntermediateTensors``.
 
@@ -479,9 +519,9 @@ class GroupCoordinator:
                 if tensor.numel() > 0:
                     group = cpu_group if tensor.is_cpu else device_group
                     handles.append(torch.distributed.irecv(tensor, src=self.ranks[src], group=group))
-                update_nested_dict(tensor_dict, key, tensor)
+                _update_nested_dict(tensor_dict, key, tensor)
             else:
-                update_nested_dict(tensor_dict, key, value)
+                _update_nested_dict(tensor_dict, key, value)
 
         return tensor_dict, handles, []
 
@@ -506,7 +546,7 @@ class GroupCoordinator:
 
         metadata_list: list[tuple[Any, Any]] = []
         assert isinstance(tensor_dict, dict), f"Expecting a dictionary, got {type(tensor_dict)}"
-        metadata_list, tensor_list = split_tensor_dict(tensor_dict)
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # `metadata_list` lives in CPU memory.
         # `send_object_list` has serialization & deserialization,
         # all happening on CPU. Therefore, we can use the CPU group.
@@ -545,7 +585,7 @@ class GroupCoordinator:
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
-                    update_nested_dict(tensor_dict, key, tensor)
+                    _update_nested_dict(tensor_dict, key, tensor)
                     continue
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
@@ -553,9 +593,9 @@ class GroupCoordinator:
                 else:
                     # use group for GPU tensors
                     torch.distributed.recv(tensor, src=self.ranks[src], group=group)
-                update_nested_dict(tensor_dict, key, tensor)
+                _update_nested_dict(tensor_dict, key, tensor)
             else:
-                update_nested_dict(tensor_dict, key, value)
+                _update_nested_dict(tensor_dict, key, value)
         return tensor_dict
 
     def barrier(self):

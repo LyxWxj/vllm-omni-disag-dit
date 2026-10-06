@@ -357,6 +357,12 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        if self.pipeline_parallel_size > 1 and self.vae_patch_parallel_size > self.pipeline_parallel_size:
+            raise ValueError(
+                "vae_patch_parallel_size cannot exceed pipeline_parallel_size when both are enabled; "
+                f"got vae_patch_parallel_size={self.vae_patch_parallel_size}, "
+                f"pipeline_parallel_size={self.pipeline_parallel_size}"
+            )
         assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."

@@ -15,7 +15,8 @@ PIPELINE_GRANT_START_TIMEOUT_S = 30.0
 
 def validate_pipeline_topology_reports(
     result: Any,
-    activation_edge: tuple[int, int],
+    activation_edges: set[tuple[int, int]],
+    feedback_edges: set[tuple[int, int]],
 ) -> None:
     while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
         result = result[0]
@@ -24,9 +25,8 @@ def validate_pipeline_topology_reports(
     actual_activation = {tuple(item["activation_edge"]) for item in result}
     actual_feedback = {tuple(item["feedback_edge"]) for item in result}
     reporting_ranks = {item["rank"] for item in result}
-    feedback_edge = (activation_edge[1], activation_edge[0])
-    expected_ranks = set(activation_edge)
-    if actual_activation != {activation_edge} or actual_feedback != {feedback_edge}:
+    expected_ranks = {rank for edge in activation_edges for rank in edge}
+    if actual_activation != activation_edges or actual_feedback != feedback_edges:
         raise ValueError("Executor pipeline topology does not match Worker PP groups")
     if reporting_ranks != expected_ranks:
         raise ValueError("pipeline topology reports do not cover every configured endpoint")
@@ -170,9 +170,7 @@ class DiffusionExecutor(ABC):
                 )
             executor_class = distributed_executor_backend
         elif distributed_executor_backend == "ray":
-            from vllm_omni.diffusion.executor.ray_executor import RayDiffusionExecutor
-
-            executor_class = RayDiffusionExecutor
+            raise NotImplementedError("ray backend is not yet supported.")
         elif distributed_executor_backend == "mp":
             from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
@@ -304,46 +302,23 @@ class DiffusionExecutor(ABC):
 
     def initialize_pipeline_transfers(
         self,
-        activation_edge: tuple[int, int],
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
         max_slots: int = 1,
     ) -> Any:
         raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
 
     def coordinate_pipeline_transfer(self, offer: Any) -> list[Any]:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        if coordinator.offer(offer):
-            self._pipeline_pending_readiness[offer.identity] = offer
-        return self._retry_pipeline_transfer_readiness()
+        raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
 
     def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        coordinator.cancel_batch(batch_id, epoch)
-        self._pipeline_pending_readiness = {
-            identity: offer
-            for identity, offer in self._pipeline_pending_readiness.items()
-            if (identity[0], identity[2]) != (batch_id, epoch)
-        }
+        raise NotImplementedError("queued pipeline transfer cancellation is not wired for this executor")
 
     def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        coordinator.retire_batch(batch_id, epoch)
-        self._pipeline_pending_readiness = {
-            identity: offer
-            for identity, offer in self._pipeline_pending_readiness.items()
-            if (identity[0], identity[2]) != (batch_id, epoch)
-        }
+        raise NotImplementedError("queued pipeline transfer retirement is not wired for this executor")
 
     def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        return coordinator.batch_retirement_ready(batch_id, epoch)
+        raise NotImplementedError("queued pipeline transfer retirement readiness is not wired for this executor")
 
     def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
         """Queue a granted transfer start without waiting for a Worker reply."""
@@ -353,10 +328,7 @@ class DiffusionExecutor(ABC):
         raise NotImplementedError("queued pipeline progress is not wired for this executor")
 
     def pipeline_stage_physical_ranks(self) -> dict[int, int]:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        return coordinator.stage_physical_ranks
+        raise NotImplementedError("queued pipeline topology is not wired for this executor")
 
     def pipeline_stage_memory_budget_bytes(self) -> int:
         raise NotImplementedError("queued pipeline memory budgeting is not wired for this executor")

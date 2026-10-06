@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """In-process diffusion executor for single-GPU deployments.
 
@@ -155,14 +155,12 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                     )
                 )
             except Exception as exc:
-                # The worker runs inline, so a pipeline's OmniClientError lands
-                # here; from_exception keeps its 4xx status for the engine/API.
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput.from_exception(exc),
+                        result=DiffusionOutput(error=str(exc)),
                     )
                 )
         return BatchRunnerOutput.from_list(runner_outputs)
@@ -340,23 +338,61 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
 
     def initialize_pipeline_transfers(
         self,
-        activation_edge: tuple[int, int],
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
         max_slots: int = 1,
     ) -> Any:
         if hasattr(self, "_pipeline_transfer_coordinator"):
             raise RuntimeError("pipeline transfer coordinator is already initialized")
         coordinator = PipelineTransferCoordinator(
-            activation_edge=activation_edge,
+            activation_edges=activation_edges,
+            feedback_edges=feedback_edges,
         )
         result = self._queued_control_rpc("initialize_pipeline_transports_all_ranks", args=(max_slots,))
         try:
-            validate_pipeline_topology_reports(result, activation_edge)
+            validate_pipeline_topology_reports(result, activation_edges, feedback_edges)
         except BaseException:
             self._mark_failed()
             raise
         self._pipeline_transfer_coordinator = coordinator
         self._pipeline_pending_readiness: dict[tuple[Any, ...], PipelineTransferOffer] = {}
         return result
+
+    def coordinate_pipeline_transfer(self, offer: PipelineTransferOffer) -> list[Any]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        if coordinator.offer(offer):
+            self._pipeline_pending_readiness[offer.identity] = offer
+        return self._retry_pipeline_transfer_readiness()
+
+    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.cancel_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.retire_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.batch_retirement_ready(batch_id, epoch)
 
     def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
         self._queued_control_rpc("start_pipeline_transfer", args=(grant,))
@@ -418,6 +454,12 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         except BaseException:
             self._mark_failed()
             raise
+
+    def pipeline_stage_physical_ranks(self) -> dict[int, int]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.stage_physical_ranks
 
     def pipeline_stage_memory_budget_bytes(self) -> int:
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)

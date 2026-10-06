@@ -250,11 +250,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if self._broadcast_mq is None:
             raise RuntimeError("Broadcast queue is closed")
 
-    def _supports_rank_local_pp_control(self) -> bool:
+    def _uses_autonomous_pipeline_stages(self) -> bool:
         config = getattr(self, "od_config", None)
         parallel = getattr(config, "parallel_config", None)
         return (
-            getattr(config, "step_execution", False)
+            getattr(config, "mode", "static") == "queued"
+            and getattr(config, "step_execution", False)
             and getattr(parallel, "data_parallel_size", 1) == 1
             and getattr(parallel, "pipeline_parallel_size", 1) == 2
             and getattr(parallel, "tensor_parallel_size", 1) == 1
@@ -262,9 +263,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             and getattr(parallel, "cfg_parallel_size", 1) == 1
             and len(getattr(self, "_result_mqs", ())) == 2
         )
-
-    def _uses_autonomous_pipeline_stages(self) -> bool:
-        return self._supports_rank_local_pp_control() and getattr(self.od_config, "mode", "static") == "queued"
 
     def uses_autonomous_pipeline_stages(self) -> bool:
         return self._uses_autonomous_pipeline_stages()
@@ -889,7 +887,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def _uses_rank_local_pp_rpc(self) -> bool:
-        return self._supports_rank_local_pp_control()
+        config = getattr(self, "od_config", None)
+        parallel = getattr(config, "parallel_config", None)
+        return (
+            getattr(config, "step_execution", False)
+            and getattr(parallel, "data_parallel_size", 1) == 1
+            and getattr(parallel, "pipeline_parallel_size", 1) == 2
+            and getattr(parallel, "tensor_parallel_size", 1) == 1
+            and getattr(parallel, "sequence_parallel_size", 1) == 1
+            and getattr(parallel, "cfg_parallel_size", 1) == 1
+            and len(getattr(self, "_result_mqs", ())) == 2
+        )
 
     def _queued_rank_local_rpc(
         self,
@@ -1080,23 +1088,61 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def initialize_pipeline_transfers(
         self,
-        activation_edge: tuple[int, int],
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
         max_slots: int = 1,
     ) -> Any:
         if hasattr(self, "_pipeline_transfer_coordinator"):
             raise RuntimeError("pipeline transfer coordinator is already initialized")
         coordinator = PipelineTransferCoordinator(
-            activation_edge=activation_edge,
+            activation_edges=activation_edges,
+            feedback_edges=feedback_edges,
         )
         result = self._queued_control_rpc("initialize_pipeline_transports_all_ranks", args=(max_slots,))
         try:
-            validate_pipeline_topology_reports(result, activation_edge)
+            validate_pipeline_topology_reports(result, activation_edges, feedback_edges)
         except BaseException as exc:
             self._fail_queued_control("pipeline topology validation", exc)
             raise
         self._pipeline_transfer_coordinator = coordinator
         self._pipeline_pending_readiness: dict[tuple[Any, ...], PipelineTransferOffer] = {}
         return result
+
+    def coordinate_pipeline_transfer(self, offer: PipelineTransferOffer) -> list[Any]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        if coordinator.offer(offer):
+            self._pipeline_pending_readiness[offer.identity] = offer
+        return self._retry_pipeline_transfer_readiness()
+
+    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.cancel_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.retire_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
+
+    def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.batch_retirement_ready(batch_id, epoch)
 
     def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
         """Broadcast a nonblocking StageEngine transfer-start command."""
@@ -1161,7 +1207,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
-        grant_limit = max(1, len(coordinator.endpoint_ranks))
+        grant_limit = max(1, len(coordinator.endpoint_ranks) // 2)
         grants = coordinator.grant_ready(limit=grant_limit)
         for grant in grants:
             if self._uses_autonomous_pipeline_stages():
@@ -1316,6 +1362,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if saw_new_offer or saw_completion or saw_readiness:
             progress.grants.extend(self._retry_pipeline_transfer_readiness())
         return progress
+
+    def pipeline_stage_physical_ranks(self) -> dict[int, int]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.stage_physical_ranks
 
     def pipeline_stage_memory_budget_bytes(self) -> int:
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
