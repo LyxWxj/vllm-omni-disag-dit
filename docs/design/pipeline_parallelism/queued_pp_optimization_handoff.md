@@ -80,24 +80,24 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 
 第一版应只作用于 `_uses_autonomous_pipeline_stages()`，普通 PP 和旧的同步路径保持原协议。实现顺序建议是：先增加 admission ack 数据结构和状态机单测，再接入单批异步 command，随后合并同一 scheduler round 的多个 batch，最后用 4 请求和 32 请求的同构/异构负载验证吞吐、bubble、输出 hash 和 `1e-8` 数值容差。每一步都要保留同步路径作为回退开关，便于区分 admission 优化收益和调度回归。
 
-本轮清理后的 feature 代码在远端 `c50d7f7f12927734b0c14c34b99f6161a2b3ad4c` 上完成了 4 请求 trace、32 请求同构和 32 请求异构回归。原始 manifest、decoded hash 和 trace worker events 保存在 `artifacts/wan22-queued-pp-cleanup-20261007/`：
+本轮 merge commit `1893402244d37dbdd90211cdb3e74e0d7c04c67e` 在服务器上完成了 correctness、精度和性能回归。manifest 保存在 `artifacts/wan22-merge-20261008/`：
 
-- 4 请求同步 trace：`trace/manifest.json`，`1024×1024`、80 帧、8 steps、PP2、edge2，4/4 成功，耗时 `54.60s`，吞吐 `0.07327 req/s`。
-- 32 请求同构、无同步：`homo32/manifest.json`，`1024×1024`、80 帧、8 steps，32/32 成功，耗时 `459.51s`，吞吐 `0.06964 req/s`。
-- 32 请求异构、无同步：`hetero32/manifest.json`，profile 按 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环，32/32 成功，耗时 `339.48s`，吞吐 `0.09426 req/s`。
+- 4 请求 no-sync accuracy：`accuracy-4x8-manifest.json`，`1024×1024`、80 帧、8 steps、PP2、edge2，4/4 成功，耗时 `53.17s`，吞吐 `0.07523 req/s`。
+- 32 请求同构、无同步：`homo32-manifest.json`，`1024×1024`、80 帧、8 steps，32/32 成功，耗时 `442.56s`，吞吐 `0.07231 req/s`。
+- 32 请求异构、无同步：`hetero32-manifest.json`，profile 按 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环，32/32 成功，耗时 `326.15s`，吞吐 `0.09811 req/s`。
 
-4 请求 trace 的四个 decoded hash 已记录；同构与异构中相同 seed、相同 `1024×1024` profile 的 8 个 decoded hash 全部一致。异构吞吐不能直接与同构吞吐作等价结论，因为四种 profile 的平均像素量更低；比较时应按像素量、帧数和 steps 归一化，或分别报告各 profile 的延迟。
+精度对照保存在 `accuracy-high-manifest.json` 对应的 paired run：merge 与 c50 基线在两个 seed、`1024×1024×80×8` 上 decoded tensor 逐元素 `max_abs=0.0`、`mean_abs=0.0`；小尺寸两请求 hash 也完全一致。异构吞吐不能直接与同构吞吐作等价结论，因为四种 profile 的平均像素量更低；比较时应按像素量、帧数和 steps 归一化，或分别报告各 profile 的延迟。
 
 最终 feature/main 对比使用相同的 32 请求、80 帧、8 steps 和四种异构 profile；feature 数值为本轮新 benchmark，main 数值沿用现有静态 PP2 对照基线。feature 使用 queued PP2、`edge_buffer_slots=2`、`vae_patch_parallel_size=1`，main 使用静态 PP2、`step_execution=false`、`vae_patch_parallel_size=2`：
 
 | 分支和负载 | 同步 | 总耗时 | 吞吐 | 完成数 |
 | --- | --- | ---: | ---: | ---: |
-| feature queued PP2，同构 1024×1024 | 关闭 | 459.51s | 0.06964 req/s | 32/32 |
-| feature queued PP2，异构 | 关闭 | 339.48s | 0.09426 req/s | 32/32 |
+| feature queued PP2，同构 1024×1024 | 关闭 | 442.56s | 0.07231 req/s | 32/32 |
+| feature queued PP2，异构 | 关闭 | 326.15s | 0.09811 req/s | 32/32 |
 | main 静态 PP2，同构 1024×1024 | 关闭 | 818.07s | 0.03912 req/s | 32/32 |
 | main 静态 PP2，异构 | 关闭 | 525.64s | 0.06088 req/s | 32/32 |
 
-异构 profile 固定为 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环排列。按现有 main 对照基线计算，feature 相对 main 的吞吐约为同构 `1.78x`、异构 `1.55x`；异构组的绝对吞吐仍受平均像素量较低影响，不能直接等价为相同计算量加速。feature manifest 保存在 `artifacts/wan22-queued-pp-cleanup-20261007/`，main manifest 沿用 `artifacts/wan22-final-main-homo32/` 和 `artifacts/wan22-final-main-hetero32/`。
+异构 profile 固定为 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环排列。按现有 main 对照基线计算，feature 相对 main 的吞吐约为同构 `1.85x`、异构 `1.61x`；异构组的绝对吞吐仍受平均像素量较低影响，不能直接等价为相同计算量加速。feature manifest 保存在 `artifacts/wan22-merge-20261008/`，main manifest 沿用 `artifacts/wan22-final-main-homo32/` 和 `artifacts/wan22-final-main-hetero32/`。
 
 ### 测试方法与同步
 
@@ -141,8 +141,8 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 
 - 已将 Engine queued batch phase、batch ownership、finalization quiescence 和 output-owner 选择移入 `vllm_omni/diffusion/queued_pp/runtime.py`；`DiffusionEngine` 保留兼容委托。
 - 本阶段新增 `vllm_omni/diffusion/queued_pp/executor_adapter.py`，统一 multiprocess/uniprocess Executor 对 rank 聚合 list envelope 的展开；readiness 类型校验、rank coverage、StageEngine 顺序和 transport 生命周期仍在各自实现中。
-- 本阶段删除两套 Executor 中重复的 result-envelope 代码，未修改普通 execute/static PP RPC。远端 Engine/retirement focused suite 为 `63 passed`。
-- `tests/diffusion/test_queued_pipeline_executor.py` 当前仍有旧 API fixture：38 个失败集中在 `initialize_pipeline_transfers((0, 1))` 和 `PipelineTransferCoordinator(activation_edge=...)` 等已变更签名，另有 82 个测试通过；下一阶段应先整理这些 stale fixtures，再继续 Worker runtime 抽取。
+- 本阶段删除两套 Executor 中重复的 result-envelope 代码，未修改普通 execute/static PP RPC。远端 Executor/connector focused suite 为 `84 passed`，Engine/retirement suite 为 `63 passed`。
+- 合并后的完整 queued correctness focused suite 共 `302 passed`，包含 upstream 新增的 VAE batch/recovery 测试；下一阶段可以继续 Worker runtime 抽取。
 
 ### 1. 建立 queued PP 专用模块边界
 
@@ -220,4 +220,4 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 - 不把 TextEncoder 或 VAE 的通用模型代码搬进 queued PP 模块。
 - 不为了减少行数删除 numerical validation、transport identity、device event、取消和 fatal recovery 检查。
 
-推荐的下一次提交先完成 queued Executor 测试 fixture 的 API 对齐和重复构造收敛，再处理 Worker transport/runtime 抽取；不要在旧 fixture 尚未对齐时扩大 Worker 重构范围。
+推荐的下一次提交处理 Worker 侧 queued runtime 抽取：先集中 finalization future、device event 和 `WanFinalDecode` 生命周期，再处理 transport reserve/poll/release；保持当前 StageEngine owner 顺序和 lease/fatal recovery contract。
