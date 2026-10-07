@@ -80,31 +80,31 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 
 第一版应只作用于 `_uses_autonomous_pipeline_stages()`，普通 PP 和旧的同步路径保持原协议。实现顺序建议是：先增加 admission ack 数据结构和状态机单测，再接入单批异步 command，随后合并同一 scheduler round 的多个 batch，最后用 4 请求和 32 请求的同构/异构负载验证吞吐、bubble、输出 hash 和 `1e-8` 数值容差。每一步都要保留同步路径作为回退开关，便于区分 admission 优化收益和调度回归。
 
-本轮 merge commit `1893402244d37dbdd90211cdb3e74e0d7c04c67e` 在服务器上完成了 correctness、精度和性能回归。manifest 保存在 `artifacts/wan22-merge-20261008/`：
+本轮 feature commit `cd4ee1d74305e51c9f99f5637bff10d1dd6cfc05` 在服务器上完成了 correctness、精度和性能回归。精度回归沿用 `artifacts/wan22-merge-20261008/` 中的 paired run；最新 32 请求 no-sync benchmark manifest 保存在 `artifacts/wan22-worker-runtime-main-20261008/`：
 
-- 4 请求 no-sync accuracy：`accuracy-4x8-manifest.json`，`1024×1024`、80 帧、8 steps、PP2、edge2，4/4 成功，耗时 `53.17s`，吞吐 `0.07523 req/s`。
-- 32 请求同构、无同步：`homo32-manifest.json`，`1024×1024`、80 帧、8 steps，32/32 成功，耗时 `442.56s`，吞吐 `0.07231 req/s`。
-- 32 请求异构、无同步：`hetero32-manifest.json`，profile 按 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环，32/32 成功，耗时 `326.15s`，吞吐 `0.09811 req/s`。
+- 4 请求 no-sync accuracy：`artifacts/wan22-merge-20261008/accuracy-4x8-manifest.json`，`1024×1024`、80 帧、8 steps、PP2、edge2，4/4 成功，耗时 `53.17s`，吞吐 `0.07523 req/s`。
+- 32 请求同构、无同步：`feature-homo32-manifest.json`，`1024×1024`、80 帧、8 steps，32/32 成功，耗时 `448.006s`，吞吐 `0.071428 req/s`。
+- 32 请求异构、无同步：`feature-hetero32-manifest.json`，profile 按 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环，32/32 成功，耗时 `324.078s`，吞吐 `0.098742 req/s`。
 
-精度对照保存在 `accuracy-high-manifest.json` 对应的 paired run：merge 与 c50 基线在两个 seed、`1024×1024×80×8` 上 decoded tensor 逐元素 `max_abs=0.0`、`mean_abs=0.0`；小尺寸两请求 hash 也完全一致。异构吞吐不能直接与同构吞吐作等价结论，因为四种 profile 的平均像素量更低；比较时应按像素量、帧数和 steps 归一化，或分别报告各 profile 的延迟。
+精度对照保存在 `artifacts/wan22-merge-20261008/accuracy-high-manifest.json` 对应的 paired run：merge 与 c50 基线在两个 seed、`1024×1024×80×8` 上 decoded tensor 逐元素 `max_abs=0.0`、`mean_abs=0.0`；小尺寸两请求 hash 也完全一致。异构吞吐不能直接与同构吞吐作等价结论，因为四种 profile 的平均像素量更低；比较时应按像素量、帧数和 steps 归一化，或分别报告各 profile 的延迟。
 
-最终 feature/main 对比使用相同的 32 请求、80 帧、8 steps 和四种异构 profile；feature 数值为本轮新 benchmark，main 数值沿用现有静态 PP2 对照基线。feature 使用 queued PP2、`edge_buffer_slots=2`、`vae_patch_parallel_size=1`，main 使用静态 PP2、`step_execution=false`、`vae_patch_parallel_size=2`：
+最终 feature/main 对比使用相同的 32 请求、80 帧、8 steps 和四种异构 profile。feature commit 为 `cd4ee1d74305e51c9f99f5637bff10d1dd6cfc05`，main 对照为 `upstream/main` 的 `32ead8e5c8930d4f4f48e74c72d26dc8c9abb88b`。feature 使用 queued PP2、`edge_buffer_slots=2`、`vae_patch_parallel_size=1`，main 使用静态 PP2、`step_execution=false`、`vae_patch_parallel_size=2`：
 
 | 分支和负载 | 同步 | 总耗时 | 吞吐 | 完成数 |
 | --- | --- | ---: | ---: | ---: |
-| feature queued PP2，同构 1024×1024 | 关闭 | 442.56s | 0.07231 req/s | 32/32 |
-| feature queued PP2，异构 | 关闭 | 326.15s | 0.09811 req/s | 32/32 |
-| main 静态 PP2，同构 1024×1024 | 关闭 | 818.07s | 0.03912 req/s | 32/32 |
-| main 静态 PP2，异构 | 关闭 | 525.64s | 0.06088 req/s | 32/32 |
+| feature queued PP2，同构 1024×1024 | 关闭 | 448.006s | 0.071428 req/s | 32/32 |
+| feature queued PP2，异构 | 关闭 | 324.078s | 0.098742 req/s | 32/32 |
+| main 静态 PP2，同构 1024×1024 | 关闭 | 797.267s | 0.040137 req/s | 32/32 |
+| main 静态 PP2，异构 | 关闭 | 512.035s | 0.062496 req/s | 32/32 |
 
-异构 profile 固定为 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环排列。按现有 main 对照基线计算，feature 相对 main 的吞吐约为同构 `1.85x`、异构 `1.61x`；异构组的绝对吞吐仍受平均像素量较低影响，不能直接等价为相同计算量加速。feature manifest 保存在 `artifacts/wan22-merge-20261008/`，main manifest 沿用 `artifacts/wan22-final-main-homo32/` 和 `artifacts/wan22-final-main-hetero32/`。
+异构 profile 固定为 `1024×1024`、`512×512`、`1280×704`、`768×768` 循环排列。按本次 main 对照计算，feature 相对 main 的吞吐约为同构 `1.78x`、异构 `1.58x`；异构组的绝对吞吐仍受平均像素量较低影响，不能直接等价为相同计算量加速。四个 manifest 保存在 `artifacts/wan22-worker-runtime-main-20261008/`：`feature-homo32-manifest.json`、`feature-hetero32-manifest.json`、`main-homo32-manifest.json`、`main-hetero32-manifest.json`。
 
 ### 测试方法与同步
 
 - **本地静态检查：** 激活仓库 `.venv` 后运行 `ruff check`、`python -m compileall` 和 `git diff --check`。本地 pytest 需要完整且可读的 `.venv` 依赖；如果 `transformers/models/rembert` 等环境文件触发 `Errno 5`，应记录为环境阻断，不修改依赖目录来掩盖问题。
 - **远程功能/性能：** 目标机器为 `lab-dell03`，仓库为 `~/vllm-omni-disag-dit`，使用 `.venv/bin/python`,使用`canhazgpu`来提交任务。feature 测试前确认 `git rev-parse HEAD` 与待测 commit 一致；运行 Wan2.2 PP2 后保存 `manifest.json`、请求 hash 和必要的 worker events。
 - **trace：** 只有需要分析时间线时设置 `VLLM_OMNI_PP_TRACE_DIR` 和 `VLLM_OMNI_PP_TRACE_SYNC=1`；性能 benchmark 必须取消这两个变量，避免同步和写日志改变调度。`1280×720` profile 直接写成 `1280×704`。
-- **main 对照：** `git checkout main && git pull --ff-only origin main`，main 静态 PP2 使用 `step_execution=false`、`vae_patch_parallel_size=2`；feature queued PP2 使用 `step_execution=true`、`vae_patch_parallel_size=1`、`edge_buffer_slots=2`。两者共享同一请求数量、分辨率、帧数、steps 和 seed。
+- **main 对照：** 本轮在服务器临时 detached worktree 中使用 `upstream/main` 的 `32ead8e5c`，main 静态 PP2 使用 `step_execution=false`、`vae_patch_parallel_size=2`；feature queued PP2 使用 `step_execution=true`、`vae_patch_parallel_size=1`、`edge_buffer_slots=2`。两者共享同一请求数量、分辨率、帧数、steps 和 seed，性能测试取消 `VLLM_OMNI_PP_TRACE_DIR` 与 `VLLM_OMNI_PP_TRACE_SYNC`。
 - **本地与远程同步：** 本地 feature 完成检查后使用带签名的 `git commit -S`，推送 `git push origin feature/pipeline_parallelism`；服务器先确认工作树干净，再运行 `git checkout feature/pipeline_parallelism && git pull --ff-only origin feature/pipeline_parallelism`。main 对照结束后恢复目标分支，并确认 `git status --short --branch`。
 
 ## 空泡归因
@@ -122,7 +122,7 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 
 ## 最新性能验证
 
-本轮 4 请求同步 trace 保存在 `artifacts/wan22-queued-pp-cleanup-20261007/trace/`，用于确认 steady-state 空泡归因；同构和异构 no-sync manifest 用于吞吐、完成数和 hash 回归。
+本轮 4 请求同步 trace 保存在 `artifacts/wan22-queued-pp-cleanup-20261007/trace/`，用于确认 steady-state 空泡归因；最新 feature/main 的同构和异构 no-sync manifest 保存在 `artifacts/wan22-worker-runtime-main-20261008/`，用于吞吐和完成数回归。
 
 ## 尚未完成的清理任务
 
