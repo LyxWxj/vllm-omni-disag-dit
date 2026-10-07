@@ -5,9 +5,30 @@
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
+
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import PipelineEdgeKind, PipelineMessage
+
+
+@dataclass
+class PipelineTransportState:
+    """Worker-owned transport reservations and consumer leases."""
+
+    send_tickets: dict[tuple[Any, ...], Any] = field(default_factory=dict)
+    receive_reservations: dict[tuple[Any, ...], PipelineEdgeKind] = field(default_factory=dict)
+    started_receive_ids: set[tuple[Any, ...]] = field(default_factory=set)
+    receive_consumers: dict[tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]] = field(
+        default_factory=dict
+    )
+    pending_received: dict[PipelineEdgeKind, deque[PipelineMessage]] = field(
+        default_factory=lambda: {
+            PipelineEdgeKind.ACTIVATION: deque(),
+            PipelineEdgeKind.FEEDBACK: deque(),
+        }
+    )
 
 
 @dataclass

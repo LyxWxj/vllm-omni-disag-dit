@@ -87,7 +87,7 @@ from vllm_omni.diffusion.ipc import (
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
-from vllm_omni.diffusion.queued_pp.worker_runtime import PipelineFinalizationState
+from vllm_omni.diffusion.queued_pp.worker_runtime import PipelineFinalizationState, PipelineTransportState
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -291,6 +291,13 @@ class DiffusionWorker:
             self._pipeline_finalization_state = state
         return state
 
+    def _get_pipeline_transport_state(self) -> PipelineTransportState:
+        state = getattr(self, "_pipeline_transport_state", None)
+        if state is None:
+            state = PipelineTransportState()
+            self._pipeline_transport_state = state
+        return state
+
     @property
     def _pipeline_finalization_futures(self) -> dict[str, Future[Any]]:
         return self._get_pipeline_finalization_state().futures
@@ -355,16 +362,7 @@ class DiffusionWorker:
         self._pipeline_stages: dict[int, PipelineStageState] = {}
         self._pipeline_events: list[PipelineEvent] = []
         self._pipeline_connectors: dict[PipelineEdgeKind, PipelineStageConnector] = {}
-        self._pipeline_send_tickets: dict[tuple[Any, ...], TransferTicket] = {}
-        self._pipeline_receive_reservations: dict[tuple[Any, ...], PipelineEdgeKind] = {}
-        self._pipeline_started_receive_ids: set[tuple[Any, ...]] = set()
-        self._pipeline_receive_consumers: dict[
-            tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]
-        ] = {}
-        self._pipeline_pending_received: dict[PipelineEdgeKind, deque[PipelineMessage]] = {
-            PipelineEdgeKind.ACTIVATION: deque(),
-            PipelineEdgeKind.FEEDBACK: deque(),
-        }
+        self._pipeline_transport_state = PipelineTransportState()
         self._pipeline_finalization_state = PipelineFinalizationState()
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
@@ -845,38 +843,25 @@ class DiffusionWorker:
 
     @property
     def pipeline_send_tickets(self) -> dict[tuple[Any, ...], TransferTicket]:
-        if not hasattr(self, "_pipeline_send_tickets"):
-            self._pipeline_send_tickets = {}
-        return self._pipeline_send_tickets
+        return self._get_pipeline_transport_state().send_tickets
 
     @property
     def pipeline_receive_reservations(self) -> dict[tuple[Any, ...], PipelineEdgeKind]:
-        if not hasattr(self, "_pipeline_receive_reservations"):
-            self._pipeline_receive_reservations = {}
-        return self._pipeline_receive_reservations
+        return self._get_pipeline_transport_state().receive_reservations
 
     @property
     def pipeline_started_receive_ids(self) -> set[tuple[Any, ...]]:
-        if not hasattr(self, "_pipeline_started_receive_ids"):
-            self._pipeline_started_receive_ids = set()
-        return self._pipeline_started_receive_ids
+        return self._get_pipeline_transport_state().started_receive_ids
 
     @property
     def pipeline_receive_consumers(
         self,
     ) -> dict[tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]]:
-        if not hasattr(self, "_pipeline_receive_consumers"):
-            self._pipeline_receive_consumers = {}
-        return self._pipeline_receive_consumers
+        return self._get_pipeline_transport_state().receive_consumers
 
     @property
     def pipeline_pending_received(self) -> dict[PipelineEdgeKind, deque[PipelineMessage]]:
-        if not hasattr(self, "_pipeline_pending_received"):
-            self._pipeline_pending_received = {
-                PipelineEdgeKind.ACTIVATION: deque(),
-                PipelineEdgeKind.FEEDBACK: deque(),
-            }
-        return self._pipeline_pending_received
+        return self._get_pipeline_transport_state().pending_received
 
     def initialize_pipeline_transports(self, max_slots: int = 1) -> dict[str, Any]:
         """Build this Worker's granted activation and feedback P2P endpoints."""
