@@ -50,6 +50,9 @@ from vllm_omni.diffusion.output_formatter import (
     normalize_diffusion_postprocess_output,
 )
 from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
+from vllm_omni.diffusion.queued_pp.runtime import QueuedPipelineBatch as _QueuedPipelineBatch
+from vllm_omni.diffusion.queued_pp.runtime import QueuedPipelineBatchPhase as _QueuedPipelineBatchPhase
+from vllm_omni.diffusion.queued_pp.runtime import distributed_vae_finalization_is_quiescent, select_output_owner_rank
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -225,51 +228,12 @@ class DiffusionExecutionMode(str, Enum):
     STEP_BATCH = "step_batch"
 
 
-class _QueuedPipelineBatchPhase(str, Enum):
-    RESERVED = "reserved"
-    PREPARED = "prepared"
-    ADMISSION_PENDING = "admission_pending"
-    SUBMITTED = "submitted"
-    AUTHORIZED = "authorized"
-    STEP_COMPLETED = "step_completed"
-    STEP_COMMITTED = "step_committed"
-    FINALIZATION_PENDING = "finalization_pending"
-    FINALIZING = "finalizing"
-    CANCELLING = "cancelling"
-    FAILED = "failed"
-
-
 class _QueuedAdmissionDeferredError(RuntimeError):
     """The scheduler selected a request before queued capacity was available."""
 
 
 class _QueuedAdmissionOversizeError(RuntimeError):
     """The request's reservation cannot fit even in an empty stage budget."""
-
-
-@dataclass
-class _QueuedPipelineBatch:
-    task: PipelineTask
-    scheduler_output: Any
-    stage_specs: dict[int, PipelineStageSpec]
-    stage_physical_ranks: dict[int, int]
-    finalizing_request_ids: frozenset[str] = frozenset()
-    decoded_output: BatchRunnerOutput | None = None
-    finalization_handle: str | None = None
-    finalization_output_rank: int | None = None
-    release_acknowledged: bool = False
-    transfer_retired: bool = False
-    cleanup_completed_request_ids: set[str] = field(default_factory=set)
-    scheduler_completed_request_ids: set[str] = field(default_factory=set)
-    cancelled: bool = False
-    failure: BaseException | None = None
-    abort_requested: bool = False
-    request_prepared: bool = False
-    stage_enqueued: bool = False
-    request_cleanup_completed: bool = False
-    reserved_bytes: int = 0
-    admission_acknowledgements: set[tuple[PipelineEventType, int, int]] = field(default_factory=set)
-    phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
 class DiffusionEngine:
@@ -794,29 +758,15 @@ class DiffusionEngine:
         return int(getattr(parallel_config, "vae_patch_parallel_size", 1) or 1) > 1
 
     def _select_queued_pipeline_output_rank(self, batch: _QueuedPipelineBatch) -> int:
-        if self._queued_pipeline_uses_distributed_vae():
-            return batch.stage_physical_ranks[0]
-
-        ranks = [batch.stage_physical_ranks[stage_id] for stage_id in (0, 1)]
-        outstanding = dict.fromkeys(ranks, 0)
-        for candidate in self._queued_pipeline_batches.values():
-            if (
-                candidate is batch
-                or candidate.phase is not _QueuedPipelineBatchPhase.FINALIZING
-                or candidate.finalization_handle is None
-                or candidate.decoded_output is not None
-                or candidate.finalization_output_rank not in outstanding
-            ):
-                continue
-            outstanding[candidate.finalization_output_rank] += 1
-
-        minimum = min(outstanding.values())
-        last_rank = getattr(self, "_queued_pipeline_last_finalization_rank", None)
-        if last_rank in ranks:
-            offset = (ranks.index(last_rank) + 1) % len(ranks)
-            ranks = ranks[offset:] + ranks[:offset]
-        selected = next(rank for rank in ranks if outstanding[rank] == minimum)
-        self._queued_pipeline_last_finalization_rank = selected
+        distributed_vae = self._queued_pipeline_uses_distributed_vae()
+        selected = select_output_owner_rank(
+            batch,
+            self._queued_pipeline_batches.values(),
+            distributed_vae=distributed_vae,
+            last_rank=getattr(self, "_queued_pipeline_last_finalization_rank", None),
+        )
+        if not distributed_vae:
+            self._queued_pipeline_last_finalization_rank = selected
         return selected
 
     def _should_wait_for_queued_pipeline_update(self) -> bool:
@@ -1031,22 +981,10 @@ class DiffusionEngine:
 
     def _distributed_vae_finalization_is_quiescent(self, batch: _QueuedPipelineBatch) -> bool:
         """Wait until no other queued batch can issue PP collectives."""
-        if not self._queued_pipeline_uses_distributed_vae():
-            return True
-        if any(
-            candidate is not batch and candidate.phase is _QueuedPipelineBatchPhase.FINALIZING
-            for candidate in self._queued_pipeline_batches.values()
-        ):
-            return False
-        return all(
-            candidate is batch
-            or candidate.phase
-            in {
-                _QueuedPipelineBatchPhase.RESERVED,
-                _QueuedPipelineBatchPhase.PREPARED,
-                _QueuedPipelineBatchPhase.FINALIZATION_PENDING,
-            }
-            for candidate in self._queued_pipeline_batches.values()
+        return distributed_vae_finalization_is_quiescent(
+            batch,
+            self._queued_pipeline_batches.values(),
+            enabled=self._queued_pipeline_uses_distributed_vae(),
         )
 
     def _progress_queued_pipeline_batch(

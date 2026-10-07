@@ -20,7 +20,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def _coordinator(activation_edge: tuple[int, int] = (0, 1)) -> PipelineTransferCoordinator:
-    return PipelineTransferCoordinator(activation_edge=activation_edge)
+    return PipelineTransferCoordinator(
+        activation_edges={activation_edge},
+        feedback_edges={(activation_edge[1], activation_edge[0])},
+    )
 
 
 def _offer(
@@ -132,7 +135,7 @@ def test_feedback_can_progress_when_activation_edge_is_blocked() -> None:
     assert coordinator.grant_ready()[0].offer is feedback
 
 
-def test_opposite_directions_can_overlap_on_the_same_endpoints() -> None:
+def test_opposite_directions_serialize_on_same_endpoints() -> None:
     coordinator = _coordinator()
     first = _offer("batch-a", src_rank=0, dst_rank=1)
     second = _offer(
@@ -147,8 +150,11 @@ def test_opposite_directions_can_overlap_on_the_same_endpoints() -> None:
 
     grants = coordinator.grant_ready(limit=2)
 
-    assert {grant.offer.identity for grant in grants} == {first.identity, second.identity}
+    assert {grant.offer.identity for grant in grants} == {second.identity}
     assert coordinator.snapshot()["busy_ranks"] == (0, 1)
+    assert not coordinator.complete(second.identity, second.src_rank)
+    assert coordinator.complete(second.identity, second.dst_rank)
+    assert coordinator.grant_ready(limit=2)[0].offer is first
 
 
 def test_transfer_rejects_reversed_activation_direction() -> None:
@@ -160,8 +166,11 @@ def test_transfer_rejects_reversed_activation_direction() -> None:
 
 
 def test_coordinator_rejects_invalid_activation_edge() -> None:
-    with pytest.raises(ValueError, match="one activation edge pair"):
-        PipelineTransferCoordinator(activation_edge=(0, 1, 2))
+    with pytest.raises(ValueError, match="endpoints must be distinct"):
+        PipelineTransferCoordinator(
+            activation_edges={(0, 0)},
+            feedback_edges={(0, 0)},
+        )
 
 
 def test_transfer_identity_rejects_replay_and_duplicate_completion() -> None:
@@ -223,11 +232,13 @@ class _Group:
         self.send_work = _Work()
         self.recv_work = _Work()
         self.send_calls = []
+        self.send_metadata = []
         self.recv_calls = []
         self.postprocess_calls = 0
 
-    def isend_tensor_dict(self, payload, dst):
+    def isend_tensor_dict(self, payload, dst, metadata_list=None):
         self.send_calls.append((payload, dst))
+        self.send_metadata.append(metadata_list)
         return [self.send_work]
 
     def irecv_tensor_dict(self, src):
@@ -274,7 +285,7 @@ def test_distributed_p2p_sender_uses_group_local_rank_and_waits() -> None:
     transport.close()
 
 
-def test_distributed_p2p_sender_rejects_metadata_mismatch() -> None:
+def test_distributed_p2p_sender_passes_offer_metadata() -> None:
     group = _Group()
     transport = DistributedP2PTransport(
         group=group,
@@ -301,8 +312,9 @@ def test_distributed_p2p_sender_rejects_metadata_mismatch() -> None:
         payload={"hidden_states": torch.ones(1)},
     )
 
-    with pytest.raises(ValueError, match="metadata does not match"):
-        transport.start_granted_transfer(PipelineTransferGrant(offer), message)
+    transport.start_granted_transfer(PipelineTransferGrant(offer), message)
+
+    assert group.send_metadata == [offer.payload_metadata]
 
 
 def test_distributed_p2p_sender_rejects_completed_identity_replay() -> None:

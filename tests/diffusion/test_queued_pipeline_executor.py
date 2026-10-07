@@ -32,6 +32,21 @@ def _topology_reports():
     ]
 
 
+def _initialize_transfers(executor, activation_edges=None, *, max_slots=1):
+    activation_edges = {(0, 1)} if activation_edges is None else set(activation_edges)
+    feedback_edges = {(dst, src) for src, dst in activation_edges}
+    return executor.initialize_pipeline_transfers(activation_edges, feedback_edges, max_slots=max_slots)
+
+
+def _coordinator(activation_edges=None):
+    activation_edges = {(0, 1)} if activation_edges is None else set(activation_edges)
+    feedback_edges = {(dst, src) for src, dst in activation_edges}
+    return PipelineTransferCoordinator(
+        activation_edges=activation_edges,
+        feedback_edges=feedback_edges,
+    )
+
+
 @pytest.fixture(params=[MultiprocDiffusionExecutor, UniProcDiffusionExecutor])
 def executor(request, mocker):
     instance = object.__new__(request.param)
@@ -126,7 +141,7 @@ def test_final_decode_rpc_passes_selected_physical_output_rank(executor) -> None
 
 def test_prepare_pipeline_requests_requires_matching_all_rank_reports(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(request_id="req-a")],
     )
@@ -147,7 +162,7 @@ def test_prepare_pipeline_requests_requires_matching_all_rank_reports(executor) 
 
 def test_prepare_pipeline_requests_rejects_missing_rank(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(request_id="req-a")],
     )
@@ -162,7 +177,7 @@ def test_prepare_pipeline_requests_rejects_missing_rank(executor) -> None:
 
 def test_memory_budget_queries_all_endpoints_and_takes_minimum(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.return_value = [
         [
@@ -189,7 +204,7 @@ def test_memory_budget_queries_all_endpoints_and_takes_minimum(executor) -> None
 )
 def test_malformed_memory_budget_reports_fail_executor(executor, reports) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.return_value = reports
 
@@ -208,7 +223,7 @@ def test_event_poll_uses_all_rank_gather_and_flattens_reply(executor) -> None:
 
 def test_progress_snapshot_supplies_events_without_a_second_worker_rpc(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
     expected_events = ["rank-0-event", "rank-1-event"]
     executor.collective_rpc.return_value = [
@@ -280,7 +295,7 @@ def test_multiproc_pp2_uses_rank_local_progress_and_readiness_reports(mocker) ->
     )
     executor._result_mqs = [object(), object()]
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
 
     offer = PipelineTransferOffer(
@@ -342,7 +357,7 @@ def test_autonomous_progress_consumes_sparse_receive_readiness_before_offer(mock
         ),
     )
     executor._result_mqs = [object(), object()]
-    coordinator = PipelineTransferCoordinator(activation_edge=(0, 1))
+    coordinator = _coordinator()
     executor._pipeline_transfer_coordinator = coordinator
     executor._pipeline_pending_readiness = {}
     offer = PipelineTransferOffer(
@@ -371,9 +386,7 @@ def test_autonomous_progress_consumes_sparse_receive_readiness_before_offer(mock
 
 def test_autonomous_transfer_start_waits_for_both_worker_commands(mocker) -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
-    executor._pipeline_transfer_coordinator = PipelineTransferCoordinator(
-        activation_edge=(0, 1),
-    )
+    executor._pipeline_transfer_coordinator = _coordinator()
     executor._uses_autonomous_pipeline_stages = mocker.Mock(return_value=True)
     executor._closed = False
     executor._result_mq = object()
@@ -450,7 +463,7 @@ def test_multiproc_pp2_piggybacks_transfer_readiness_on_next_progress(mocker) ->
         ),
     )
     executor._result_mqs = [object(), object()]
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
     offer = PipelineTransferOffer(
         batch_id="batch-a",
@@ -501,7 +514,7 @@ def test_multiproc_pp2_rejects_incomplete_piggyback_readiness(mocker) -> None:
         ),
     )
     executor._result_mqs = [object(), object()]
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     offer = PipelineTransferOffer(
         batch_id="batch-a",
         step_index=0,
@@ -544,9 +557,7 @@ def test_rank_local_readiness_requires_exact_endpoint_coverage(mocker) -> None:
         ),
     )
     executor._result_mqs = [object(), object()]
-    executor._pipeline_transfer_coordinator = PipelineTransferCoordinator(
-        activation_edge=(0, 1)
-    )
+    executor._pipeline_transfer_coordinator = _coordinator()
     executor._pipeline_pending_readiness = {}
     offer = PipelineTransferOffer(
         batch_id="batch-local",
@@ -591,7 +602,7 @@ def test_drain_aggregates_nonzero_rank_events(executor) -> None:
 
 def test_executor_coordinates_ready_offer_and_dispatches_grant(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1), max_slots=1)
+    _initialize_transfers(executor, max_slots=1)
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.return_value = [True]
     offer = PipelineTransferOffer(
@@ -619,7 +630,7 @@ def test_executor_coordinates_ready_offer_and_dispatches_grant(executor) -> None
 
 def test_executor_defers_offer_until_receive_credit_is_available(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1), max_slots=1)
+    _initialize_transfers(executor, max_slots=1)
     executor.collective_rpc.reset_mock()
     offer = PipelineTransferOffer(
         batch_id="batch-a",
@@ -654,7 +665,7 @@ def test_executor_defers_offer_until_receive_credit_is_available(executor) -> No
 
 def test_executor_readiness_rejection_never_dispatches_grant(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.side_effect = RuntimeError("sender reservation missing")
     offer = PipelineTransferOffer(
@@ -682,14 +693,14 @@ def test_executor_rejects_worker_topology_mismatch_and_fails_closed(executor) ->
     executor.collective_rpc.return_value = _topology_reports()
 
     with pytest.raises(ValueError, match="does not match Worker PP groups"):
-        executor.initialize_pipeline_transfers((2, 3))
+        _initialize_transfers(executor, {(2, 3)})
 
     assert executor._is_failed
 
 
 def test_progress_retires_endpoints_before_granting_reverse_rank_offer(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     activation = PipelineTransferOffer(
         batch_id="batch-a",
         step_index=0,
@@ -748,7 +759,7 @@ def test_progress_retires_endpoints_before_granting_reverse_rank_offer(executor)
 
 def test_progress_retries_ready_offer_after_active_edge_completes(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     activation = PipelineTransferOffer(
         batch_id="batch-a",
         step_index=0,
@@ -804,7 +815,7 @@ def test_progress_retries_ready_offer_after_active_edge_completes(executor) -> N
 
 def test_progress_invalid_completion_fails_executor_closed(executor) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.return_value = [
         [
@@ -834,7 +845,7 @@ def test_progress_invalid_completion_fails_executor_closed(executor) -> None:
 )
 def test_progress_rejects_incomplete_rank_coverage(executor, reports) -> None:
     executor.collective_rpc.return_value = _topology_reports()
-    executor.initialize_pipeline_transfers((0, 1))
+    _initialize_transfers(executor)
     executor.collective_rpc.reset_mock()
     executor.collective_rpc.return_value = [reports]
 

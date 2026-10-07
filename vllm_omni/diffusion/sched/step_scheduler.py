@@ -68,7 +68,17 @@ class StepScheduler(BaseScheduler):
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if getattr(getattr(self, "od_config", None), "mode", "static") == "queued":
             return True
-        return super()._can_schedule_waiting(state)
+        if not super()._can_schedule_waiting(state):
+            return False
+
+        is_first_step = self._request_progress[state.request_id].current_step == 0
+        for request_id in self._running:
+            running = self._request_states[request_id]
+            if state.req.allow_mixed_step_phases and running.req.allow_mixed_step_phases:
+                continue
+            if (self._request_progress[request_id].current_step == 0) != is_first_step:
+                return False
+        return True
 
     def schedule(self) -> DiffusionSchedulerOutput:
         """Schedule denoise work while decode-owned requests retain state only."""

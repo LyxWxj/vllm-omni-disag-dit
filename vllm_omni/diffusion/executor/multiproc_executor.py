@@ -44,6 +44,10 @@ from vllm_omni.diffusion.offloader.config import (
     any_selected_component_uses_allgather,
     resolve_offload,
 )
+from vllm_omni.diffusion.queued_pp.executor_adapter import (
+    unwrap_nested_pipeline_result,
+    unwrap_singleton_pipeline_result,
+)
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
@@ -1016,9 +1020,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._pipeline_retired_finalization_ids.discard(batch_id)
             self._pipeline_finalization_submitted_ids.discard(batch_id)
             self._pipeline_finalization_outputs.pop(batch_id, None)
-        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-            return result[0]
-        return result
+        return unwrap_nested_pipeline_result(result)
 
     def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
         if self._uses_rank_local_pp_rpc():
@@ -1035,8 +1037,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "pipeline_batch_release_ready_all_ranks",
             args=(pp_stage_id, batch_id),
         )
-        while isinstance(result, list) and len(result) == 1:
-            result = result[0]
+        result = unwrap_singleton_pipeline_result(result)
         if type(result) is not bool:
             raise RuntimeError("Queued pipeline retirement readiness returned an invalid result.")
         return result
@@ -1046,9 +1047,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "cleanup_finalized_pipeline_request_all_ranks",
             args=(request_id,),
         )
-        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-            return result[0]
-        return result
+        return unwrap_nested_pipeline_result(result)
 
     def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
         if self._uses_rank_local_pp_rpc():
@@ -1071,8 +1070,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._pipeline_cached_events = None
             return cached_events
         result = self.collective_rpc("poll_pipeline_events_all_ranks", exec_all_ranks=True)
-        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-            return result[0]
+        result = unwrap_nested_pipeline_result(result)
         return result if isinstance(result, list) else [result]
 
     def cancel_pipeline_requests(self, request_generations: Any) -> Any:
@@ -1082,16 +1080,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             args=(request_generations,),
             exec_all_ranks=True,
         )
-        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-            return result[0]
-        return result
+        return unwrap_nested_pipeline_result(result)
 
     def drain_pipeline(self, deadline: float | None = None) -> Any:
         self._ensure_open()
         result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,), exec_all_ranks=True)
-        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-            return result[0]
-        return result
+        return unwrap_nested_pipeline_result(result)
 
     def initialize_pipeline_transfers(
         self,
@@ -1387,8 +1381,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise RuntimeError("pipeline transfer coordinator is not initialized")
         try:
             result = self._queued_control_rpc("pipeline_stage_memory_budget_bytes", exec_all_ranks=True)
-            while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-                result = result[0]
+            result = unwrap_nested_pipeline_result(result)
             if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
                 raise RuntimeError("Workers returned invalid pipeline memory budget reports")
             expected = coordinator.endpoint_ranks
