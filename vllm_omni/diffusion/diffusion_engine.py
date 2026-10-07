@@ -228,6 +228,7 @@ class DiffusionExecutionMode(str, Enum):
 class _QueuedPipelineBatchPhase(str, Enum):
     RESERVED = "reserved"
     PREPARED = "prepared"
+    ADMISSION_PENDING = "admission_pending"
     SUBMITTED = "submitted"
     AUTHORIZED = "authorized"
     STEP_COMPLETED = "step_completed"
@@ -267,6 +268,7 @@ class _QueuedPipelineBatch:
     stage_enqueued: bool = False
     request_cleanup_completed: bool = False
     reserved_bytes: int = 0
+    admission_acknowledgements: set[tuple[PipelineEventType, int, int]] = field(default_factory=set)
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
@@ -695,7 +697,27 @@ class DiffusionEngine:
         for event in events:
             if not isinstance(event, PipelineEvent) or event.task.batch_id not in known_batches:
                 raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
+            batch = self._queued_pipeline_batches[event.task.batch_id]
+            if event.task != batch.task:
+                raise RuntimeError("Worker returned an event with a mismatched queued pipeline task.")
             grouped.setdefault(event.task.batch_id, []).append(event)
+            if event.event_type in {PipelineEventType.ACCEPTED, PipelineEventType.AUTHORIZED}:
+                batch.admission_acknowledgements.add((event.event_type, event.pp_stage_id, event.physical_rank))
+                expected = {
+                    (event.event_type, stage_id, physical_rank)
+                    for stage_id, physical_rank in batch.stage_physical_ranks.items()
+                }
+                if expected.issubset(batch.admission_acknowledgements):
+                    if event.event_type is PipelineEventType.ACCEPTED:
+                        batch.stage_enqueued = True
+                        if batch.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING:
+                            batch.phase = _QueuedPipelineBatchPhase.SUBMITTED
+                    elif batch.phase in {
+                        _QueuedPipelineBatchPhase.ADMISSION_PENDING,
+                        _QueuedPipelineBatchPhase.SUBMITTED,
+                    }:
+                        batch.stage_enqueued = True
+                        batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Queued pipeline progress end: events=%s", {batch_id: len(items) for batch_id, items in grouped.items()}
@@ -748,7 +770,13 @@ class DiffusionEngine:
     def _queued_denoise_batch_count(self) -> int:
         """Count batches authorized to consume a model-stage denoise slot."""
         return sum(
-            batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED for batch in self._queued_pipeline_batches.values()
+            batch.phase
+            in {
+                _QueuedPipelineBatchPhase.ADMISSION_PENDING,
+                _QueuedPipelineBatchPhase.SUBMITTED,
+                _QueuedPipelineBatchPhase.AUTHORIZED,
+            }
+            for batch in self._queued_pipeline_batches.values()
         )
 
     def _queued_pipeline_waits_on_finalization(self) -> bool:
@@ -972,23 +1000,34 @@ class DiffusionEngine:
             if batch.phase is _QueuedPipelineBatchPhase.PREPARED
         ]
         batches_to_authorize = []
+        autonomous = getattr(self.executor, "uses_autonomous_pipeline_stages", lambda: False)() is True
+        autonomous_admissions: list[tuple[PipelineTask, dict[int, PipelineStageSpec]]] = []
         for batch in ordered:
             if available_slots <= 0:
                 break
-            self.executor.submit_pipeline_batch(batch.task, batch.stage_specs)
-            batch.stage_enqueued = True
-            batch.phase = _QueuedPipelineBatchPhase.SUBMITTED
+            if autonomous:
+                autonomous_admissions.append((batch.task, batch.stage_specs))
+            else:
+                self.executor.submit_pipeline_batch(batch.task, batch.stage_specs)
+                batch.stage_enqueued = True
+                batch.phase = _QueuedPipelineBatchPhase.SUBMITTED
             batches_to_authorize.append(batch)
             available_slots -= 1
-        if len(batches_to_authorize) == 1:
-            batch = batches_to_authorize[0]
-            self.executor.authorize_pipeline_batch(batch.stage_physical_ranks, batch.task.batch_id)
-        elif batches_to_authorize:
-            self.executor.authorize_pipeline_batches(
-                [(batch.stage_physical_ranks, batch.task.batch_id) for batch in batches_to_authorize]
-            )
-        for batch in batches_to_authorize:
-            batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
+        if autonomous_admissions:
+            self.executor.submit_pipeline_admissions(autonomous_admissions)
+            for batch in batches_to_authorize:
+                batch.stage_enqueued = True
+                batch.phase = _QueuedPipelineBatchPhase.ADMISSION_PENDING
+        else:
+            if len(batches_to_authorize) == 1:
+                batch = batches_to_authorize[0]
+                self.executor.authorize_pipeline_batch(batch.stage_physical_ranks, batch.task.batch_id)
+            elif batches_to_authorize:
+                self.executor.authorize_pipeline_batches(
+                    [(batch.stage_physical_ranks, batch.task.batch_id) for batch in batches_to_authorize]
+                )
+            for batch in batches_to_authorize:
+                batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
 
     def _distributed_vae_finalization_is_quiescent(self, batch: _QueuedPipelineBatch) -> bool:
         """Wait until no other queued batch can issue PP collectives."""
@@ -1240,7 +1279,11 @@ class DiffusionEngine:
         pipeline_events: list[PipelineEvent] | None = None,
     ) -> BatchRunnerOutput | None:
         """Drive one retained batch through progress, commit, decode, and retirement."""
-        if batch.phase in {_QueuedPipelineBatchPhase.PREPARED, _QueuedPipelineBatchPhase.SUBMITTED}:
+        if batch.phase in {
+            _QueuedPipelineBatchPhase.PREPARED,
+            _QueuedPipelineBatchPhase.ADMISSION_PENDING,
+            _QueuedPipelineBatchPhase.SUBMITTED,
+        }:
             return None
         if batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED:
             if not self._progress_queued_pipeline_batch(batch, pipeline_events):

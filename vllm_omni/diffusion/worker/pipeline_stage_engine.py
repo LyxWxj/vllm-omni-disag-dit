@@ -13,7 +13,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
 
-from vllm_omni.diffusion.worker.pipeline_state import PipelineWorkerUpdate
+from vllm_omni.diffusion.worker.pipeline_state import PipelineEvent, PipelineWorkerUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ class PipelineStageEngine:
                 raise RuntimeError("Pipeline StageEngine command queue is full") from exc
         return result.result()
 
-    def submit(self, method: str, *args: Any, **kwargs: Any) -> None:
+    def submit(self, method: str, *args: Any, publish_result_events: bool = False, **kwargs: Any) -> None:
         """Queue a command and return once it is owned by the StageEngine."""
         result: Future[Any] = Future()
         with self._state_lock:
@@ -90,7 +90,19 @@ class PipelineStageEngine:
 
         def report_failure(completed: Future[Any]) -> None:
             try:
-                completed.result()
+                result = completed.result()
+                if not publish_result_events:
+                    return
+                events = result if isinstance(result, tuple) else (result,)
+                if not all(isinstance(event, PipelineEvent) for event in events):
+                    raise RuntimeError(f"StageEngine command {method!r} returned invalid pipeline events")
+                self._publish_update(
+                    PipelineWorkerUpdate(
+                        worker_id=self._worker_id,
+                        progress=None,
+                        events=tuple(events),
+                    )
+                )
             except BaseException as exc:
                 try:
                     self._publish_update(

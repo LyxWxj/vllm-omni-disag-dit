@@ -927,6 +927,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return self._queued_rank_local_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
         return self._queued_control_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
 
+    def submit_pipeline_admissions(self, admissions: list[tuple[Any, Any]]) -> Any:
+        if not self._uses_autonomous_pipeline_stages():
+            raise RuntimeError("Asynchronous pipeline admission requires autonomous pipeline stages")
+        if not admissions:
+            raise ValueError("pipeline admission batch must not be empty")
+        return self._queued_rank_local_rpc("admit_pipeline_batches", args=(admissions,))
+
     def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
         if coordinator is None:
@@ -1334,7 +1341,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if update.error is not None:
                 raise RuntimeError(f"Pipeline StageEngine failed on Worker {update.worker_id}: {update.error}")
             rank_progress = update.progress
-            if rank_progress is None or rank_progress.rank != update.worker_id:
+            if rank_progress is None:
+                worker_events.extend(update.events)
+                continue
+            if rank_progress.rank != update.worker_id:
                 raise RuntimeError("Pipeline StageEngine update has invalid rank-local progress")
             worker_events.extend(update.events)
             for identity, ready in rank_progress.readiness:
@@ -1347,6 +1357,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         for update in updates:
             rank_progress = update.progress
+            if rank_progress is None:
+                continue
             for completion in rank_progress.completions:
                 if coordinator.complete(completion.identity, completion.rank):
                     progress.completed.append(completion.identity)

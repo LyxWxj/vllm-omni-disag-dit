@@ -9,7 +9,6 @@ import pytest
 
 from vllm_omni.diffusion.worker.pipeline_stage_engine import (
     PipelineStageEngine,
-    _StageAsyncCommand,
     _StageCommand,
     _StageWake,
 )
@@ -79,7 +78,7 @@ def test_stage_engine_rearms_progress_after_prequeued_wake() -> None:
         with engine._state_lock:
             engine._commands.put_nowait(_StageWake())
             engine._wake_pending = True
-            engine._commands.put_nowait(_StageAsyncCommand("rpc", ("accepted",), {}, result))
+            engine._commands.put_nowait(_StageCommand("rpc", ("accepted",), {}, result, rearm_progress=True))
 
         assert result.result(timeout=1) == "accepted"
         deadline = time.monotonic() + 1

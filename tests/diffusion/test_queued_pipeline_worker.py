@@ -571,6 +571,19 @@ def test_stage_engine_does_not_poll_running_finalization_future() -> None:
     assert worker.pipeline_stage_engine_needs_progress()
 
 
+def test_stage_engine_keeps_polling_pending_received_message() -> None:
+    worker = _worker()
+    transport = SimpleNamespace(has_outstanding_operations=False)
+    worker._pipeline_connectors = {
+        PipelineEdgeKind.ACTIVATION: SimpleNamespace(transport=transport),
+        PipelineEdgeKind.FEEDBACK: SimpleNamespace(transport=transport),
+    }
+    worker._pipeline_finalization_futures = {}
+    worker.pipeline_pending_received[PipelineEdgeKind.ACTIVATION].append(object())
+
+    assert worker.pipeline_stage_engine_needs_progress()
+
+
 def test_final_decode_uses_a_dedicated_cuda_stream(mocker) -> None:
     worker = _worker()
     worker.device = torch.device("cuda", 0)

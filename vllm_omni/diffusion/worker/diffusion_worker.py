@@ -1018,7 +1018,10 @@ class DiffusionWorker:
         first_stage = self.pipeline_stages.get(0)
         if first_stage is not None and first_stage.spec.is_first:
             activation_connector = self._require_pipeline_connector(PipelineEdgeKind.ACTIVATION)
-            if activation_connector.send_in_use < activation_connector.max_slots:
+            if (
+                activation_connector.send_in_use < activation_connector.max_slots
+                and not self._pipeline_stage_engine_has_unstarted_send(PipelineEdgeKind.ACTIVATION)
+            ):
                 stage_progress = self.progress_pipeline(0)
                 if stage_progress is not None:
                     if not isinstance(stage_progress.output, PipelineTransferOffer):
@@ -1055,6 +1058,8 @@ class DiffusionWorker:
             return False
         if self.pipeline_receive_consumers:
             return True
+        if any(not ticket.started for ticket in self.pipeline_send_tickets.values()):
+            return True
         for batch_id, future in self._pipeline_finalization_futures.items():
             if not future.done():
                 continue
@@ -1068,11 +1073,7 @@ class DiffusionWorker:
             if transport is not None and transport.has_outstanding_operations:
                 return True
         for edge_kind, messages in self.pipeline_pending_received.items():
-            if any(
-                self._cancelled_pipeline_message_context(edge_kind, message) is not None
-                or self._pipeline_message_is_runnable(edge_kind, message)
-                for message in messages
-            ):
+            if messages:
                 return True
         return self._pipeline_stage_engine_has_runnable_forward() or self._pipeline_stage_engine_has_expected_receive()
 
@@ -1144,7 +1145,17 @@ class DiffusionWorker:
             return False
         task = stage.pending_tasks[0]
         connector = self.pipeline_connectors[PipelineEdgeKind.ACTIVATION]
-        return task.batch_id in stage.authorized_batches and connector.send_in_use < connector.max_slots
+        return (
+            task.batch_id in stage.authorized_batches
+            and connector.send_in_use < connector.max_slots
+            and not self._pipeline_stage_engine_has_unstarted_send(PipelineEdgeKind.ACTIVATION)
+        )
+
+    def _pipeline_stage_engine_has_unstarted_send(self, edge_kind: PipelineEdgeKind) -> bool:
+        return any(
+            identity[4] is edge_kind and not ticket.started
+            for identity, ticket in self.pipeline_send_tickets.items()
+        )
 
     def _pipeline_stage_engine_has_expected_receive(self) -> bool:
         """Keep ticking until each admitted receive identity has announced credit."""
@@ -1430,6 +1441,24 @@ class DiffusionWorker:
         for pp_stage_id, batch_id in authorizations:
             events.append(self.authorize_pipeline_batch(pp_stage_id, batch_id))
         return events
+
+    def admit_pipeline_batch(
+        self,
+        task: PipelineTask,
+        pp_stage_spec: PipelineStageSpec | dict[int, PipelineStageSpec],
+    ) -> tuple[PipelineEvent, PipelineEvent]:
+        accepted = self.enqueue_pipeline_batch(task, pp_stage_spec)
+        authorized = self.authorize_pipeline_batch(accepted.pp_stage_id, task.batch_id)
+        return accepted, authorized
+
+    def admit_pipeline_batches(
+        self,
+        admissions: list[tuple[PipelineTask, PipelineStageSpec | dict[int, PipelineStageSpec]]],
+    ) -> tuple[PipelineEvent, ...]:
+        events: list[PipelineEvent] = []
+        for task, pp_stage_spec in admissions:
+            events.extend(self.admit_pipeline_batch(task, pp_stage_spec))
+        return tuple(events)
 
     @staticmethod
     def _select_rank_value(values: dict[int, Any]) -> Any:
@@ -2646,8 +2675,17 @@ class WorkerProc:
                     return self.worker.execute_method(method, *args, **kwargs)
 
                 result = preparation_executor.submit(prepare_pipeline_request).result()
-            elif stage_engine is not None and method == "start_pipeline_transfer":
-                stage_engine.submit(method, *args, **kwargs)
+            elif stage_engine is not None and method in {
+                "start_pipeline_transfer",
+                "admit_pipeline_batch",
+                "admit_pipeline_batches",
+            }:
+                stage_engine.submit(
+                    method,
+                    *args,
+                    publish_result_events=method.startswith("admit_pipeline"),
+                    **kwargs,
+                )
                 result = True
             elif stage_engine is not None:
                 result = stage_engine.call(method, *args, **kwargs)

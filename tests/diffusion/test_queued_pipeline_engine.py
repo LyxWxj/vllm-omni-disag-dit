@@ -82,6 +82,47 @@ def test_queued_submission_records_ownership_before_control_dispatch(mocker) -> 
     engine.executor.authorize_pipeline_batch.assert_called_once_with({0: 0, 1: 1}, batch.task.batch_id)
 
 
+def test_autonomous_admission_waits_for_both_stage_acknowledgements(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.executor.uses_autonomous_pipeline_stages.return_value = True
+    engine.executor.submit_pipeline_admissions.side_effect = lambda *_args: [True, True]
+
+    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+
+    assert batch.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
+    assert batch.stage_enqueued is True
+    assert engine._queued_denoise_batch_count() == 1
+    events = [
+        PipelineEvent(PipelineEventType.ACCEPTED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.ACCEPTED, batch.task, 1, 1),
+        PipelineEvent(PipelineEventType.AUTHORIZED, batch.task, 0, 0),
+        PipelineEvent(PipelineEventType.AUTHORIZED, batch.task, 1, 1),
+    ]
+    engine.executor.poll_pipeline_events.return_value = events
+
+    grouped = engine._collect_queued_pipeline_events()
+
+    assert set(grouped) == {batch.task.batch_id}
+    assert batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
+    engine.executor.submit_pipeline_admissions.assert_called_once_with([(batch.task, batch.stage_specs)])
+
+
+def test_autonomous_admission_batches_prepared_fifo(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    engine.executor.uses_autonomous_pipeline_stages.return_value = True
+    first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"), authorize=False)
+    second = engine._submit_queued_pipeline_batch(_scheduler_output("req-b"), authorize=False)
+
+    engine._authorize_waiting_queued_batches()
+
+    assert first.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
+    assert second.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
+    engine.executor.submit_pipeline_admissions.assert_called_once_with(
+        [(first.task, first.stage_specs), (second.task, second.stage_specs)]
+    )
+
+
 def test_queued_reservation_keeps_distinct_request_ownership(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
