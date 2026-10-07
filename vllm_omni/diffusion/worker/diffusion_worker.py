@@ -87,6 +87,7 @@ from vllm_omni.diffusion.ipc import (
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.queued_pp.worker_runtime import PipelineFinalizationState
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -283,6 +284,53 @@ class DiffusionWorker:
     delegated to DiffusionModelRunner.
     """
 
+    def _get_pipeline_finalization_state(self) -> PipelineFinalizationState:
+        state = getattr(self, "_pipeline_finalization_state", None)
+        if state is None:
+            state = PipelineFinalizationState()
+            self._pipeline_finalization_state = state
+        return state
+
+    @property
+    def _pipeline_finalization_futures(self) -> dict[str, Future[Any]]:
+        return self._get_pipeline_finalization_state().futures
+
+    @_pipeline_finalization_futures.setter
+    def _pipeline_finalization_futures(self, value: dict[str, Future[Any]]) -> None:
+        self._get_pipeline_finalization_state().futures = value
+
+    @property
+    def _pipeline_finalization_executor(self) -> ThreadPoolExecutor | None:
+        return self._get_pipeline_finalization_state().executor
+
+    @_pipeline_finalization_executor.setter
+    def _pipeline_finalization_executor(self, value: ThreadPoolExecutor | None) -> None:
+        self._get_pipeline_finalization_state().executor = value
+
+    @property
+    def _pipeline_finalization_published(self) -> set[str]:
+        return self._get_pipeline_finalization_state().published
+
+    @_pipeline_finalization_published.setter
+    def _pipeline_finalization_published(self, value: set[str]) -> None:
+        self._get_pipeline_finalization_state().published = value
+
+    @property
+    def _pipeline_finalization_device_events(self) -> dict[str, Any]:
+        return self._get_pipeline_finalization_state().device_events
+
+    @_pipeline_finalization_device_events.setter
+    def _pipeline_finalization_device_events(self, value: dict[str, Any]) -> None:
+        self._get_pipeline_finalization_state().device_events = value
+
+    @property
+    def _pipeline_finalization_stream(self) -> Any | None:
+        return self._get_pipeline_finalization_state().stream
+
+    @_pipeline_finalization_stream.setter
+    def _pipeline_finalization_stream(self, value: Any | None) -> None:
+        self._get_pipeline_finalization_state().stream = value
+
     def __init__(
         self,
         local_rank: int,
@@ -317,11 +365,7 @@ class DiffusionWorker:
             PipelineEdgeKind.ACTIVATION: deque(),
             PipelineEdgeKind.FEEDBACK: deque(),
         }
-        self._pipeline_finalization_futures: dict[str, Future[BatchRunnerOutput | None]] = {}
-        self._pipeline_finalization_executor: ThreadPoolExecutor | None = None
-        self._pipeline_finalization_published: set[str] = set()
-        self._pipeline_finalization_device_events: dict[str, Any] = {}
-        self._pipeline_finalization_stream: torch.Stream | None = None
+        self._pipeline_finalization_state = PipelineFinalizationState()
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -1628,9 +1672,7 @@ class DiffusionWorker:
         context = self.model_runner.release_pipeline_batch(pp_stage_id, batch_id)
         stage.retire(batch_id)
         if hasattr(self, "_pipeline_finalization_futures") and batch_id in self._pipeline_finalization_futures:
-            self._pipeline_finalization_futures.pop(batch_id, None)
-            self._pipeline_finalization_published.discard(batch_id)
-            self._pipeline_finalization_device_events.pop(batch_id, None)
+            self._get_pipeline_finalization_state().clear_batch(batch_id)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.RELEASED, context.task, pp_stage_id))
 
     def pipeline_batch_release_ready(self, pp_stage_id: int | dict[int, int], batch_id: str) -> bool:
@@ -1747,16 +1789,8 @@ class DiffusionWorker:
         if not should_finalize:
             return batch_id if return_handle else None
 
-        if not hasattr(self, "_pipeline_finalization_futures"):
-            self._pipeline_finalization_futures = {}
-        if not hasattr(self, "_pipeline_finalization_executor"):
-            self._pipeline_finalization_executor = None
         if batch_id not in self._pipeline_finalization_futures:
-            if self._pipeline_finalization_executor is None:
-                self._pipeline_finalization_executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix=f"WanFinalDecode-rank{self.rank}",
-                )
+            finalization_executor = self._get_pipeline_finalization_state().ensure_executor(self.rank)
 
             def finalize() -> BatchRunnerOutput | None:
                 started_at = time.perf_counter()
@@ -1796,7 +1830,7 @@ class DiffusionWorker:
                 )
                 return result
 
-            future = self._pipeline_finalization_executor.submit(finalize)
+            future = finalization_executor.submit(finalize)
             self._pipeline_finalization_futures[batch_id] = future
             wake_stage_engine = getattr(self, "_pipeline_stage_engine_wake", None)
             if callable(wake_stage_engine):
@@ -2223,9 +2257,7 @@ class DiffusionWorker:
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
         try:
-            if self._pipeline_finalization_executor is not None:
-                self._pipeline_finalization_executor.shutdown(wait=True, cancel_futures=False)
-                self._pipeline_finalization_executor = None
+            self._get_pipeline_finalization_state().shutdown()
             if self.model_runner is not None:
                 mgr = getattr(self.model_runner, "kv_transfer_manager", None)
                 try:

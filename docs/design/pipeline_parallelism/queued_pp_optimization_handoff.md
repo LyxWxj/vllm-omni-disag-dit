@@ -143,6 +143,8 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 - 本阶段新增 `vllm_omni/diffusion/queued_pp/executor_adapter.py`，统一 multiprocess/uniprocess Executor 对 rank 聚合 list envelope 的展开；readiness 类型校验、rank coverage、StageEngine 顺序和 transport 生命周期仍在各自实现中。
 - 本阶段删除两套 Executor 中重复的 result-envelope 代码，未修改普通 execute/static PP RPC。远端 Executor/connector focused suite 为 `84 passed`，Engine/retirement suite 为 `63 passed`。
 - 合并后的完整 queued correctness focused suite 共 `302 passed`，包含 upstream 新增的 VAE batch/recovery 测试；下一阶段可以继续 Worker runtime 抽取。
+- 本阶段新增 `vllm_omni/diffusion/queued_pp/worker_runtime.py`，集中 Worker finalization future、executor、published 状态、device event 和 CUDA stream；Worker 保留兼容属性与原有 model/StageEngine 调用顺序。Worker/Engine/retirement focused suite 为 `129 passed`。
+- upstream merge 后 stage0 activation grant/start gate 的旧测试期望已对齐为 gate contract：未启动前不会继续发第二个 activation，避免把真实 backpressure 当成回归。
 
 ### 1. 建立 queued PP 专用模块边界
 
@@ -220,4 +222,4 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 - 不把 TextEncoder 或 VAE 的通用模型代码搬进 queued PP 模块。
 - 不为了减少行数删除 numerical validation、transport identity、device event、取消和 fatal recovery 检查。
 
-推荐的下一次提交处理 Worker 侧 queued runtime 抽取：先集中 finalization future、device event 和 `WanFinalDecode` 生命周期，再处理 transport reserve/poll/release；保持当前 StageEngine owner 顺序和 lease/fatal recovery contract。
+推荐的下一次提交处理 Worker transport/runtime 抽取：集中 reserve/start/poll/release 与 receive consumer lease 的窄适配层；保持当前 StageEngine owner 顺序、未启动 send gate、device event 和 fatal recovery contract。

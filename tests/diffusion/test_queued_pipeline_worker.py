@@ -1460,7 +1460,7 @@ def test_two_batch_progress_runs_stage0_b_while_stage1_consumes_a(mocker) -> Non
     assert last.pipeline_stages[1].terminal_statuses[batch_b.batch_id] is PipelineTaskStatus.COMPLETED
 
 
-def test_stage0_progress_issues_one_activation_per_local_tick(mocker) -> None:
+def test_stage0_waits_for_activation_grant_before_next_forward(mocker) -> None:
     worker = _worker()
     worker.rank = 0
     mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=_PPGroup(0))
@@ -1479,9 +1479,8 @@ def test_stage0_progress_issues_one_activation_per_local_tick(mocker) -> None:
 
     second_progress = worker.progress_pipeline_transfers()
 
-    assert [offer.batch_id for offer in second_progress.offers] == [second.batch_id]
-    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 2
-    assert worker.progress_pipeline_transfers().offers == []
+    assert second_progress.offers == []
+    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 1
 
 
 def test_release_rpc_consumes_acknowledgement_without_dropping_next_batch_event() -> None:
