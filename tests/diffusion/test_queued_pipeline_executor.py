@@ -9,6 +9,7 @@ import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from tests.helpers.queued_pipeline import pipeline_coordinator as _coordinator
+from tests.helpers.queued_pipeline import pipeline_offer as _offer
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
     PipelineEndpointCompletion,
@@ -117,6 +118,30 @@ def test_batch_authorization_uses_one_control_rpc(executor) -> None:
         "authorize_pipeline_batches",
         args=(authorizations,),
     )
+
+
+def test_transfer_batch_lifecycle_is_shared_by_executor_backends(executor) -> None:
+    coordinator = _coordinator()
+    executor._pipeline_transfer_coordinator = coordinator
+    executor._pipeline_pending_readiness = {}
+
+    cancelled = _offer("batch-cancel")
+    coordinator.offer(cancelled)
+    executor._pipeline_pending_readiness[cancelled.identity] = cancelled
+    executor.cancel_pipeline_transfer_batch(cancelled.batch_id, cancelled.epoch)
+    assert cancelled.identity not in executor._pipeline_pending_readiness
+    assert coordinator.offer(cancelled) is False
+
+    retired = _offer("batch-retire")
+    coordinator.offer(retired)
+    coordinator.mark_receive_ready(retired.identity)
+    coordinator.grant_ready()
+    assert not executor.pipeline_transfer_batch_retirement_ready(retired.batch_id, retired.epoch)
+    assert not coordinator.complete(retired.identity, retired.src_rank)
+    assert coordinator.complete(retired.identity, retired.dst_rank)
+    assert executor.pipeline_transfer_batch_retirement_ready(retired.batch_id, retired.epoch)
+    executor.retire_pipeline_transfer_batch(retired.batch_id, retired.epoch)
+    assert coordinator.snapshot()["grants"] == 0
 
 
 def test_final_decode_rpc_passes_selected_physical_output_rank(executor) -> None:

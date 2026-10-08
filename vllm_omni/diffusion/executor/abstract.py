@@ -312,13 +312,32 @@ class DiffusionExecutor(ABC):
         raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
 
     def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        raise NotImplementedError("queued pipeline transfer cancellation is not wired for this executor")
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.cancel_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
 
     def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        raise NotImplementedError("queued pipeline transfer retirement is not wired for this executor")
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        coordinator.retire_batch(batch_id, epoch)
+        self._pipeline_pending_readiness = {
+            identity: offer
+            for identity, offer in self._pipeline_pending_readiness.items()
+            if (identity[0], identity[2]) != (batch_id, epoch)
+        }
 
     def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
-        raise NotImplementedError("queued pipeline transfer retirement readiness is not wired for this executor")
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.batch_retirement_ready(batch_id, epoch)
 
     def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
         """Queue a granted transfer start without waiting for a Worker reply."""
