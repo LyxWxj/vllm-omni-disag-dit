@@ -10,6 +10,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineTransferCoordinator,
     PipelineTransferOffer,
 )
+from vllm_omni.diffusion.worker.pipeline_state import PipelineStageSpec, PipelineTask
 
 
 def pipeline_coordinator(
@@ -45,4 +46,33 @@ def pipeline_offer(
         src_rank=src_rank,
         dst_rank=dst_rank,
         payload_metadata=payload_metadata,
+    )
+
+
+def pipeline_task(
+    batch_id: str = "batch-a",
+    *,
+    request_id: str = "req-a",
+    request_ids: tuple[str, ...] | None = None,
+    step_index: int = 0,
+    epoch: int = 2,
+    branch: str = "conditional",
+) -> PipelineTask:
+    """Build a queued task while keeping request and transfer identity aligned."""
+    return PipelineTask(
+        batch_id=batch_id,
+        request_ids=(request_id,) if request_ids is None else request_ids,
+        step_index=step_index,
+        epoch=epoch,
+        branch=branch,
+    )
+
+
+def pipeline_stage_spec(stage_id: int, *, world_size: int = 2) -> PipelineStageSpec:
+    """Build one logical stage in the M2 two-stage topology."""
+    return PipelineStageSpec(
+        pp_stage_id=stage_id,
+        world_size=world_size,
+        is_first=stage_id == 0,
+        is_last=stage_id == world_size - 1,
     )

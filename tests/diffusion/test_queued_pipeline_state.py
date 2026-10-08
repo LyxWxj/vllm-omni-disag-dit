@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from functools import partial
+
 import pytest
 
+from tests.helpers.queued_pipeline import pipeline_task
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
     PipelineMessage,
@@ -13,15 +16,13 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
 from vllm_omni.diffusion.worker.pipeline_state import (
     PipelineStageSpec,
     PipelineStageState,
-    PipelineTask,
     PipelineTaskStatus,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _task(batch_id: str = "batch-a") -> PipelineTask:
-    return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=1)
+_task = partial(pipeline_task, epoch=1)
 
 
 def _grant() -> PipelineTransferGrant:

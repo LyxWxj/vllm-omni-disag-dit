@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.queued_pipeline import pipeline_stage_spec, pipeline_task
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
     PipelineTransferGrant,
@@ -203,17 +204,8 @@ def test_rank_local_transfer_readiness_batch_preserves_offer_order(mocker) -> No
     accept.assert_has_calls([mocker.call(first), mocker.call(second)])
 
 
-def _task(batch_id: str = "batch-a", *, epoch: int = 2) -> PipelineTask:
-    return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=epoch)
-
-
-def _spec(stage_id: int) -> PipelineStageSpec:
-    return PipelineStageSpec(
-        pp_stage_id=stage_id,
-        world_size=2,
-        is_first=stage_id == 0,
-        is_last=stage_id == 1,
-    )
+_task = pipeline_task
+_spec = pipeline_stage_spec
 
 
 def test_worker_metadata_agreement_uses_global_cpu_control_group(mocker) -> None:
