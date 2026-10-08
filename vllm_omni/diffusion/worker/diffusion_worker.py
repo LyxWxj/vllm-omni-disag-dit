@@ -949,6 +949,9 @@ class DiffusionWorker:
     ) -> PipelineTransferOffer:
         return self._get_queued_worker_runtime()._make_pipeline_transfer_offer(task, edge_kind, payload)
 
+    def _record_pipeline_event(self, event: PipelineEvent) -> PipelineEvent:
+        return self._get_queued_worker_runtime()._record_pipeline_event(event)
+
     def poll_pipeline_received(
         self,
         edge_kind: PipelineEdgeKind,
