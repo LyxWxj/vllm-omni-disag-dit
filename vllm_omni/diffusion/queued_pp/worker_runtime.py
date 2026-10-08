@@ -318,6 +318,22 @@ class QueuedWorkerRuntime:
         if callable(helper):
             return helper(operation, func)
         return _run_and_gather_rank_values(operation, func)
+
+    def _get_pp_group(self) -> Any:
+        helper = getattr(self.owner, "_get_pp_group", None)
+        if callable(helper):
+            return helper()
+        return get_pp_group()
+
+    def _require_pipeline_stage(self, pp_stage_id: int) -> PipelineStageState:
+        stage = self.pipeline_stages.get(pp_stage_id)
+        if stage is None:
+            raise KeyError(f"Unknown pipeline stage {pp_stage_id}.")
+        return stage
+
+    def _owner_method(self, name: str, fallback: Any) -> Any:
+        method = getattr(self.owner, name, None)
+        return method if callable(method) else fallback
     @property
     def pipeline_stages(self) -> dict[int, PipelineStageState]:
         if not hasattr(self, "_pipeline_stages"):
@@ -362,7 +378,7 @@ class QueuedWorkerRuntime:
         """Build this Worker's granted activation and feedback P2P endpoints."""
         if self.pipeline_connectors:
             raise RuntimeError("pipeline transports are already initialized")
-        pp_group = get_pp_group()
+        pp_group = self._get_pp_group()
         if pp_group.world_size != 2:
             raise ValueError("queued v1 transport requires PP world size 2")
         src_rank, dst_rank = pp_group.ranks
@@ -403,9 +419,10 @@ class QueuedWorkerRuntime:
 
     def accept_pipeline_transfer_offer_all_ranks(self, offer: PipelineTransferOffer) -> bool:
         """Return false for temporary receive backpressure; raise on invalid readiness."""
+        accept_offer = self._owner_method("accept_pipeline_transfer_offer", self.accept_pipeline_transfer_offer)
         rank_results = self._run_and_gather_rank_values(
             "queued pipeline transfer readiness",
-            lambda: (self.rank, self.accept_pipeline_transfer_offer(offer)),
+            lambda: (self.rank, accept_offer(offer)),
         )
         endpoint_results: dict[int, bool] = {}
         for rank, ready in rank_results:
@@ -429,7 +446,8 @@ class QueuedWorkerRuntime:
         """Report readiness for a batch of offers in one rank-local RPC."""
         if not isinstance(offers, (tuple, list)):
             raise TypeError("pipeline transfer offers must be a tuple or list")
-        readiness = [(offer.identity, self.accept_pipeline_transfer_offer(offer)) for offer in offers]
+        accept_offer = self._owner_method("accept_pipeline_transfer_offer", self.accept_pipeline_transfer_offer)
+        readiness = [(offer.identity, accept_offer(offer)) for offer in offers]
         return {"rank": self.rank, "readiness": readiness}
 
     def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
@@ -623,9 +641,12 @@ class QueuedWorkerRuntime:
     ) -> list[tuple[PipelineTransportProgress, list[Any]]]:
         """Advance each Worker and collect its events in the same rank agreement."""
 
+        progress_fn = self._owner_method("progress_pipeline_transfers", self.progress_pipeline_transfers)
+        poll_events = self._owner_method("poll_pipeline_events", self.poll_pipeline_events)
+
         def progress_and_poll() -> tuple[PipelineTransportProgress, list[Any]]:
-            progress = self.progress_pipeline_transfers()
-            return progress, self.poll_pipeline_events()
+            progress = progress_fn()
+            return progress, poll_events()
 
         return self._run_and_gather_rank_values("queued pipeline progress snapshot", progress_and_poll)
 
@@ -634,10 +655,13 @@ class QueuedWorkerRuntime:
         pending_offers: tuple[PipelineTransferOffer, ...] = (),
     ) -> tuple[PipelineTransportProgress, list[Any]]:
         """Advance one local Worker and return only its progress and events."""
-        readiness = [(offer.identity, self.accept_pipeline_transfer_offer(offer)) for offer in pending_offers]
-        progress = self.progress_pipeline_transfers()
+        accept_offer = self._owner_method("accept_pipeline_transfer_offer", self.accept_pipeline_transfer_offer)
+        progress_fn = self._owner_method("progress_pipeline_transfers", self.progress_pipeline_transfers)
+        poll_events = self._owner_method("poll_pipeline_events", self.poll_pipeline_events)
+        readiness = [(offer.identity, accept_offer(offer)) for offer in pending_offers]
+        progress = progress_fn()
         progress.readiness = readiness
-        return progress, self.poll_pipeline_events()
+        return progress, poll_events()
 
     def _consume_ready_pipeline_message(
         self,

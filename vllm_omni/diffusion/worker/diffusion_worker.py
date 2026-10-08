@@ -314,6 +314,9 @@ class DiffusionWorker:
     def _run_and_gather_rank_values(self, operation: str, func: Callable[[], Any]) -> list[Any]:
         return _run_and_gather_rank_values(operation, func)
 
+    def _get_pp_group(self) -> Any:
+        return get_pp_group()
+
     @property
     def _pipeline_finalization_futures(self) -> dict[str, Future[Any]]:
         return self._get_pipeline_finalization_state().futures
