@@ -150,6 +150,7 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 - 本阶段新增 `tests/helpers/queued_pipeline.py`，共享单副本 transfer coordinator 和 metadata-only offer factory；connector 与 executor 测试删除重复拓扑构造，同时保留各自的 fake Worker、executor state 和错误清理断言。迁移后的完整 queued correctness 相关集合为 `368 passed, 15 warnings`。
 - 本阶段将 executor 两套重复的 transfer batch cancel/retire/readiness 实现下沉到 `DiffusionExecutor` 公共层，并增加两个后端共用的生命周期 contract 测试；远端 executor/worker/engine/connector 集合为 `215 passed, 15 warnings`，实现净减少 12 行。
 - 本阶段继续扩展 `tests/helpers/queued_pipeline.py`，共享 `PipelineTask` 和 `PipelineStageSpec` factory；state/Worker 测试保留各自的 epoch 默认语义。迁移后的 state/Worker/Engine/retirement/executor/connector 集合为 `238 passed, 15 warnings`。
+- 本阶段新增 `vllm_omni/diffusion/queued_pp/model_runtime.py`，承接 ModelRunner 的 queued preparation、stage execution、feedback、finalization 和 context retirement；`DiffusionModelRunner` 保留通用模型路径和原 RPC 方法名作为委托。远端 ModelRunner/Worker/Engine/retirement/executor/connector 集合为 `239 passed, 15 warnings`，主 ModelRunner 文件减少约 409 行。
 
 ### 1. 建立 queued PP 专用模块边界
 
