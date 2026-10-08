@@ -22,6 +22,7 @@ import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
 from tests.helpers.distributed import collective_context, start_collective_workers
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.group_coordinator import PipelineGroupCoordinator
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     get_classifier_free_guidance_rank,
@@ -86,6 +87,48 @@ class FakeWork:
 
     def wait(self):
         self.waited = True
+
+
+def test_pipeline_tensor_dict_broadcast_maps_local_source_on_physical_ranks(monkeypatch) -> None:
+    coordinator = object.__new__(PipelineGroupCoordinator)
+    coordinator.world_size = 2
+    coordinator.ranks = [2, 3]
+    coordinator.rank = 2
+    coordinator.rank_in_group = 0
+    coordinator.cpu_group = "cpu"
+    coordinator.device_group = "device"
+    coordinator.shm_broadcaster = None
+    broadcasts = []
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast_object_list",
+        lambda values, *, src, group: broadcasts.append(("object", src, group, values)),
+    )
+
+    def broadcast(tensor, *, src, group, async_op):
+        broadcasts.append(("tensor", src, group, async_op))
+        return FakeWork()
+
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+
+    tensor = torch.ones(2)
+    assert coordinator.broadcast_tensor_dict({"hidden_states": tensor}, src=0) == {"hidden_states": tensor}
+    assert broadcasts[0][0:3] == ("object", 2, "cpu")
+    assert broadcasts[1][0:3] == ("tensor", 2, "cpu")
+
+
+def test_pipeline_tensor_dict_pp2_groups_follow_source_rank() -> None:
+    coordinator = object.__new__(PipelineGroupCoordinator)
+    coordinator.world_size = 2
+    coordinator.device_groups = ["device-0-1", "device-1-0"]
+    coordinator.cpu_groups = ["cpu-0-1", "cpu-1-0"]
+    coordinator.device_group = coordinator.device_groups[0]
+    coordinator.cpu_group = coordinator.cpu_groups[0]
+
+    assert coordinator._tensor_dict_comm_groups(0) == ("device-0-1", "cpu-0-1")
+    assert coordinator._tensor_dict_comm_groups(1) == ("device-1-0", "cpu-1-0")
 
 
 class SimpleScheduler:
@@ -370,6 +413,17 @@ class TestVaeDecodeGuard:
 
         assert pipeline.vae.calls == 0
         assert output == (None,)
+
+    def test_queued_output_owner_can_decode_on_non_first_stage(self, monkeypatch):
+        self._set_rank(monkeypatch, world_size=2, first_stage=False)
+        pipeline = self._make_pipeline()
+        pipeline._queued_pipeline_decode_owner = True
+        z = torch.ones(2, 3)
+
+        output = pipeline.vae.decode(z)[0]
+
+        assert pipeline.vae.calls == 1
+        torch.testing.assert_close(output, z + 1)
 
     def test_calls_original_decode_when_distributed_vae_enabled(self, monkeypatch):
         self._set_rank(monkeypatch, world_size=2, first_stage=False)

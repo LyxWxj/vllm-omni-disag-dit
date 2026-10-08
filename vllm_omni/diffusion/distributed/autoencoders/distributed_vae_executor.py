@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.distributed.parallel_state import get_vae_group, get_world_group
 
 logger = init_logger(__name__)
 
@@ -47,10 +47,16 @@ class DistributedVaeExecutor:
     """
 
     def __init__(self):
-        # Use a dedicated process group spanning the complete worker WORLD.
-        world_group = get_world_group()
-        self.group = world_group.device_group
-        self._error_group = world_group.cpu_group
+        # PP gets a dedicated communicator so asynchronous final decode cannot
+        # reorder collectives with the PP activation/feedback transport.
+        try:
+            vae_group = get_vae_group()
+        except AssertionError:
+            # CPU/unit tests may provide only a world-group shim before the
+            # model-parallel VAE group is initialized.
+            vae_group = get_world_group()
+        self.group = vae_group.device_group
+        self._error_group = getattr(vae_group, "cpu_group", self.group)
         # Reporting an OOM must not require another device allocation.
         self._error_status = torch.zeros((), dtype=torch.int32, device="cpu")
         self.world_size = dist.get_world_size(self.group)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """In-process diffusion executor for single-GPU deployments.
 
@@ -30,12 +30,28 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
+    PipelineCoordinatorProgress,
+    PipelineTransferCoordinator,
+    PipelineTransferOffer,
+)
+from vllm_omni.diffusion.executor.abstract import (
+    PIPELINE_GRANT_START_TIMEOUT_S,
+    DiffusionExecutor,
+    normalize_pipeline_preparation_reports,
+    normalize_pipeline_transfer_readiness,
+    normalize_pipeline_transport_snapshot,
+    validate_pipeline_topology_reports,
+)
+from vllm_omni.diffusion.queued_pp.executor_adapter import (
+    unwrap_nested_pipeline_result,
+    unwrap_singleton_pipeline_result,
+)
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -143,14 +159,12 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                     )
                 )
             except Exception as exc:
-                # The worker runs inline, so a pipeline's OmniClientError lands
-                # here; from_exception keeps its 4xx status for the engine/API.
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput.from_exception(exc),
+                        result=DiffusionOutput(error=str(exc)),
                     )
                 )
         return BatchRunnerOutput.from_list(runner_outputs)
@@ -185,6 +199,254 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         if isinstance(result, BaseRunnerOutput):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+
+    def _queued_control_rpc(
+        self,
+        method: str,
+        *,
+        args: tuple = (),
+        timeout: float | None = None,
+        exec_all_ranks: bool = False,
+    ) -> Any:
+        if self._is_failed:
+            raise EngineDeadError()
+        self._ensure_open()
+        try:
+            kwargs: dict[str, Any] = {"args": args}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            worker_aggregated = method.endswith("_all_ranks")
+            if exec_all_ranks or worker_aggregated:
+                kwargs["exec_all_ranks"] = True
+            return self.collective_rpc(method, **kwargs)
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
+        return self._queued_control_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        expected_request_ids = tuple(request.request_id for request in scheduler_output.scheduled_new_reqs)
+        expected_request_ids += tuple(
+            getattr(getattr(scheduler_output, "scheduled_cached_reqs", None), "request_ids", ())
+        )
+        if len(expected_request_ids) != 1:
+            raise ValueError("M2 queued preparation requires exactly one new request.")
+        try:
+            result = self._queued_control_rpc("prepare_pipeline_requests_all_ranks", args=(scheduler_output,))
+            return normalize_pipeline_preparation_reports(
+                result,
+                coordinator.endpoint_ranks,
+                expected_request_ids,
+            )
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def finalize_pipeline_batch(
+        self,
+        pp_stage_id: dict[int, int],
+        batch_id: str,
+        output_rank: int,
+    ) -> str:
+        try:
+            result = self._queued_control_rpc(
+                "finalize_pipeline_batch",
+                args=(pp_stage_id, batch_id, output_rank),
+            )
+            if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], str):
+                raise RuntimeError("Queued final decode submission returned an invalid handle.")
+            return result[0]
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def poll_pipeline_finalization(self, batch_id: str, output_rank: int) -> BaseRunnerOutput | None:
+        try:
+            result = self.collective_rpc(
+                "poll_pipeline_finalization",
+                args=(batch_id,),
+                unique_reply_rank=output_rank,
+            )
+            if result is not None and not isinstance(result, BaseRunnerOutput):
+                raise RuntimeError("Queued final decode poll returned an invalid output.")
+            return result
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
+        result = self._queued_control_rpc("release_pipeline_batch_all_ranks", args=(pp_stage_id, batch_id))
+        return unwrap_nested_pipeline_result(result)
+
+    def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
+        result = self._queued_control_rpc(
+            "pipeline_batch_release_ready_all_ranks",
+            args=(pp_stage_id, batch_id),
+        )
+        result = unwrap_singleton_pipeline_result(result)
+        if type(result) is not bool:
+            raise RuntimeError("Queued pipeline retirement readiness returned an invalid result.")
+        return result
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
+        result = self._queued_control_rpc(
+            "cleanup_finalized_pipeline_request_all_ranks",
+            args=(request_id,),
+        )
+        return unwrap_nested_pipeline_result(result)
+
+    def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
+        return self._queued_control_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
+
+    def authorize_pipeline_batches(self, authorizations: list[tuple[int | dict[int, int], str]]) -> Any:
+        return self._queued_control_rpc("authorize_pipeline_batches", args=(authorizations,))
+
+    def poll_pipeline_events(self) -> list[Any]:
+        self._ensure_open()
+        cached_events = getattr(self, "_pipeline_cached_events", None)
+        if cached_events is not None:
+            self._pipeline_cached_events = None
+            return cached_events
+        result = self.collective_rpc("poll_pipeline_events_all_ranks", exec_all_ranks=True)
+        result = unwrap_nested_pipeline_result(result)
+        return result if isinstance(result, list) else [result]
+
+    def cancel_pipeline_requests(self, request_generations: Any) -> Any:
+        self._ensure_open()
+        result = self.collective_rpc(
+            "cancel_pipeline_requests_all_ranks",
+            args=(request_generations,),
+            exec_all_ranks=True,
+        )
+        return unwrap_nested_pipeline_result(result)
+
+    def drain_pipeline(self, deadline: float | None = None) -> Any:
+        self._ensure_open()
+        result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,), exec_all_ranks=True)
+        return unwrap_nested_pipeline_result(result)
+
+    def initialize_pipeline_transfers(
+        self,
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
+        max_slots: int = 1,
+    ) -> Any:
+        if hasattr(self, "_pipeline_transfer_coordinator"):
+            raise RuntimeError("pipeline transfer coordinator is already initialized")
+        coordinator = PipelineTransferCoordinator(
+            activation_edges=activation_edges,
+            feedback_edges=feedback_edges,
+        )
+        result = self._queued_control_rpc("initialize_pipeline_transports_all_ranks", args=(max_slots,))
+        try:
+            validate_pipeline_topology_reports(result, activation_edges, feedback_edges)
+        except BaseException:
+            self._mark_failed()
+            raise
+        self._pipeline_transfer_coordinator = coordinator
+        self._pipeline_pending_readiness: dict[tuple[Any, ...], PipelineTransferOffer] = {}
+        return result
+
+    def coordinate_pipeline_transfer(self, offer: PipelineTransferOffer) -> list[Any]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        if coordinator.offer(offer):
+            self._pipeline_pending_readiness[offer.identity] = offer
+        return self._retry_pipeline_transfer_readiness()
+
+    def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
+        self._queued_control_rpc("start_pipeline_transfer", args=(grant,))
+
+    def _retry_pipeline_transfer_readiness(self) -> list[Any]:
+        coordinator = self._pipeline_transfer_coordinator
+        try:
+            attempted: set[tuple[Any, ...]] = set()
+            while True:
+                candidates = [
+                    offer for offer in coordinator.pending_readiness_offers() if offer.identity not in attempted
+                ]
+                if not candidates:
+                    break
+                for offer in candidates:
+                    attempted.add(offer.identity)
+                    ready = normalize_pipeline_transfer_readiness(
+                        self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+                    )
+                    if ready:
+                        coordinator.mark_receive_ready(offer.identity)
+                        self._pipeline_pending_readiness.pop(offer.identity, None)
+            return self._start_ready_pipeline_transfers()
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def _start_ready_pipeline_transfers(self) -> list[Any]:
+        coordinator = self._pipeline_transfer_coordinator
+        grants = coordinator.grant_ready()
+        for grant in grants:
+            self._queued_control_rpc(
+                "start_pipeline_transfer",
+                args=(grant,),
+                timeout=PIPELINE_GRANT_START_TIMEOUT_S,
+            )
+        return grants
+
+    def progress_pipeline(self) -> PipelineCoordinatorProgress:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        try:
+            result = self._queued_control_rpc("progress_pipeline_transfers_and_poll_events_all_ranks")
+            worker_progress, worker_events = normalize_pipeline_transport_snapshot(result, coordinator.endpoint_ranks)
+            cached_events = getattr(self, "_pipeline_cached_events", None)
+            self._pipeline_cached_events = (cached_events or []) + worker_events
+            progress = PipelineCoordinatorProgress()
+            for rank_progress in worker_progress:
+                for completion in rank_progress.completions:
+                    if coordinator.complete(completion.identity, completion.rank):
+                        progress.completed.append(completion.identity)
+            for rank_progress in worker_progress:
+                for offer in rank_progress.offers:
+                    if coordinator.offer(offer):
+                        self._pipeline_pending_readiness[offer.identity] = offer
+            progress.grants.extend(self._retry_pipeline_transfer_readiness())
+            return progress
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def pipeline_stage_physical_ranks(self) -> dict[int, int]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.stage_physical_ranks
+
+    def pipeline_stage_memory_budget_bytes(self) -> int:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        try:
+            result = self._queued_control_rpc("pipeline_stage_memory_budget_bytes", exec_all_ranks=True)
+            result = unwrap_nested_pipeline_result(result)
+            if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+                raise RuntimeError("Workers returned invalid pipeline memory budget reports")
+            expected = coordinator.endpoint_ranks
+            ranks = {item.get("rank") for item in result}
+            if len(result) != len(expected) or ranks != expected:
+                raise RuntimeError("pipeline memory budget reports do not cover every configured endpoint")
+            budgets = [item.get("free_bytes") for item in result]
+            if any(type(value) is not int or value <= 0 for value in budgets):
+                raise RuntimeError("pipeline memory budget reports must contain positive integer free_bytes")
+            return min(budgets)
+        except BaseException:
+            self._mark_failed()
+            raise
 
     def _device_is_usable(self) -> bool:
         """Whether the accelerator context survived the failure we just caught.

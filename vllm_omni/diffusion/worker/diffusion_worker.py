@@ -15,9 +15,12 @@ import queue
 import signal
 import sys
 import threading
+import time
 import traceback
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -64,6 +67,15 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
+    PipelineEdgeKind,
+    PipelineMessage,
+    PipelineStageConnector,
+    PipelineTransferGrant,
+    PipelineTransferOffer,
+    PipelineTransportProgress,
+    TransferTicket,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import (
     DIFFUSION_RPC_RESULT_ENVELOPE,
@@ -71,6 +83,12 @@ from vllm_omni.diffusion.ipc import (
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.queued_pp.worker_runtime import (
+    PipelineFinalizationState,
+    PipelineTransportRuntime,
+    PipelineTransportState,
+    QueuedWorkerRuntime,
+)
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -81,6 +99,17 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.pipeline_stage_engine import PipelineStageEngine
+from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineEvent,
+    PipelineEventType,
+    PipelineFinalizationUpdate,
+    PipelineProgress,
+    PipelineStageSpec,
+    PipelineStageState,
+    PipelineTask,
+    PipelineWorkerUpdate,
+)
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -101,6 +130,7 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
+_PIPELINE_PREPARATION_METHODS = frozenset({"prepare_pipeline_requests_all_ranks"})
 
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
@@ -116,12 +146,9 @@ def _cleanup_after_execution_error(exc: Exception) -> None:
 def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
-    values: list[Any] = [None] * dist.get_world_size()
-    # Object collectives are control-plane traffic. Using the default NCCL
-    # group serializes them through temporary CUDA tensors, adding pointless
-    # H2D/DtoH copies to every rank-wide status check. Reuse the world
-    # coordinator's Gloo group, as vLLM does for CPU metadata collectives.
-    dist.all_gather_object(values, value, group=get_world_group().cpu_group)
+    control_group = get_world_group().cpu_group
+    values: list[Any] = [None] * dist.get_world_size(group=control_group)
+    dist.all_gather_object(values, value, group=control_group)
     return values
 
 
@@ -139,6 +166,22 @@ def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list
     if failures:
         raise RuntimeError(f"{operation} failed on " + "; ".join(failures))
     return [result for _, result in rank_results]
+
+
+def _run_and_agree_rank_status(operation: str, func: Callable[[], Any]) -> Any:
+    """Run locally, agree on failures, and retain the local result in place."""
+    local_result: Any = None
+    try:
+        local_result = func()
+        local_status = (True, None)
+    except Exception as exc:
+        logger.exception("%s failed on this Worker rank", operation)
+        local_status = (False, f"{type(exc).__name__}: {exc}")
+    rank_statuses = _all_gather_rank_values(local_status)
+    failures = [f"rank {rank}: {error}" for rank, (ok, error) in enumerate(rank_statuses) if not ok]
+    if failures:
+        raise RuntimeError(f"{operation} failed on " + "; ".join(failures))
+    return local_result
 
 
 def _setup_diffusion_worker_proc_title_and_log_prefix(
@@ -186,16 +229,11 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
     import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
-    # vLLM #49381 replaced the per-format ModelOpt linear methods with the
-    # generic ``ModelOptLinearMethod`` and removed the ``LinearMethodCls``
-    # attributes this used to match on. The same two formats are identified by
-    # the ModelOpt quant-algo string carried on the config
-    # (``ModelOptQuantConfigBase.quant_method``): "FP8" used to select
-    # ``ModelOptFp8LinearMethod`` and "FP8_PER_CHANNEL_PER_TOKEN" used to select
-    # ``ModelOptFp8PcPtLinearMethod``. "FP8_PB_WO" / "NVFP4" / "W4A16_NVFP4"
-    # were never matched here and still are not.
-    quant_algo = getattr(quant_config, "quant_method", None)
-    if quant_algo in ("FP8", "FP8_PER_CHANNEL_PER_TOKEN"):
+    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
+    if linear_method_cls in {
+        vllm_modelopt.ModelOptFp8LinearMethod,
+        vllm_modelopt.ModelOptFp8PcPtLinearMethod,
+    }:
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda() and current_platform.has_device_capability(89):
@@ -245,15 +283,84 @@ class DiffusionWorker:
     delegated to DiffusionModelRunner.
     """
 
+    def _get_pipeline_finalization_state(self) -> PipelineFinalizationState:
+        state = getattr(self, "_pipeline_finalization_state", None)
+        if state is None:
+            state = PipelineFinalizationState()
+            self._pipeline_finalization_state = state
+        return state
+
+    def _get_pipeline_transport_state(self) -> PipelineTransportState:
+        state = getattr(self, "_pipeline_transport_state", None)
+        if state is None:
+            state = PipelineTransportState()
+            self._pipeline_transport_state = state
+        return state
+
+    def _get_pipeline_transport_runtime(self) -> PipelineTransportRuntime:
+        runtime = getattr(self, "_pipeline_transport_runtime", None)
+        if runtime is None:
+            runtime = PipelineTransportRuntime(self)
+            self._pipeline_transport_runtime = runtime
+        return runtime
+
+    def _get_queued_worker_runtime(self) -> QueuedWorkerRuntime:
+        runtime = getattr(self, "_queued_worker_runtime", None)
+        if runtime is None:
+            runtime = QueuedWorkerRuntime(self)
+            self._queued_worker_runtime = runtime
+        return runtime
+
+    def _run_and_gather_rank_values(self, operation: str, func: Callable[[], Any]) -> list[Any]:
+        return _run_and_gather_rank_values(operation, func)
+
+    @property
+    def _pipeline_finalization_futures(self) -> dict[str, Future[Any]]:
+        return self._get_pipeline_finalization_state().futures
+
+    @_pipeline_finalization_futures.setter
+    def _pipeline_finalization_futures(self, value: dict[str, Future[Any]]) -> None:
+        self._get_pipeline_finalization_state().futures = value
+
+    @property
+    def _pipeline_finalization_executor(self) -> ThreadPoolExecutor | None:
+        return self._get_pipeline_finalization_state().executor
+
+    @_pipeline_finalization_executor.setter
+    def _pipeline_finalization_executor(self, value: ThreadPoolExecutor | None) -> None:
+        self._get_pipeline_finalization_state().executor = value
+
+    @property
+    def _pipeline_finalization_published(self) -> set[str]:
+        return self._get_pipeline_finalization_state().published
+
+    @_pipeline_finalization_published.setter
+    def _pipeline_finalization_published(self, value: set[str]) -> None:
+        self._get_pipeline_finalization_state().published = value
+
+    @property
+    def _pipeline_finalization_device_events(self) -> dict[str, Any]:
+        return self._get_pipeline_finalization_state().device_events
+
+    @_pipeline_finalization_device_events.setter
+    def _pipeline_finalization_device_events(self, value: dict[str, Any]) -> None:
+        self._get_pipeline_finalization_state().device_events = value
+
+    @property
+    def _pipeline_finalization_stream(self) -> Any | None:
+        return self._get_pipeline_finalization_state().stream
+
+    @_pipeline_finalization_stream.setter
+    def _pipeline_finalization_stream(self, value: Any | None) -> None:
+        self._get_pipeline_finalization_state().stream = value
+
     def __init__(
         self,
         local_rank: int,
         rank: int,
         od_config: OmniDiffusionConfig,
         skip_load_model: bool = False,
-        distributed_init_method: str | None = None,
     ):
-        self.distributed_init_method = distributed_init_method
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
@@ -263,58 +370,54 @@ class DiffusionWorker:
         self.init_snapshot: MemorySnapshot | None = None
         self.requested_memory: int | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
-        self._owns_sleep_pool = False
         self.lora_manager: DiffusionLoRAManager | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
-        self._shutdown_complete = False
+        self._pipeline_stages: dict[int, PipelineStageState] = {}
+        self._pipeline_events: list[PipelineEvent] = []
+        self._pipeline_connectors: dict[PipelineEdgeKind, PipelineStageConnector] = {}
+        self._pipeline_transport_state = PipelineTransportState()
+        self._pipeline_finalization_state = PipelineFinalizationState()
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        try:
-            # Create model runner — one decision chain, in precedence order:
-            #   1. explicit od_config.diffusion_model_runner_cls (user override),
-            #   2. the runner declared by the engine class that engine_backend
-            #      selects (e.g. ARDiffusionEngine -> ARDiffusionModelRunner),
-            #   3. the platform default.
-            # Routing policy therefore lives on the engine class / config surface;
-            # engines never mutate od_config. Overrides must be import-path
-            # strings — guard with isinstance so a non-string (e.g. a Mock
-            # od_config in tests) doesn't shadow the platform hook.
-            runner_override = getattr(self.od_config, "diffusion_model_runner_cls", None)
-            engine_runner = None
-            if not (isinstance(runner_override, str) and runner_override):
-                try:
-                    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+        # Create model runner — one decision chain, in precedence order:
+        #   1. explicit od_config.diffusion_model_runner_cls (user override),
+        #   2. the runner declared by the engine class that engine_backend
+        #      selects (e.g. ARDiffusionEngine -> ARDiffusionModelRunner),
+        #   3. the platform default.
+        # Routing policy therefore lives on the engine class / config surface;
+        # engines never mutate od_config. Overrides must be import-path
+        # strings — guard with isinstance so a non-string (e.g. a Mock
+        # od_config in tests) doesn't shadow the platform hook.
+        runner_override = getattr(self.od_config, "diffusion_model_runner_cls", None)
+        engine_runner = None
+        if not (isinstance(runner_override, str) and runner_override):
+            try:
+                from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
-                    engine_cls = DiffusionEngine.resolve_engine_class(self.od_config)
-                    engine_runner = getattr(engine_cls, "default_diffusion_model_runner_cls", None)
-                except Exception:
-                    logger.warning("Worker %s: engine_backend resolution failed; using platform runner", self.rank)
-                    engine_runner = None
-            if isinstance(runner_override, str) and runner_override:
-                model_runner_cls_path = runner_override
-            elif isinstance(engine_runner, str) and engine_runner:
-                model_runner_cls_path = engine_runner
-            else:
-                model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
-            model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
-            self.model_runner = model_runner_cls(
-                vllm_config=self.vllm_config,
-                od_config=self.od_config,
-                device=self.device,
-            )
-            self.profiler: WorkerProfiler | None = self._create_profiler()
-            if not skip_load_model:
-                self.load_model(load_format=self.od_config.diffusion_load_format)
-                self.init_lora_manager()
-        except Exception:
-            # init_device() owns process-global distributed state. If anything
-            # after it fails, unwind that state before another inline worker is
-            # allowed to initialize in this process.
-            self.shutdown()
-            raise
+                engine_cls = DiffusionEngine.resolve_engine_class(self.od_config)
+                engine_runner = getattr(engine_cls, "default_diffusion_model_runner_cls", None)
+            except Exception:
+                logger.warning("Worker %s: engine_backend resolution failed; using platform runner", self.rank)
+                engine_runner = None
+        if isinstance(runner_override, str) and runner_override:
+            model_runner_cls_path = runner_override
+        elif isinstance(engine_runner, str) and engine_runner:
+            model_runner_cls_path = engine_runner
+        else:
+            model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        self.model_runner = model_runner_cls(
+            vllm_config=self.vllm_config,
+            od_config=self.od_config,
+            device=self.device,
+        )
+        self.profiler: WorkerProfiler | None = self._create_profiler()
+        if not skip_load_model:
+            self.load_model(load_format=self.od_config.diffusion_load_format)
+            self.init_lora_manager()
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
@@ -322,16 +425,15 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
 
-        # Set environment variables for local distributed initialization.
-        if self.distributed_init_method is None:
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        # Set environment variables for distributed initialization
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
         # Setup device
-        self.device = current_omni_platform.get_torch_device(self.local_rank)
+        self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
@@ -357,12 +459,7 @@ class DiffusionWorker:
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
         ):
-            init_distributed_environment(
-                world_size=world_size,
-                rank=rank,
-                distributed_init_method=self.distributed_init_method or "env://",
-                local_rank=self.local_rank,
-            )
+            init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
             parallel_config = self.od_config.parallel_config
@@ -473,13 +570,15 @@ class DiffusionWorker:
                 raise RuntimeError("Diffusion KV memory snapshot was not captured before model loading")
             override = self.vllm_config.cache_config.kv_cache_memory_bytes
             if override:
-                # Post-allocation warmup avoids retaining a second activation arena.
+                # Match native vLLM: an explicit cache budget skips automatic
+                # capacity derivation, but still runs the maximum-shape model
+                # request so lazy kernels and communication buffers initialize.
+                self.model_runner.profile_run(profile_requests)
                 logger.info(
                     "Worker %d: Initial free memory %s GiB, reserved %s GiB memory for "
                     "Diffusion KV Cache as specified by kv_cache_memory_bytes config and "
                     "skipped automatic memory profiling. This does not respect the "
-                    "gpu_memory_utilization config. Model kernels will be initialized by "
-                    "the post-allocation startup warmup.",
+                    "gpu_memory_utilization config. A profile warmup was still executed.",
                     self.rank,
                     format_gib(self.init_snapshot.free_memory),
                     format_gib(int(override)),
@@ -491,8 +590,6 @@ class DiffusionWorker:
                 weights_memory=self.model_runner.model_memory_usage,
             ) as profile_result:
                 self.model_runner.profile_run(profile_requests)
-
-            current_omni_platform.empty_cache()
 
             available_memory = self.requested_memory - profile_result.non_kv_cache_memory
             if available_memory <= 0:
@@ -561,17 +658,11 @@ class DiffusionWorker:
         with self._maybe_get_memory_pool_context("kv_cache"):
             self.model_runner.set_kv_cache_config(kv_cache_config)
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
         """Clear Worker-local rows without freeing Scheduler-owned blocks."""
 
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.remove_diffusion_kv_requests(request_ids)
-
-    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
-        return _run_and_gather_rank_values(
-            "Diffusion KV receive",
-            lambda: self.model_runner.prepare_kv_for_forward(scheduler_output),
-        )
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -748,6 +839,208 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+
+    @property
+    def pipeline_stages(self) -> dict[int, PipelineStageState]:
+        return self._get_queued_worker_runtime().pipeline_stages
+
+    @property
+    def pipeline_events(self) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().pipeline_events
+
+    @property
+    def pipeline_connectors(self) -> dict[PipelineEdgeKind, PipelineStageConnector]:
+        return self._get_queued_worker_runtime().pipeline_connectors
+
+    @property
+    def pipeline_send_tickets(self) -> dict[tuple[Any, ...], TransferTicket]:
+        return self._get_queued_worker_runtime().pipeline_send_tickets
+
+    @property
+    def pipeline_receive_reservations(self) -> dict[tuple[Any, ...], PipelineEdgeKind]:
+        return self._get_queued_worker_runtime().pipeline_receive_reservations
+
+    @property
+    def pipeline_started_receive_ids(self) -> set[tuple[Any, ...]]:
+        return self._get_queued_worker_runtime().pipeline_started_receive_ids
+
+    @property
+    def pipeline_receive_consumers(
+        self,
+    ) -> dict[tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]]:
+        return self._get_queued_worker_runtime().pipeline_receive_consumers
+
+    @property
+    def pipeline_pending_received(self) -> dict[PipelineEdgeKind, deque[PipelineMessage]]:
+        return self._get_queued_worker_runtime().pipeline_pending_received
+
+    def _pipeline_stage(self, pp_stage_spec: PipelineStageSpec) -> PipelineStageState:
+        return self._get_queued_worker_runtime()._pipeline_stage(pp_stage_spec)
+
+    def _pipeline_event(
+        self,
+        event_type: PipelineEventType,
+        task: PipelineTask,
+        pp_stage_id: int,
+    ) -> PipelineEvent:
+        return self._get_queued_worker_runtime()._pipeline_event(event_type, task, pp_stage_id)
+
+    def initialize_pipeline_transports(self, max_slots: int = 1) -> dict[str, Any]:
+        return self._get_queued_worker_runtime().initialize_pipeline_transports(max_slots)
+
+    def initialize_pipeline_transports_all_ranks(self, max_slots: int = 1) -> list[dict[str, Any]]:
+        return self._get_queued_worker_runtime().initialize_pipeline_transports_all_ranks(max_slots)
+
+    def reserve_pipeline_send(self, offer: PipelineTransferOffer, payload: dict[str, Any]) -> PipelineTransferOffer:
+        return self._get_queued_worker_runtime().reserve_pipeline_send(offer, payload)
+
+    def accept_pipeline_transfer_offer(self, offer: PipelineTransferOffer) -> bool:
+        return self._get_queued_worker_runtime().accept_pipeline_transfer_offer(offer)
+
+    def accept_pipeline_transfer_offer_all_ranks(self, offer: PipelineTransferOffer) -> bool:
+        return self._get_queued_worker_runtime().accept_pipeline_transfer_offer_all_ranks(offer)
+
+    def accept_pipeline_transfer_offer_rank_local(self, offer: PipelineTransferOffer) -> dict[str, Any]:
+        return self._get_queued_worker_runtime().accept_pipeline_transfer_offer_rank_local(offer)
+
+    def accept_pipeline_transfer_offers_rank_local(
+        self,
+        offers: tuple[PipelineTransferOffer, ...] | list[PipelineTransferOffer],
+    ) -> dict[str, Any]:
+        return self._get_queued_worker_runtime().accept_pipeline_transfer_offers_rank_local(offers)
+
+    def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
+        return self._get_queued_worker_runtime().start_pipeline_transfer(grant)
+
+    def retire_pipeline_send(self, identity: tuple[Any, ...]) -> bool:
+        return self._get_queued_worker_runtime().retire_pipeline_send(identity)
+
+    def progress_pipeline_transfers(self) -> PipelineTransportProgress:
+        return self._get_queued_worker_runtime().progress_pipeline_transfers()
+
+    def pipeline_stage_engine_tick(self) -> PipelineWorkerUpdate | None:
+        return self._get_queued_worker_runtime().pipeline_stage_engine_tick()
+
+    def pipeline_stage_engine_needs_progress(self) -> bool:
+        return self._get_queued_worker_runtime().pipeline_stage_engine_needs_progress()
+
+    def progress_pipeline_transfers_and_poll_events_all_ranks(
+        self,
+    ) -> list[tuple[PipelineTransportProgress, list[Any]]]:
+        return self._get_queued_worker_runtime().progress_pipeline_transfers_and_poll_events_all_ranks()
+
+    def progress_pipeline_transfers_and_poll_events(
+        self,
+        pending_offers: tuple[PipelineTransferOffer, ...] = (),
+    ) -> tuple[PipelineTransportProgress, list[Any]]:
+        return self._get_queued_worker_runtime().progress_pipeline_transfers_and_poll_events(pending_offers)
+
+    def enqueue_pipeline_batch(
+        self,
+        task: PipelineTask,
+        pp_stage_spec: PipelineStageSpec | dict[int, PipelineStageSpec],
+    ) -> PipelineEvent:
+        return self._get_queued_worker_runtime().enqueue_pipeline_batch(task, pp_stage_spec)
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> dict[str, Any]:
+        return self._get_queued_worker_runtime().prepare_pipeline_requests(scheduler_output)
+
+    def prepare_pipeline_requests_all_ranks(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
+        return self._get_queued_worker_runtime().prepare_pipeline_requests_all_ranks(scheduler_output)
+
+    def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> PipelineEvent:
+        return self._get_queued_worker_runtime().authorize_pipeline_batch(pp_stage_id, batch_id)
+
+    def authorize_pipeline_batches(
+        self,
+        authorizations: list[tuple[int | dict[int, int], str]],
+    ) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().authorize_pipeline_batches(authorizations)
+
+    def admit_pipeline_batch(
+        self,
+        task: PipelineTask,
+        pp_stage_spec: PipelineStageSpec | dict[int, PipelineStageSpec],
+    ) -> tuple[PipelineEvent, PipelineEvent]:
+        return self._get_queued_worker_runtime().admit_pipeline_batch(task, pp_stage_spec)
+
+    def admit_pipeline_batches(
+        self,
+        admissions: list[tuple[PipelineTask, PipelineStageSpec | dict[int, PipelineStageSpec]]],
+    ) -> tuple[PipelineEvent, ...]:
+        return self._get_queued_worker_runtime().admit_pipeline_batches(admissions)
+
+    def progress_pipeline(
+        self,
+        pp_stage_id: int,
+        intermediate_tensors: Any | None = None,
+    ) -> PipelineProgress | None:
+        return self._get_queued_worker_runtime().progress_pipeline(pp_stage_id, intermediate_tensors)
+
+    def complete_pipeline_feedback(self, pp_stage_id: int, batch_id: str, latents: torch.Tensor) -> PipelineEvent:
+        return self._get_queued_worker_runtime().complete_pipeline_feedback(pp_stage_id, batch_id, latents)
+
+    def cancel_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
+        return self._get_queued_worker_runtime().cancel_pipeline_batch(pp_stage_id, batch_id)
+
+    def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
+        return self._get_queued_worker_runtime().release_pipeline_batch(pp_stage_id, batch_id)
+
+    def pipeline_batch_release_ready(self, pp_stage_id: int | dict[int, int], batch_id: str) -> bool:
+        return self._get_queued_worker_runtime().pipeline_batch_release_ready(pp_stage_id, batch_id)
+
+    def pipeline_batch_release_ready_all_ranks(
+        self,
+        pp_stage_id: int | dict[int, int],
+        batch_id: str,
+    ) -> bool:
+        return self._get_queued_worker_runtime().pipeline_batch_release_ready_all_ranks(pp_stage_id, batch_id)
+
+    def finalize_pipeline_batch(
+        self,
+        pp_stage_id: int | dict[int, int],
+        batch_id: str,
+        output_rank: int | None = None,
+    ) -> str | None:
+        return self._get_queued_worker_runtime().finalize_pipeline_batch(pp_stage_id, batch_id, output_rank)
+
+    def poll_pipeline_finalization(self, batch_id: str) -> BatchRunnerOutput | None:
+        return self._get_queued_worker_runtime().poll_pipeline_finalization(batch_id)
+
+    def release_pipeline_batch_all_ranks(
+        self,
+        pp_stage_id: int | dict[int, int],
+        batch_id: str,
+    ) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().release_pipeline_batch_all_ranks(pp_stage_id, batch_id)
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> bool:
+        return self._get_queued_worker_runtime().cleanup_finalized_pipeline_request(request_id)
+
+    def cleanup_finalized_pipeline_request_all_ranks(self, request_id: str) -> list[bool]:
+        return self._get_queued_worker_runtime().cleanup_finalized_pipeline_request_all_ranks(request_id)
+
+    def poll_pipeline_events(self) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().poll_pipeline_events()
+
+    def pipeline_stage_memory_budget_bytes(self) -> list[dict[str, int]]:
+        return self._get_queued_worker_runtime().pipeline_stage_memory_budget_bytes()
+
+    def poll_pipeline_events_all_ranks(self) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().poll_pipeline_events_all_ranks()
+
+    def cancel_pipeline_requests(self, request_generations: Any) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().cancel_pipeline_requests(request_generations)
+
+    def cancel_pipeline_requests_all_ranks(self, request_generations: Any) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().cancel_pipeline_requests_all_ranks(request_generations)
+
+    def drain_pipeline(self, deadline: float | None = None) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().drain_pipeline(deadline)
+
+    def drain_pipeline_all_ranks(self, deadline: float | None = None) -> list[PipelineEvent]:
+        return self._get_queued_worker_runtime().drain_pipeline_all_ranks(deadline)
+
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
 
@@ -823,18 +1116,6 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
-        progress = getattr(getattr(self, "model_runner", None), "_kv_receive_progress", None)
-        if progress is not None and progress.submitted:
-            raise RuntimeError("Cannot sleep with live native KV prefetch reservations; finish requests first")
-        # The config validator rejects sleep for the native paged path. Keep
-        # this worker-side guard precise as well: test doubles and legacy
-        # configs may expose arbitrary attributes through Mock/getattr.
-        if (
-            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and getattr(self.od_config, "kv_transfer_config", None) is not None
-        ):
-            raise ValueError("Cannot sleep while native KV connector memory is registered")
         CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
 
@@ -901,19 +1182,6 @@ class DiffusionWorker:
             logger.info(f"[Worker {self.rank}] Buffers restored from CPU.")
         logger.info(f"[Worker {self.rank}] Wake-up complete.")
         return True
-
-    def synchronize_device(self, timeout: float | None = None) -> None:
-        """Wait until this rank has no device work left.
-
-        A KV prefetch still receiving on its background thread has queued no
-        device work yet, so it is joined first. ``timeout`` bounds that join
-        (and the multi-process worker's output drain before this call); the
-        device wait itself is unbounded.
-        """
-        manager = getattr(self.model_runner, "kv_transfer_manager", None)
-        if manager is not None and not manager.wait_prefetch(timeout=timeout):
-            raise TimeoutError("Diffusion KV prefetch did not finish before pause")
-        current_omni_platform.synchronize()
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
@@ -1027,95 +1295,35 @@ class DiffusionWorker:
             allocator = CuMemAllocator.get_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
-                self._owns_sleep_pool = True
             logger.info(f"[Worker {self.rank}] Activating Diffusion CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         return nullcontext()
 
     def shutdown(self) -> None:
-        """Shutdown the worker and release process-global resources."""
-        if getattr(self, "_shutdown_complete", False):
-            return
-        self._shutdown_complete = True
-
-        # Detach every model-owned reference before releasing the CuMem pools.
-        # Inline executors stay in the parent process, so relying on their
-        # wrapper becoming unreachable is not sufficient for deterministic
-        # teardown between sequential engine instances.
-        model_runner = getattr(self, "model_runner", None)
-        self.model_runner = None
-        self.lora_manager = None
-        self.profiler = None
-        self._sleep_saved_buffers = {}
-        self._step_lora_state = {}
-
-        if model_runner is not None:
-            mgr = getattr(model_runner, "kv_transfer_manager", None)
-            if mgr is None:
-                mgr = getattr(model_runner, "_kv_transfer_manager", None)
-            try:
-                offload_backend = getattr(model_runner, "offload_backend", None)
-                if offload_backend is not None:
-                    offload_backend.shutdown()
-            except Exception:
-                logger.exception("Failed to shut down diffusion offload backend during shutdown")
-            try:
-                if mgr is not None:
-                    mgr.close()
-            except Exception:
-                logger.exception("Failed to close diffusion KV transfer manager during shutdown")
-
+        """Shutdown the worker and cleanup distributed environment."""
         try:
-            shutdown_kv_connector()
-        except Exception:
-            logger.exception("Failed to shutdown diffusion KV connector")
-
-        try:
-            a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
-            if a2a_permute is not None:
-                a2a_permute.clear_a2a_permute_workspaces()
-        except Exception:
-            logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
-
-        try:
-            destroy_distributed_env()
-        except Exception:
-            logger.exception("Failed to destroy diffusion distributed environment")
-
-        # Drop the local runner only after its background services are stopped.
-        # Tensor finalizers must run before release_pools(), otherwise the
-        # singleton keeps allocations visible to the next sleep-enabled worker.
-        del model_runner
-        owns_sleep_pool = getattr(self, "_owns_sleep_pool", False)
-        if owns_sleep_pool:
+            self._get_pipeline_finalization_state().shutdown()
+            if self.model_runner is not None:
+                mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+                try:
+                    offload_backend = getattr(self.model_runner, "offload_backend", None)
+                    if offload_backend is not None:
+                        offload_backend.disable()
+                finally:
+                    if mgr is not None:
+                        mgr.shutdown_prefetch()
+        finally:
             try:
-                current_omni_platform.synchronize()
-            except Exception:
-                logger.exception("Failed to synchronize diffusion device during shutdown")
-        try:
-            gc.collect()
-        except Exception:
-            logger.exception("Failed to collect diffusion model resources during shutdown")
-        if owns_sleep_pool:
-            try:
-                CuMemAllocator = _get_cumem_allocator_class()
-                allocator = CuMemAllocator.get_instance()
-                if allocator.get_current_usage():
-                    gc.collect()
-                allocator.release_pools()
-                self._owns_sleep_pool = False
-                # Re-collect after dropping the pool references so their
-                # finalizers remove every tracked allocation before the next
-                # inline worker checks get_current_usage().
-                gc.collect()
-                remaining_usage = allocator.get_current_usage()
-                if remaining_usage:
-                    logger.warning(
-                        "Diffusion CuMem allocator still tracks %s bytes after shutdown",
-                        remaining_usage,
-                    )
-            except Exception:
-                logger.exception("Failed to release diffusion CuMem pools during shutdown")
+                shutdown_kv_connector()
+            finally:
+                try:
+                    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+                    if a2a_permute is not None:
+                        a2a_permute.clear_a2a_permute_workspaces()
+                except Exception:
+                    logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                finally:
+                    destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:
@@ -1191,7 +1399,31 @@ class WorkerProc:
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
-        if not self.od_config.step_execution:
+        self._stage_engine: PipelineStageEngine | None = None
+        self._pipeline_prepare_executor: ThreadPoolExecutor | None = None
+        parallel = self.od_config.parallel_config
+        if (
+            self.od_config.mode == "queued"
+            and self.od_config.step_execution
+            and parallel.data_parallel_size == 1
+            and parallel.pipeline_parallel_size == 2
+            and parallel.tensor_parallel_size == 1
+            and parallel.sequence_parallel_size == 1
+            and parallel.cfg_parallel_size == 1
+        ):
+            worker_device = getattr(self.worker.worker, "device", None)
+            self._stage_engine = PipelineStageEngine(
+                worker=self.worker,
+                worker_id=gpu_id,
+                device=worker_device,
+                publish_update=self._publish_pipeline_update,
+            )
+            self.worker.worker._pipeline_stage_engine_wake = self._stage_engine.notify_progress
+            self._pipeline_prepare_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"DiffusionPipelinePrep-rank{gpu_id}",
+            )
+        if not self.od_config.step_execution or self._stage_engine is not None:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1227,6 +1459,60 @@ class WorkerProc:
         """Serialize writes to the single-writer result queue."""
         with self._result_mq_lock:
             self.result_mq.enqueue(msg)
+
+    def _publish_pipeline_update(self, update: PipelineWorkerUpdate) -> None:
+        finalization_updates = tuple(
+            PipelineFinalizationUpdate(batch_id=finalization.batch_id, error=finalization.error)
+            for finalization in update.finalizations
+        )
+        for finalization in update.finalizations:
+            if finalization.error is not None:
+                self._enqueue_result(
+                    AsyncDiffusionOutput(
+                        kind=AsyncOutputKind.PIPELINE_FINALIZED,
+                        async_output_id=finalization.batch_id,
+                        error=finalization.error,
+                    )
+                )
+            elif finalization.output is not None:
+                self._queue_pipeline_finalization_output(
+                    finalization.batch_id,
+                    finalization.output,
+                    finalization.device_event,
+                )
+
+        if update.error is not None:
+            self._enqueue_result(update)
+            return
+        if update.progress is None:
+            return
+        if not (
+            update.progress.offers
+            or update.progress.completions
+            or update.progress.readiness
+            or update.events
+            or update.error
+            or finalization_updates
+        ):
+            return
+        self._enqueue_result(
+            PipelineWorkerUpdate(
+                worker_id=update.worker_id,
+                progress=update.progress,
+                events=update.events,
+                finalizations=finalization_updates,
+                error=update.error,
+            )
+        )
+
+    def _queue_pipeline_finalization_output(self, batch_id: str, output: Any, gpu_event: Any | None) -> None:
+        if self._async_output_queue is None:
+            raise RuntimeError("Queued pipeline finalization output queue is not initialized")
+        if gpu_event is None:
+            gpu_event = current_omni_platform.record_device_event()
+        with self._async_output_done:
+            self._async_output_pending += 1
+        self._async_output_queue.put((output, batch_id, gpu_event, AsyncOutputKind.PIPELINE_FINALIZED))
 
     def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""
@@ -1275,27 +1561,29 @@ class WorkerProc:
         """
         device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
         d2h_stream = torch.Stream(device=device)
-        transport_options = {}
-        if self.od_config.video_output_transport.enable_registered_shm is True:
-            transport_options["enable_registered_shm"] = True
         while True:
             item = self._async_output_queue.get()
             if item is None:
                 break
-            output, async_output_id, gpu_event = item
+            if len(item) == 3:
+                output, async_output_id, gpu_event = item
+                output_kind = AsyncOutputKind.OUTPUT_READY
+            else:
+                output, async_output_id, gpu_event, output_kind = item
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
                 if gpu_event is not None:
                     d2h_stream.wait_event(gpu_event)
-                pack_diffusion_output_shm(output, d2h_stream=d2h_stream, **transport_options)
+                pack_diffusion_output_shm(output, d2h_stream=d2h_stream)
                 d2h_stream.synchronize()
 
                 self._enqueue_result(
                     AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
+                        kind=output_kind,
                         async_output_id=async_output_id,
-                        output=output,
+                        output=output if output_kind is AsyncOutputKind.OUTPUT_READY else None,
+                        result=output if output_kind is AsyncOutputKind.PIPELINE_FINALIZED else None,
                     )
                 )
             except Exception:
@@ -1305,24 +1593,22 @@ class WorkerProc:
                 )
                 self._enqueue_result(
                     AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
+                        kind=output_kind,
                         async_output_id=async_output_id,
                         error="Background D2H/SHM packing failed",
                     )
                 )
             finally:
                 with self._async_output_done:
-                    # Clamped: only items enqueued by _return_result are counted.
+                    # Clamped: only explicit output-queue submissions are counted.
                     self._async_output_pending = max(0, self._async_output_pending - 1)
                     self._async_output_done.notify_all()
 
-    def drain_async_outputs(self, timeout: float | None = None) -> bool:
+    def drain_async_outputs(self, timeout: float = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S) -> bool:
         """Block until background D2H/SHM packing has no work left.
 
         Returns False if outputs are still in flight when ``timeout`` expires.
         """
-        if timeout is None:
-            timeout = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S
         with self._async_output_done:
             if self._async_output_pending == 0:
                 return True
@@ -1331,7 +1617,7 @@ class WorkerProc:
         if not drained:
             logger.warning(
                 "Worker %d: %d async output(s) still in flight after %.1fs; "
-                "releasing device memory now may drop OUTPUT_READY messages",
+                "releasing device memory now may drop async output messages",
                 self.gpu_id,
                 pending,
                 timeout,
@@ -1341,6 +1627,14 @@ class WorkerProc:
     def shutdown(self) -> None:
         """Stop background work and release worker-owned IPC resources."""
         self._running = False
+
+        if self._pipeline_prepare_executor is not None:
+            self._pipeline_prepare_executor.shutdown(wait=True, cancel_futures=True)
+            self._pipeline_prepare_executor = None
+
+        if self._stage_engine is not None:
+            self._stage_engine.shutdown()
+            self._stage_engine = None
 
         if self._async_output_queue is not None:
             self._async_output_queue.put(None)
@@ -1376,13 +1670,10 @@ class WorkerProc:
         if not torch.distributed.is_initialized():
             return [status]
 
-        world_size = torch.distributed.get_world_size()
+        control_group = get_world_group().cpu_group
+        world_size = torch.distributed.get_world_size(group=control_group)
         statuses: list[dict[str, Any] | None] = [None] * world_size
-        torch.distributed.all_gather_object(
-            statuses,
-            status,
-            group=get_world_group().cpu_group,
-        )
+        torch.distributed.all_gather_object(statuses, status, group=control_group)
         missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
         if missing_ranks:
             logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)
@@ -1396,16 +1687,21 @@ class WorkerProc:
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
         collect_rank_status = rpc_request.get("collect_rank_status", False)
+        reply_all_ranks = rpc_request.get("reply_all_ranks", False)
         wave_id = rpc_request.get("wave_id")
 
         if collect_rank_status and not exec_all_ranks:
             raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")
+        if reply_all_ranks and not exec_all_ranks:
+            raise ValueError("reply_all_ranks requires exec_all_ranks=True")
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
         # For DP multi-concurrency (output_rank=None), only the primary rank
         # within each DP replica should reply.  This prevents SP/TP/CFG/PP
         # ranks from enqueuing extra replies that the executor doesn't drain.
-        if output_rank is None and exec_all_ranks:
+        if reply_all_ranks:
+            should_reply = self.result_mq is not None
+        elif output_rank is None and exec_all_ranks:
             from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
             from vllm_omni.diffusion.distributed.parallel_state import (
@@ -1438,12 +1734,40 @@ class WorkerProc:
         }
 
         try:
-            if method == "synchronize_device" and not self.drain_async_outputs(timeout=kwargs.get("timeout")):
-                raise TimeoutError("Diffusion async outputs did not drain before pause")
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            pipeline = getattr(getattr(self.worker, "worker", None), "pipeline", None)
+            profiler_enabled = bool(getattr(pipeline, "enable_diffusion_pipeline_profiler", False))
+            stage_engine = getattr(self, "_stage_engine", None)
+            preparation_executor = getattr(self, "_pipeline_prepare_executor", None)
+            if stage_engine is not None and method in _PIPELINE_PREPARATION_METHODS and not profiler_enabled:
+                if preparation_executor is None:
+                    raise RuntimeError("Queued pipeline preparation executor is not initialized")
+
+                def prepare_pipeline_request() -> Any:
+                    device = getattr(getattr(self.worker, "worker", None), "device", None)
+                    if device is not None:
+                        current_omni_platform.set_device(device)
+                    return self.worker.execute_method(method, *args, **kwargs)
+
+                result = preparation_executor.submit(prepare_pipeline_request).result()
+            elif stage_engine is not None and method in {
+                "start_pipeline_transfer",
+                "admit_pipeline_batch",
+                "admit_pipeline_batches",
+            }:
+                stage_engine.submit(
+                    method,
+                    *args,
+                    publish_result_events=method.startswith("admit_pipeline"),
+                    **kwargs,
+                )
+                result = True
+            elif stage_engine is not None:
+                result = stage_engine.call(method, *args, **kwargs)
+            else:
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(
@@ -1475,6 +1799,18 @@ class WorkerProc:
                     True,
                 )
             return None, False
+
+        if reply_all_ranks:
+            return (
+                {
+                    "rank_local_rpc": True,
+                    "worker_id": self.gpu_id,
+                    "status": "ok",
+                    "result": result,
+                    "wave_id": wave_id,
+                },
+                should_reply,
+            )
 
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
@@ -1514,14 +1850,27 @@ class WorkerProc:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
-            if isinstance(msg, dict) and msg.get("type") == "sleep":
+            if isinstance(msg, dict) and msg.get("type") == "pipeline_wake":
+                if self._stage_engine is not None:
+                    self._stage_engine.notify_progress()
+            elif isinstance(msg, dict) and msg.get("type") == "sleep":
                 self.drain_async_outputs()
                 task = OmniSleepTask(level=msg.get("level", 2), task_id=msg.get("task_id", "local"))
-                ack = self.worker.handle_sleep_task(task)
+                ack = (
+                    self._stage_engine.call("handle_sleep_task", task)
+                    if self._stage_engine is not None
+                    else self.worker.handle_sleep_task(task)
+                )
                 self._return_result(ack)
             elif isinstance(msg, dict) and msg.get("type") == "wake_up":
                 task = OmniWakeTask(tags=msg.get("tags"), task_id=msg.get("task_id", "local"))
-                ack = self.worker.handle_wake_task(task)
+                ack = (
+                    self._stage_engine.call("handle_wake_task", task)
+                    if self._stage_engine is not None
+                    else self.worker.handle_wake_task(task)
+                )
+                if self._stage_engine is not None:
+                    self._stage_engine.notify_progress()
                 self._return_result(ack)
             # Route message based on type
             elif isinstance(msg, dict) and msg.get("type") == "rpc":
@@ -1529,7 +1878,14 @@ class WorkerProc:
                     rpc_id = msg.get("rpc_id")
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
+                        reply_start = time.perf_counter()
                         self._return_result(result, rpc_id=rpc_id)
+                        if msg.get("method") == "poll_pipeline_finalization" and result is not None:
+                            logger.info(
+                                "Queued pipeline final decode reply packed batch=%s elapsed_ms=%.3f",
+                                msg.get("args", (None,))[0],
+                                (time.perf_counter() - reply_start) * 1000,
+                            )
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)
@@ -1539,6 +1895,7 @@ class WorkerProc:
                     # that compete with the expected responder's message.
                     output_rank = msg.get("output_rank")
                     exec_all_ranks = msg.get("exec_all_ranks", False)
+                    reply_all_ranks = msg.get("reply_all_ranks", False)
                     wave_id = msg.get("wave_id")
                     if self.result_mq is not None:
                         if rpc_id is not None:
@@ -1550,6 +1907,16 @@ class WorkerProc:
                                     rpc_id=rpc_id,
                                     error=error,
                                 )
+                            )
+                        elif reply_all_ranks:
+                            self._return_result(
+                                {
+                                    "rank_local_rpc": True,
+                                    "worker_id": self.gpu_id,
+                                    "status": "error",
+                                    "error": error,
+                                    "wave_id": wave_id,
+                                }
                             )
                         elif output_rank is None and exec_all_ranks:
                             # DP multi-concurrency: primary ranks reply, tagged
@@ -1590,7 +1957,10 @@ class WorkerProc:
             else:
                 # Handle direct generation requests.
                 try:
-                    output = self.worker.execute_model(msg, self.od_config)
+                    if self._stage_engine is not None:
+                        output = self._stage_engine.call("execute_model", msg, self.od_config)
+                    else:
+                        output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:
                     logger.error(
                         f"Error executing forward in event loop: {e}",
@@ -1690,59 +2060,41 @@ class WorkerWrapperBase:
         wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
-        rank: int | None = None,
-        distributed_init_method: str | None = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
 
         Args:
-            gpu_id: Local GPU device ID
+            gpu_id: GPU device ID
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
-            custom_pipeline_args: Optional arguments passed to native pipelines.
-                A ``pipeline_class`` entry triggers custom pipeline initialization.
-            rank: Global distributed rank. Defaults to ``gpu_id`` for local
-                multiprocessing.
-            distributed_init_method: Explicit rendezvous URL, or None for the
-                local launcher's environment-based rendezvous.
+            custom_pipeline_args: Optional arguments for custom pipeline initialization
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
         self.base_worker_class = base_worker_class
         self.worker_extension_cls = worker_extension_cls
         self.custom_pipeline_args = custom_pipeline_args
-        self.uses_custom_pipeline = bool(custom_pipeline_args and "pipeline_class" in custom_pipeline_args)
 
         # Prepare worker class with extension support
         worker_class = self._prepare_worker_class()
 
-        # Create the actual worker instance. Only dynamic custom pipelines skip
-        # initial loading; native pipelines may also use custom_pipeline_args
-        # for model-specific component paths.
-        worker_init_kwargs: dict[str, Any] = {
-            "local_rank": gpu_id,
-            "rank": gpu_id if rank is None else rank,
-            "od_config": od_config,
-            "skip_load_model": self.uses_custom_pipeline,
-        }
-        if distributed_init_method is not None:
-            worker_init_kwargs["distributed_init_method"] = distributed_init_method
-        worker = worker_class(**worker_init_kwargs)
-        try:
-            # Re-initialize pipeline with custom pipeline if provided.
-            if self.uses_custom_pipeline:
-                worker.re_init_pipeline(self.custom_pipeline_args)
-        except Exception:
-            # The executor never receives a wrapper whose constructor raises.
-            # Unwind a successfully created worker here so its distributed
-            # groups do not poison the next inline engine initialization.
-            try:
-                worker.shutdown()
-            except Exception:
-                logger.exception("Failed to clean up worker after custom pipeline initialization failure")
-            raise
-        self.worker = worker
+        # Create the actual worker instance
+        # When custom_pipeline_args is provided, skip initial model loading
+        # since re_init_pipeline will handle it. This avoids allocating memory
+        # through CuMemAllocator twice, which causes assertion failures in
+        # sleep mode.
+        self.worker = worker_class(
+            local_rank=gpu_id,
+            rank=gpu_id,
+            od_config=od_config,
+            skip_load_model=(self.custom_pipeline_args is not None),
+        )
+        self._execute_method_lock = threading.RLock()
+
+        # Re-initialize pipeline with custom pipeline if provided
+        if self.custom_pipeline_args is not None:
+            self.worker.re_init_pipeline(self.custom_pipeline_args)
 
     def _prepare_worker_class(self) -> type:
         """
@@ -1754,8 +2106,8 @@ class WorkerWrapperBase:
         """
         worker_class = self.base_worker_class
 
-        # If custom pipeline initialization is requested, use CustomPipelineWorkerExtension.
-        if self.uses_custom_pipeline:
+        # If custom_pipeline_args is provided, use CustomPipelineWorkerExtension
+        if self.custom_pipeline_args is not None:
             # Set worker_extension_cls to CustomPipelineWorkerExtension if not already set
             if self.worker_extension_cls is None:
                 self.worker_extension_cls = CustomPipelineWorkerExtension
@@ -1882,8 +2234,9 @@ class WorkerWrapperBase:
             # 2. Otherwise, since we define `__getattr__` and redirect attribute
             #    query to `self.worker`, the method will be called on the worker
             assert isinstance(method, str), "Method must be str"
-            func = getattr(self.worker, method)
-            return func(*args, **kwargs)
+            with self._execute_method_lock:
+                func = getattr(self.worker, method)
+                return func(*args, **kwargs)
 
         except Exception as e:
             msg = f"Error executing method {method!r}. This might cause issues in distributed execution."

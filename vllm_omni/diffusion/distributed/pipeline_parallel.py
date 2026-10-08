@@ -51,6 +51,10 @@ class AsyncLatents:
         self._tensor = self._tensor_dict["latents"]
         return self._tensor
 
+    def resolve(self) -> torch.Tensor:
+        """Wait for communication and return the received latent tensor."""
+        return self._resolve()
+
     # Attribute access (e.g. .shape, .to(), .dtype) delegates to the resolved tensor.
     def __getattr__(self, name: str):
         return getattr(self._resolve(), name)
@@ -137,7 +141,7 @@ class PipelineParallelMixin:
             cls.diffuse = wrapped_diffuse
 
     def _wrapped_vae_decode(self) -> None:
-        vae, orig_decode = self.vae, self.vae.decode
+        pipeline, vae, orig_decode = self, self.vae, self.vae.decode
 
         @wraps(orig_decode)
         def wrapped_decode(z: torch.Tensor, *args: Any, **kwargs: Any):
@@ -147,7 +151,7 @@ class PipelineParallelMixin:
                 if get_pipeline_parallel_world_size() > 2:
                     z = get_pp_group().broadcast(z, src=0)
                 return orig_decode(z, *args, **kwargs)
-            elif is_pipeline_first_stage():
+            elif is_pipeline_first_stage() or getattr(pipeline, "_queued_pipeline_decode_owner", False):
                 return orig_decode(z, *args, **kwargs)
             return (None,)  # decoder returns a tuple
 

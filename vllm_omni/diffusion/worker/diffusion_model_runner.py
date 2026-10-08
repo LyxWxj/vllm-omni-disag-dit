@@ -62,6 +62,7 @@ from vllm_omni.diffusion.offloader.config import (
     resolve_offload_strategy,
 )
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
+from vllm_omni.diffusion.queued_pp.model_runtime import QueuedModelRuntime, dit_any_rank_failed
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -72,6 +73,11 @@ from vllm_omni.diffusion.sched.interface import (
     validate_new_request_data_identity,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
+from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineBatchContext,
+    PipelineStageSpec,
+    PipelineTask,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.stage_payload import DiffusionStagePayloadMixin
 from vllm_omni.diffusion.worker.utils import (
@@ -93,30 +99,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _dit_any_rank_failed(local_failed: bool) -> bool:
-    """All-reduce a per-request failure flag across the DiT process group.
-
-    Every DiT rank must reach this point in lockstep; the caller wraps
-    ``pipeline.prepare_encode`` so both the success and the exception paths
-    call the helper. In single-rank execution this collapses to the local
-    flag with no collectives issued.
-    """
-    if not torch.distributed.is_initialized():
-        return local_failed
-    try:
-        from vllm_omni.diffusion.distributed import parallel_state
-
-        get_dit_group = getattr(parallel_state, "get_dit_group", None)
-        group = get_dit_group() if get_dit_group is not None else None
-    except (AssertionError, ImportError):
-        group = None
-    if group is None:
-        return local_failed
-    signal = torch.tensor(1 if local_failed else 0, dtype=torch.int32)
-    if current_omni_platform.is_available():
-        signal = signal.to(device=current_omni_platform.device_type)
-    torch.distributed.all_reduce(signal, op=torch.distributed.ReduceOp.MAX, group=group)
-    return bool(signal.item())
+_dit_any_rank_failed = dit_any_rank_failed
 
 
 def _normalize_pipeline_outputs(
@@ -200,6 +183,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
+        self._pipeline_batch_contexts: dict[tuple[int, str], PipelineBatchContext] = {}
+        self._pipeline_request_owners: dict[tuple[str, int], tuple[int, str]] = {}
 
         # Initialize KV cache manager for connector management.
         payload_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -1084,6 +1069,87 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def _supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
+
+    def _dit_any_rank_failed(self, local_failed: bool) -> bool:
+        return _dit_any_rank_failed(local_failed)
+
+    def _get_queued_model_runtime(self) -> QueuedModelRuntime:
+        runtime = getattr(self, "_queued_model_runtime", None)
+        if runtime is None:
+            runtime = QueuedModelRuntime(self)
+            self._queued_model_runtime = runtime
+        return runtime
+
+    @property
+    def pipeline_batch_contexts(self) -> dict[tuple[int, str], PipelineBatchContext]:
+        return self._get_queued_model_runtime().pipeline_batch_contexts
+
+    @property
+    def pipeline_request_owners(self) -> dict[tuple[str, int], tuple[int, str]]:
+        return self._get_queued_model_runtime().pipeline_request_owners
+
+    def _pipeline_inference_context(self) -> AbstractContextManager[Any]:
+        return self._get_queued_model_runtime()._pipeline_inference_context()
+
+    def _run_queued_preparation_phase(self, request_id: str, phase: str, operation: Callable[[], Any]) -> Any:
+        return self._get_queued_model_runtime()._run_queued_preparation_phase(request_id, phase, operation)
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[str, ...]:
+        return self._get_queued_model_runtime().prepare_pipeline_requests(scheduler_output)
+
+    def prepare_pipeline_batch(
+        self,
+        task: PipelineTask,
+        pp_stage_spec: PipelineStageSpec,
+        states: list[StepRequestState],
+    ) -> PipelineBatchContext:
+        return self._get_queued_model_runtime().prepare_pipeline_batch(task, pp_stage_spec, states)
+
+    def execute_pipeline_stage(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+        intermediate_tensors: Any | None,
+    ) -> Any:
+        return self._get_queued_model_runtime().execute_pipeline_stage(context, pp_stage_spec, intermediate_tensors)
+
+    def complete_pipeline_step(self, context: PipelineBatchContext, pp_stage_spec: PipelineStageSpec) -> torch.Tensor:
+        return self._get_queued_model_runtime().complete_pipeline_step(context, pp_stage_spec)
+
+    def adopt_pipeline_feedback(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+        latents: torch.Tensor,
+    ) -> None:
+        return self._get_queued_model_runtime().adopt_pipeline_feedback(context, pp_stage_spec, latents)
+
+    def pipeline_has_distributed_vae(self) -> bool:
+        return self._get_queued_model_runtime().pipeline_has_distributed_vae()
+
+    def validate_pipeline_finalization(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+    ) -> StepRequestState:
+        return self._get_queued_model_runtime().validate_pipeline_finalization(context, pp_stage_spec)
+
+    def finalize_pipeline_batch(
+        self,
+        context: PipelineBatchContext,
+        pp_stage_spec: PipelineStageSpec,
+        output_owner: bool | None = None,
+    ) -> BatchRunnerOutput | None:
+        return self._get_queued_model_runtime().finalize_pipeline_batch(context, pp_stage_spec, output_owner)
+
+    def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineBatchContext:
+        return self._get_queued_model_runtime().release_pipeline_batch(pp_stage_id, batch_id)
+
+    def cancel_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineBatchContext:
+        return self._get_queued_model_runtime().cancel_pipeline_batch(pp_stage_id, batch_id)
+
+    def _require_pipeline_context(self, context: PipelineBatchContext, pp_stage_spec: PipelineStageSpec) -> None:
+        return self._get_queued_model_runtime()._require_pipeline_context(context, pp_stage_spec)
 
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""

@@ -58,6 +58,7 @@ _WORLD: GroupCoordinator | None = None
 # get _TP&_EP from vllm.distributed.parallel_state
 _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
+_VAE: GroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
@@ -301,6 +302,11 @@ def get_pp_group() -> PipelineGroupCoordinator:
     return _PP
 
 
+def get_vae_group() -> GroupCoordinator:
+    """Return the process group used by distributed VAE work."""
+    return _VAE if _VAE is not None else get_world_group()
+
+
 def get_pipeline_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
     return get_pp_group().world_size
@@ -475,6 +481,7 @@ def init_model_parallel_group(
         "expert",
         "sequence",
         "classifier_free_guidance",
+        "vae",
         "fully_shard",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
@@ -714,8 +721,9 @@ def _initialize_model_parallel(
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
     backend: str | None = None,
+    vae_patch_parallel_size: int = 1,
 ) -> None:
-    global _FS, _HSDP_REPLICATE
+    global _FS, _HSDP_REPLICATE, _VAE
 
     if backend is None:
         backend = current_omni_platform.dist_backend
@@ -793,6 +801,14 @@ def _initialize_model_parallel(
     non_dp_size = cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     if world_size % non_dp_size != 0:
         raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
+    if vae_patch_parallel_size <= 0:
+        raise ValueError(f"vae_patch_parallel_size must be positive, got {vae_patch_parallel_size}")
+    if pipeline_parallel_size > 1 and vae_patch_parallel_size > pipeline_parallel_size:
+        raise ValueError(
+            "vae_patch_parallel_size cannot exceed pipeline_parallel_size when both are enabled; "
+            f"got vae_patch_parallel_size={vae_patch_parallel_size}, "
+            f"pipeline_parallel_size={pipeline_parallel_size}"
+        )
     if use_hsdp:
         if data_parallel_size not in (None, 1):
             raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
@@ -959,6 +975,15 @@ def _initialize_model_parallel(
             use_all2all=True,
         )
 
+    if pipeline_parallel_size > 1 and vae_patch_parallel_size > 1:
+        assert _VAE is None, "VAE process group is already initialized"
+        _VAE = init_model_parallel_group(
+            group_ranks=get_rank_groups("pp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="vae",
+        )
+
 
 def initialize_model_parallel(
     data_parallel_size: int | None = None,
@@ -973,6 +998,7 @@ def initialize_model_parallel(
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
     backend: str | None = None,
+    vae_patch_parallel_size: int = 1,
 ) -> None:
     """Atomically initialize diffusion parallel groups.
 
@@ -984,6 +1010,7 @@ def initialize_model_parallel(
         "cfg": _CFG,
         "sp": _SP,
         "pp": _PP,
+        "vae": _VAE,
         "fs": _FS,
         "hsdp_replicate": _HSDP_REPLICATE,
         "vllm_tp": vllm_parallel_state._TP,
@@ -1010,6 +1037,7 @@ def initialize_model_parallel(
             fully_shard_degree=fully_shard_degree,
             enable_expert_parallel=enable_expert_parallel,
             use_hsdp=use_hsdp,
+            vae_patch_parallel_size=vae_patch_parallel_size,
             backend=backend,
         )
     except BaseException:
@@ -1019,7 +1047,7 @@ def initialize_model_parallel(
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
+    global _DP, _CFG, _SP, _PP, _VAE, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
@@ -1036,6 +1064,10 @@ def destroy_model_parallel():
     if _HSDP_REPLICATE:
         _HSDP_REPLICATE.destroy()
     _HSDP_REPLICATE = None
+
+    if _VAE:
+        _VAE.destroy()
+    _VAE = None
 
     if _CFG:
         _CFG.destroy()

@@ -12,7 +12,6 @@ import queue
 import threading
 import time
 import weakref
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
@@ -25,20 +24,38 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
+    PipelineCoordinatorProgress,
+    PipelineTransferCoordinator,
+    PipelineTransferOffer,
+)
+from vllm_omni.diffusion.executor.abstract import (
+    PIPELINE_GRANT_START_TIMEOUT_S,
+    DiffusionExecutor,
+    normalize_pipeline_preparation_reports,
+    normalize_pipeline_transfer_readiness,
+    normalize_pipeline_transfer_readiness_reports,
+    normalize_pipeline_transport_snapshot,
+    validate_pipeline_topology_reports,
+)
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
     any_selected_component_uses_allgather,
     resolve_offload,
 )
+from vllm_omni.diffusion.queued_pp.executor_adapter import (
+    unwrap_nested_pipeline_result,
+    unwrap_singleton_pipeline_result,
+)
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.diffusion.worker.pipeline_state import PipelineWorkerUpdate
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -48,24 +65,7 @@ _WORKER_SHUTDOWN_GRACE_S = 15.0
 _WORKER_TERMINATE_GRACE_S = 5.0
 _WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
-# Upper bound on remembered dropped async_output_ids (see drop_output).
-_DROPPED_OUTPUT_IDS_MAX = 4096
-
-
-class _DropPlaceholder(concurrent.futures.Future):
-    """Placeholder registered by :meth:`MultiprocDiffusionExecutor.drop_output`.
-
-    Distinguishes "abort said nobody wants this output" from a genuine
-    ``wait_output_ready`` waiter, so the result pump can discard the tensors
-    for the former while still resolving the latter directly.
-    """
-
-
-def _dropped_output_error(async_output_id: str) -> RuntimeError:
-    return RuntimeError(
-        f"async output {async_output_id} was dropped: the request was aborted "
-        "before its output was claimed; retry with a new request."
-    )
+_MAX_PIPELINE_UPDATES_PER_WORKER_SNAPSHOT = 32
 
 
 def _is_empty_dp_prompt(prompt: object) -> bool:
@@ -171,6 +171,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._processes: list[mp.Process] = []
         self._closed = False
         self._is_failed = False
+        self._queued_control_failure: BaseException | None = None
         self._failure_callbacks: list[Callable[[], None]] = []
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
@@ -208,17 +209,27 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_futures: dict[str, concurrent.futures.Future[AsyncDiffusionOutput]] = {}
         self._output_futures: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._completed_outputs: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
+        self._pipeline_finalization_outputs: dict[str, concurrent.futures.Future[BaseRunnerOutput]] = {}
+        self._pipeline_retired_finalization_ids: set[str] = set()
+        self._pipeline_finalization_submitted_ids: set[str] = set()
         self._batch_split_map: dict[str, dict[str, str]] = {}  # batch_id -> {per_req_id: request_id}
-        # Bounded memory of ids drained by drop_output() so a late
-        # wait_output_ready() fails fast instead of hanging on a new Future.
-        self._dropped_output_ids: OrderedDict[str, None] = OrderedDict()
         self._futures_lock = threading.RLock()
         self._pump_running = False
         self._pump_stop = threading.Event()
         # When pumps are active they are the sole readers of the worker result
         # queues; non-async messages are placed here for collective_rpc().
         self._sync_result_buffer: queue.Queue = queue.Queue()
-        if not self.od_config.step_execution:
+        self._sync_result_buffers = {id(result_mq): queue.Queue() for result_mq in self._result_mqs}
+        self._pipeline_update_buffers: dict[int, queue.Queue[PipelineWorkerUpdate]] = {
+            worker_id: queue.Queue(maxsize=128) for worker_id in range(len(self._result_mqs))
+        }
+        self._pipeline_update_cursor = 0
+        self._pipeline_update_error: BaseException | None = None
+        self._pipeline_update_lock = threading.Lock()
+        self._pipeline_update_callback: Callable[[], None] | None = None
+        self._pipeline_progress_lock = threading.Lock()
+        self._collective_rpc_lock = threading.RLock()
+        if not self.od_config.step_execution or self._uses_autonomous_pipeline_stages():
             self._start_result_pump()
 
         self._start_worker_monitor()
@@ -243,6 +254,54 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if self._broadcast_mq is None:
             raise RuntimeError("Broadcast queue is closed")
 
+    def _uses_autonomous_pipeline_stages(self) -> bool:
+        config = getattr(self, "od_config", None)
+        parallel = getattr(config, "parallel_config", None)
+        return (
+            getattr(config, "mode", "static") == "queued"
+            and getattr(config, "step_execution", False)
+            and getattr(parallel, "data_parallel_size", 1) == 1
+            and getattr(parallel, "pipeline_parallel_size", 1) == 2
+            and getattr(parallel, "tensor_parallel_size", 1) == 1
+            and getattr(parallel, "sequence_parallel_size", 1) == 1
+            and getattr(parallel, "cfg_parallel_size", 1) == 1
+            and len(getattr(self, "_result_mqs", ())) == 2
+        )
+
+    def uses_autonomous_pipeline_stages(self) -> bool:
+        return self._uses_autonomous_pipeline_stages()
+
+    def set_pipeline_update_callback(self, callback: Callable[[], None] | None) -> None:
+        self._pipeline_update_callback = callback
+
+    def pipeline_updates_pending(self) -> bool:
+        if self._pipeline_update_error is not None or any(
+            not updates.empty() for updates in self._pipeline_update_buffers.values()
+        ):
+            return True
+        with self._futures_lock:
+            return any(future.done() for future in self._pipeline_finalization_outputs.values())
+
+    def _publish_pipeline_update(self, update: PipelineWorkerUpdate) -> None:
+        update_buffer = self._pipeline_update_buffers.get(update.worker_id)
+        if update_buffer is None:
+            with self._pipeline_update_lock:
+                if self._pipeline_update_error is None:
+                    self._pipeline_update_error = RuntimeError(f"Unknown Worker update rank {update.worker_id}")
+        else:
+            try:
+                update_buffer.put_nowait(update)
+            except queue.Full:
+                with self._pipeline_update_lock:
+                    if self._pipeline_update_error is None:
+                        self._pipeline_update_error = RuntimeError(
+                            f"Queued pipeline Worker {update.worker_id} update buffer overflowed; "
+                            "metadata was not dropped silently"
+                        )
+        callback = self._pipeline_update_callback
+        if callback is not None:
+            callback()
+
     def _dequeue_one_with_failure_polling(
         self,
         deadline: float | None,
@@ -263,9 +322,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if remaining <= 0:
                     raise TimeoutError(f"RPC call to {method} timed out.")
                 chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
-            if not self.od_config.step_execution:
+            if getattr(self, "_pump_running", False):
+                if self._uses_autonomous_pipeline_stages():
+                    target = result_mq if result_mq is not None else self._result_mq
+                    result_buffers = getattr(self, "_sync_result_buffers", {})
+                    result_buffer = result_buffers.get(id(target)) if target is not None else None
+                else:
+                    result_buffer = self._sync_result_buffer
                 try:
-                    return self._sync_result_buffer.get(timeout=chunk_timeout)
+                    return (result_buffer or self._sync_result_buffer).get(timeout=chunk_timeout)
                 except queue.Empty:
                     if self._is_failed or self._closed:
                         raise EngineDeadError()
@@ -276,7 +341,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     raise RuntimeError("Result queue is closed")
                 try:
                     return queue_to_read.dequeue(timeout=chunk_timeout)
-                except (TimeoutError, zmq.error.Again):
+                except (TimeoutError, queue.Empty, zmq.error.Again):
                     if self._is_failed:
                         raise EngineDeadError()
                     continue
@@ -625,7 +690,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
-                timeout_options: dict[str, Any] = {"timeout": _DLO_DP_WAVE_TIMEOUT_S}
+                allgather_active = any_selected_component_uses_allgather(self.od_config)
+                timeout_options: dict[str, Any] = {}
+                if allgather_active:
+                    timeout_options["timeout"] = _DLO_DP_WAVE_TIMEOUT_S
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,
@@ -693,20 +761,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # need to advertise supports_request_batch=True.
             return self.execute_request(scheduler_output)
 
-        try:
-            result = self.collective_rpc(
-                "execute_model_batch",
-                args=(scheduler_output, self.od_config),
-                unique_reply_rank=0,
-                exec_all_ranks=True,
-                timeout=_DLO_DP_WAVE_TIMEOUT_S,
-            )
-        except TimeoutError as exc:
-            # A rank that never replied leaves the process group unusable, so
-            # tear the worker group down instead of letting the next wave hang
-            # on it too. Mirrors the execute_request() contract.
-            self._fail_closed_on_dp_wave_timeout(exc)
-            raise
+        result = self.collective_rpc(
+            "execute_model_batch",
+            args=(scheduler_output, self.od_config),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
         if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
             # Propagate async_output_id to per-request RunnerOutputs so the
             # engine waits in step_streaming() instead of blocking here.
@@ -752,21 +812,562 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()
-        try:
-            result = self.collective_rpc(
-                "execute_stepwise",
-                args=(scheduler_output,),
-                unique_reply_rank=0,
-                exec_all_ranks=True,
-                timeout=_DLO_DP_WAVE_TIMEOUT_S,
-            )
-        except TimeoutError as exc:
-            self._fail_closed_on_dp_wave_timeout(exc)
-            raise
+        result = self.collective_rpc(
+            "execute_stepwise",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
 
         if isinstance(result, BaseRunnerOutput):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+
+    def _fail_queued_control(self, operation: str, exc: BaseException) -> None:
+        if getattr(self, "_queued_control_failure", None) is None:
+            self._queued_control_failure = exc
+        first_failure = self._queued_control_failure
+        logger.error("Queued pipeline %s failed after dispatch; failing the worker group: %s", operation, first_failure)
+        self._is_failed = True
+        try:
+            self.shutdown()
+        except BaseException:
+            logger.exception(
+                "Worker-group cleanup failed after queued pipeline failure; preserving the original failure: %s",
+                first_failure,
+            )
+        for callback in self._failure_callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.exception("failure_callback raised")
+
+    def _queued_control_rpc(
+        self,
+        method: str,
+        *,
+        args: tuple = (),
+        timeout: float | None = None,
+        exec_all_ranks: bool = False,
+    ) -> Any:
+        if self._is_failed:
+            raise EngineDeadError()
+        self._ensure_open()
+        try:
+            kwargs: dict[str, Any] = {"args": args}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            # Queued *_all_ranks Worker methods already gather local results
+            # and failures over the control group. With one DP replica, let
+            # the DP primary return that aggregate directly instead of doing
+            # a second status all-gather in _execute_rpc.
+            worker_aggregated = (
+                method.endswith("_all_ranks")
+                and getattr(
+                    getattr(getattr(self, "od_config", None), "parallel_config", None),
+                    "data_parallel_size",
+                    1,
+                )
+                == 1
+            )
+            if exec_all_ranks or worker_aggregated:
+                kwargs["exec_all_ranks"] = True
+            return self.collective_rpc(method, **kwargs)
+        except BaseException as exc:
+            self._fail_queued_control(method, exc)
+            raise
+
+    def _wake_pipeline_stages(self) -> None:
+        if not self._uses_autonomous_pipeline_stages():
+            return
+        try:
+            self._ensure_open()
+            if self._broadcast_mq is None:
+                raise RuntimeError("Pipeline StageEngine wake has no Worker broadcast queue")
+            self._broadcast_mq.enqueue({"type": "pipeline_wake"})
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline StageEngine wake", exc)
+            raise
+
+    def _uses_rank_local_pp_rpc(self) -> bool:
+        config = getattr(self, "od_config", None)
+        parallel = getattr(config, "parallel_config", None)
+        return (
+            getattr(config, "step_execution", False)
+            and getattr(parallel, "data_parallel_size", 1) == 1
+            and getattr(parallel, "pipeline_parallel_size", 1) == 2
+            and getattr(parallel, "tensor_parallel_size", 1) == 1
+            and getattr(parallel, "sequence_parallel_size", 1) == 1
+            and getattr(parallel, "cfg_parallel_size", 1) == 1
+            and len(getattr(self, "_result_mqs", ())) == 2
+        )
+
+    def _queued_rank_local_rpc(
+        self,
+        method: str,
+        *,
+        args: tuple = (),
+        timeout: float | None = None,
+    ) -> list[Any]:
+        if self._is_failed:
+            raise EngineDeadError()
+        self._ensure_open()
+        try:
+            reports = self.collective_rpc(
+                method,
+                args=args,
+                timeout=timeout,
+                exec_all_ranks=True,
+                reply_all_ranks=True,
+            )
+            return reports
+        except BaseException as exc:
+            self._fail_queued_control(method, exc)
+            raise
+
+    def submit_pipeline_batch(self, task: Any, pp_stage_spec: Any) -> Any:
+        if self._uses_rank_local_pp_rpc():
+            return self._queued_rank_local_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
+        return self._queued_control_rpc("enqueue_pipeline_batch", args=(task, pp_stage_spec))
+
+    def submit_pipeline_admissions(self, admissions: list[tuple[Any, Any]]) -> Any:
+        if not self._uses_autonomous_pipeline_stages():
+            raise RuntimeError("Asynchronous pipeline admission requires autonomous pipeline stages")
+        if not admissions:
+            raise ValueError("pipeline admission batch must not be empty")
+        return self._queued_rank_local_rpc("admit_pipeline_batches", args=(admissions,))
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        expected_request_ids = tuple(request.request_id for request in scheduler_output.scheduled_new_reqs)
+        expected_request_ids += tuple(
+            getattr(getattr(scheduler_output, "scheduled_cached_reqs", None), "request_ids", ())
+        )
+        if len(expected_request_ids) != 1:
+            raise ValueError("M2 queued preparation requires exactly one new request.")
+        try:
+            result = self._queued_control_rpc("prepare_pipeline_requests_all_ranks", args=(scheduler_output,))
+            return normalize_pipeline_preparation_reports(
+                result,
+                coordinator.endpoint_ranks,
+                expected_request_ids,
+            )
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline request preparation", exc)
+            raise
+
+    def finalize_pipeline_batch(
+        self,
+        pp_stage_id: dict[int, int],
+        batch_id: str,
+        output_rank: int,
+    ) -> str:
+        with self._futures_lock:
+            self._pipeline_retired_finalization_ids.discard(batch_id)
+            self._pipeline_finalization_submitted_ids.add(batch_id)
+        try:
+            result = self._queued_control_rpc(
+                "finalize_pipeline_batch",
+                args=(pp_stage_id, batch_id, output_rank),
+            )
+            if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], str):
+                raise RuntimeError("Queued final decode submission returned an invalid handle.")
+            return result[0]
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline final decode submission", exc)
+            raise
+
+    def poll_pipeline_finalization(self, batch_id: str, output_rank: int) -> BaseRunnerOutput | None:
+        if self._uses_autonomous_pipeline_stages():
+            try:
+                with self._futures_lock:
+                    future = self._pipeline_finalization_outputs.get(batch_id)
+                    if future is None or not future.done():
+                        return None
+                    self._pipeline_finalization_outputs.pop(batch_id, None)
+                    self._pipeline_finalization_submitted_ids.discard(batch_id)
+                return future.result()
+            except BaseException as exc:
+                if not self._is_failed:
+                    self._fail_queued_control("pipeline final decode poll", exc)
+                raise
+        try:
+            result = self.collective_rpc(
+                "poll_pipeline_finalization",
+                args=(batch_id,),
+                unique_reply_rank=output_rank,
+            )
+            if result is not None and not isinstance(result, BaseRunnerOutput):
+                raise RuntimeError("Queued final decode poll returned an invalid output.")
+            return result
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline final decode poll", exc)
+            raise
+
+    def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
+        result = self._queued_control_rpc("release_pipeline_batch_all_ranks", args=(pp_stage_id, batch_id))
+        with self._futures_lock:
+            finalization_result_received = batch_id in self._pipeline_finalization_outputs
+            if batch_id in self._pipeline_finalization_submitted_ids and not finalization_result_received:
+                self._pipeline_retired_finalization_ids.add(batch_id)
+            else:
+                self._pipeline_retired_finalization_ids.discard(batch_id)
+            self._pipeline_finalization_submitted_ids.discard(batch_id)
+            self._pipeline_finalization_outputs.pop(batch_id, None)
+        return unwrap_nested_pipeline_result(result)
+
+    def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
+        if self._uses_rank_local_pp_rpc():
+            try:
+                reports = self._queued_rank_local_rpc("pipeline_batch_release_ready", args=(pp_stage_id, batch_id))
+                if len(reports) != 2 or any(type(report) is not bool for report in reports):
+                    raise RuntimeError("Queued pipeline retirement readiness returned invalid rank-local results.")
+                return all(reports)
+            except BaseException as exc:
+                if not self._is_failed:
+                    self._fail_queued_control("pipeline batch release readiness", exc)
+                raise
+        result = self._queued_control_rpc(
+            "pipeline_batch_release_ready_all_ranks",
+            args=(pp_stage_id, batch_id),
+        )
+        result = unwrap_singleton_pipeline_result(result)
+        if type(result) is not bool:
+            raise RuntimeError("Queued pipeline retirement readiness returned an invalid result.")
+        return result
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
+        result = self._queued_control_rpc(
+            "cleanup_finalized_pipeline_request_all_ranks",
+            args=(request_id,),
+        )
+        return unwrap_nested_pipeline_result(result)
+
+    def authorize_pipeline_batch(self, pp_stage_id: int | dict[int, int], batch_id: str) -> Any:
+        if self._uses_rank_local_pp_rpc():
+            return self._queued_rank_local_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
+        return self._queued_control_rpc("authorize_pipeline_batch", args=(pp_stage_id, batch_id))
+
+    def authorize_pipeline_batches(self, authorizations: list[tuple[int | dict[int, int], str]]) -> Any:
+        if self._uses_rank_local_pp_rpc():
+            return self._queued_rank_local_rpc("authorize_pipeline_batches", args=(authorizations,))
+        return self._queued_control_rpc("authorize_pipeline_batches", args=(authorizations,))
+
+    def poll_pipeline_events(self) -> list[Any]:
+        self._ensure_open()
+        if self._uses_autonomous_pipeline_stages():
+            cached_events = getattr(self, "_pipeline_cached_events", [])
+            self._pipeline_cached_events = []
+            return cached_events
+        cached_events = getattr(self, "_pipeline_cached_events", None)
+        if cached_events is not None:
+            self._pipeline_cached_events = None
+            return cached_events
+        result = self.collective_rpc("poll_pipeline_events_all_ranks", exec_all_ranks=True)
+        result = unwrap_nested_pipeline_result(result)
+        return result if isinstance(result, list) else [result]
+
+    def cancel_pipeline_requests(self, request_generations: Any) -> Any:
+        self._ensure_open()
+        result = self.collective_rpc(
+            "cancel_pipeline_requests_all_ranks",
+            args=(request_generations,),
+            exec_all_ranks=True,
+        )
+        return unwrap_nested_pipeline_result(result)
+
+    def drain_pipeline(self, deadline: float | None = None) -> Any:
+        self._ensure_open()
+        result = self.collective_rpc("drain_pipeline_all_ranks", args=(deadline,), exec_all_ranks=True)
+        return unwrap_nested_pipeline_result(result)
+
+    def initialize_pipeline_transfers(
+        self,
+        activation_edges: set[tuple[int, int]],
+        feedback_edges: set[tuple[int, int]],
+        max_slots: int = 1,
+    ) -> Any:
+        if hasattr(self, "_pipeline_transfer_coordinator"):
+            raise RuntimeError("pipeline transfer coordinator is already initialized")
+        coordinator = PipelineTransferCoordinator(
+            activation_edges=activation_edges,
+            feedback_edges=feedback_edges,
+        )
+        result = self._queued_control_rpc("initialize_pipeline_transports_all_ranks", args=(max_slots,))
+        try:
+            validate_pipeline_topology_reports(result, activation_edges, feedback_edges)
+        except BaseException as exc:
+            self._fail_queued_control("pipeline topology validation", exc)
+            raise
+        self._pipeline_transfer_coordinator = coordinator
+        self._pipeline_pending_readiness: dict[tuple[Any, ...], PipelineTransferOffer] = {}
+        return result
+
+    def coordinate_pipeline_transfer(self, offer: PipelineTransferOffer) -> list[Any]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        if coordinator.offer(offer):
+            self._pipeline_pending_readiness[offer.identity] = offer
+        return self._retry_pipeline_transfer_readiness()
+
+    def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
+        """Broadcast a nonblocking StageEngine transfer-start command."""
+        self._ensure_open()
+        try:
+            if self._broadcast_mq is None:
+                raise RuntimeError("broadcast queue is closed")
+            self._broadcast_mq.enqueue(
+                {
+                    "type": "rpc",
+                    "method": "start_pipeline_transfer",
+                    "args": (grant,),
+                    "kwargs": {},
+                    "output_rank": -1,
+                    "exec_all_ranks": True,
+                    "collect_rank_status": False,
+                    "reply_all_ranks": False,
+                }
+            )
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline transfer start enqueue", exc)
+            raise
+
+    def _retry_pipeline_transfer_readiness(self) -> list[Any]:
+        coordinator = self._pipeline_transfer_coordinator
+        try:
+            attempted: set[tuple[Any, ...]] = set()
+            while True:
+                candidates = [
+                    offer for offer in coordinator.pending_readiness_offers() if offer.identity not in attempted
+                ]
+                if not candidates:
+                    break
+                if self._uses_autonomous_pipeline_stages():
+                    # Autonomous Workers reserve destination credit locally and
+                    # publish it through their sparse update stream.
+                    break
+                for offer in candidates:
+                    attempted.add(offer.identity)
+                    if self._uses_rank_local_pp_rpc():
+                        readiness_reports = self._queued_rank_local_rpc(
+                            "accept_pipeline_transfer_offer_rank_local",
+                            args=(offer,),
+                        )
+                        ready = normalize_pipeline_transfer_readiness_reports(
+                            readiness_reports,
+                            coordinator.endpoint_ranks,
+                        )
+                    else:
+                        ready = normalize_pipeline_transfer_readiness(
+                            self._queued_control_rpc("accept_pipeline_transfer_offer_all_ranks", args=(offer,))
+                        )
+                    if ready:
+                        coordinator.mark_receive_ready(offer.identity)
+                        self._pipeline_pending_readiness.pop(offer.identity, None)
+            return self._start_ready_pipeline_transfers()
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline transfer readiness", exc)
+            raise
+
+    def _start_ready_pipeline_transfers(self) -> list[Any]:
+        coordinator = self._pipeline_transfer_coordinator
+        grant_limit = max(1, len(coordinator.endpoint_ranks) // 2)
+        grants = coordinator.grant_ready(limit=grant_limit)
+        for grant in grants:
+            if self._uses_autonomous_pipeline_stages():
+                self.enqueue_pipeline_transfer_start(grant)
+                continue
+            if self._uses_rank_local_pp_rpc():
+                reports = self._queued_rank_local_rpc(
+                    "start_pipeline_transfer", args=(grant,), timeout=PIPELINE_GRANT_START_TIMEOUT_S
+                )
+                if len(reports) != 2 or any(report is not True for report in reports):
+                    error = RuntimeError("Pipeline grant start did not succeed on both endpoints.")
+                    self._fail_queued_control("pipeline grant start", error)
+                    raise error
+            else:
+                self._queued_control_rpc(
+                    "start_pipeline_transfer",
+                    args=(grant,),
+                    timeout=PIPELINE_GRANT_START_TIMEOUT_S,
+                )
+        return grants
+
+    def progress_pipeline(self) -> PipelineCoordinatorProgress:
+        progress_lock = getattr(self, "_pipeline_progress_lock", None)
+        if progress_lock is None:
+            progress_lock = threading.Lock()
+            self._pipeline_progress_lock = progress_lock
+        with progress_lock:
+            return self._progress_pipeline_unlocked()
+
+    def _progress_pipeline_unlocked(self) -> PipelineCoordinatorProgress:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        try:
+            if self._uses_autonomous_pipeline_stages():
+                return self._progress_autonomous_pipeline_stages(coordinator)
+            rank_local = self._uses_rank_local_pp_rpc()
+            pending_offers = tuple(coordinator.pending_readiness_offers()) if rank_local else ()
+            if rank_local:
+                result = self._queued_rank_local_rpc(
+                    "progress_pipeline_transfers_and_poll_events", args=(pending_offers,)
+                )
+            else:
+                result = self._queued_control_rpc("progress_pipeline_transfers_and_poll_events_all_ranks")
+            worker_progress, worker_events = normalize_pipeline_transport_snapshot(result, coordinator.endpoint_ranks)
+            cached_events = getattr(self, "_pipeline_cached_events", None)
+            self._pipeline_cached_events = (cached_events or []) + worker_events
+            progress = PipelineCoordinatorProgress()
+            for rank_progress in worker_progress:
+                for completion in rank_progress.completions:
+                    if coordinator.complete(completion.identity, completion.rank):
+                        progress.completed.append(completion.identity)
+            for rank_progress in worker_progress:
+                for offer in rank_progress.offers:
+                    coordinator.offer(offer)
+                    self._pipeline_pending_readiness[offer.identity] = offer
+            if rank_local:
+                expected_ids = {offer.identity for offer in pending_offers}
+                for rank_progress in worker_progress:
+                    reported_ids = [identity for identity, _ in rank_progress.readiness]
+                    if len(reported_ids) != len(expected_ids) or set(reported_ids) != expected_ids:
+                        raise RuntimeError("Pipeline progress readiness did not cover pending transfer offers.")
+                for offer in pending_offers:
+                    reports = [
+                        {"rank": item.rank, "ready": dict(item.readiness)[offer.identity]} for item in worker_progress
+                    ]
+                    if normalize_pipeline_transfer_readiness_reports(reports, coordinator.endpoint_ranks):
+                        coordinator.mark_receive_ready(offer.identity)
+                        self._pipeline_pending_readiness.pop(offer.identity, None)
+                progress.grants.extend(self._start_ready_pipeline_transfers())
+            else:
+                progress.grants.extend(self._retry_pipeline_transfer_readiness())
+            return progress
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline progress", exc)
+            raise
+
+    def _progress_autonomous_pipeline_stages(
+        self,
+        coordinator: PipelineTransferCoordinator,
+    ) -> PipelineCoordinatorProgress:
+        """Consume sparse Worker updates and run control only when edges change."""
+        with self._pipeline_update_lock:
+            update_error = self._pipeline_update_error
+            self._pipeline_update_error = None
+        if update_error is not None:
+            raise RuntimeError("Queued pipeline StageEngine update channel failed") from update_error
+
+        updates: list[PipelineWorkerUpdate] = []
+        worker_ids = sorted(self._pipeline_update_buffers)
+        if worker_ids:
+            cursor = self._pipeline_update_cursor % len(worker_ids)
+            consumed_per_worker = {worker_id: 0 for worker_id in worker_ids}
+            while True:
+                found = False
+                round_start = cursor
+                for offset in range(len(worker_ids)):
+                    worker_index = (round_start + offset) % len(worker_ids)
+                    worker_id = worker_ids[worker_index]
+                    if consumed_per_worker[worker_id] >= _MAX_PIPELINE_UPDATES_PER_WORKER_SNAPSHOT:
+                        continue
+                    try:
+                        update = self._pipeline_update_buffers[worker_id].get_nowait()
+                    except queue.Empty:
+                        continue
+                    updates.append(update)
+                    consumed_per_worker[worker_id] += 1
+                    found = True
+                if not found:
+                    break
+                cursor = (round_start + 1) % len(worker_ids)
+            self._pipeline_update_cursor = cursor
+
+        progress = PipelineCoordinatorProgress()
+        worker_events: list[Any] = []
+        saw_new_offer = False
+        saw_completion = False
+        saw_readiness = False
+        expected_workers = coordinator.endpoint_ranks
+        for update in updates:
+            if not isinstance(update, PipelineWorkerUpdate) or update.worker_id not in expected_workers:
+                raise RuntimeError("Pipeline StageEngine published an update for an unknown Worker rank")
+            if update.error is not None:
+                raise RuntimeError(f"Pipeline StageEngine failed on Worker {update.worker_id}: {update.error}")
+            rank_progress = update.progress
+            if rank_progress is None:
+                worker_events.extend(update.events)
+                continue
+            if rank_progress.rank != update.worker_id:
+                raise RuntimeError("Pipeline StageEngine update has invalid rank-local progress")
+            worker_events.extend(update.events)
+            for identity, ready in rank_progress.readiness:
+                if type(ready) is not bool:
+                    raise RuntimeError("Pipeline StageEngine published invalid receive readiness")
+                if ready:
+                    coordinator.mark_receive_ready(identity, rank=update.worker_id)
+                    self._pipeline_pending_readiness.pop(identity, None)
+                    saw_readiness = True
+
+        for update in updates:
+            rank_progress = update.progress
+            if rank_progress is None:
+                continue
+            for completion in rank_progress.completions:
+                if coordinator.complete(completion.identity, completion.rank):
+                    progress.completed.append(completion.identity)
+                saw_completion = True
+            for offer in rank_progress.offers:
+                if coordinator.offer(offer):
+                    if not self._uses_autonomous_pipeline_stages():
+                        self._pipeline_pending_readiness[offer.identity] = offer
+                    saw_new_offer = True
+
+        cached_events = getattr(self, "_pipeline_cached_events", [])
+        self._pipeline_cached_events = [*cached_events, *worker_events]
+        if saw_new_offer or saw_completion or saw_readiness:
+            progress.grants.extend(self._retry_pipeline_transfer_readiness())
+        return progress
+
+    def pipeline_stage_physical_ranks(self) -> dict[int, int]:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        return coordinator.stage_physical_ranks
+
+    def pipeline_stage_memory_budget_bytes(self) -> int:
+        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
+        if coordinator is None:
+            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        try:
+            result = self._queued_control_rpc("pipeline_stage_memory_budget_bytes", exec_all_ranks=True)
+            result = unwrap_nested_pipeline_result(result)
+            if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+                raise RuntimeError("Workers returned invalid pipeline memory budget reports")
+            expected = coordinator.endpoint_ranks
+            ranks = {item.get("rank") for item in result}
+            if len(result) != len(expected) or ranks != expected:
+                raise RuntimeError("pipeline memory budget reports do not cover every configured endpoint")
+            budgets = [item.get("free_bytes") for item in result]
+            if any(type(value) is not int or value <= 0 for value in budgets):
+                raise RuntimeError("pipeline memory budget reports must contain positive integer free_bytes")
+            return min(budgets)
+        except BaseException as exc:
+            if not self._is_failed:
+                self._fail_queued_control("pipeline memory budget", exc)
+            raise
 
     def collective_rpc(
         self,
@@ -776,18 +1377,52 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
         exec_all_ranks: bool = False,
+        reply_all_ranks: bool = False,
+    ) -> Any:
+        rpc_lock = getattr(self, "_collective_rpc_lock", None)
+        if rpc_lock is None:
+            rpc_lock = threading.RLock()
+            self._collective_rpc_lock = rpc_lock
+        with rpc_lock:
+            return self._collective_rpc_unlocked(
+                method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                unique_reply_rank=unique_reply_rank,
+                exec_all_ranks=exec_all_ranks,
+                reply_all_ranks=reply_all_ranks,
+            )
+
+    def _collective_rpc_unlocked(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
+        reply_all_ranks: bool = False,
     ) -> Any:
         self._ensure_open()
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        multi_rank_reply = unique_reply_rank is None and exec_all_ranks
+        if reply_all_ranks and (
+            unique_reply_rank is not None
+            or not exec_all_ranks
+            or not self.od_config.step_execution
+            or getattr(self.od_config.parallel_config, "data_parallel_size", 1) != 1
+        ):
+            raise ValueError("reply_all_ranks requires step execution, all-rank dispatch, and one DP replica")
+
+        multi_rank_reply = unique_reply_rank is None and exec_all_ranks and not reply_all_ranks
         execute_all_ranks = unique_reply_rank is None or exec_all_ranks
         # Status aggregation is for control-plane RPCs, where rank 0 sends
         # one envelope representing every rank. DP request concurrency needs
         # one independent reply per DP primary instead.
-        collect_rank_status = unique_reply_rank is None and not multi_rank_reply
+        collect_rank_status = unique_reply_rank is None and not multi_rank_reply and not reply_all_ranks
         rpc_request = {
             "type": "rpc",
             "method": method,
@@ -796,6 +1431,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "output_rank": None if multi_rank_reply else (unique_reply_rank if unique_reply_rank is not None else 0),
             "exec_all_ranks": execute_all_ranks,
             "collect_rank_status": collect_rank_status,
+            "reply_all_ranks": reply_all_ranks,
         }
 
         # ── Path 1: async execute_model / execute_model_batch ──
@@ -836,14 +1472,43 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # - unique_reply_rank=None + exec_all_ranks=True: all DP ranks reply
             #   (N responses, one per DP worker).
             # - Otherwise: 1 response (only rank 0 or specified rank)
-            if unique_reply_rank is None and exec_all_ranks:
+            if reply_all_ranks:
+                num_responses = len(self._result_mqs)
+                if num_responses != self.od_config.num_gpus:
+                    raise RuntimeError(
+                        "Rank-local queued RPC requires one result queue per Worker; "
+                        f"found {num_responses} queues for {self.od_config.num_gpus} Workers"
+                    )
+            elif unique_reply_rank is None and exec_all_ranks:
                 dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
                 num_responses = max(1, dp_size)
             else:
                 num_responses = 1
 
             responses: list = []
-            if unique_reply_rank is None and exec_all_ranks and num_responses > 1:
+            if reply_all_ranks:
+                rank_local_results: list[Any] = []
+                rank_errors: list[str] = []
+                for worker_id, result_mq in enumerate(self._result_mqs):
+                    response = self._dequeue_one_with_failure_polling(deadline, method, result_mq)
+                    response = self._validate_wave_id(response, wave_id, deadline, method, result_mq)
+                    if (
+                        not isinstance(response, dict)
+                        or response.get("rank_local_rpc") is not True
+                        or response.get("worker_id") != worker_id
+                    ):
+                        rank_errors.append(f"worker {worker_id} returned a malformed rank-local RPC response")
+                        continue
+                    if response.get("status") == "error":
+                        rank_errors.append(f"worker {worker_id}: {response.get('error', 'unknown error')}")
+                    elif response.get("status") == "ok":
+                        rank_local_results.append(response.get("result"))
+                    else:
+                        rank_errors.append(f"worker {worker_id} returned an invalid rank-local RPC status")
+                if rank_errors:
+                    raise RuntimeError(f"Rank-local RPC '{method}' failed: " + "; ".join(rank_errors))
+                responses = rank_local_results
+            elif unique_reply_rank is None and exec_all_ranks and num_responses > 1:
                 # DP multi-concurrency: collect num_responses replies, sort by dp_rank.
                 result_mqs: list[MessageQueue | None] = [None] * num_responses
                 if self.od_config.step_execution:
@@ -897,7 +1562,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
                     responses.append(response)
 
-            return responses[0] if unique_reply_rank is not None else responses
+            result = responses[0] if unique_reply_rank is not None else responses
+            if self._uses_autonomous_pipeline_stages():
+                if (
+                    method == "start_pipeline_transfer"
+                    and reply_all_ranks
+                    and (len(result) != 2 or any(report is not True for report in result))
+                ):
+                    raise RuntimeError("Pipeline transfer start did not succeed on both Workers.")
+                self._wake_pipeline_stages()
+            return result
         except Exception as e:
             logger.error(f"RPC call failed: {e}")
             raise
@@ -930,6 +1604,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         Dispatches AsyncDiffusionOutput messages to the appropriate future:
         * RPC_RESULT / COMPUTE_DONE → _rpc_futures[rpc_id]
         * OUTPUT_READY → _output_futures[async_output_id]
+        * PIPELINE_FINALIZED → queued PP finalization result cache
         """
         result_mq = result_mq or self._result_mq
         if result_mq is None:
@@ -949,19 +1624,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 continue
 
             if not isinstance(msg, AsyncDiffusionOutput):
+                if isinstance(msg, PipelineWorkerUpdate):
+                    self._publish_pipeline_update(msg)
+                    continue
                 # Non-async message: place into the sync buffer for
                 # collective_rpc() to consume via Path 2.
-                self._sync_result_buffer.put(msg)
-                continue
-
-            # If shutdown started while we were dequeuing, drop this delivery
-            # so it cannot repopulate _completed_outputs after shutdown()
-            # cleared it (issue #6413 / #6439 review). OUTPUT_READY must still
-            # flow through the dispatch below: unpack_diffusion_output_shm()
-            # is the only receive-side path that unlinks named SHM segments,
-            # and the closed-time re-checks under _futures_lock already
-            # prevent any cache write after unpack.
-            if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
+                if self._uses_autonomous_pipeline_stages():
+                    getattr(self, "_sync_result_buffers", {}).get(id(result_mq), self._sync_result_buffer).put(msg)
+                else:
+                    self._sync_result_buffer.put(msg)
                 continue
 
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
@@ -999,82 +1670,51 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
                     if batch_id:
                         with self._futures_lock:
-                            if self._closed:
-                                # shutdown() cleared _completed_outputs while
-                                # we were unpacking; drop this delivery.
-                                continue
-                            self._finish_output(batch_id, output_result, exc)
-
-    def _finish_output(
-        self,
-        async_output_id: str,
-        result: DiffusionOutput | None,
-        exc: BaseException | None,
-    ) -> None:
-        """Hand one delivered async output to its waiter. Caller holds ``_futures_lock``.
-
-        * id already recorded as dropped -> discard the tensors: a
-          ``wait_output_ready`` observed a cancelled waiter and evicted it
-          into the dropped-id LRU before this delivery, so caching would
-          break the "every late wait on a dropped id fails the same way"
-          contract;
-        * no waiter registered -> cache for a later ``wait_output_ready()``;
-        * :class:`_DropPlaceholder` (request aborted) -> discard the tensors:
-          terminate the placeholder with an error so a caller that already
-          reused it via ``wait_output_ready()`` wakes up, and remember the id
-          (bounded) so a later wait fails fast instead of hanging;
-        * genuine pending waiter -> resolve it directly, never cache;
-        * waiter already cancelled/done -> discard the tensors and record the
-          id as dropped so a later wait fails fast instead of hanging.
-        """
-        pending = self._output_futures.pop(async_output_id, None)
-        if pending is None:
-            if async_output_id in self._dropped_output_ids:
-                # Timeline-B: wait_output_ready has already observed a
-                # cancelled/done stale entry and moved this id into the
-                # dropped-id LRU. Late OUTPUT_READY must not repopulate
-                # _completed_outputs — a subsequent wait_output_ready would
-                # otherwise pop a successful Future and violate the dropped
-                # contract.
-                self._dropped_output_ids.move_to_end(async_output_id)
-                return
-            fut: concurrent.futures.Future = concurrent.futures.Future()
-            if exc is not None:
-                fut.set_exception(exc)
-            else:
-                fut.set_result(result)
-            self._completed_outputs[async_output_id] = fut
-        elif isinstance(pending, _DropPlaceholder):
-            try_set_exception(pending, _dropped_output_error(async_output_id))
-            self._remember_dropped(async_output_id)
-        elif not pending.done():
-            # Concurrent cancellation can still race between ``.done()`` and
-            # ``set_result/set_exception``. The helpers swallow the resulting
-            # ``InvalidStateError`` and report ``False`` so we can still
-            # record the id as dropped — the waiter was popped from
-            # ``_output_futures`` above, so without this a subsequent
-            # ``wait_output_ready`` would allocate a fresh Future and hang.
-            if exc is not None:
-                delivered = try_set_exception(pending, exc)
-            else:
-                delivered = try_set_result(pending, result)
-            if not delivered:
-                self._remember_dropped(async_output_id)
-        else:
-            # Waiter already cancelled or resolved. Do not re-cache the delivered
-            # tensors, but remember the id so a later ``wait_output_ready`` on
-            # the same id fails fast instead of allocating a fresh Future that
-            # would never complete (fully-async abort overlap: ``step_streaming``
-            # took a live waiter, ``asyncio.wrap_future`` cancelled it, then
-            # ``OUTPUT_READY`` lands here).
-            self._remember_dropped(async_output_id)
-
-    def _remember_dropped(self, async_output_id: str) -> None:
-        dropped = self._dropped_output_ids
-        dropped[async_output_id] = None
-        dropped.move_to_end(async_output_id)
-        while len(dropped) > _DROPPED_OUTPUT_IDS_MAX:
-            dropped.popitem(last=False)
+                            pending = self._output_futures.pop(batch_id, None)
+                            if pending is not None and not pending.done():
+                                if exc is not None:
+                                    try_set_exception(pending, exc)
+                                else:
+                                    try_set_result(pending, output_result)
+                            else:
+                                fut = concurrent.futures.Future()
+                                if exc is not None:
+                                    fut.set_exception(exc)
+                                else:
+                                    fut.set_result(output_result)
+                                self._completed_outputs[batch_id] = fut
+            elif msg.kind == AsyncOutputKind.PIPELINE_FINALIZED:
+                batch_id = msg.async_output_id
+                if not batch_id:
+                    logger.error("Queued pipeline finalization result has no batch id")
+                    continue
+                with self._futures_lock:
+                    if batch_id in self._pipeline_retired_finalization_ids:
+                        retired = True
+                        future = None
+                    else:
+                        retired = False
+                        future = self._pipeline_finalization_outputs.setdefault(batch_id, concurrent.futures.Future())
+                if retired:
+                    if not msg.error:
+                        try:
+                            unpack_diffusion_output_shm(msg.result)
+                        except Exception:
+                            logger.exception("Could not release late finalization output for batch %s", batch_id)
+                    with self._futures_lock:
+                        self._pipeline_retired_finalization_ids.discard(batch_id)
+                    continue
+                if msg.error:
+                    try_set_exception(future, RuntimeError(msg.error))
+                else:
+                    try:
+                        unpack_diffusion_output_shm(msg.result)
+                        try_set_result(future, msg.result)
+                    except Exception as exc:
+                        try_set_exception(future, exc)
+                callback = self._pipeline_update_callback
+                if callback is not None:
+                    callback()
 
     def _deliver_batch_split(
         self,
@@ -1083,9 +1723,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         error: str | None = None,
     ) -> None:
         """Resolve per-request futures from one batch-level output."""
-        if self._closed:
-            # shutdown() has taken over; do not touch _completed_outputs.
-            return
         for per_req_id, req_id in per_req_map.items():
             req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
             per_req_result: DiffusionOutput
@@ -1096,11 +1733,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             else:
                 per_req_result = DiffusionOutput(error="No output result for batch request")
             with self._futures_lock:
-                if self._closed:
-                    # Belt-and-braces: re-check under the lock so a shutdown
-                    # that started mid-loop cannot repopulate the cleared dict.
-                    return
-                self._finish_output(per_req_id, per_req_result, None)
+                pending = self._output_futures.pop(per_req_id, None)
+                if pending is not None and not pending.done():
+                    try_set_result(pending, per_req_result)
+                else:
+                    fut: concurrent.futures.Future = concurrent.futures.Future()
+                    fut.set_result(per_req_result)
+                    self._completed_outputs[per_req_id] = fut
 
     def describe_pending_state(self, async_output_id: str | None = None) -> str:
         """Summarize async-output bookkeeping for diagnosing stuck waits."""
@@ -1123,69 +1762,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return str(self._rpc_id_counter)
 
     def wait_output_ready(self, async_output_id: str) -> concurrent.futures.Future[DiffusionOutput]:
-        """Return a Future that resolves when the async output is ready.
-
-        After :meth:`drop_output` has drained an id, the output is gone for
-        good: a wait on that id returns an already-failed Future instead of a
-        fresh one that would never complete.
-        """
+        """Return a Future that resolves when the async output is ready."""
         with self._futures_lock:
             cached = self._completed_outputs.pop(async_output_id, None)
             if cached is not None:
                 return cached
-            # Share an already-registered Future (a genuine pending waiter or a
-            # drop_output placeholder) rather than clobbering it. But if the
-            # registered entry is already cancelled or resolved, it is not a
-            # live waiter — evict it, remember the id, and fall through to the
-            # dropped path so abort-after-cancel installs terminal state
-            # instead of returning a Future that never completes.
-            existing = self._output_futures.get(async_output_id)
-            if existing is not None:
-                if isinstance(existing, _DropPlaceholder) or not existing.done():
-                    return existing
-                self._output_futures.pop(async_output_id, None)
-                self._remember_dropped(async_output_id)
-            if async_output_id in self._dropped_output_ids:
-                # Keep the id in the bounded LRU so *every* late wait on a
-                # dropped id fails the same way. Deleting here would make
-                # fail-fast one-shot and the next wait would hang on a fresh
-                # Future.
-                self._dropped_output_ids.move_to_end(async_output_id)
-                dropped: concurrent.futures.Future = concurrent.futures.Future()
-                dropped.set_exception(_dropped_output_error(async_output_id))
-                return dropped
             fut: concurrent.futures.Future = concurrent.futures.Future()
             self._output_futures[async_output_id] = fut
         return fut
-
-    def drop_output(self, async_output_id: str) -> None:
-        """Discard an async output that will never be waited on.
-
-        An aborted request never calls :meth:`wait_output_ready`, so a late
-        ``OUTPUT_READY`` would be unpacked and cached in ``_completed_outputs``
-        forever (issue #6413). Draining it here keeps engine-process memory
-        bounded under abort traffic. Handles both arrival orderings:
-
-        * result already arrived -> pop and drop the cached future;
-        * result not yet arrived -> register a :class:`_DropPlaceholder` so the
-          pump discards the tensors instead of caching them.
-
-        Either way the id is remembered (bounded) so a late
-        :meth:`wait_output_ready` fails fast rather than hanging. A genuine
-        waiter that is already registered is left untouched so it can drain
-        through the normal path.
-        """
-        with self._futures_lock:
-            if self._closed:
-                # Executor is torn down; abort path must not repopulate the
-                # cleared state (issue #6413 / #6439 review).
-                return
-            if self._completed_outputs.pop(async_output_id, None) is not None:
-                self._remember_dropped(async_output_id)
-                return
-            if async_output_id in self._output_futures:
-                return
-            self._output_futures[async_output_id] = _DropPlaceholder()
 
     def check_health(self) -> None:
         if self._is_failed:
@@ -1228,10 +1812,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
-                # Cached async outputs hold unpacked tensors; drop them so they
-                # do not survive shutdown (issue #6413).
-                self._completed_outputs.clear()
-                self._dropped_output_ids.clear()
             self._processes = (cleaner.processes or []) if cleaner is not None else []
             if not self._processes:
                 self._shutdown_cleaner = None

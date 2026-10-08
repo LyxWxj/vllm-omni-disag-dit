@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from collections.abc import Iterable
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import PIL.Image
 import torch
@@ -22,6 +22,13 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_rank,
+    get_pipeline_parallel_world_size,
+    get_pp_group,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
@@ -40,23 +47,21 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
-    resolve_wan_output_fps,
-    resolve_wan_preencode_batch_frames,
-    resolve_wan_preencode_mp4,
-    resolve_wan_video_codec_options,
-    wan_preencoded_mp4_payload,
-)
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
@@ -67,11 +72,9 @@ FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
-        # Keep native Wan's unshifted training endpoints; set_timesteps applies
-        # the requested shift to the interpolated inference sigmas.
         return FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=1.0,
+            shift=flow_shift,
             prediction_type="flow_prediction",
         )
     if sample_solver == "euler":
@@ -109,8 +112,11 @@ def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tupl
     return loaded_weights
 
 
-def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc") -> str:
-    extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+def resolve_wan_sample_solver_from_sampling(
+    sampling_params: OmniDiffusionSamplingParams,
+    default: str = "unipc",
+) -> str:
+    extra_args = sampling_params.extra_args or {}
     raw = extra_args.get("sample_solver", default)
     sample_solver = str(raw).strip().lower()
     if sample_solver not in WAN_SAMPLE_SOLVER_CHOICES:
@@ -118,8 +124,15 @@ def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc")
     return sample_solver
 
 
-def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> float:
-    extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc") -> str:
+    return resolve_wan_sample_solver_from_sampling(req.sampling_params, default)
+
+
+def resolve_wan_flow_shift_from_sampling(
+    sampling_params: OmniDiffusionSamplingParams,
+    od_config: OmniDiffusionConfig,
+) -> float:
+    extra_args = sampling_params.extra_args or {}
     raw_flow_shift = extra_args.get("flow_shift")
     if raw_flow_shift is None:
         raw_flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
@@ -128,6 +141,10 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         return float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+
+
+def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> float:
+    return resolve_wan_flow_shift_from_sampling(req.sampling_params, od_config)
 
 
 def resolve_wan_guidance_scales(
@@ -190,12 +207,10 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
 def resolve_wan_transformer_quant_config(
     config: dict, quant_config: QuantizationConfig | None, component: str
 ) -> QuantizationConfig | None:
-    """Resolve the expert before applying its checkpoint's storage contract."""
+    """Resolve a Wan expert's checkpoint quantization contract."""
     from vllm_omni.quantization.component_config import ComponentQuantizationConfig
     from vllm_omni.quantization.factory import resolve_quant_config_from_disk
 
-    # Wan experts are siblings: "transformer_2" must not inherit "transformer"
-    # through the generic layer-prefix resolver. Select the whole expert name.
     component_quant_config = (
         quant_config.component_configs.get(component, quant_config.default_config)
         if isinstance(quant_config, ComponentQuantizationConfig)
@@ -205,18 +220,13 @@ def resolve_wan_transformer_quant_config(
     resolved_quant_config = resolve_quant_config_from_disk(component_quant_config, config.get("quantization_config"))
     if quantization_disabled and resolved_quant_config is not None:
         raise ValueError(
-            f"Quantization is disabled for component {component!r}, but its checkpoint declares quantization. "
-            "Use a BF16 checkpoint for this component or enable its matching quantization method."
+            f"Quantization is disabled for component {component!r}, but its checkpoint declares quantization."
         )
     return resolved_quant_config
 
 
 def create_transformer_from_config(
-    config: dict,
-    quant_config: QuantizationConfig | None = None,
-    prefix: str = "",
-    *,
-    component: str = "transformer",
+    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -252,7 +262,11 @@ def create_transformer_from_config(
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
 
-    quant_config = resolve_wan_transformer_quant_config(config, quant_config, component)
+    if "quantization_config" in config:
+        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
+
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
     if prefix:
@@ -277,9 +291,6 @@ def get_wan22_post_process_func(
             output_type = sampling_params.output_type
         if output_type == "latent":
             return video
-        encoded = wan_preencoded_mp4_payload(video)
-        if encoded is not None:
-            return encoded
         video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
@@ -372,6 +383,8 @@ class Wan22Pipeline(
     WanLoraLoaderMixin,
 ):
     supports_request_batch = True
+    supports_step_execution = True
+    supports_pipeline_stage_execution = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -495,13 +508,13 @@ class Wan22Pipeline(
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
-            self.transformer = self._create_transformer(transformer_config, component="transformer")
+            self.transformer = self._create_transformer(transformer_config)
         else:
             self.transformer = None
 
         if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = self._create_transformer(transformer_2_config, component="transformer_2")
+            self.transformer_2 = self._create_transformer(transformer_2_config)
         else:
             self.transformer_2 = None
 
@@ -539,17 +552,10 @@ class Wan22Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-    def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
+    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        # Startup metadata describes the first expert, not a user policy for both.
-        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
-            quant_config = None
-        return create_transformer_from_config(
-            config,
-            quant_config=quant_config,
-            component=component,
-        )
+        return create_transformer_from_config(config, quant_config=quant_config)
 
     @property
     def guidance_scale(self):
@@ -566,6 +572,207 @@ class Wan22Pipeline(
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    def _step_model_dtype(self) -> torch.dtype:
+        if self.transformer is not None:
+            return self.transformer.dtype
+        if self.transformer_2 is not None:
+            return self.transformer_2.dtype
+        return self.text_encoder.dtype
+
+    @staticmethod
+    def _normalize_conditioning_sources(
+        prompt: str | list[str] | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt: str | list[str] | None,
+        negative_prompt_embeds: torch.Tensor | None,
+    ) -> tuple[str | list[str] | None, str | list[str] | None]:
+        """Apply the same embedding precedence used by request-mode Wan."""
+        if prompt_embeds is not None:
+            prompt = None
+        if negative_prompt_embeds is not None:
+            negative_prompt = None
+        return prompt, negative_prompt
+
+    def _prepare_generation_geometry(
+        self,
+        sampling: OmniDiffusionSamplingParams,
+    ) -> tuple[int, int, int]:
+        height = sampling.height or 480
+        width = sampling.width or 832
+        num_frames = sampling.num_frames or 81
+        patch_size = self.transformer_config.patch_size
+        mod_value = self.vae_scale_factor_spatial * patch_size[1]
+        height = height // mod_value * mod_value
+        width = width // mod_value * mod_value
+        if num_frames % self.vae_scale_factor_temporal != 1:
+            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+        return height, width, max(num_frames, 1)
+
+    def _prepare_prompt_conditioning(
+        self,
+        *,
+        prompt: str | list[str] | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt: str | list[str] | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        do_classifier_free_guidance: bool,
+        num_outputs_per_prompt: int,
+        num_prompts: int,
+        max_sequence_length: int,
+        height: int,
+        width: int,
+        guidance_high: float,
+        boundary_ratio: float | None,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        prompt, negative_prompt = self._normalize_conditioning_sources(
+            prompt,
+            prompt_embeds,
+            negative_prompt,
+            negative_prompt_embeds,
+        )
+        if isinstance(prompt, list) and not all(prompt):
+            raise ValueError("Prompt is required for Wan2.2 generation when prompt_embeds are not provided.")
+        if isinstance(prompt, str) and not prompt:
+            raise ValueError("Prompt is required for Wan2.2 generation when prompt_embeds are not provided.")
+        self.check_inputs(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
+            boundary_ratio=boundary_ratio,
+        )
+
+        if prompt_embeds is None:
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                num_videos_per_prompt=num_outputs_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=self.device,
+                dtype=dtype,
+            )
+            return prompt_embeds, negative_prompt_embeds
+
+        prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
+        if prompt_embeds.ndim == 2:
+            prompt_embeds = prompt_embeds.unsqueeze(0)
+        elif prompt_embeds.ndim != 3:
+            raise ValueError("Wan prompt_embeds must be a 2D or 3D tensor.")
+        prompt_embed_batch = int(prompt_embeds.shape[0])
+        prompt_embeds = prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
+
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=dtype)
+            if negative_prompt_embeds.ndim == 2:
+                negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
+            elif negative_prompt_embeds.ndim != 3:
+                raise ValueError("Wan negative_prompt_embeds must be a 2D or 3D tensor.")
+            negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
+        elif do_classifier_free_guidance:
+            _, negative_prompt_embeds = self.encode_prompt(
+                prompt=[""] * (prompt_embed_batch if prompt_embed_batch > 0 else num_prompts),
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=True,
+                num_videos_per_prompt=num_outputs_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=self.device,
+                dtype=dtype,
+            )
+        return prompt_embeds, negative_prompt_embeds
+
+    def _prepare_request_scheduler(
+        self,
+        sampling: OmniDiffusionSamplingParams,
+        num_steps: int,
+    ) -> tuple[Any, torch.Tensor, str, float]:
+        sample_solver = resolve_wan_sample_solver_from_sampling(
+            sampling,
+            default=getattr(self, "_sample_solver", "unipc"),
+        )
+        flow_shift = resolve_wan_flow_shift_from_sampling(sampling, self.od_config)
+        scheduler = build_wan_scheduler(sample_solver, flow_shift)
+        scheduler.set_timesteps(num_steps, device=self.device)
+        return scheduler, scheduler.timesteps, sample_solver, flow_shift
+
+    def _select_transformer(
+        self,
+        timestep: torch.Tensor,
+        *,
+        boundary_timestep: float | None,
+        guidance_low: float,
+        guidance_high: float,
+    ) -> tuple[nn.Module, float]:
+        if self.transformer is None or self.transformer_2 is None:
+            current_model = self.transformer if self.transformer is not None else self.transformer_2
+            if current_model is None:
+                raise RuntimeError("No Wan transformer is loaded.")
+            use_high_guidance = boundary_timestep is not None and bool(torch.all(timestep < boundary_timestep))
+            return current_model, guidance_high if use_high_guidance else guidance_low
+
+        if boundary_timestep is not None and bool(torch.all(timestep < boundary_timestep)):
+            if self.transformer_2 is not None:
+                return self.transformer_2, guidance_high
+            if self.transformer is not None:
+                return self.transformer, guidance_high
+            raise RuntimeError("No transformer available for low-noise stage")
+
+        if boundary_timestep is not None and bool(torch.any(timestep < boundary_timestep)):
+            raise ValueError("Wan step batch cannot span different transformer components.")
+        if self.transformer is not None:
+            return self.transformer, guidance_low
+        if self.transformer_2 is not None:
+            return self.transformer_2, guidance_low
+        raise RuntimeError("No transformer available for high-noise stage")
+
+    def _build_denoise_kwargs(
+        self,
+        *,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        dtype: torch.dtype,
+        attention_kwargs: dict[str, Any],
+        current_model: nn.Module,
+        latent_condition: torch.Tensor | None = None,
+        first_frame_mask: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        if self.expand_timesteps and latent_condition is not None:
+            if first_frame_mask is None:
+                raise ValueError("Wan image-conditioned execution requires first_frame_mask.")
+            latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+            latent_model_input = latent_model_input.to(dtype)
+            patch_size = self.transformer_config.patch_size
+            patch_height = latents.shape[3] // patch_size[1]
+            patch_width = latents.shape[4] // patch_size[2]
+            patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
+            patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]
+            timestep_input = (patch_mask[0][0] * timestep.flatten()[0]).flatten()
+            timestep_input = timestep_input.unsqueeze(0).expand(latents.shape[0], -1)
+        else:
+            latent_model_input = latents.to(dtype)
+            timestep_input = timestep.reshape(-1)
+            if timestep_input.numel() == 1:
+                timestep_input = timestep_input.expand(latents.shape[0])
+            elif timestep_input.numel() != latents.shape[0]:
+                raise ValueError(
+                    "Wan timestep rows must match latent rows: "
+                    f"timesteps={timestep_input.numel()}, latents={latents.shape[0]}."
+                )
+
+        return {
+            "hidden_states": latent_model_input,
+            "timestep": timestep_input,
+            "encoder_hidden_states": prompt_embeds,
+            "attention_kwargs": attention_kwargs,
+            "return_dict": False,
+            "current_model": current_model,
+        }
 
     def diffuse(
         self,
@@ -589,68 +796,26 @@ class Wan22Pipeline(
                 self._current_timestep = t
                 self.record_denoise_step(step_idx, t)
 
-                # Select model based on timestep and boundary_ratio
-                # High noise stage (t >= boundary_timestep): use transformer
-                # Low noise stage (t < boundary_timestep): use transformer_2
-                if boundary_timestep is not None and t < boundary_timestep:
-                    # Low noise stage - always use guidance_high for this stage
-                    current_guidance_scale = guidance_high
-                    if self.transformer_2 is not None:
-                        current_model = self.transformer_2
-                    elif self.transformer is not None:
-                        # Fallback to transformer if transformer_2 not loaded
-                        current_model = self.transformer
-                    else:
-                        raise RuntimeError("No transformer available for low-noise stage")
-                else:
-                    # High noise stage - always use guidance_low for this stage
-                    current_guidance_scale = guidance_low
-                    if self.transformer is not None:
-                        current_model = self.transformer
-                    elif self.transformer_2 is not None:
-                        # Fallback to transformer_2 if transformer not loaded
-                        current_model = self.transformer_2
-                    else:
-                        raise RuntimeError("No transformer available for high-noise stage")
-
-                if self.expand_timesteps and latent_condition is not None:
-                    # I2V mode: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
-                    latent_model_input = latent_model_input.to(dtype)
-
-                    # Expand timesteps per patch - use floor division to match patch embedding
-                    patch_size = self.transformer_config.patch_size
-                    patch_height = latents.shape[3] // patch_size[1]
-                    patch_width = latents.shape[4] // patch_size[2]
-
-                    # Create mask at patch resolution (same as hidden states sequence length)
-                    patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
-                    patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
-                    temp_ts = (patch_mask[0][0] * t).flatten()
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    # T2V mode: standard forward
-                    latent_model_input = latents.to(dtype)
-                    timestep = t.expand(latents.shape[0])
+                current_model, current_guidance_scale = self._select_transformer(
+                    t,
+                    boundary_timestep=boundary_timestep,
+                    guidance_low=guidance_low,
+                    guidance_high=guidance_high,
+                )
 
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                }
+                positive_kwargs = self._build_denoise_kwargs(
+                    latents=latents,
+                    timestep=t,
+                    prompt_embeds=prompt_embeds,
+                    dtype=dtype,
+                    attention_kwargs=attention_kwargs,
+                    current_model=current_model,
+                    latent_condition=latent_condition,
+                    first_frame_mask=first_frame_mask,
+                )
                 if do_true_cfg:
-                    negative_kwargs = {
-                        "hidden_states": latent_model_input,
-                        "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "attention_kwargs": attention_kwargs,
-                        "return_dict": False,
-                        "current_model": current_model,
-                    }
+                    negative_kwargs = dict(positive_kwargs, encoder_hidden_states=negative_prompt_embeds)
                 else:
                     negative_kwargs = None
 
@@ -680,6 +845,461 @@ class Wan22Pipeline(
 
         return latents
 
+    @staticmethod
+    def _step_prompt_fields(
+        prompt: object,
+    ) -> tuple[str | None, torch.Tensor | None, str | None, torch.Tensor | None, bool]:
+        if isinstance(prompt, str):
+            return prompt, None, None, None, False
+        if not isinstance(prompt, dict):
+            return None, None, None, None, False
+
+        additional = prompt.get("additional_information")
+        additional = additional if isinstance(additional, dict) else {}
+
+        def field(name: str) -> object:
+            value = prompt.get(name)
+            return additional.get(name) if value is None else value
+
+        raw_image = (prompt.get("multi_modal_data") or {}).get("image")
+        has_image = raw_image is not None and (not isinstance(raw_image, list) or bool(raw_image))
+        return (
+            cast(str | None, prompt.get("prompt")),
+            cast(torch.Tensor | None, field("prompt_embeds")),
+            cast(str | None, prompt.get("negative_prompt")),
+            cast(torch.Tensor | None, field("negative_prompt_embeds")),
+            has_image,
+        )
+
+    def _prepare_step_latents(
+        self,
+        *,
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        dtype: torch.dtype,
+        generator: torch.Generator | list[torch.Generator] | None,
+        request_latents: torch.Tensor | None,
+        pp_group: Any | None,
+    ) -> torch.Tensor:
+        expected_shape = (
+            batch_size,
+            num_channels_latents,
+            (num_frames - 1) // self.vae_scale_factor_temporal + 1,
+            height // self.vae_scale_factor_spatial,
+            width // self.vae_scale_factor_spatial,
+        )
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
+        if request_latents is not None and tuple(request_latents.shape) != expected_shape:
+            raise ValueError(
+                f"Wan request latents have shape {tuple(request_latents.shape)}, expected {expected_shape}."
+            )
+
+        if pp_group is None or pp_group.is_first_rank:
+            return self.prepare_latents(
+                batch_size=batch_size,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                dtype=dtype,
+                device=self.device,
+                generator=generator,
+                latents=request_latents,
+            )
+        return torch.empty(expected_shape, dtype=dtype, device=self.device)
+
+    def _prepare_encode_local(
+        self,
+        state: StepRequestState,
+        pp_group: Any | None,
+        **kwargs: Any,
+    ) -> StepRequestState:
+        """Build rank-local Wan step state without issuing PP collectives."""
+        del kwargs
+        if self.is_dmd:
+            raise ValueError("Wan step execution does not support DMD pipelines.")
+        if self.has_transformer_2 or self.transformer_2 is not None:
+            raise ValueError("Wan step execution currently supports single-transformer checkpoints only.")
+
+        sampling = state.sampling
+        prompt, prompt_embeds, negative_prompt, negative_prompt_embeds, has_image = self._step_prompt_fields(
+            state.prompt
+        )
+        if has_image:
+            raise ValueError("Wan step execution currently supports text-only T2V requests.")
+
+        guidance_low, guidance_high = resolve_wan_guidance_scales(sampling, default_guidance_scale=4.0)
+        do_true_cfg = guidance_low > 1.0 or guidance_high > 1.0
+        if pp_group is not None and do_true_cfg:
+            raise ValueError("Wan step execution does not yet support classifier-free guidance with PP>1.")
+
+        height, width, num_frames = self._prepare_generation_geometry(sampling)
+
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else sampling.boundary_ratio
+        if boundary_ratio is None:
+            boundary_ratio = 0.875
+        dtype = self._step_model_dtype()
+        num_outputs = sampling.num_outputs_per_prompt or 1
+        num_prompts = len(prompt) if isinstance(prompt, list) else 1
+        if prompt_embeds is None:
+            latent_batch_size = num_prompts * num_outputs
+        elif prompt_embeds.ndim == 2:
+            latent_batch_size = num_outputs
+        elif prompt_embeds.ndim == 3:
+            latent_batch_size = prompt_embeds.shape[0] * num_outputs
+        else:
+            raise ValueError("Wan prompt_embeds must be a 2D or 3D tensor.")
+
+        conditioning_owner = pp_group is None or pp_group.is_first_rank
+        if conditioning_owner:
+            prompt_embeds, negative_prompt_embeds = self._prepare_prompt_conditioning(
+                prompt=prompt,
+                prompt_embeds=prompt_embeds,
+                negative_prompt=negative_prompt,
+                negative_prompt_embeds=negative_prompt_embeds,
+                do_classifier_free_guidance=do_true_cfg,
+                num_outputs_per_prompt=num_outputs,
+                num_prompts=num_prompts,
+                max_sequence_length=sampling.max_sequence_length or 512,
+                height=height,
+                width=width,
+                guidance_high=guidance_high,
+                boundary_ratio=boundary_ratio,
+                dtype=dtype,
+            )
+            latent_batch_size = prompt_embeds.shape[0]
+        else:
+            prompt_embeds = None
+            negative_prompt_embeds = None
+
+        num_steps = 40 if sampling.num_inference_steps is None else sampling.num_inference_steps
+        scheduler, timesteps, _, _ = self._prepare_request_scheduler(sampling, num_steps)
+
+        latents = self._prepare_step_latents(
+            batch_size=latent_batch_size,
+            num_channels_latents=self.transformer_config.in_channels,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            dtype=torch.float32,
+            generator=sampling.generator,
+            request_latents=sampling.latents,
+            pp_group=pp_group,
+        )
+
+        state.prompt_embeds = prompt_embeds
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = scheduler
+        state.do_true_cfg = do_true_cfg
+        state.extra.update(
+            {
+                "wan_boundary_timestep": boundary_ratio * scheduler.config.num_train_timesteps,
+                "wan_dtype": dtype,
+                "wan_guidance_high": guidance_high,
+                "wan_guidance_low": guidance_low,
+            }
+        )
+        self._num_timesteps = len(timesteps)
+        return state
+
+    def prepare_encode(
+        self,
+        state: StepRequestState,
+        **kwargs: Any,
+    ) -> StepRequestState:
+        """Prepare one Wan request and broadcast latents after all ranks agree."""
+        pp_group = get_pp_group() if get_pipeline_parallel_world_size() > 1 else None
+        local_error: Exception | None = None
+        try:
+            self._prepare_encode_local(state, pp_group, **kwargs)
+        except Exception as exc:
+            local_error = exc
+
+        if pp_group is None:
+            if local_error is not None:
+                raise local_error
+            if state.prompt_embeds is None or state.latents is None:
+                raise RuntimeError("Wan step preparation completed without conditioning or latents.")
+            state.txt_seq_lens = [int(state.prompt_embeds.shape[1])] * int(state.prompt_embeds.shape[0])
+            state.negative_txt_seq_lens = (
+                [int(state.negative_prompt_embeds.shape[1])] * int(state.negative_prompt_embeds.shape[0])
+                if state.negative_prompt_embeds is not None
+                else None
+            )
+            return state
+
+        local_status = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+        preparation_statuses: list[str | None] = [None] * pp_group.world_size
+        torch.distributed.all_gather_object(
+            preparation_statuses,
+            local_status,
+            group=pp_group.cpu_group,
+        )
+        failures = [f"rank {rank}: {status}" for rank, status in enumerate(preparation_statuses) if status is not None]
+        if failures:
+            raise RuntimeError(
+                "Wan step preparation failed before latent broadcast: " + "; ".join(failures)
+            ) from local_error
+
+        if state.latents is None:
+            raise RuntimeError("Wan step preparation completed without latents.")
+        broadcast_state = pp_group.broadcast_tensor_dict(
+            {
+                "prompt_embeds": state.prompt_embeds,
+                "negative_prompt_embeds": state.negative_prompt_embeds,
+                "latents": state.latents,
+            }
+            if pp_group.is_first_rank
+            else None,
+            src=0,
+        )
+        if broadcast_state is None:
+            raise RuntimeError("Wan step preparation broadcast returned no rank-local state.")
+        state.prompt_embeds = broadcast_state["prompt_embeds"]
+        state.negative_prompt_embeds = broadcast_state["negative_prompt_embeds"]
+        state.latents = broadcast_state["latents"]
+        state.txt_seq_lens = [int(state.prompt_embeds.shape[1])] * int(state.prompt_embeds.shape[0])
+        state.negative_txt_seq_lens = (
+            [int(state.negative_prompt_embeds.shape[1])] * int(state.negative_prompt_embeds.shape[0])
+            if state.negative_prompt_embeds is not None
+            else None
+        )
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Run one Wan transformer step using request-local state."""
+        del kwargs
+        positive_kwargs, negative_kwargs, do_true_cfg, active_guidance = self._prepare_step_forward(
+            input_batch,
+            states=states,
+        )
+        return self.predict_noise_maybe_with_cfg(
+            do_true_cfg=do_true_cfg,
+            true_cfg_scale=active_guidance,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+
+    def _prepare_step_forward(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, bool, float | torch.Tensor]:
+        """Build one step's model kwargs without executing or communicating."""
+        states = tuple(states or input_batch.states)
+        if not states:
+            raise ValueError("Wan denoise_step requires at least one request state.")
+        if input_batch.prompt_embeds is None:
+            raise ValueError("Wan denoise_step requires prompt embeddings.")
+
+        boundaries = {float(state.extra["wan_boundary_timestep"]) for state in states}
+        guidance_lows = {float(state.extra["wan_guidance_low"]) for state in states}
+        guidance_highs = {float(state.extra["wan_guidance_high"]) for state in states}
+        dtypes = {state.extra["wan_dtype"] for state in states}
+        if len(boundaries) != 1 or len(guidance_lows) != 1 or len(guidance_highs) != 1 or len(dtypes) != 1:
+            raise ValueError("Wan step batch contains incompatible request-local execution settings.")
+
+        timestep = input_batch.timesteps
+        self._current_timestep = timestep
+        current_model, _ = self._select_transformer(
+            timestep,
+            boundary_timestep=next(iter(boundaries)),
+            guidance_low=next(iter(guidance_lows)),
+            guidance_high=next(iter(guidance_highs)),
+        )
+        boundary_timestep = next(iter(boundaries))
+        guidance_low = next(iter(guidance_lows))
+        guidance_high = next(iter(guidance_highs))
+        guidance_by_row = torch.where(
+            timestep.reshape(-1) < boundary_timestep,
+            torch.as_tensor(guidance_high, device=timestep.device, dtype=torch.float32),
+            torch.as_tensor(guidance_low, device=timestep.device, dtype=torch.float32),
+        )
+        do_true_cfg = bool(torch.any(guidance_by_row > 1.0))
+        if do_true_cfg and input_batch.negative_prompt_embeds is None:
+            raise ValueError("Wan CFG step execution requires negative prompt embeddings.")
+        effective_guidance = torch.where(guidance_by_row > 1.0, guidance_by_row, torch.ones_like(guidance_by_row))
+        if effective_guidance.numel() == 1 or bool(torch.all(effective_guidance == effective_guidance[0])):
+            active_guidance: float | torch.Tensor = float(effective_guidance[0])
+        else:
+            active_guidance = effective_guidance.reshape(
+                effective_guidance.shape[0],
+                *([1] * (input_batch.latents.ndim - 1)),
+            )
+        positive_kwargs = self._build_denoise_kwargs(
+            latents=input_batch.latents,
+            timestep=timestep,
+            prompt_embeds=input_batch.prompt_embeds,
+            dtype=next(iter(dtypes)),
+            attention_kwargs={},
+            current_model=current_model,
+        )
+        negative_kwargs = (
+            self._build_denoise_kwargs(
+                latents=input_batch.latents,
+                timestep=timestep,
+                prompt_embeds=input_batch.negative_prompt_embeds,
+                dtype=next(iter(dtypes)),
+                attention_kwargs={},
+                current_model=current_model,
+            )
+            if do_true_cfg
+            else None
+        )
+        return positive_kwargs, negative_kwargs, do_true_cfg, active_guidance
+
+    def validate_pipeline_stage_execution(self, pp_stage_spec: Any) -> None:
+        actual_world_size = get_pipeline_parallel_world_size()
+        actual_rank = get_pipeline_parallel_rank()
+        actual_is_first = is_pipeline_first_stage()
+        actual_is_last = is_pipeline_last_stage()
+        if actual_world_size != 2 or pp_stage_spec.world_size != actual_world_size:
+            raise ValueError("Wan queued pipeline execution currently requires exactly two stages.")
+        if pp_stage_spec.pp_stage_id != actual_rank:
+            raise ValueError(
+                f"Wan queued pipeline stage id {pp_stage_spec.pp_stage_id} does not match PP rank {actual_rank}."
+            )
+        if pp_stage_spec.is_first != actual_is_first or pp_stage_spec.is_last != actual_is_last:
+            raise ValueError("Wan queued pipeline stage endpoint flags do not match the initialized PP topology.")
+
+    def forward_pipeline_stage(
+        self,
+        input_batch: InputBatch,
+        *,
+        pp_stage_spec: Any,
+        intermediate_tensors: IntermediateTensors | None,
+        states: Sequence[StepRequestState] | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        """Run one Wan PP partition without transport or scheduler feedback."""
+        self.validate_pipeline_stage_execution(pp_stage_spec)
+        positive_kwargs, negative_kwargs, do_true_cfg, _ = self._prepare_step_forward(
+            input_batch,
+            states=states,
+        )
+        if do_true_cfg or negative_kwargs is not None:
+            raise ValueError("Wan queued pipeline execution does not support classifier-free guidance.")
+        return self.predict_noise(
+            **positive_kwargs,
+            intermediate_tensors=intermediate_tensors,
+            return_conditioning=pp_stage_spec.is_first,
+        )
+
+    def step_scheduler(
+        self,
+        state: StepRequestState,
+        noise_pred: torch.Tensor | None,
+        **kwargs: Any,
+    ) -> None:
+        """Apply exactly one request-local scheduler update and advance progress."""
+        del kwargs
+        timestep = state.current_timestep
+        if timestep is None or state.latents is None or state.scheduler is None:
+            raise ValueError(f"Wan request {state.request_id} is not ready for a scheduler step.")
+        state.latents = self.scheduler_step_maybe_with_cfg(
+            noise_pred,
+            timestep,
+            state.latents,
+            state.do_true_cfg,
+            per_request_scheduler=state.scheduler,
+            generator=None,
+        )
+        state.step_index += 1
+
+    def step_scheduler_pipeline_stage(
+        self,
+        state: StepRequestState,
+        noise_pred: torch.Tensor,
+    ) -> None:
+        """Apply one queued last-stage update without static PP feedback."""
+        timestep = state.current_timestep
+        if timestep is None or state.latents is None or state.scheduler is None:
+            raise ValueError(f"Wan request {state.request_id} is not ready for a scheduler step.")
+        if state.do_true_cfg:
+            raise ValueError("Wan queued pipeline execution does not support classifier-free guidance.")
+        state.latents = CFGParallelMixin.scheduler_step(
+            self,
+            noise_pred,
+            timestep,
+            state.latents,
+            per_request_scheduler=state.scheduler,
+            generator=None,
+        )
+        state.step_index += 1
+
+    @staticmethod
+    def _materialize_latents(latents: torch.Tensor | AsyncLatents) -> torch.Tensor:
+        return latents.resolve() if isinstance(latents, AsyncLatents) else latents
+
+    def _decode_latents(
+        self,
+        latents: torch.Tensor | AsyncLatents,
+        output_type: str,
+    ) -> DiffusionOutput:
+        latents = self._materialize_latents(latents)
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        if output_type == "latent":
+            return DiffusionOutput(output=latents, stage_durations=stage_durations)
+
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        decoded = self.vae.decode(latents / latents_std + latents_mean, return_dict=False)[0]
+        if decoded is None:
+            return DiffusionOutput(stage_durations=stage_durations)
+        if decoded.dim() == 5:
+            return DiffusionOutput(
+                media=DiffusionMediaOutput(
+                    video=VideoMediaOutput(
+                        tensor=decoded,
+                        spec=VideoTensorSpec(
+                            layout=VideoTensorLayout.BCTHW,
+                            encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                            value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                        ),
+                    )
+                ),
+                stage_durations=stage_durations,
+            )
+        return DiffusionOutput(output=decoded, stage_durations=stage_durations)
+
+    def post_decode(
+        self,
+        state: StepRequestState,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Decode the final request-local Wan latents."""
+        if state.latents is None:
+            raise ValueError(f"Wan request {state.request_id} has no latents to decode.")
+        if not kwargs.get("queued_pipeline", False):
+            self._current_timestep = None
+        if current_omni_platform.is_available() and not kwargs.get("queued_pipeline", False):
+            current_omni_platform.empty_cache()
+
+        state.latents = self._materialize_latents(state.latents)
+        output_type = kwargs.get("output_type") or state.sampling.output_type or "np"
+        return self._decode_latents(state.latents, output_type)
+
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
@@ -696,24 +1316,12 @@ class Wan22Pipeline(
         )
         prompt_embeds = prompt_fields["prompt_embeds"]
         negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
-        prompt: list[str] | None = prompt_texts if prompt_embeds is None else None
+        prompt: list[str] | None = prompt_texts
         negative_prompt: list[str] | None = None
-        if negative_prompt_embeds is None and any(value is not None for value in negative_prompts):
+        if any(value is not None for value in negative_prompts):
             negative_prompt = [value or "" for value in negative_prompts]
 
-        if prompt is not None and not all(prompt):
-            raise ValueError("Prompt is required for Wan2.2 generation when prompt_embeds are not provided.")
-
-        height = common.height or 480
-        width = common.width or 832
-        num_frames = common.num_frames or 81
-
-        # Ensure dimensions are compatible with VAE and patch size
-        # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
-        patch_size = self.transformer_config.patch_size
-        mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
-        height = (height // mod_value) * mod_value
-        width = (width // mod_value) * mod_value
+        height, width, num_frames = self._prepare_generation_geometry(common)
         if self.is_dmd:
             # The checkpoint was distilled for these three transitions. Ignore
             # request-level step counts, including the engine's 1-step warmup.
@@ -722,8 +1330,6 @@ class Wan22Pipeline(
             num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
         output_type = common.output_type or "np"
-        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
-        preencode_batch_frames = resolve_wan_preencode_batch_frames(common) if preencode_mp4 else 17
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
@@ -742,22 +1348,6 @@ class Wan22Pipeline(
         if boundary_ratio is None:
             boundary_ratio = 0.875
             logger.warning("boundary_ratio is required for T2V generation. using default value 0.875")
-
-        # validate shapes
-        self.check_inputs(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
-            boundary_ratio=boundary_ratio,
-        )
-
-        if num_frames % self.vae_scale_factor_temporal != 1:
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
-        num_frames = max(num_frames, 1)
 
         device = self.device
         # Get dtype from whichever transformer is loaded
@@ -778,32 +1368,21 @@ class Wan22Pipeline(
             _t_pipeline_start = time.perf_counter()
             _t_text_enc_start = _t_pipeline_start
         do_classifier_free_guidance = guidance_low > 1.0 or guidance_high > 1.0
-        if prompt_embeds is None:
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=do_classifier_free_guidance,
-                num_videos_per_prompt=num_outputs_per_prompt,
-                max_sequence_length=common.max_sequence_length or 512,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
-            prompt_embeds = prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
-            if negative_prompt_embeds is not None:
-                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
-                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
-            elif do_classifier_free_guidance:
-                _, negative_prompt_embeds = self.encode_prompt(
-                    prompt=[""] * req.num_reqs,
-                    negative_prompt=negative_prompt,
-                    do_classifier_free_guidance=True,
-                    num_videos_per_prompt=num_outputs_per_prompt,
-                    max_sequence_length=common.max_sequence_length or 512,
-                    device=device,
-                    dtype=dtype,
-                )
+        prompt_embeds, negative_prompt_embeds = self._prepare_prompt_conditioning(
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt=negative_prompt,
+            negative_prompt_embeds=negative_prompt_embeds,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            num_outputs_per_prompt=num_outputs_per_prompt,
+            num_prompts=req.num_reqs,
+            max_sequence_length=common.max_sequence_length or 512,
+            height=height,
+            width=width,
+            guidance_high=guidance_high,
+            boundary_ratio=boundary_ratio,
+            dtype=dtype,
+        )
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -812,19 +1391,10 @@ class Wan22Pipeline(
         if self.is_dmd:
             timesteps = torch.tensor(FASTWAN_DMD_TIMESTEPS, device=device, dtype=torch.float32)
         else:
-            first_request = req.requests[0]
-            sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
-            flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
-            if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-                self._sample_solver = sample_solver
-                self._flow_shift = flow_shift
-
-            if sample_solver == "unipc":
-                self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
-            else:
-                self.scheduler.set_timesteps(num_steps, device=device)
-            timesteps = self.scheduler.timesteps
+            self.scheduler, timesteps, self._sample_solver, self._flow_shift = self._prepare_request_scheduler(
+                common,
+                num_steps,
+            )
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
@@ -964,50 +1534,7 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
-        media = None
-        if output_type == "latent":
-            output = latents
-        else:
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            if preencode_mp4:
-                output = decode_to_mp4(
-                    self.vae,
-                    latents,
-                    fps=resolve_wan_output_fps(common),
-                    batch_frames=preencode_batch_frames,
-                    video_codec_options=resolve_wan_video_codec_options(common),
-                )
-            else:
-                decoded = self.vae.decode(latents, return_dict=False)[0]
-                # Distributed VAE decode uses broadcast_result=False, so only the
-                # output-owning rank receives the full [B, C, T, H, W] video; other
-                # ranks get an empty placeholder. Emit typed media only from the
-                # owning rank and keep the placeholder on the legacy output field, so
-                # the media batch-dimension check in split_diffusion_output_by_request
-                # does not trip on every non-owner rank.
-                if decoded.dim() == 5:
-                    output = None
-                    media = DiffusionMediaOutput(
-                        video=VideoMediaOutput(
-                            tensor=decoded,
-                            spec=VideoTensorSpec(
-                                layout=VideoTensorLayout.BCTHW,
-                                encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
-                                value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
-                            ),
-                        )
-                    )
-                else:
-                    output = decoded
+        decoded_output = self._decode_latents(latents, output_type)
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -1032,11 +1559,7 @@ class Wan22Pipeline(
                 )
 
         return split_diffusion_output_by_request(
-            DiffusionOutput(
-                output=output,
-                media=media,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            ),
+            decoded_output,
             req,
             num_outputs_per_prompt=num_outputs_per_prompt,
         )

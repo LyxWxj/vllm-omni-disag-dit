@@ -490,6 +490,10 @@ class StageDeployConfig:
     video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None
+    mode: str | None = None
+    max_inflight_batches: int | None = None
+    edge_buffer_slots: int | None = None
+    stage_buffer_bytes: int | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
     vae_fast_path: str | None = None

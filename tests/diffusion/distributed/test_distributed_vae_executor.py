@@ -85,10 +85,10 @@ def mock_dist(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
-def mock_world_group(monkeypatch: pytest.MonkeyPatch):
+def mock_vae_group(monkeypatch: pytest.MonkeyPatch):
     group = object()
     monkeypatch.setattr(
-        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_world_group",
+        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_vae_group",
         lambda: FakeWorldGroup(device_group=group),
     )
     return group
@@ -105,9 +105,9 @@ def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
 # ============================
 
 
-def test_uses_dedicated_world_device_group(mock_world_group):
+def test_uses_vae_device_group(mock_vae_group):
     executor = DistributedVaeExecutor()
-    assert executor.group is mock_world_group
+    assert executor.group is mock_vae_group
 
 
 def test_balance_tasks():
