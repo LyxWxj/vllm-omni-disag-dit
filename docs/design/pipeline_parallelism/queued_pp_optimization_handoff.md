@@ -148,6 +148,7 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 - 本阶段继续在 `worker_runtime.py` 集中 send ticket、receive reservation、started receive identity、consumer lease 和 pending message queues；Worker transport 方法仍通过兼容属性访问这些 owner state。迁移后 Worker/Engine/retirement suite 仍为 `129 passed`。
 - 本阶段新增 `PipelineTransportRuntime`，将 reserve/send、offer readiness、grant start、send retirement、bounded receive polling、receive lease release 和取消时的未启动 transfer 清理集中到 `worker_runtime.py`；`DiffusionWorker` 保留原 RPC 方法名和 StageEngine 调用顺序作为薄适配层。远端完整 queued correctness focused suite 为 `302 passed, 15 warnings`。
 - 本阶段新增 `tests/helpers/queued_pipeline.py`，共享单副本 transfer coordinator 和 metadata-only offer factory；connector 与 executor 测试删除重复拓扑构造，同时保留各自的 fake Worker、executor state 和错误清理断言。迁移后的完整 queued correctness 相关集合为 `368 passed, 15 warnings`。
+- 本阶段将 executor 两套重复的 transfer batch cancel/retire/readiness 实现下沉到 `DiffusionExecutor` 公共层，并增加两个后端共用的生命周期 contract 测试；远端 executor/worker/engine/connector 集合为 `215 passed, 15 warnings`，实现净减少 12 行。
 
 ### 1. 建立 queued PP 专用模块边界
 
@@ -225,4 +226,4 @@ VAE1 模式下，Engine 根据各 rank 当前 outstanding finalization 数量在
 - 不把 TextEncoder 或 VAE 的通用模型代码搬进 queued PP 模块。
 - 不为了减少行数删除 numerical validation、transport identity、device event、取消和 fatal recovery 检查。
 
-推荐的下一次提交审查并删除已经被最终 `PipelineStageEngine` 覆盖的旧 prototype 和 queue snapshot 测试；保留 task identity、credit、device event、stale identity 和 failure cleanup contract 的 observable assertions。
+推荐的下一次提交继续审查已经被最终 `PipelineStageEngine` 覆盖的旧 prototype 和 queue snapshot 测试；保留 task identity、credit、device event、stale identity 和 failure cleanup contract 的 observable assertions。
