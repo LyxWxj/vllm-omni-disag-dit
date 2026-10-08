@@ -319,6 +319,12 @@ class QueuedWorkerRuntime:
             return helper(operation, func)
         return _run_and_gather_rank_values(operation, func)
 
+    def _all_gather_rank_values(self, value: Any) -> list[Any]:
+        helper = getattr(self.owner, "_all_gather_rank_values", None)
+        if callable(helper):
+            return helper(value)
+        return _all_gather_rank_values(value)
+
     def _get_pp_group(self) -> Any:
         helper = getattr(self.owner, "_get_pp_group", None)
         if callable(helper):
@@ -1109,7 +1115,7 @@ class QueuedWorkerRuntime:
         distributed_vae_requested = int(getattr(parallel, "vae_patch_parallel_size", 1) or 1) > 1
         if distributed_vae_requested:
             local: dict[str, Any] = {}
-            pp_group = get_pp_group()
+            pp_group = self._get_pp_group()
             expected_stage_ranks = dict(enumerate(pp_group.ranks))
             if output_rank is None:
                 output_rank = expected_stage_ranks[0]
@@ -1165,7 +1171,7 @@ class QueuedWorkerRuntime:
                 return_handle = should_finalize
                 output_rank = self.rank if should_finalize else None
             else:
-                pp_group = get_pp_group()
+                pp_group = self._get_pp_group()
                 if type(output_rank) is not int or output_rank not in pp_group.ranks:
                     raise ValueError("queued finalization output rank must belong to the PP group")
                 should_finalize = self.rank == output_rank
@@ -1277,7 +1283,7 @@ class QueuedWorkerRuntime:
 
     def pipeline_stage_memory_budget_bytes(self) -> list[dict[str, int]]:
         local_report = {"rank": self.rank, "free_bytes": int(current_omni_platform.get_free_memory(self.device))}
-        pp_group = get_pp_group()
+        pp_group = self._get_pp_group()
         if pp_group.world_size == 1:
             return [local_report]
         reports: list[dict[str, int] | None] = [None] * pp_group.world_size
@@ -1286,7 +1292,7 @@ class QueuedWorkerRuntime:
 
     def poll_pipeline_events_all_ranks(self) -> list[PipelineEvent]:
         """Clear every rank's queue and return all events on the reply rank."""
-        rank_events = _all_gather_rank_values(self.poll_pipeline_events())
+        rank_events = self._all_gather_rank_values(self.poll_pipeline_events())
         return [event for events in rank_events for event in events]
 
     def cancel_pipeline_requests(self, request_generations: Any) -> list[PipelineEvent]:

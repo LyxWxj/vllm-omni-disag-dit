@@ -314,6 +314,9 @@ class DiffusionWorker:
     def _run_and_gather_rank_values(self, operation: str, func: Callable[[], Any]) -> list[Any]:
         return _run_and_gather_rank_values(operation, func)
 
+    def _all_gather_rank_values(self, value: Any) -> list[Any]:
+        return _all_gather_rank_values(value)
+
     def _get_pp_group(self) -> Any:
         return get_pp_group()
 
@@ -937,6 +940,24 @@ class DiffusionWorker:
         pending_offers: tuple[PipelineTransferOffer, ...] = (),
     ) -> tuple[PipelineTransportProgress, list[Any]]:
         return self._get_queued_worker_runtime().progress_pipeline_transfers_and_poll_events(pending_offers)
+
+    def _make_pipeline_transfer_offer(
+        self,
+        task: PipelineTask,
+        edge_kind: PipelineEdgeKind,
+        payload: dict[str, Any] | None = None,
+    ) -> PipelineTransferOffer:
+        return self._get_queued_worker_runtime()._make_pipeline_transfer_offer(task, edge_kind, payload)
+
+    def poll_pipeline_received(
+        self,
+        edge_kind: PipelineEdgeKind,
+        limit: int = 1,
+    ) -> list[PipelineMessage]:
+        return self._get_queued_worker_runtime().poll_pipeline_received(edge_kind, limit)
+
+    def release_pipeline_received(self, edge_kind: PipelineEdgeKind, message: PipelineMessage) -> None:
+        return self._get_queued_worker_runtime().release_pipeline_received(edge_kind, message)
 
     def enqueue_pipeline_batch(
         self,
