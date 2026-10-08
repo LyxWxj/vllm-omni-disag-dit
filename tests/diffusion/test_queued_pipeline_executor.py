@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from tests.helpers.queued_pipeline import pipeline_coordinator as _coordinator
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
     PipelineEndpointCompletion,
-    PipelineTransferCoordinator,
     PipelineTransferOffer,
     PipelineTransportProgress,
 )
@@ -36,15 +36,6 @@ def _initialize_transfers(executor, activation_edges=None, *, max_slots=1):
     activation_edges = {(0, 1)} if activation_edges is None else set(activation_edges)
     feedback_edges = {(dst, src) for src, dst in activation_edges}
     return executor.initialize_pipeline_transfers(activation_edges, feedback_edges, max_slots=max_slots)
-
-
-def _coordinator(activation_edges=None):
-    activation_edges = {(0, 1)} if activation_edges is None else set(activation_edges)
-    feedback_edges = {(dst, src) for src, dst in activation_edges}
-    return PipelineTransferCoordinator(
-        activation_edges=activation_edges,
-        feedback_edges=feedback_edges,
-    )
 
 
 @pytest.fixture(params=[MultiprocDiffusionExecutor, UniProcDiffusionExecutor])

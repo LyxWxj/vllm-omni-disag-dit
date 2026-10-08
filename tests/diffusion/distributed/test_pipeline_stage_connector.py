@@ -4,6 +4,8 @@
 import pytest
 import torch
 
+from tests.helpers.queued_pipeline import pipeline_coordinator as _coordinator
+from tests.helpers.queued_pipeline import pipeline_offer as _offer
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     DistributedP2PTransport,
     PipelineEdgeKind,
@@ -17,31 +19,6 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
 from vllm_omni.diffusion.distributed.transport_schema import TensorMetadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
-
-
-def _coordinator(activation_edge: tuple[int, int] = (0, 1)) -> PipelineTransferCoordinator:
-    return PipelineTransferCoordinator(
-        activation_edges={activation_edge},
-        feedback_edges={(activation_edge[1], activation_edge[0])},
-    )
-
-
-def _offer(
-    batch_id: str,
-    *,
-    edge_kind: PipelineEdgeKind = PipelineEdgeKind.ACTIVATION,
-    src_rank: int = 0,
-    dst_rank: int = 1,
-) -> PipelineTransferOffer:
-    return PipelineTransferOffer(
-        batch_id=batch_id,
-        step_index=0,
-        epoch=1,
-        branch="conditional",
-        edge_kind=edge_kind,
-        src_rank=src_rank,
-        dst_rank=dst_rank,
-    )
 
 
 def test_transfer_requires_offer_and_receive_readiness() -> None:
