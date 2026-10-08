@@ -87,7 +87,12 @@ from vllm_omni.diffusion.ipc import (
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
-from vllm_omni.diffusion.queued_pp.worker_runtime import PipelineFinalizationState, PipelineTransportState
+from vllm_omni.diffusion.queued_pp.worker_runtime import (
+    PIPELINE_CONSUMER_EVENT_FAILED,
+    PipelineFinalizationState,
+    PipelineTransportRuntime,
+    PipelineTransportState,
+)
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -131,7 +136,7 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 _PIPELINE_PREPARATION_METHODS = frozenset({"prepare_pipeline_requests_all_ranks"})
-_PIPELINE_CONSUMER_EVENT_FAILED = object()
+_PIPELINE_CONSUMER_EVENT_FAILED = PIPELINE_CONSUMER_EVENT_FAILED
 
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
@@ -297,6 +302,13 @@ class DiffusionWorker:
             state = PipelineTransportState()
             self._pipeline_transport_state = state
         return state
+
+    def _get_pipeline_transport_runtime(self) -> PipelineTransportRuntime:
+        runtime = getattr(self, "_pipeline_transport_runtime", None)
+        if runtime is None:
+            runtime = PipelineTransportRuntime(self)
+            self._pipeline_transport_runtime = runtime
+        return runtime
 
     @property
     def _pipeline_finalization_futures(self) -> dict[str, Future[Any]]:
@@ -901,60 +913,10 @@ class DiffusionWorker:
         )
 
     def reserve_pipeline_send(self, offer: PipelineTransferOffer, payload: dict[str, Any]) -> PipelineTransferOffer:
-        """Reserve sender credit and payload without starting communication."""
-        if self.rank != offer.src_rank:
-            raise ValueError("only the transfer source can reserve a pipeline send")
-        if not isinstance(payload, dict):
-            raise TypeError("pipeline send payload must be a tensor dictionary")
-        connector = self._require_pipeline_connector(offer.edge_kind)
-        if offer.identity in self.pipeline_send_tickets:
-            raise ValueError("pipeline transfer send is already reserved")
-        message = PipelineMessage(
-            batch_id=offer.batch_id,
-            step_index=offer.step_index,
-            epoch=offer.epoch,
-            branch=offer.branch,
-            payload=payload,
-        )
-        self.pipeline_send_tickets[offer.identity] = connector.enqueue_send(message)
-        return offer
+        return self._get_pipeline_transport_runtime().reserve_send(offer, payload)
 
     def accept_pipeline_transfer_offer(self, offer: PipelineTransferOffer) -> bool:
-        """Check sender ownership and reserve receive credit, if currently available."""
-        if self.rank not in {offer.src_rank, offer.dst_rank}:
-            return True
-        connector = self._require_pipeline_connector(offer.edge_kind)
-        if self.rank == offer.src_rank:
-            ticket = self.pipeline_send_tickets.get(offer.identity)
-            if ticket is None:
-                raise KeyError("pipeline transfer offer has no reserved sender ticket")
-            if ticket.started or ticket.released:
-                raise RuntimeError("pipeline sender ticket is not available for a new grant")
-            message = ticket.message
-            if not isinstance(message.payload, dict):
-                raise TypeError("pipeline sender payload must be a tensor dictionary")
-            if (message.batch_id, message.step_index, message.epoch, message.branch) != (
-                offer.batch_id,
-                offer.step_index,
-                offer.epoch,
-                offer.branch,
-            ):
-                raise ValueError("pipeline sender ticket identity does not match the transfer offer")
-        else:
-            if offer.identity in self.pipeline_receive_reservations:
-                if self.pipeline_receive_reservations[offer.identity] is not offer.edge_kind:
-                    raise ValueError("pipeline receive reservation has a different edge kind")
-                return True
-            if offer.identity in self.pipeline_receive_consumers:
-                raise ValueError("pipeline receive transfer is still owned by its stage consumer")
-            reserved = sum(edge_kind is offer.edge_kind for edge_kind in self.pipeline_receive_reservations.values())
-            # The reservation covers the transport receive slot only. Once a
-            # message is handed to the stage, its tensor remains tracked by a
-            # separate compute lease and no longer blocks another receive.
-            if reserved >= connector.max_slots:
-                return False
-            self.pipeline_receive_reservations[offer.identity] = offer.edge_kind
-        return True
+        return self._get_pipeline_transport_runtime().accept_offer(offer)
 
     def accept_pipeline_transfer_offer_all_ranks(self, offer: PipelineTransferOffer) -> bool:
         """Return false for temporary receive backpressure; raise on invalid readiness."""
@@ -988,58 +950,22 @@ class DiffusionWorker:
         return {"rank": self.rank, "readiness": readiness}
 
     def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
-        """Start only this Worker's endpoint after the Executor grants it."""
-        offer = grant.offer
-        if self.rank not in {offer.src_rank, offer.dst_rank}:
-            return True
-        connector = self._require_pipeline_connector(offer.edge_kind)
-        if self.rank == offer.src_rank:
-            ticket = self.pipeline_send_tickets.get(offer.identity)
-            if ticket is None:
-                raise KeyError("pipeline transfer grant has no reserved sender ticket")
-            connector.start_granted_send(ticket, grant)
-        else:
-            if offer.identity not in self.pipeline_receive_reservations:
-                raise KeyError("pipeline transfer grant has no reserved receive credit")
-            if offer.identity in self.pipeline_started_receive_ids:
-                raise ValueError("pipeline transfer receive has already started")
-            transport = connector.transport
-            if not isinstance(transport, DistributedP2PTransport):
-                raise RuntimeError("pipeline destination does not use distributed P2P transport")
-            self.pipeline_started_receive_ids.add(offer.identity)
-            transport.start_granted_transfer(grant)
-        return True
+        return self._get_pipeline_transport_runtime().start_transfer(grant)
 
     def retire_pipeline_send(self, identity: tuple[Any, ...]) -> bool:
-        """Wait, release connector credit, and drop the retained tensor payload."""
-        ticket = self.pipeline_send_tickets.get(identity)
-        if ticket is None:
-            raise KeyError("unknown pipeline send reservation")
-        if len(identity) < 5 or not isinstance(identity[4], PipelineEdgeKind):
-            raise ValueError("invalid pipeline transfer identity")
-        connector = self._require_pipeline_connector(identity[4])
-        connector.wait_send_completion(ticket)
-        connector.release_send(ticket)
-        self.pipeline_send_tickets.pop(identity)
-        return True
+        return self._get_pipeline_transport_runtime().retire_send(identity)
 
     def progress_pipeline_transfers(self) -> PipelineTransportProgress:
         """Advance one local FIFO compute task and bounded transport work."""
         progress = PipelineTransportProgress(rank=self.rank)
+        transport_runtime = self._get_pipeline_transport_runtime()
 
-        for identity, ticket in list(self.pipeline_send_tickets.items()):
-            connector = self._require_pipeline_connector(identity[4])
-            if connector.poll_send_completion(ticket):
-                connector.release_send(ticket)
-                self.pipeline_send_tickets.pop(identity)
-                progress.completions.append(PipelineEndpointCompletion(identity=identity, rank=self.rank))
+        transport_runtime.poll_completed_sends(progress)
 
         self._release_completed_pipeline_consumers(progress)
 
         for edge_kind in (PipelineEdgeKind.FEEDBACK, PipelineEdgeKind.ACTIVATION):
-            connector = self._require_pipeline_connector(edge_kind)
-            for message in connector.poll_received(limit=1):
-                self.pipeline_pending_received[edge_kind].append(message)
+            transport_runtime.poll_received_into_pending(edge_kind)
             self._consume_ready_pipeline_message(edge_kind, progress)
 
         self._release_completed_pipeline_consumers(progress)
@@ -1340,50 +1266,28 @@ class DiffusionWorker:
             )
 
     def _release_completed_pipeline_consumers(self, progress: PipelineTransportProgress) -> None:
-        for identity, (edge_kind, message, event) in list(self.pipeline_receive_consumers.items()):
-            if event is _PIPELINE_CONSUMER_EVENT_FAILED:
-                continue
-            if event is not None and not event.query():
-                continue
-            self.pipeline_receive_consumers.pop(identity)
+        del progress
+        self._get_pipeline_transport_runtime().release_completed_consumers()
 
     def _find_pipeline_receive_reservation(
         self,
         edge_kind: PipelineEdgeKind,
         message: PipelineMessage,
     ) -> tuple[Any, ...]:
-        identity = (message.batch_id, message.step_index, message.epoch, message.branch)
-        matching = [
-            key
-            for key, reserved_edge in self.pipeline_receive_reservations.items()
-            if key[:4] == identity and reserved_edge is edge_kind
-        ]
-        if len(matching) != 1:
-            raise RuntimeError("pipeline receive message has no unique reservation")
-        return matching[0]
+        return self._get_pipeline_transport_runtime().find_receive_reservation(edge_kind, message)
 
     def poll_pipeline_received(
         self,
         edge_kind: PipelineEdgeKind,
         limit: int = 1,
     ) -> list[PipelineMessage]:
-        return self._require_pipeline_connector(edge_kind).poll_received(limit=limit)
+        return self._get_pipeline_transport_runtime().poll_received(edge_kind, limit)
 
     def release_pipeline_received(self, edge_kind: PipelineEdgeKind, message: PipelineMessage) -> None:
-        connector = self._require_pipeline_connector(edge_kind)
-        identity = (message.batch_id, message.step_index, message.epoch, message.branch)
-        matching = [key for key in self.pipeline_receive_reservations if key[:4] == identity]
-        if len(matching) != 1 or self.pipeline_receive_reservations[matching[0]] is not edge_kind:
-            raise RuntimeError("pipeline receive reservation does not match released message")
-        connector.release_received(message)
-        self.pipeline_receive_reservations.pop(matching[0])
-        self.pipeline_started_receive_ids.discard(matching[0])
+        self._get_pipeline_transport_runtime().release_received(edge_kind, message)
 
     def _require_pipeline_connector(self, edge_kind: PipelineEdgeKind) -> PipelineStageConnector:
-        connector = self.pipeline_connectors.get(edge_kind)
-        if connector is None:
-            raise RuntimeError(f"pipeline connector {edge_kind.value!r} is not initialized")
-        return connector
+        return self._get_pipeline_transport_runtime().require_connector(edge_kind)
 
     def _pipeline_event(
         self,
@@ -1623,19 +1527,7 @@ class DiffusionWorker:
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.CANCELLED, context.task, pp_stage_id))
 
     def _release_unstarted_pipeline_batch_transfers(self, task: PipelineTask) -> None:
-        for identity, ticket in list(self.pipeline_send_tickets.items()):
-            if identity[0] != task.batch_id or identity[2] != task.epoch or ticket.started:
-                continue
-            connector = self._require_pipeline_connector(identity[4])
-            connector.release_send(ticket)
-            self.pipeline_send_tickets.pop(identity)
-        for identity in list(self.pipeline_receive_reservations):
-            if (
-                identity[0] == task.batch_id
-                and identity[2] == task.epoch
-                and identity not in self.pipeline_started_receive_ids
-            ):
-                self.pipeline_receive_reservations.pop(identity)
+        self._get_pipeline_transport_runtime().release_unstarted_batch_transfers(task)
 
     def release_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineEvent:
         """Release one terminal ModelRunner context after dependent work retires."""
