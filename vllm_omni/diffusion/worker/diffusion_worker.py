@@ -949,6 +949,10 @@ class DiffusionWorker:
     ) -> PipelineTransferOffer:
         return self._get_queued_worker_runtime()._make_pipeline_transfer_offer(task, edge_kind, payload)
 
+    @staticmethod
+    def _select_rank_value(values: dict[int, Any]) -> Any:
+        return QueuedWorkerRuntime._select_rank_value(values)
+
     def _record_pipeline_event(self, event: PipelineEvent) -> PipelineEvent:
         return self._get_queued_worker_runtime()._record_pipeline_event(event)
 
