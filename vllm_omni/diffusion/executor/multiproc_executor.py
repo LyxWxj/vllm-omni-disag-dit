@@ -69,6 +69,12 @@ _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
 _MAX_PIPELINE_UPDATES_PER_WORKER_SNAPSHOT = 32
 
 
+def _create_spawn_wake_events(num_workers: int) -> list[Event]:
+    """Create wake events with the same context used for Worker processes."""
+    context = mp.get_context("spawn")
+    return [context.Event() for _ in range(num_workers)]
+
+
 def _is_empty_dp_prompt(prompt: object) -> bool:
     """Return whether a DP request has no usable text prompt."""
     if prompt is None:
@@ -179,7 +185,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events = _create_spawn_wake_events(num_workers)
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()

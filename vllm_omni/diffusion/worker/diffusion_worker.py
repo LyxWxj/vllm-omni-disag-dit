@@ -852,6 +852,20 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def abort_stepwise_requests(self, request_ids: list[str]) -> None:
+        """Release local runner state after queued step communication drains."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.abort_stepwise_requests(request_ids)
+        for request_id in request_ids:
+            self._step_lora_state.pop(request_id, None)
+
+    def abort_stepwise_requests_all_ranks(self, request_ids: list[str]) -> Any:
+        """Clean the same aborted request state on every diffusion rank."""
+        return self._run_and_gather_rank_values(
+            "queued step abort cleanup",
+            lambda: self.abort_stepwise_requests(request_ids),
+        )
+
 
     @property
     def pipeline_stages(self) -> dict[int, PipelineStageState]:
@@ -2228,6 +2242,9 @@ class WorkerWrapperBase:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
+
+    def abort_stepwise_requests_all_ranks(self, request_ids: list[str]) -> Any:
+        return self.worker.abort_stepwise_requests_all_ranks(request_ids)
 
     def sleep(self, level: int = 1) -> int:
         """

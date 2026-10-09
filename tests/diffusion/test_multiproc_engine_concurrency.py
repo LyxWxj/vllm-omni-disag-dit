@@ -171,6 +171,21 @@ def test_submit_queued_step_returns_future_for_packed_runner_output(mocker) -> N
     assert future.result(timeout=1.0) is runner_output
 
 
+def test_worker_wake_events_use_spawn_context(mocker) -> None:
+    from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+    spawn_context = Mock()
+    expected_events = [object(), object()]
+    spawn_context.Event.side_effect = expected_events
+    get_context = mocker.patch.object(executor_module.mp, "get_context", return_value=spawn_context)
+
+    events = executor_module._create_spawn_wake_events(2)
+
+    get_context.assert_called_once_with("spawn")
+    assert events == expected_events
+    assert spawn_context.Event.call_count == 2
+
+
 def _inject_interleave(executor):
     """Monkey-patch ``executor._broadcast_mq.enqueue`` so that:
 

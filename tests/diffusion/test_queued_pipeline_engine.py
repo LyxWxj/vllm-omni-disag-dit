@@ -3,6 +3,8 @@
 
 import queue
 import threading
+from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,7 @@ from vllm_omni.diffusion.diffusion_engine import (
     _QueuedAdmissionDeferredError,
     _QueuedPipelineBatchPhase,
 )
+from vllm_omni.diffusion.queued_pp.engine_queue import QueuedStepFuture, QueuedStepFutureQueue
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionRequestStatus,
@@ -19,6 +22,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
 )
 from vllm_omni.diffusion.worker.pipeline_state import PipelineEvent, PipelineEventType, PipelineTask
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -80,6 +84,119 @@ def test_queued_submission_records_ownership_before_control_dispatch(mocker) -> 
     assert set(batch.stage_specs) == {0, 1}
     engine.executor.submit_pipeline_batch.assert_called_once_with(batch.task, batch.stage_specs)
     engine.executor.authorize_pipeline_batch.assert_called_once_with({0: 0, 1: 1}, batch.task.batch_id)
+
+
+def _future_queue_engine(mocker, *, depth: int) -> DiffusionEngine:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._queued_step_future_queue = QueuedStepFutureQueue(depth)
+    engine._queued_step_abort_request_ids = set()
+    engine.stop_event = threading.Event()
+    engine._cv = threading.Condition(threading.RLock())
+    engine._rpc_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    engine._scheduler_num_waiting_reqs = 0
+    engine._process_aborts_queue = mocker.Mock()
+    engine._wait_for_admission_if_needed_locked = mocker.Mock()
+    engine._emit_outputs = mocker.Mock()
+    engine._emit_finished_outputs = mocker.Mock()
+    return engine
+
+
+def test_future_queue_skips_inflight_request_and_commits_oldest_first(mocker) -> None:
+    engine = _future_queue_engine(mocker, depth=2)
+    first = _scheduler_output("req-a")
+    second = replace(
+        _scheduler_output("req-b"),
+        step_id=8,
+        scheduled_cached_reqs=CachedRequestData(request_ids=["req-a"]),
+    )
+    engine.scheduler = mocker.Mock()
+    engine.scheduler.has_requests.side_effect = [True, True, True]
+    engine.scheduler.schedule.side_effect = [first, second]
+    output_a = BatchRunnerOutput.from_list(
+        [RunnerOutput(request_id="req-a", step_index=1, finished=False)]
+    )
+    output_b = BatchRunnerOutput.from_list(
+        [RunnerOutput(request_id="req-b", step_index=1, finished=False)]
+    )
+    future_a = Future()
+    future_a.set_result(output_a)
+    future_b = Future()
+    future_b.set_result(output_b)
+    engine.executor = SimpleNamespace(execute_model=mocker.Mock(side_effect=[future_a, future_b]))
+    engine.scheduler.update_from_output.return_value = set()
+
+    DiffusionEngine._run_queued_step_future_round(engine)
+    DiffusionEngine._run_queued_step_future_round(engine)
+
+    assert len(engine._queued_step_future_queue) == 2
+    assert engine._queued_step_future_queue.request_ids == frozenset({"req-a", "req-b"})
+    engine.executor.execute_model.assert_has_calls(
+        [
+            mocker.call(first, non_block=True),
+            mocker.call(replace(second, scheduled_cached_reqs=CachedRequestData.make_empty()), non_block=True),
+        ]
+    )
+
+    DiffusionEngine._run_queued_step_future_round(engine)
+
+    engine.scheduler.update_from_output.assert_called_once_with(first, output_a)
+    engine._emit_outputs.assert_called_once_with(set(), ["req-a"], output_a)
+    assert engine._queued_step_future_queue.request_ids == frozenset({"req-b"})
+
+
+def test_future_queue_returns_unsubmitted_scheduler_tail_to_waiting(mocker) -> None:
+    engine = _future_queue_engine(mocker, depth=1)
+    first = _scheduler_output("req-a")
+    second = replace(_scheduler_output("req-b"), step_id=8)
+    scheduler_output = replace(
+        first,
+        scheduled_new_reqs=[first.scheduled_new_reqs[0], second.scheduled_new_reqs[0]],
+        num_running_reqs=2,
+    )
+    future = Future()
+    engine.scheduler = mocker.Mock()
+    engine.scheduler.has_requests.return_value = True
+    engine.scheduler.schedule.return_value = scheduler_output
+    engine.executor = SimpleNamespace(execute_model=mocker.Mock(return_value=future))
+    defer_tail = mocker.patch.object(DiffusionEngine, "_defer_queued_future_admission_tail")
+
+    DiffusionEngine._run_queued_step_future_round(engine)
+
+    assert len(engine._queued_step_future_queue) == 1
+    defer_tail.assert_called_once()
+    assert [item.scheduled_request_ids for item in defer_tail.call_args.args[0]] == [["req-b"]]
+
+
+def test_future_queue_abort_cleans_worker_state_after_step_drains(mocker) -> None:
+    engine = _future_queue_engine(mocker, depth=1)
+    scheduler_output = _scheduler_output("req-a")
+    runner_output = BatchRunnerOutput.from_list(
+        [RunnerOutput(request_id="req-a", step_index=1, finished=False)]
+    )
+    future = Future()
+    future.set_result(runner_output)
+    entry = QueuedStepFuture(future, scheduler_output, ("req-a",))
+    engine._queued_step_future_queue.append(entry)
+    engine._queued_step_abort_request_ids.add("req-a")
+    engine.scheduler = mocker.Mock()
+    engine.scheduler.update_from_output.return_value = {"req-a"}
+    engine.executor = SimpleNamespace(collective_rpc=mocker.Mock(return_value=True))
+    engine._process_aborts_queue = mocker.Mock()
+
+    DiffusionEngine._collect_queued_step_future(engine, entry)
+
+    engine.executor.collective_rpc.assert_called_once_with(
+        "abort_stepwise_requests_all_ranks",
+        args=(["req-a"],),
+        unique_reply_rank=0,
+        exec_all_ranks=True,
+    )
+    engine.scheduler.finish_requests.assert_called_once_with(["req-a"], DiffusionRequestStatus.FINISHED_ABORTED)
+    engine.scheduler.update_from_output.assert_called_once_with(scheduler_output, runner_output)
+    engine._emit_outputs.assert_called_once_with({"req-a"}, ["req-a"], runner_output)
+    assert not engine._queued_step_abort_request_ids
+    assert not engine._queued_step_future_queue.request_ids
 
 
 def test_autonomous_admission_waits_for_both_stage_acknowledgements(mocker) -> None:

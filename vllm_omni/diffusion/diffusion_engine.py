@@ -50,6 +50,7 @@ from vllm_omni.diffusion.output_formatter import (
     normalize_diffusion_postprocess_output,
 )
 from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
+from vllm_omni.diffusion.queued_pp.engine_queue import QueuedStepFuture, QueuedStepFutureQueue
 from vllm_omni.diffusion.queued_pp.queue_config import resolve_queued_queue_depth
 from vllm_omni.diffusion.queued_pp.runtime import QueuedPipelineBatch as _QueuedPipelineBatch
 from vllm_omni.diffusion.queued_pp.runtime import QueuedPipelineBatchPhase as _QueuedPipelineBatchPhase
@@ -419,6 +420,12 @@ class DiffusionEngine:
         self._queued_stage_buffer_budget_bytes: int | None = None
         self._queued_pipeline_epoch = 0
         self._queued_pipeline_decode_barrier_batch_ids: set[str] = set()
+        self._queued_step_future_queue = (
+            QueuedStepFutureQueue(resolve_queued_queue_depth(self.od_config))
+            if self._uses_queued_step_future_queue()
+            else None
+        )
+        self._queued_step_abort_request_ids: set[str] = set()
         set_update_callback = getattr(self.executor, "set_pipeline_update_callback", None)
         if callable(set_update_callback):
             set_update_callback(self._notify_queued_pipeline_update)
@@ -432,6 +439,212 @@ class DiffusionEngine:
             self.execute_fn = self.executor.execute_step
         else:
             self.execute_fn = self.executor.execute_batch
+
+    def _uses_queued_step_future_queue(self) -> bool:
+        """Limit native queued Futures to the first supported Wan-style PP2 path."""
+        if (
+            getattr(self.od_config, "mode", "static") != "queued"
+            or self.execution_mode is not DiffusionExecutionMode.STEP_BATCH
+            or not callable(getattr(self.executor, "execute_model", None))
+        ):
+            return False
+        parallel = getattr(self.od_config, "parallel_config", None)
+        if any(
+            getattr(parallel, name, 1) != expected
+            for name, expected in (
+                ("data_parallel_size", 1),
+                ("pipeline_parallel_size", 2),
+                ("tensor_parallel_size", 1),
+                ("sequence_parallel_size", 1),
+                ("cfg_parallel_size", 1),
+            )
+        ):
+            return False
+        if (
+            is_scheduler_paged_kv_mode(
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            )
+            or getattr(self.od_config, "kv_transfer_config", None) is not None
+            or any_selected_component_uses_allgather(self.od_config)
+        ):
+            return False
+
+        pipeline_cls = _resolve_custom_pipeline_cls(getattr(self.od_config, "custom_pipeline_args", None))
+        if pipeline_cls is None:
+            pipeline_cls = DiffusionModelRegistry._try_load_model_cls(
+                getattr(self.od_config, "model_class_name", None)
+            )
+        if pipeline_cls is None:
+            return False
+        from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
+
+        return isinstance(pipeline_cls, type) and issubclass(pipeline_cls, PipelineParallelMixin) and bool(
+            getattr(pipeline_cls, "supports_step_execution", False)
+        ) and all(
+            callable(getattr(pipeline_cls, method, None))
+            for method in ("prepare_encode", "denoise_step", "step_scheduler", "post_decode")
+        )
+
+    def _run_queued_step_future_round(self) -> None:
+        """Fill the bounded Future FIFO, then retire its oldest step in order."""
+        future_queue = self._queued_step_future_queue
+        if future_queue is None:
+            raise RuntimeError("Queued step Future FIFO is not initialized")
+
+        entry: QueuedStepFuture | None = None
+        scheduler_output: DiffusionSchedulerOutput | None = None
+        with self._cv:
+            has_requests = self.scheduler.has_requests()
+            while (
+                not has_requests
+                and not future_queue
+                and self._rpc_queue.empty()
+                and self.abort_queue.empty()
+                and not self.stop_event.is_set()
+            ):
+                self._cv.wait(timeout=1.0)
+                has_requests = self.scheduler.has_requests()
+
+            if self.stop_event.is_set():
+                return
+            if future_queue and (not future_queue.has_capacity or not has_requests):
+                entry = future_queue.pop_oldest()
+            elif has_requests:
+                self._wait_for_admission_if_needed_locked()
+                scheduler_output = self.scheduler.schedule()
+                self._scheduler_num_waiting_reqs = max(int(scheduler_output.num_waiting_reqs), 0)
+            elif future_queue:
+                entry = future_queue.pop_oldest()
+
+        if entry is not None:
+            self._collect_queued_step_future(entry)
+            return
+        if scheduler_output is None:
+            return
+        if scheduler_output.finished_req_ids:
+            finished = set(scheduler_output.finished_req_ids)
+            scheduler_output.finished_req_ids.clear()
+            self._emit_finished_outputs(finished, None)
+        if scheduler_output.is_empty:
+            return
+        if any(
+            value is not None
+            for value in (
+                scheduler_output.kv_connector_metadata,
+                scheduler_output.kv_prefetch_connector_metadata,
+                scheduler_output.kv_required_request_ids,
+            )
+        ) or scheduler_output.kv_poll_only:
+            raise RuntimeError("Native queued Future execution does not support scheduler-managed KV yet")
+
+        task_outputs = self._split_queued_scheduler_output(scheduler_output)
+        submitted = 0
+        for index, task_output in enumerate(task_outputs):
+            request_ids = tuple(task_output.scheduled_request_ids)
+            if not request_ids:
+                continue
+            if any(future_queue.contains_request(request_id) for request_id in request_ids):
+                continue
+            if not future_queue.has_capacity:
+                self._defer_queued_future_admission_tail(task_outputs[index:])
+                break
+            task_output.finished_req_ids.clear()
+            task_output.kv_prefetch_job = scheduler_output.kv_prefetch_job if submitted == 0 else None
+            try:
+                future = self.executor.execute_model(task_output, non_block=True)
+                if not isinstance(future, concurrent.futures.Future):
+                    raise TypeError("execute_model(non_block=True) must return concurrent.futures.Future")
+                future_queue.append(
+                    QueuedStepFuture(
+                        future=future,
+                        scheduler_output=task_output,
+                        request_ids=request_ids,
+                    )
+                )
+                submitted += 1
+            except Exception as exc:
+                logger.error("Queued step submission failed for %s", request_ids, exc_info=True)
+                runner_output = BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            request_id=request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(exc),
+                        )
+                        for request_id in request_ids
+                    ]
+                )
+                finished = self.scheduler.update_from_output(task_output, runner_output)
+                self._emit_outputs(finished, list(request_ids), runner_output)
+        if submitted == 0 and future_queue:
+            self._collect_queued_step_future(future_queue.pop_oldest())
+        elif submitted == 0 and not future_queue:
+            with self._cv:
+                self._cv.wait(timeout=0.001)
+
+    def _defer_queued_future_admission_tail(self, scheduler_outputs: list[Any]) -> None:
+        future_queue = self._queued_step_future_queue
+        assert future_queue is not None
+        for scheduler_output in reversed(scheduler_outputs):
+            request_ids = tuple(scheduler_output.scheduled_request_ids)
+            if any(future_queue.contains_request(request_id) for request_id in request_ids):
+                continue
+            self._defer_queued_admission(scheduler_output)
+
+    def _collect_queued_step_future(self, entry: QueuedStepFuture) -> None:
+        future_queue = self._queued_step_future_queue
+        assert future_queue is not None
+        try:
+            try:
+                runner_output = entry.future.result()
+                if not isinstance(runner_output, BaseRunnerOutput):
+                    raise TypeError(f"Queued step Future returned {type(runner_output)!r}")
+            except Exception as exc:
+                logger.error("Queued step Future failed for %s", entry.request_ids, exc_info=True)
+                runner_output = BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            request_id=request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(exc),
+                        )
+                        for request_id in entry.request_ids
+                    ]
+                )
+
+            self._process_aborts_queue()
+            aborted_ids = self._queued_step_abort_request_ids.intersection(entry.request_ids)
+            if aborted_ids:
+                cleanup = self.executor.collective_rpc(
+                    "abort_stepwise_requests_all_ranks",
+                    args=(sorted(aborted_ids),),
+                    unique_reply_rank=0,
+                    exec_all_ranks=True,
+                )
+                if cleanup is False:
+                    raise RuntimeError("Queued step abort cleanup was not acknowledged by all ranks")
+                self.scheduler.finish_requests(list(aborted_ids), DiffusionRequestStatus.FINISHED_ABORTED)
+                self._queued_step_abort_request_ids.difference_update(aborted_ids)
+
+            finished = self.scheduler.update_from_output(entry.scheduler_output, runner_output)
+            self._emit_outputs(finished, list(entry.request_ids), runner_output)
+        finally:
+            future_queue.release(entry)
+
+    def _drain_queued_step_future_queue(self) -> None:
+        future_queue = getattr(self, "_queued_step_future_queue", None)
+        if future_queue is None:
+            return
+        while future_queue:
+            entry = future_queue.pop_oldest()
+            try:
+                entry.future.result()
+            except Exception:
+                logger.exception("Queued step Future failed during Engine shutdown")
+            finally:
+                future_queue.release(entry)
 
     def _ensure_queued_pipeline_transports(self) -> None:
         """Initialize the M2 two-stage transport lazily after engine startup."""
@@ -1519,6 +1732,15 @@ class DiffusionEngine:
             self._process_aborts_queue()
             self._process_rpc_queue()
 
+            if getattr(self, "_queued_step_future_queue", None) is not None:
+                try:
+                    self._run_queued_step_future_round()
+                except Exception as exc:
+                    logger.error("Queued step Future Engine round failed", exc_info=True)
+                    self._fail_engine(exc)
+                    break
+                continue
+
             with self._cv:
                 while (
                     not self.scheduler.has_requests()
@@ -1698,6 +1920,7 @@ class DiffusionEngine:
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
             self._emit_outputs(finished_req_ids, sched_output.scheduled_request_ids, runner_output)
 
+        self._drain_queued_step_future_queue()
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
 
@@ -2493,6 +2716,11 @@ class DiffusionEngine:
                 logger.error("Queued abort cleanup is pending; retaining ownership", exc_info=True)
 
         request_ids = [request_id for request_id in request_ids if request_id not in owned_queued_request_ids]
+        future_queue = getattr(self, "_queued_step_future_queue", None)
+        if future_queue is not None:
+            in_flight = {request_id for request_id in request_ids if future_queue.contains_request(request_id)}
+            self._queued_step_abort_request_ids.update(in_flight)
+            request_ids = [request_id for request_id in request_ids if request_id not in in_flight]
         self._remove_diffusion_kv_requests(request_ids)
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:

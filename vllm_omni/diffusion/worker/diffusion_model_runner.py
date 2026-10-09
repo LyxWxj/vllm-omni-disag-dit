@@ -1333,6 +1333,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             record_output_peak_memory=True,
         )
 
+    def abort_stepwise_requests(self, request_ids: list[str]) -> None:
+        """Release Worker-local step state after an in-flight Future drains."""
+        for request_id in request_ids:
+            self.state_cache.pop(request_id, None)
+        self.input_batch = None
+
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""
         if scheduler_output.scheduled_cached_reqs.request_ids:
