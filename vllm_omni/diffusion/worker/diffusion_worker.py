@@ -71,7 +71,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     DistributedP2PTransport,
     PipelineEdgeKind,
-    PipelineEndpointCompletion,
     PipelineMessage,
     PipelineStageConnector,
     PipelineTransferGrant,
@@ -855,16 +854,16 @@ class DiffusionWorker:
 
     def progress_pipeline_transfers(self) -> PipelineTransportProgress:
         """Advance one local FIFO compute task and bounded transport work."""
-        progress = PipelineTransportProgress(rank=self.rank)
+        progress = PipelineTransportProgress()
 
         for identity, ticket in list(self.pipeline_send_tickets.items()):
             connector = self._require_pipeline_connector(identity[3])
             if connector.poll_send_completion(ticket):
                 connector.release_send(ticket)
                 self.pipeline_send_tickets.pop(identity)
-                progress.completions.append(PipelineEndpointCompletion(identity=identity, rank=self.rank))
+                progress.completions.append(identity)
 
-        self._release_completed_pipeline_consumers(progress)
+        self._release_completed_pipeline_consumers()
 
         for edge_kind in (PipelineEdgeKind.FEEDBACK, PipelineEdgeKind.ACTIVATION):
             connector = self._require_pipeline_connector(edge_kind)
@@ -872,7 +871,7 @@ class DiffusionWorker:
                 self.pipeline_pending_received[edge_kind].append(message)
             self._consume_ready_pipeline_message(edge_kind, progress)
 
-        self._release_completed_pipeline_consumers(progress)
+        self._release_completed_pipeline_consumers()
 
         first_stage = self.pipeline_stages.get(0)
         if first_stage is not None and first_stage.spec.is_first:
@@ -1054,7 +1053,7 @@ class DiffusionWorker:
             pending.popleft()
             reservation = self._find_pipeline_receive_reservation(edge_kind, message)
             self.release_pipeline_received(edge_kind, message)
-            progress.completions.append(PipelineEndpointCompletion(identity=reservation, rank=self.rank))
+            progress.completions.append(reservation)
             return
         if not self._pipeline_message_is_runnable(edge_kind, message):
             return
@@ -1065,7 +1064,7 @@ class DiffusionWorker:
         # message in pipeline_receive_consumers as a separate compute lease;
         # its tensor remains alive until the stage has consumed it.
         self.release_pipeline_received(edge_kind, message)
-        progress.completions.append(PipelineEndpointCompletion(identity=reservation, rank=self.rank))
+        progress.completions.append(reservation)
         try:
             if edge_kind is PipelineEdgeKind.ACTIVATION:
                 stage_progress = self.progress_pipeline(
@@ -1142,7 +1141,7 @@ class DiffusionWorker:
                 f"Stale pipeline message identity {message_identity!r} does not match task {task_identity!r}."
             )
 
-    def _release_completed_pipeline_consumers(self, progress: PipelineTransportProgress) -> None:
+    def _release_completed_pipeline_consumers(self) -> None:
         for identity, (edge_kind, message, event) in list(self.pipeline_receive_consumers.items()):
             if event is _PIPELINE_CONSUMER_EVENT_FAILED:
                 continue
@@ -1167,16 +1166,9 @@ class DiffusionWorker:
 
     def release_pipeline_received(self, edge_kind: PipelineEdgeKind, message: PipelineMessage) -> None:
         connector = self._require_pipeline_connector(edge_kind)
-        identity = (message.batch_id, message.step_index, message.epoch)
-        matching = [
-            key
-            for key, (reserved_edge, _started) in self.pipeline_receive_reservations.items()
-            if key[:3] == identity and reserved_edge is edge_kind
-        ]
-        if len(matching) != 1:
-            raise RuntimeError("pipeline receive reservation does not match released message")
+        reservation = self._find_pipeline_receive_reservation(edge_kind, message)
         connector.release_received(message)
-        self.pipeline_receive_reservations.pop(matching[0])
+        self.pipeline_receive_reservations.pop(reservation)
 
     def _require_pipeline_connector(self, edge_kind: PipelineEdgeKind) -> PipelineStageConnector:
         connector = self.pipeline_connectors.get(edge_kind)

@@ -1149,8 +1149,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if rank_progress is None:
                 worker_events.extend(update.events)
                 continue
-            if rank_progress.rank != update.worker_id:
-                raise RuntimeError("Pipeline StageEngine update has invalid rank-local progress")
             worker_events.extend(update.events)
             for identity in rank_progress.readiness:
                 coordinator.mark_receive_ready(identity, rank=update.worker_id)
@@ -1160,8 +1158,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             rank_progress = update.progress
             if rank_progress is None:
                 continue
-            for completion in rank_progress.completions:
-                coordinator.complete(completion.identity, completion.rank)
+            for identity in rank_progress.completions:
+                coordinator.complete(identity, update.worker_id)
                 saw_completion = True
             for offer in rank_progress.offers:
                 if coordinator.offer(offer):

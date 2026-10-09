@@ -212,7 +212,7 @@ def test_non_output_finalization_publishes_completion_metadata(mocker) -> None:
     finalization = PipelineFinalizationUpdate(batch_id="batch-a")
     update = PipelineWorkerUpdate(
         worker_id=4,
-        progress=PipelineTransportProgress(rank=4),
+        progress=PipelineTransportProgress(),
         events=(),
         finalizations=(finalization,),
     )
@@ -231,7 +231,7 @@ def test_worker_proc_publishes_readiness_only_updates(mocker) -> None:
     identity = ("batch-a", 0, 2, PipelineEdgeKind.ACTIVATION, 0, 1)
     update = PipelineWorkerUpdate(
         worker_id=1,
-        progress=PipelineTransportProgress(rank=1, readiness=[identity]),
+        progress=PipelineTransportProgress(readiness=[identity]),
         events=(),
     )
 
@@ -251,7 +251,7 @@ def test_selected_non_first_finalization_publishes_its_output(mocker) -> None:
     finalization = PipelineFinalizationUpdate(batch_id="batch-b", output=output, device_event=device_event)
     update = PipelineWorkerUpdate(
         worker_id=1,
-        progress=PipelineTransportProgress(rank=1),
+        progress=PipelineTransportProgress(),
         events=(),
         finalizations=(finalization,),
     )
@@ -982,8 +982,8 @@ def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> N
 
     first_activation_progress = first.progress_pipeline_transfers()
     last_activation_progress = last.progress_pipeline_transfers()
-    assert [completion.rank for completion in first_activation_progress.completions] == [0]
-    assert [completion.rank for completion in last_activation_progress.completions] == [1]
+    assert first_activation_progress.completions == [activation.identity]
+    assert last_activation_progress.completions == [activation.identity]
     feedback = last_activation_progress.offers[0]
     assert feedback.edge_kind is PipelineEdgeKind.FEEDBACK
 
@@ -995,8 +995,8 @@ def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> N
 
     last_feedback_progress = last.progress_pipeline_transfers()
     first_feedback_progress = first.progress_pipeline_transfers()
-    assert [completion.rank for completion in last_feedback_progress.completions] == [1]
-    assert [completion.rank for completion in first_feedback_progress.completions] == [0]
+    assert last_feedback_progress.completions == [feedback.identity]
+    assert first_feedback_progress.completions == [feedback.identity]
     assert first.pipeline_stages[0].terminal_statuses[task.batch_id] is PipelineTaskStatus.COMPLETED
     assert not first.pipeline_send_tickets
     assert not last.pipeline_send_tickets
@@ -1028,7 +1028,7 @@ def test_progress_poll_executes_next_first_stage_batch_while_prior_feedback_is_p
     worker.start_pipeline_transfer(grant)
     second_progress = worker.progress_pipeline_transfers()
 
-    assert [completion.identity for completion in second_progress.completions] == [first_offer.identity]
+    assert second_progress.completions == [first_offer.identity]
     assert [offer.batch_id for offer in second_progress.offers] == [second.batch_id]
     assert worker.pipeline_stages[0].active_task is None
     assert worker.pipeline_stages[0].awaiting_feedback == {
@@ -1193,7 +1193,7 @@ def test_worker_releases_transport_credit_before_consumer_event_completes(mocker
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
 
     first_progress = receiver.progress_pipeline_transfers()
-    assert [completion.identity for completion in first_progress.completions] == [offer.identity]
+    assert first_progress.completions == [offer.identity]
     assert offer.identity not in receiver.pipeline_receive_reservations
     assert offer.identity in receiver.pipeline_receive_consumers
     second_progress = receiver.progress_pipeline_transfers()
@@ -1341,7 +1341,7 @@ def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> 
     after_authorization = receiver.progress_pipeline_transfers()
     assert len(after_authorization.offers) == 1
     assert after_authorization.offers[0].edge_kind is PipelineEdgeKind.FEEDBACK
-    assert [completion.identity for completion in after_authorization.completions] == [offer.identity]
+    assert after_authorization.completions == [offer.identity]
     assert offer.identity not in receiver.pipeline_receive_reservations
     assert offer.identity in receiver.pipeline_receive_consumers
     assert len(receiver.pipeline_pending_received[PipelineEdgeKind.ACTIVATION]) == 0
@@ -1435,7 +1435,7 @@ def test_cancelled_stage_one_drains_activation_without_execution(mocker) -> None
     progress = receiver.progress_pipeline_transfers()
 
     assert progress.offers == []
-    assert [completion.identity for completion in progress.completions] == [offer.identity]
+    assert progress.completions == [offer.identity]
     assert receiver.model_runner.pipeline_batch_contexts[(1, task.batch_id)].status is PipelineTaskStatus.CANCELLED
     assert offer.identity not in receiver.pipeline_receive_reservations
     record_event.assert_not_called()
@@ -1468,7 +1468,7 @@ def test_cancelled_stage_zero_drains_feedback_without_adoption(mocker) -> None:
 
     progress = receiver.progress_pipeline_transfers()
 
-    assert [completion.identity for completion in progress.completions] == [offer.identity]
+    assert progress.completions == [offer.identity]
     assert receiver.model_runner.feedback_adoptions == 0
     assert offer.identity not in receiver.pipeline_receive_reservations
     record_event.assert_not_called()

@@ -91,17 +91,10 @@ class PipelineTransferGrant:
     completed_ranks: set[int] = field(default_factory=set)
 
 
-@dataclass(frozen=True)
-class PipelineEndpointCompletion:
-    identity: tuple[Any, ...]
-    rank: int
-
-
 @dataclass
 class PipelineTransportProgress:
-    rank: int
     offers: list[PipelineTransferOffer] = field(default_factory=list)
-    completions: list[PipelineEndpointCompletion] = field(default_factory=list)
+    completions: list[tuple[Any, ...]] = field(default_factory=list)
     readiness: list[tuple[Any, ...]] = field(default_factory=list)
 
 
@@ -670,8 +663,6 @@ class PipelineStageConnector:
                 raise RuntimeError("cannot retire a batch before transport completion")
         for ticket in matching:
             if ticket.started and not ticket.completed:
-                if not discard_results:
-                    raise RuntimeError("cannot retire a batch before transport completion")
                 self._wait_or_abort(ticket, discard=True)
         for ticket in matching:
             self._send_tickets.remove(ticket)

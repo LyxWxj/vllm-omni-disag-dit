@@ -8,7 +8,6 @@ import pytest
 
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
-    PipelineEndpointCompletion,
     PipelineTransferCoordinator,
     PipelineTransferOffer,
     PipelineTransportProgress,
@@ -51,10 +50,10 @@ def test_sparse_readiness_grants_transfer_without_worker_control_rpc(mocker) -> 
     executor.collective_rpc = mocker.Mock(side_effect=AssertionError("unexpected fallback RPC"))
     offer = _offer()
     executor._pipeline_update_buffers[0].put(
-        PipelineWorkerUpdate(0, PipelineTransportProgress(rank=0, offers=[offer]), ())
+        PipelineWorkerUpdate(0, PipelineTransportProgress(offers=[offer]), ())
     )
     executor._pipeline_update_buffers[1].put(
-        PipelineWorkerUpdate(1, PipelineTransportProgress(rank=1, readiness=[offer.identity]), ())
+        PipelineWorkerUpdate(1, PipelineTransportProgress(readiness=[offer.identity]), ())
     )
 
     progress = executor.progress_pipeline()
@@ -76,8 +75,7 @@ def test_transfer_completion_waits_for_both_endpoint_updates(mocker) -> None:
         PipelineWorkerUpdate(
             0,
             PipelineTransportProgress(
-                rank=0,
-                completions=[PipelineEndpointCompletion(offer.identity, 0)],
+                completions=[offer.identity],
             ),
             (),
         )
@@ -89,8 +87,7 @@ def test_transfer_completion_waits_for_both_endpoint_updates(mocker) -> None:
         PipelineWorkerUpdate(
             1,
             PipelineTransportProgress(
-                rank=1,
-                completions=[PipelineEndpointCompletion(offer.identity, 1)],
+                completions=[offer.identity],
             ),
             (),
         )
