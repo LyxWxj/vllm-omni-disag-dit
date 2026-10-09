@@ -135,7 +135,7 @@ def test_feedback_can_progress_when_activation_edge_is_blocked() -> None:
     assert coordinator.grant_ready()[0].offer is feedback
 
 
-def test_opposite_directions_can_overlap_on_the_same_endpoints() -> None:
+def test_opposite_directions_are_serialized_by_endpoint_ownership() -> None:
     coordinator = _coordinator()
     first = _offer("batch-a", src_rank=0, dst_rank=1)
     second = _offer(
@@ -150,8 +150,13 @@ def test_opposite_directions_can_overlap_on_the_same_endpoints() -> None:
 
     grants = coordinator.grant_ready(limit=2)
 
-    assert {grant.offer.identity for grant in grants} == {first.identity, second.identity}
+    assert [grant.offer.identity for grant in grants] == [second.identity]
     assert coordinator.snapshot()["busy_ranks"] == (0, 1)
+    assert not coordinator.grant_ready()
+
+    coordinator.complete(second.identity, second.src_rank)
+    coordinator.complete(second.identity, second.dst_rank)
+    assert coordinator.grant_ready()[0].offer is first
 
 
 def test_transfer_rejects_reversed_activation_direction() -> None:

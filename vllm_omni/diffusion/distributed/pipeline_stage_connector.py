@@ -586,6 +586,11 @@ class DistributedP2PTransport:
             offer.branch,
         ):
             raise ValueError("pipeline message identity does not match its transfer grant")
+        if offer.payload_metadata and (
+            not isinstance(message.payload, dict)
+            or pipeline_payload_metadata(message.payload) != offer.payload_metadata
+        ):
+            raise ValueError("pipeline message metadata does not match its transfer grant")
 
 
 class PipelineStageConnector:
