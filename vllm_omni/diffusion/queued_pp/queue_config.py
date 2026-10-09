@@ -88,6 +88,20 @@ def submit_step_future(executor: Any, scheduler_output: Any) -> Future:
     return queue.submit(executor, scheduler_output)
 
 
+def execute_model(executor: Any, scheduler_output: Any, *, non_block: bool = False) -> Any:
+    """Private vLLM-shaped adapter for queued step execution.
+
+    Keeping this entry in ``queued_pp`` avoids widening the common diffusion
+    executor interface while the native Future path is introduced gradually.
+    """
+    if non_block:
+        ensure_open = getattr(executor, "_ensure_open", None)
+        if callable(ensure_open):
+            ensure_open()
+        return submit_step_future(executor, scheduler_output)
+    return executor.execute_step(scheduler_output)
+
+
 def shutdown_step_futures(executor: Any) -> None:
     """Drain and close the private step Future queue during executor shutdown."""
     queue = getattr(executor, "_queued_step_future_queue", None)
