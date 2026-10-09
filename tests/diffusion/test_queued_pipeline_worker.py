@@ -1479,8 +1479,10 @@ def test_stage0_progress_issues_one_activation_per_local_tick(mocker) -> None:
 
     second_progress = worker.progress_pipeline_transfers()
 
-    assert [offer.batch_id for offer in second_progress.offers] == [second.batch_id]
-    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 2
+    # A pending grant must start before the next activation is admitted. This
+    # keeps the local FIFO and bounded send window aligned with StageEngine.
+    assert second_progress.offers == []
+    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 1
     assert worker.progress_pipeline_transfers().offers == []
 
 
