@@ -9,6 +9,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import PipelineTransportProgress
+from vllm_omni.diffusion.queued_pp.queue_config import execute_model as execute_queued_model
 
 PIPELINE_GRANT_START_TIMEOUT_S = 30.0
 
@@ -227,6 +228,10 @@ class DiffusionExecutor(ABC):
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute step-mode work from a scheduler output."""
         pass
+
+    def execute_model(self, scheduler_output: DiffusionSchedulerOutput, *, non_block: bool = False) -> Any:
+        """Forward the optional vLLM-shaped entry to the queued adapter."""
+        return execute_queued_model(self, scheduler_output, non_block=non_block)
 
     @abstractmethod
     def collective_rpc(
