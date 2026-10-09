@@ -223,11 +223,13 @@ class _Group:
         self.recv_calls = []
         self.postprocess_calls = 0
 
-    def isend_tensor_dict(self, payload, dst):
+    def isend_tensor_dict(self, payload, dst, metadata_list=None):
+        del metadata_list
         self.send_calls.append((payload, dst))
         return [self.send_work]
 
-    def irecv_tensor_dict(self, src):
+    def irecv_tensor_dict(self, src, metadata_list=None):
+        del metadata_list
         self.recv_calls.append(src)
 
         def postprocess():
@@ -438,7 +440,8 @@ def test_distributed_p2p_postprocess_failure_preserves_prior_ready_message() -> 
             self.works = [_Work(completed=True), _Work(completed=True)]
             self.callback_calls = [0, 0]
 
-        def irecv_tensor_dict(self, src):
+        def irecv_tensor_dict(self, src, metadata_list=None):
+            del metadata_list
             index = len(self.recv_calls)
             self.recv_calls.append(src)
 

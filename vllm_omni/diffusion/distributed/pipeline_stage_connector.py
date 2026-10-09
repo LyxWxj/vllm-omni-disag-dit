@@ -383,13 +383,14 @@ class DistributedP2PTransport:
         self._send_handles: dict[tuple[str, int, int], list[Any] | None] = {}
         self._completed_send_ids: set[tuple[str, int, int]] = set()
         self._pending_receives: deque[_PendingReceive] = deque()
+        self._ready_receives: deque[PipelineMessage] = deque()
         self._active_receive_ids: set[tuple[str, int, int]] = set()
         self._completed_receive_ids: set[tuple[str, int, int]] = set()
         self._closed = False
 
     @property
     def has_outstanding_operations(self) -> bool:
-        return bool(self._send_handles or self._pending_receives or self._active_receive_ids)
+        return bool(self._send_handles or self._pending_receives or self._ready_receives or self._active_receive_ids)
 
     def start_granted_transfer(
         self,
@@ -462,6 +463,8 @@ class DistributedP2PTransport:
         self._ensure_open()
         if limit is None or type(limit) is not int or limit <= 0:
             raise ValueError("distributed P2P polling requires a positive limit")
+        if self._ready_receives:
+            return [self._ready_receives.popleft() for _ in range(min(limit, len(self._ready_receives)))]
         ready: list[PipelineMessage] = []
         while self._pending_receives and len(ready) < limit:
             pending = self._pending_receives[0]
@@ -480,6 +483,7 @@ class DistributedP2PTransport:
                     pending.postprocess_index += 1
             except BaseException as exc:
                 pending.failure = exc
+                self._ready_receives.extend(ready)
                 raise
             self._pending_receives.popleft()
             self._active_receive_ids.remove(pending.identity)

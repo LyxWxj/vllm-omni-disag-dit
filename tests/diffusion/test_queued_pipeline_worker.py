@@ -379,8 +379,8 @@ def test_final_decode_completion_wakes_stage_engine(mocker) -> None:
 def test_stage_engine_does_not_poll_running_finalization_future() -> None:
     worker = _worker()
     worker.pipeline_connectors = {
-        PipelineEdgeKind.ACTIVATION: SimpleNamespace(transport=None),
-        PipelineEdgeKind.FEEDBACK: SimpleNamespace(transport=None),
+        PipelineEdgeKind.ACTIVATION: SimpleNamespace(transport=SimpleNamespace(has_outstanding_operations=False)),
+        PipelineEdgeKind.FEEDBACK: SimpleNamespace(transport=SimpleNamespace(has_outstanding_operations=False)),
     }
     future: Future[object] = Future()
     worker._pipeline_finalization_futures = {"batch-a": future}
@@ -751,11 +751,13 @@ class _PPGroup:
         self.recv_calls = []
         self.receive_payload = {"hidden_states": torch.tensor([1.0])}
 
-    def isend_tensor_dict(self, payload, dst):
+    def isend_tensor_dict(self, payload, dst, metadata_list=None):
+        del metadata_list
         self.send_calls.append((payload, dst))
         return []
 
-    def irecv_tensor_dict(self, src):
+    def irecv_tensor_dict(self, src, metadata_list=None):
+        del metadata_list
         self.recv_calls.append(src)
         return self.receive_payload, [], []
 
