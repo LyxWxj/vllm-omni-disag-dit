@@ -134,7 +134,7 @@ def _spec(stage_id: int) -> PipelineStageSpec:
 
 
 def _reserve_receive(worker: DiffusionWorker, offer: PipelineTransferOffer) -> None:
-    worker.pipeline_receive_reservations[offer.identity] = (offer.edge_kind, False)
+    worker.pipeline_receive_reservations[offer.identity] = False
 
 
 def test_worker_metadata_agreement_uses_global_cpu_control_group(mocker) -> None:

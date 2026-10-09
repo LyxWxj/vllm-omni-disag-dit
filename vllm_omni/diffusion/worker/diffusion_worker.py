@@ -307,9 +307,9 @@ class DiffusionWorker:
         self.pipeline_events: list[PipelineEvent] = []
         self.pipeline_connectors: dict[PipelineEdgeKind, PipelineStageConnector] = {}
         self.pipeline_send_tickets: dict[tuple[Any, ...], TransferTicket] = {}
-        self.pipeline_receive_reservations: dict[tuple[Any, ...], tuple[PipelineEdgeKind, bool]] = {}
+        self.pipeline_receive_reservations: dict[tuple[Any, ...], bool] = {}
         self.pipeline_receive_consumers: dict[
-            tuple[Any, ...], tuple[PipelineEdgeKind, PipelineMessage, Any | None]
+            tuple[Any, ...], tuple[PipelineMessage, Any | None]
         ] = {}
         self.pipeline_pending_received: dict[PipelineEdgeKind, deque[PipelineMessage]] = {
             PipelineEdgeKind.ACTIVATION: deque(),
@@ -845,10 +845,10 @@ class DiffusionWorker:
             reservation = self.pipeline_receive_reservations.get(offer.identity)
             if reservation is None:
                 raise KeyError("pipeline transfer grant has no reserved receive credit")
-            if reservation[1]:
+            if reservation:
                 raise ValueError("pipeline transfer receive has already started")
             transport = connector.transport
-            self.pipeline_receive_reservations[offer.identity] = (reservation[0], True)
+            self.pipeline_receive_reservations[offer.identity] = True
             transport.start_granted_transfer(grant)
         return True
 
@@ -955,7 +955,7 @@ class DiffusionWorker:
 
         for edge_kind in (PipelineEdgeKind.ACTIVATION, PipelineEdgeKind.FEEDBACK):
             connector = self._require_pipeline_connector(edge_kind)
-            reserved = sum(kind is edge_kind for kind, _started in self.pipeline_receive_reservations.values())
+            reserved = sum(identity[3] is edge_kind for identity in self.pipeline_receive_reservations)
             available = connector.max_slots - reserved
             if available <= 0:
                 continue
@@ -965,7 +965,7 @@ class DiffusionWorker:
                 offer = self._make_pipeline_transfer_offer(task, edge_kind)
                 if offer.identity in self.pipeline_receive_reservations:
                     continue
-                self.pipeline_receive_reservations[offer.identity] = (edge_kind, False)
+                self.pipeline_receive_reservations[offer.identity] = False
                 progress.readiness.append(offer.identity)
                 available -= 1
 
@@ -1081,7 +1081,6 @@ class DiffusionWorker:
                 self.complete_pipeline_feedback(0, message.batch_id, latents)
         except BaseException:
             self.pipeline_receive_consumers[reservation] = (
-                edge_kind,
                 message,
                 _PIPELINE_CONSUMER_EVENT_FAILED,
             )
@@ -1090,12 +1089,11 @@ class DiffusionWorker:
         consumer_event = current_omni_platform.record_device_event()
         if consumer_event is None and current_omni_platform.is_available():
             self.pipeline_receive_consumers[reservation] = (
-                edge_kind,
                 message,
                 _PIPELINE_CONSUMER_EVENT_FAILED,
             )
             raise RuntimeError("failed to record pipeline receive consumer completion event")
-        self.pipeline_receive_consumers[reservation] = (edge_kind, message, consumer_event)
+        self.pipeline_receive_consumers[reservation] = (message, consumer_event)
 
     def _cancelled_pipeline_message_context(
         self,
@@ -1142,7 +1140,7 @@ class DiffusionWorker:
             )
 
     def _release_completed_pipeline_consumers(self) -> None:
-        for identity, (edge_kind, message, event) in list(self.pipeline_receive_consumers.items()):
+        for identity, (message, event) in list(self.pipeline_receive_consumers.items()):
             if event is _PIPELINE_CONSUMER_EVENT_FAILED:
                 continue
             if event is not None and not event.query():
@@ -1157,8 +1155,8 @@ class DiffusionWorker:
         identity = (message.batch_id, message.step_index, message.epoch)
         matching = [
             key
-            for key, reserved_edge in self.pipeline_receive_reservations.items()
-            if key[:3] == identity and reserved_edge[0] is edge_kind
+            for key in self.pipeline_receive_reservations
+            if key[:3] == identity and key[3] is edge_kind
         ]
         if len(matching) != 1:
             raise RuntimeError("pipeline receive message has no unique reservation")
@@ -1401,7 +1399,7 @@ class DiffusionWorker:
             connector = self._require_pipeline_connector(identity[3])
             connector.release_send(ticket)
             self.pipeline_send_tickets.pop(identity)
-        for identity, (_edge_kind, started) in list(self.pipeline_receive_reservations.items()):
+        for identity, started in list(self.pipeline_receive_reservations.items()):
             if (
                 identity[0] == task.batch_id
                 and identity[2] == task.epoch
