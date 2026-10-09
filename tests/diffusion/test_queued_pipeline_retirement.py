@@ -18,7 +18,7 @@ def test_final_decode_completes_scheduler_only_after_successful_output(mocker) -
     engine = _engine(mocker, scheduler_output)
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-    batch.finalizing_request_ids = frozenset({"req-a"})
+    batch.finalizing = True
     engine.scheduler.complete_pipeline_request = mocker.Mock(return_value={"req-a"})
     engine.executor.finalize_pipeline_batch.return_value = SimpleNamespace(
         get_request_output=lambda request_id: SimpleNamespace(
@@ -38,7 +38,7 @@ def test_async_final_decode_keeps_batch_finalizing_until_poll_completes(mocker) 
     engine = _engine(mocker, scheduler_output)
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-    batch.finalizing_request_ids = frozenset({"req-a"})
+    batch.finalizing = True
     output = SimpleNamespace(get_request_output=lambda request_id: SimpleNamespace(result=SimpleNamespace(error=None)))
     engine.executor.finalize_pipeline_batch.return_value = "decode-handle"
     engine.executor.poll_pipeline_finalization.side_effect = [None, output]
@@ -62,13 +62,12 @@ def test_async_final_decode_keeps_batch_finalizing_until_poll_completes(mocker) 
     assert engine.executor.poll_pipeline_finalization.call_count == 2
 
 
-def test_distributed_vae_decode_waits_until_step_transfers_retire(mocker) -> None:
+def test_final_decode_waits_until_step_transfers_retire(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
-    engine.od_config.parallel_config = SimpleNamespace(vae_patch_parallel_size=2)
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-    batch.finalizing_request_ids = frozenset({"req-a"})
+    batch.finalizing = True
     engine.executor.pipeline_batch_release_ready.side_effect = [False, True]
     engine.executor.finalize_pipeline_batch.return_value = "decode-handle"
     engine.executor.poll_pipeline_finalization.return_value = None
@@ -190,7 +189,7 @@ def test_retirement_keeps_finalizing_batch_until_receive_ownership_retires(mocke
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.FINALIZING
     batch.decoded_output = object()
-    batch.finalizing_request_ids = frozenset({"req-a"})
+    batch.finalizing = True
     engine.executor.pipeline_batch_release_ready.return_value = False
 
     engine._retire_queued_pipeline_batch(batch)
@@ -205,7 +204,7 @@ def test_final_retirement_cleans_persistent_worker_state(mocker) -> None:
     engine = _engine(mocker, scheduler_output)
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-    batch.finalizing_request_ids = frozenset({"req-a"})
+    batch.finalizing = True
     engine.scheduler.complete_pipeline_request = mocker.Mock(return_value={"req-a"})
     engine.executor.release_pipeline_batch.return_value = [
         PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
@@ -283,7 +282,7 @@ def test_final_retirement_failure_preserves_decoded_output_and_scheduler_finaliz
     engine.scheduler.complete_pipeline_request = mocker.Mock(return_value={"req-a"})
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-    batch.finalizing_request_ids = frozenset({"req-a"})
+    batch.finalizing = True
     output = SimpleNamespace(get_request_output=lambda request_id: SimpleNamespace(result=SimpleNamespace(error=None)))
     engine.executor.finalize_pipeline_batch.return_value = output
     engine.executor.release_pipeline_batch.return_value = []
@@ -313,7 +312,7 @@ def test_retirement_retry_skips_successful_release_after_cleanup_failure(mocker)
     engine.scheduler.complete_pipeline_request = mocker.Mock(return_value={"req-a"})
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-    batch.finalizing_request_ids = frozenset({"req-a"})
+    batch.finalizing = True
     engine.executor.release_pipeline_batch.return_value = [
         PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
         PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),

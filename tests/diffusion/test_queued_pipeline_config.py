@@ -26,12 +26,11 @@ def _queued_config(**overrides) -> OmniDiffusionConfig:
 
 
 def test_static_mode_keeps_queued_capacity_fields_inert() -> None:
-    config = OmniDiffusionConfig(model="test", max_inflight_batches=0, edge_buffer_slots=-1, stage_buffer_bytes=0)
+    config = OmniDiffusionConfig(model="test", max_inflight_batches=0, edge_buffer_slots=-1)
 
     assert config.mode == "static"
     assert config.max_inflight_batches == 0
     assert config.edge_buffer_slots == -1
-    assert config.stage_buffer_bytes == 0
 
 
 def test_queued_mode_requires_step_execution() -> None:
@@ -39,26 +38,10 @@ def test_queued_mode_requires_step_execution() -> None:
         _queued_config(step_execution=False)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"parallel_config": DiffusionParallelConfig(pipeline_parallel_size=1)}, "pipeline_parallel_size=2"),
-    ],
-)
-def test_queued_mode_rejects_out_of_scope_capacity_or_topology(overrides, message) -> None:
-    with pytest.raises(ValueError, match=message):
-        _queued_config(**overrides)
-
-
 @pytest.mark.parametrize("field", ["max_inflight_batches", "edge_buffer_slots"])
 def test_capacity_counts_are_positive(field: str) -> None:
     with pytest.raises(ValueError, match=field):
         _queued_config(**{field: 0})
-
-
-def test_stage_buffer_bytes_must_be_positive_when_explicit() -> None:
-    with pytest.raises(ValueError, match="stage_buffer_bytes"):
-        _queued_config(stage_buffer_bytes=0)
 
 
 def test_queued_mode_accepts_multiple_scheduler_requests() -> None:

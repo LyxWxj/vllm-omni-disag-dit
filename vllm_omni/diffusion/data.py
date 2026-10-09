@@ -1118,11 +1118,9 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
-    # Queued pipeline-parallel capacity settings. These are inert in static
-    # mode and deliberately narrow in M2 until stage-local scheduling lands.
+    # Queued pipeline-parallel capacity settings.
     max_inflight_batches: int = 1
     edge_buffer_slots: int = 2
-    stage_buffer_bytes: int | None = None
 
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
@@ -1274,10 +1272,6 @@ class OmniDiffusionConfig:
                 value = getattr(self, name)
                 if type(value) is not int or value <= 0:
                     raise ValueError(f"{name} must be a positive integer, got {value!r}")
-            if self.stage_buffer_bytes is not None and (
-                type(self.stage_buffer_bytes) is not int or self.stage_buffer_bytes <= 0
-            ):
-                raise ValueError("stage_buffer_bytes must be a positive integer when set")
             if not self.step_execution:
                 raise ValueError("mode='queued' requires step_execution=True")
 
@@ -1346,8 +1340,6 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
-        if self.mode == "queued" and self.parallel_config.pipeline_parallel_size != 2:
-            raise ValueError("mode='queued' currently requires pipeline_parallel_size=2")
         self.master_port = self._resolve_master_port()
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.

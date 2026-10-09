@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def _task(batch_id: str = "batch-a") -> PipelineTask:
-    return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=1)
+    return PipelineTask(batch_id=batch_id, request_id="req-a", step_index=0, epoch=1)
 
 
 def _grant() -> PipelineTransferGrant:

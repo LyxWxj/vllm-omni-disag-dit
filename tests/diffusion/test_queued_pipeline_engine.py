@@ -47,11 +47,8 @@ def _engine(mocker, scheduler_output: DiffusionSchedulerOutput) -> DiffusionEngi
     )
     engine.executor = mocker.Mock()
     engine.executor.pipeline_stage_physical_ranks.return_value = {0: 0, 1: 1}
-    engine.executor.pipeline_stage_memory_budget_bytes.return_value = 1 << 30
     engine.od_config = SimpleNamespace(mode="queued", max_inflight_batches=2)
     engine._queued_pipeline_batches = {}
-    engine._queued_reserved_bytes = 0
-    engine._queued_stage_buffer_budget_bytes = None
     engine._queued_pipeline_epoch = 3
 
     submit = DiffusionEngine._submit_queued_pipeline_batch
@@ -124,8 +121,8 @@ def test_queued_reservation_keeps_distinct_request_ownership(mocker) -> None:
 
     second = engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
 
-    assert first.task.request_ids == ("req-a",)
-    assert second.task.request_ids == ("req-b",)
+    assert first.task.request_id == "req-a"
+    assert second.task.request_id == "req-b"
     assert len(engine._queued_pipeline_batches) == 2
 
 
@@ -138,8 +135,7 @@ def test_finalizing_batch_releases_denoise_admission_capacity(mocker) -> None:
     assert engine._queued_denoise_batch_count() == 0
     second = engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
 
-    assert second.task.request_ids == ("req-b",)
-    assert engine._queued_reserved_bytes == first.reserved_bytes + second.reserved_bytes
+    assert second.task.request_id == "req-b"
 
 
 def test_prepared_fifo_prevents_continuation_starvation(mocker) -> None:
@@ -154,7 +150,6 @@ def test_prepared_fifo_prevents_continuation_starvation(mocker) -> None:
 
     first.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
     engine._queued_pipeline_batches.pop(first.task.batch_id)
-    engine._queued_reserved_bytes -= first.reserved_bytes
     engine.scheduler.get_request_state.return_value.req.sampling_params.step_index = 1
     continuation = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
 
@@ -269,19 +264,6 @@ def test_failure_cleanup_finds_original_step_after_scheduler_advance(mocker) -> 
     engine.scheduler.finish_requests.assert_called_once_with("req-a", DiffusionRequestStatus.FINISHED_ERROR)
 
 
-def test_queued_byte_reservation_defers_after_budget_is_consumed(mocker) -> None:
-    engine = _engine(mocker, _scheduler_output())
-    engine._queued_stage_buffer_budget_bytes = engine._estimate_queued_request_bytes(_scheduler_output("req-a"))
-
-    first = engine._reserve_queued_pipeline_batch(_scheduler_output("req-a"))
-
-    with pytest.raises(RuntimeError, match="stage buffer capacity is exhausted"):
-        engine._reserve_queued_pipeline_batch(_scheduler_output("req-b"))
-
-    assert engine._queued_reserved_bytes == first.reserved_bytes
-    assert len(engine._queued_pipeline_batches) == 1
-
-
 def test_queued_admission_deferral_preserves_new_and_cached_identity(mocker) -> None:
     scheduler_output = _scheduler_output("req-a")
     engine = _engine(mocker, scheduler_output)
@@ -313,7 +295,7 @@ def test_queued_admission_deferral_keeps_owned_cached_request_running(mocker) ->
     engine = _engine(mocker, _scheduler_output("req-a"))
     engine.scheduler.preempt_request = mocker.Mock(return_value=True)
     engine._queued_pipeline_batches = {
-        "owned": SimpleNamespace(task=SimpleNamespace(request_ids=("req-b",))),
+        "owned": SimpleNamespace(task=SimpleNamespace(request_id="req-b")),
     }
     cached_output = DiffusionSchedulerOutput(
         step_id=8,
@@ -327,23 +309,6 @@ def test_queued_admission_deferral_keeps_owned_cached_request_running(mocker) ->
     engine._defer_queued_admission(cached_output)
 
     engine.scheduler.preempt_request.assert_not_called()
-
-
-def test_queued_oversize_request_is_rejected_without_retry_loop(mocker) -> None:
-    engine = _engine(mocker, _scheduler_output())
-    engine._queued_stage_buffer_budget_bytes = 1
-    engine.scheduler.finish_requests = mocker.Mock()
-    engine._emit_finished_outputs = mocker.Mock()
-    scheduler_output = _scheduler_output("req-too-large")
-
-    with pytest.raises(RuntimeError, match="exceeds stage buffer budget"):
-        engine._reserve_queued_pipeline_batch(scheduler_output)
-
-    engine._reject_queued_admission(scheduler_output, RuntimeError("request exceeds stage buffer budget"))
-
-    engine.scheduler.finish_requests.assert_called_once_with(["req-too-large"], DiffusionRequestStatus.FINISHED_ERROR)
-    engine._emit_finished_outputs.assert_called_once()
-    assert engine._queued_pipeline_batches == {}
 
 
 def test_queued_failure_targets_matching_descriptor_batch(mocker) -> None:
@@ -517,7 +482,7 @@ def test_busy_loop_progresses_retained_batch_when_scheduler_snapshot_is_empty(mo
         phase=_QueuedPipelineBatchPhase.AUTHORIZED,
         failure=None,
         abort_requested=False,
-        task=SimpleNamespace(request_ids=("req-a",)),
+        task=SimpleNamespace(request_id="req-a"),
     )
     engine._queued_pipeline_batches = {"retained": retained}
     empty = DiffusionSchedulerOutput(
@@ -557,7 +522,7 @@ def test_busy_loop_skips_scheduler_for_owned_queued_work(mocker) -> None:
         phase=_QueuedPipelineBatchPhase.AUTHORIZED,
         failure=None,
         abort_requested=False,
-        task=SimpleNamespace(request_ids=("req-a",)),
+        task=SimpleNamespace(request_id="req-a"),
     )
     engine._queued_pipeline_batches = {"retained": retained}
     engine.scheduler.has_requests = mocker.Mock(return_value=True)
@@ -675,7 +640,7 @@ def test_busy_loop_progresses_cached_retained_batch_after_deferred_new_tail(mock
         phase=_QueuedPipelineBatchPhase.AUTHORIZED,
         failure=None,
         abort_requested=False,
-        task=SimpleNamespace(request_ids=("req-a",)),
+        task=SimpleNamespace(request_id="req-a"),
     )
     engine._queued_pipeline_batches = {"retained": retained}
     mixed = DiffusionSchedulerOutput(
@@ -713,7 +678,7 @@ def test_malformed_shared_snapshot_does_not_repoll_retained_batch(mocker) -> Non
     retained_output = _scheduler_output("req-b")
     admitted = engine._submit_queued_pipeline_batch(admitted_output)
     retained = engine._submit_queued_pipeline_batch(retained_output)
-    unknown_task = PipelineTask("unknown", ("req-c",), step_index=0, epoch=99)
+    unknown_task = PipelineTask("unknown", "req-c", step_index=0, epoch=99)
     engine.executor.poll_pipeline_events.return_value = [
         PipelineEvent(PipelineEventType.STEP_COMPLETED, unknown_task, 0, 0)
     ]
@@ -792,7 +757,7 @@ def test_abort_overrides_failure_or_finalizing_success(mocker, finalizing: bool)
     batch = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
     if finalizing:
         batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-        batch.finalizing_request_ids = frozenset({"req-a"})
+        batch.finalizing = True
         engine.executor.cleanup_finalized_pipeline_request.return_value = [True, True]
     else:
         batch.phase = _QueuedPipelineBatchPhase.FAILED
@@ -840,7 +805,7 @@ def test_queued_progress_rejects_unknown_task_event(mocker) -> None:
     batch = engine._submit_queued_pipeline_batch(scheduler_output)
     other_task = PipelineTask(
         batch_id="other-batch",
-        request_ids=("req-b",),
+        request_id="req-b",
         step_index=0,
         epoch=99,
     )
@@ -925,5 +890,5 @@ def test_queued_final_step_enters_finalizing_without_client_completion(mocker) -
     batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
 
     assert engine._commit_queued_pipeline_step(batch) == frozenset({"req-a"})
-    assert batch.finalizing_request_ids == frozenset({"req-a"})
+    assert batch.finalizing
     assert batch.phase is _QueuedPipelineBatchPhase.FINALIZING

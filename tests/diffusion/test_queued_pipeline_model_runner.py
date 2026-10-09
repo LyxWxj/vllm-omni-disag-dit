@@ -92,7 +92,7 @@ def _runner() -> DiffusionModelRunner:
 
 
 def _task(batch_id: str = "batch-a") -> PipelineTask:
-    return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=1)
+    return PipelineTask(batch_id=batch_id, request_id="req-a", step_index=0, epoch=1)
 
 
 def test_prepare_pipeline_requests_retains_local_state_without_denoising(mocker) -> None:
@@ -203,27 +203,6 @@ def test_prepare_pipeline_requests_agrees_and_rolls_back_metadata_install_failur
     assert runner.pipeline.denoise_calls == 0
 
 
-def test_non_output_stage_joins_distributed_vae_finalization(mocker) -> None:
-    runner = _runner()
-    state = _state()
-    runner.pipeline.vae = SimpleNamespace(is_distributed_enabled=lambda: True)
-    runner.pipeline.post_decode = mocker.Mock(return_value=DiffusionOutput())
-    task = _task("distributed-decode")
-    spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
-    context = runner.prepare_pipeline_batch(task, spec, [state])
-    state.step_index = 2
-    context.status = PipelineTaskStatus.COMPLETED
-    mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_model_runner.set_forward_context",
-        return_value=nullcontext(),
-    )
-
-    output = runner.finalize_pipeline_batch(context, spec)
-
-    assert output is None
-    runner.pipeline.post_decode.assert_called_once_with(state, queued_pipeline=True)
-
-
 def test_assigned_non_first_output_stage_can_decode_locally(mocker) -> None:
     runner = _runner()
     state = _state()
@@ -231,7 +210,7 @@ def test_assigned_non_first_output_stage_can_decode_locally(mocker) -> None:
     runner.pipeline.post_decode = mocker.Mock(return_value=DiffusionOutput())
     task = _task("rank-one-output")
     spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
-    context = runner.prepare_pipeline_batch(task, spec, [state])
+    context = runner.prepare_pipeline_batch(task, spec, state)
     state.step_index = 2
     context.status = PipelineTaskStatus.COMPLETED
     mocker.patch(
@@ -348,13 +327,13 @@ def test_prepare_pipeline_batch_owns_independent_context() -> None:
     state = _state()
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
 
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
 
     assert context.input_batch is not runner.input_batch
-    assert context.states == (state,)
+    assert context.state is state
     assert runner.pipeline_batch_contexts[(0, "batch-a")] is context
     with pytest.raises(ValueError, match="already exists"):
-        runner.prepare_pipeline_batch(_task(), spec, [state])
+        runner.prepare_pipeline_batch(_task(), spec, state)
 
 
 def test_prepare_pipeline_batch_rejects_stale_step_identity() -> None:
@@ -364,24 +343,24 @@ def test_prepare_pipeline_batch_rejects_stale_step_identity() -> None:
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
 
     with pytest.raises(ValueError, match="does not match request state step"):
-        runner.prepare_pipeline_batch(_task(), spec, [state])
+        runner.prepare_pipeline_batch(_task(), spec, state)
 
 
 def test_prepare_pipeline_batch_rejects_overlapping_request_step_owner() -> None:
     runner = _runner()
     state = _state()
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
-    runner.prepare_pipeline_batch(_task(), spec, [state])
+    runner.prepare_pipeline_batch(_task(), spec, state)
 
     with pytest.raises(ValueError, match="already owned"):
-        runner.prepare_pipeline_batch(_task("batch-b"), spec, [state])
+        runner.prepare_pipeline_batch(_task("batch-b"), spec, state)
 
 
 def test_last_stage_executes_and_updates_scheduler_exactly_once() -> None:
     runner = _runner()
     state = _state()
     spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
 
     result = runner.execute_pipeline_stage(context, spec, intermediate_tensors=object())
     feedback = runner.complete_pipeline_step(context, spec)
@@ -402,7 +381,7 @@ def test_last_stage_executes_and_updates_scheduler_exactly_once() -> None:
 def test_local_stage_executes_with_real_forward_context() -> None:
     runner = _runner()
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
-    context = runner.prepare_pipeline_batch(_task(), spec, [_state()])
+    context = runner.prepare_pipeline_batch(_task(), spec, _state())
 
     assert not is_forward_context_available()
     runner.execute_pipeline_stage(context, spec, intermediate_tensors=None)
@@ -419,7 +398,7 @@ def test_last_stage_empty_latent_postcondition_marks_context_failed() -> None:
     runner = _runner()
     state = _state()
     spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
     runner.execute_pipeline_stage(context, spec, intermediate_tensors=object())
 
     def clear_latents(state, noise_pred) -> None:
@@ -439,7 +418,7 @@ def test_last_stage_non_tensor_result_marks_context_failed() -> None:
     runner = _runner()
     state = _state()
     spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
     context.status = PipelineTaskStatus.ACTIVE
     context.result = object()
 
@@ -454,7 +433,7 @@ def test_first_stage_adopts_feedback_without_scheduler_update() -> None:
     runner = _runner()
     state = _state()
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
     runner.execute_pipeline_stage(context, spec, intermediate_tensors=None)
     feedback = torch.full_like(state.latents, 7.0)
 
@@ -473,7 +452,7 @@ def test_feedback_adoption_mutates_inference_tensor_inside_inference_scope() -> 
     with torch.inference_mode():
         state = _state()
         feedback = torch.full_like(state.latents, 9.0)
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
     runner.execute_pipeline_stage(context, spec, intermediate_tensors=None)
 
     runner.adopt_pipeline_feedback(context, spec, feedback)
@@ -485,7 +464,7 @@ def test_feedback_adoption_mutates_inference_tensor_inside_inference_scope() -> 
 def test_release_rejects_non_terminal_context() -> None:
     runner = _runner()
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
-    runner.prepare_pipeline_batch(_task(), spec, [_state()])
+    runner.prepare_pipeline_batch(_task(), spec, _state())
 
     with pytest.raises(RuntimeError, match="non-terminal"):
         runner.release_pipeline_batch(0, "batch-a")
@@ -494,7 +473,7 @@ def test_release_rejects_non_terminal_context() -> None:
 def test_cancel_pipeline_batch_requires_explicit_release() -> None:
     runner = _runner()
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
-    context = runner.prepare_pipeline_batch(_task(), spec, [_state()])
+    context = runner.prepare_pipeline_batch(_task(), spec, _state())
 
     assert runner.cancel_pipeline_batch(0, "batch-a") is context
     assert context.status is PipelineTaskStatus.CANCELLED
@@ -507,7 +486,7 @@ def test_cancel_pipeline_batch_overrides_completed_local_work() -> None:
     runner = _runner()
     state = _state()
     spec = PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True)
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
     runner.execute_pipeline_stage(context, spec, intermediate_tensors=object())
     runner.complete_pipeline_step(context, spec)
 
@@ -521,7 +500,7 @@ def test_cancel_pipeline_batch_overrides_completed_local_work() -> None:
 def test_context_rejects_changed_stage_specification() -> None:
     runner = _runner()
     first = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
-    context = runner.prepare_pipeline_batch(_task(), first, [_state()])
+    context = runner.prepare_pipeline_batch(_task(), first, _state())
     forged = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=False, is_last=True)
 
     with pytest.raises(ValueError, match="changed after preparation"):
@@ -531,7 +510,7 @@ def test_context_rejects_changed_stage_specification() -> None:
 def test_feedback_rejects_mismatched_latent_shape() -> None:
     runner = _runner()
     spec = PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False)
-    context = runner.prepare_pipeline_batch(_task(), spec, [_state()])
+    context = runner.prepare_pipeline_batch(_task(), spec, _state())
     runner.execute_pipeline_stage(context, spec, intermediate_tensors=None)
 
     with pytest.raises(ValueError, match="do not match"):
@@ -547,7 +526,7 @@ def test_context_revalidates_request_progress_before_each_phase(phase: str) -> N
     is_last = phase == "completion"
     spec = PipelineStageSpec(pp_stage_id=int(is_last), world_size=2, is_first=not is_last, is_last=is_last)
     state = _state()
-    context = runner.prepare_pipeline_batch(_task(), spec, [state])
+    context = runner.prepare_pipeline_batch(_task(), spec, state)
     if phase != "forward":
         runner.execute_pipeline_stage(context, spec, intermediate_tensors=None if not is_last else object())
     state.step_index = 1

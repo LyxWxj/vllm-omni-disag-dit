@@ -839,8 +839,6 @@ class DiffusionWorker:
         if self.pipeline_connectors:
             raise RuntimeError("pipeline transports are already initialized")
         pp_group = get_pp_group()
-        if pp_group.world_size != 2:
-            raise ValueError("queued v1 transport requires PP world size 2")
         src_rank, dst_rank = pp_group.ranks
         for edge_kind, edge_src, edge_dst in (
             (PipelineEdgeKind.ACTIVATION, src_rank, dst_rank),
@@ -1282,17 +1280,14 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         if isinstance(pp_stage_spec, dict):
             pp_stage_spec = self._select_rank_value(pp_stage_spec)
-        states = []
-        for request_id in task.request_ids:
-            state = self.model_runner.state_cache.get(request_id)
-            if state is None:
-                raise ValueError(f"Missing prepared pipeline state for request {request_id!r}.")
-            states.append(state)
+        state = self.model_runner.state_cache.get(task.request_id)
+        if state is None:
+            raise ValueError(f"Missing prepared pipeline state for request {task.request_id!r}.")
         stage_was_new = pp_stage_spec.pp_stage_id not in self.pipeline_stages
         stage = self._pipeline_stage(pp_stage_spec)
         stage.enqueue(task)
         try:
-            self.model_runner.prepare_pipeline_batch(task, pp_stage_spec, states)
+            self.model_runner.prepare_pipeline_batch(task, pp_stage_spec, state)
         except BaseException:
             stage.rollback_pending(task.batch_id)
             if stage_was_new:
@@ -1542,75 +1537,24 @@ class DiffusionWorker:
         batch_id: str,
         output_rank: int | None = None,
     ) -> str | None:
-        """Submit local decode on its selected owner or join distributed VAE decode."""
+        """Submit decode on the selected output owner."""
         if isinstance(pp_stage_id, dict):
             pp_stage_id = self._select_rank_value(pp_stage_id)
-
-        parallel = getattr(self.od_config, "parallel_config", None)
-        distributed_vae_requested = int(getattr(parallel, "vae_patch_parallel_size", 1) or 1) > 1
-        if distributed_vae_requested:
-            local: dict[str, Any] = {}
-            pp_group = get_pp_group()
-            expected_stage_ranks = dict(enumerate(pp_group.ranks))
-            if output_rank is None:
-                output_rank = expected_stage_ranks[0]
-            if output_rank != expected_stage_ranks[0]:
-                raise ValueError("distributed VAE finalization output must stay on the first PP stage")
-
-            def validate_local_decode() -> dict[str, Any]:
-                stage = self._require_pipeline_stage(pp_stage_id)
-                context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
-                if context is None:
-                    raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
-                state = self.model_runner.validate_pipeline_finalization(context, stage.spec)
-                if not self.model_runner.pipeline_has_distributed_vae():
-                    raise RuntimeError("distributed VAE decode was requested but is not enabled locally")
-                local.update(stage=stage, context=context)
-                return {
-                    "rank": self.rank,
-                    "pp_stage_id": stage.spec.pp_stage_id,
-                    "batch_id": batch_id,
-                    "shape": tuple(state.latents.shape),
-                    "dtype": str(state.latents.dtype),
-                }
-
-            reports = _run_and_gather_rank_values(
-                "queued distributed VAE finalization readiness",
-                validate_local_decode,
-            )
-            reports_are_mappings = all(isinstance(report, dict) for report in reports)
-            reported_stage_ranks = (
-                {report.get("pp_stage_id"): report.get("rank") for report in reports} if reports_are_mappings else {}
-            )
-            if (
-                len(reports) != len(expected_stage_ranks)
-                or reported_stage_ranks != expected_stage_ranks
-                or any(report.get("batch_id") != batch_id for report in reports if isinstance(report, dict))
-                or not reports_are_mappings
-                or len({(report.get("shape"), report.get("dtype")) for report in reports if isinstance(report, dict)})
-                != 1
-            ):
-                raise RuntimeError("distributed VAE finalization readiness did not match across PP ranks")
-            stage = local["stage"]
-            context = local["context"]
-            should_finalize = True
-            return_handle = True
+        stage = self._require_pipeline_stage(pp_stage_id)
+        context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
+        if context is None:
+            raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
+        self.model_runner.validate_pipeline_finalization(context, stage.spec)
+        if output_rank is None:
+            should_finalize = stage.spec.is_first
+            return_handle = should_finalize
+            output_rank = self.rank if should_finalize else None
         else:
-            stage = self._require_pipeline_stage(pp_stage_id)
-            context = self.model_runner.pipeline_batch_contexts.get((pp_stage_id, batch_id))
-            if context is None:
-                raise KeyError(f"Unknown pipeline batch context {(pp_stage_id, batch_id)!r}.")
-            self.model_runner.validate_pipeline_finalization(context, stage.spec)
-            if output_rank is None:
-                should_finalize = stage.spec.is_first
-                return_handle = should_finalize
-                output_rank = self.rank if should_finalize else None
-            else:
-                pp_group = get_pp_group()
-                if type(output_rank) is not int or output_rank not in pp_group.ranks:
-                    raise ValueError("queued finalization output rank must belong to the PP group")
-                should_finalize = self.rank == output_rank
-                return_handle = True
+            pp_group = get_pp_group()
+            if type(output_rank) is not int or output_rank not in pp_group.ranks:
+                raise ValueError("queued finalization output rank must belong to the PP group")
+            should_finalize = self.rank == output_rank
+            return_handle = True
         if not should_finalize:
             return batch_id if return_handle else None
 
@@ -1715,15 +1659,6 @@ class DiffusionWorker:
         events, self._pipeline_events = self.pipeline_events, []
         return events
 
-    def pipeline_stage_memory_budget_bytes(self) -> list[dict[str, int]]:
-        local_report = {"rank": self.rank, "free_bytes": int(current_omni_platform.get_free_memory(self.device))}
-        pp_group = get_pp_group()
-        if pp_group.world_size == 1:
-            return [local_report]
-        reports: list[dict[str, int] | None] = [None] * pp_group.world_size
-        dist.all_gather_object(reports, local_report, group=pp_group.cpu_group)
-        return [report for report in reports if report is not None]
-
     def cancel_pipeline_requests(self, request_generations: Any) -> list[PipelineEvent]:
         """Cancel all local contexts matching request IDs or (ID, generation)."""
         is_single_pair = (
@@ -1750,10 +1685,9 @@ class DiffusionWorker:
                 raise ValueError("pipeline cancellation selectors must be request IDs or (request_id, epoch)")
         events: list[PipelineEvent] = []
         for (pp_stage_id, batch_id), context in list(self.model_runner.pipeline_batch_contexts.items()):
-            matches_request = bool(request_ids.intersection(context.request_state_ids))
-            matches_generation = any(
-                (request_id, context.task.epoch) in request_epochs for request_id in context.request_state_ids
-            )
+            request_id = context.task.request_id
+            matches_request = request_id in request_ids
+            matches_generation = (request_id, context.task.epoch) in request_epochs
             if matches_request or matches_generation:
                 events.append(self.cancel_pipeline_batch(pp_stage_id, batch_id))
         return events
@@ -2146,16 +2080,7 @@ class WorkerProc:
         self._result_mq_lock = threading.Lock()
         self._stage_engine: PipelineStageEngine | None = None
         self._pipeline_prepare_executor: ThreadPoolExecutor | None = None
-        parallel = self.od_config.parallel_config
-        if (
-            self.od_config.mode == "queued"
-            and self.od_config.step_execution
-            and parallel.data_parallel_size == 1
-            and parallel.pipeline_parallel_size == 2
-            and parallel.tensor_parallel_size == 1
-            and parallel.sequence_parallel_size == 1
-            and parallel.cfg_parallel_size == 1
-        ):
+        if self.od_config.mode == "queued" and self.od_config.step_execution:
             worker_device = getattr(self.worker.worker, "device", None)
             self._stage_engine = PipelineStageEngine(
                 worker=self.worker,

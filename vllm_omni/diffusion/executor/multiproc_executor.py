@@ -247,16 +247,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def _uses_autonomous_pipeline_stages(self) -> bool:
         config = getattr(self, "od_config", None)
-        parallel = getattr(config, "parallel_config", None)
         return (
             getattr(config, "mode", "static") == "queued"
             and getattr(config, "step_execution", False)
-            and getattr(parallel, "data_parallel_size", 1) == 1
-            and getattr(parallel, "pipeline_parallel_size", 1) == 2
-            and getattr(parallel, "tensor_parallel_size", 1) == 1
-            and getattr(parallel, "sequence_parallel_size", 1) == 1
-            and getattr(parallel, "cfg_parallel_size", 1) == 1
-            and len(getattr(self, "_result_mqs", ())) == 2
         )
 
     def set_pipeline_update_callback(self, callback: Callable[[], None] | None) -> None:
@@ -1189,29 +1182,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if coordinator is None:
             raise RuntimeError("pipeline transfer coordinator is not initialized")
         return coordinator.stage_physical_ranks
-
-    def pipeline_stage_memory_budget_bytes(self) -> int:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        try:
-            result = self._queued_control_rpc("pipeline_stage_memory_budget_bytes", exec_all_ranks=True)
-            while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-                result = result[0]
-            if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
-                raise RuntimeError("Workers returned invalid pipeline memory budget reports")
-            expected = coordinator.endpoint_ranks
-            ranks = {item.get("rank") for item in result}
-            if len(result) != len(expected) or ranks != expected:
-                raise RuntimeError("pipeline memory budget reports do not cover every configured endpoint")
-            budgets = [item.get("free_bytes") for item in result]
-            if any(type(value) is not int or value <= 0 for value in budgets):
-                raise RuntimeError("pipeline memory budget reports must contain positive integer free_bytes")
-            return min(budgets)
-        except BaseException as exc:
-            if not self._is_failed:
-                self._fail_queued_control("pipeline memory budget", exc)
-            raise
 
     def collective_rpc(
         self,

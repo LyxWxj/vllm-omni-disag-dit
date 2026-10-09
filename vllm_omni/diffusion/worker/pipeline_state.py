@@ -55,14 +55,14 @@ class PipelineTask:
     """One conditional denoise task in the v1 queued contract."""
 
     batch_id: str
-    request_ids: tuple[str, ...]
+    request_id: str
     step_index: int
     epoch: int
     branch: str = "conditional"
 
     def __post_init__(self) -> None:
-        if not self.batch_id or not self.request_ids:
-            raise ValueError("pipeline tasks require a batch id and request ids")
+        if not self.batch_id or not self.request_id:
+            raise ValueError("pipeline tasks require a batch id and request id")
         if self.step_index < 0 or self.epoch < 0:
             raise ValueError("step_index and epoch must be non-negative")
         if self.branch != "conditional":
@@ -114,8 +114,7 @@ class PipelineBatchContext:
 
     task: PipelineTask
     stage_spec: PipelineStageSpec
-    request_state_ids: tuple[str, ...]
-    states: tuple[Any, ...]
+    state: Any
     input_batch: Any
     tensors: dict[str, Any] = field(default_factory=dict)
     result: Any | None = None
@@ -128,10 +127,8 @@ class PipelineBatchContext:
     def __post_init__(self) -> None:
         if self.pp_stage_id < 0:
             raise ValueError("pp_stage_id must be non-negative")
-        if not self.request_state_ids:
-            raise ValueError("pipeline context requires request state ids")
-        if self.request_state_ids != tuple(state.request_id for state in self.states):
-            raise ValueError("pipeline context request ids must match its states")
+        if self.task.request_id != self.state.request_id:
+            raise ValueError("pipeline context request id must match its state")
 
 
 @dataclass

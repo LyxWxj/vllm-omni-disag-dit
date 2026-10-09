@@ -1235,27 +1235,22 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         task: PipelineTask,
         pp_stage_spec: PipelineStageSpec,
-        states: list[StepRequestState],
+        state: StepRequestState,
     ) -> PipelineBatchContext:
         """Create an independently owned context from coherently prepared states."""
         if self.pipeline is None or not supports_pipeline_stage_execution(self.pipeline):
             raise ValueError("The loaded diffusion pipeline does not support queued local-stage execution.")
         self.pipeline.validate_pipeline_stage_execution(pp_stage_spec)
-        request_state_ids = tuple(state.request_id for state in states)
-        if request_state_ids != task.request_ids:
+        if state.request_id != task.request_id:
+            raise ValueError("Pipeline task request id does not match its prepared state.")
+        if state.step_index != task.step_index:
             raise ValueError(
-                f"Pipeline task request ids {task.request_ids!r} do not match prepared states {request_state_ids!r}."
-            )
-        if len(states) != 1:
-            raise ValueError("M2 queued pipeline execution requires exactly one request state per batch.")
-        if states[0].step_index != task.step_index:
-            raise ValueError(
-                f"Pipeline task step {task.step_index} does not match request state step {states[0].step_index}."
+                f"Pipeline task step {task.step_index} does not match request state step {state.step_index}."
             )
         key = (pp_stage_spec.pp_stage_id, task.batch_id)
         if key in self.pipeline_batch_contexts:
             raise ValueError(f"Pipeline batch context {key!r} already exists.")
-        owner_key = (states[0].request_id, task.step_index)
+        owner_key = (state.request_id, task.step_index)
         existing_owner = self.pipeline_request_owners.get(owner_key)
         if existing_owner is not None:
             raise ValueError(f"Request step {owner_key!r} is already owned by pipeline batch {existing_owner!r}.")
@@ -1263,9 +1258,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             context = PipelineBatchContext(
                 task=task,
                 stage_spec=pp_stage_spec,
-                request_state_ids=request_state_ids,
-                states=tuple(states),
-                input_batch=InputBatch.make_batch(states),
+                state=state,
+                input_batch=InputBatch.make_batch([state]),
             )
         self.pipeline_batch_contexts[key] = context
         self.pipeline_request_owners[owner_key] = key
@@ -1300,7 +1294,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     context.input_batch,
                     pp_stage_spec=pp_stage_spec,
                     intermediate_tensors=intermediate_tensors,
-                    states=context.states,
+                    states=(context.state,),
                 )
         except BaseException:
             context.status = PipelineTaskStatus.FAILED
@@ -1321,7 +1315,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if not isinstance(context.result, torch.Tensor):
             context.status = PipelineTaskStatus.FAILED
             raise RuntimeError("Pipeline batch produced a non-tensor result for numerical completion.")
-        state = context.states[0]
+        state = context.state
         try:
             self._validate_pipeline_context_progress(context)
             kv_backend = getattr(self, "diffusion_kv_backend", None)
@@ -1357,7 +1351,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             raise ValueError("Only the first pipeline stage can adopt latent feedback.")
         if context.status is not PipelineTaskStatus.ACTIVE:
             raise RuntimeError("Pipeline batch must be active before feedback adoption.")
-        state = context.states[0]
+        state = context.state
         try:
             self._validate_pipeline_context_progress(context)
             if state.latents is None:
@@ -1377,11 +1371,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             raise
         context.status = PipelineTaskStatus.COMPLETED
 
-    def pipeline_has_distributed_vae(self) -> bool:
-        vae = getattr(self.pipeline, "vae", None)
-        is_distributed_enabled = getattr(vae, "is_distributed_enabled", None)
-        return callable(is_distributed_enabled) and bool(is_distributed_enabled())
-
     def validate_pipeline_finalization(
         self,
         context: PipelineBatchContext,
@@ -1390,7 +1379,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self._require_pipeline_context(context, pp_stage_spec)
         if context.status is not PipelineTaskStatus.COMPLETED:
             raise RuntimeError("Pipeline batch must be completed before final decode.")
-        state = context.states[0]
+        state = context.state
         if not state.request_denoise_completed:
             raise RuntimeError("Pipeline request has not completed its denoise schedule.")
         if state.latents is None:
@@ -1403,17 +1392,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         pp_stage_spec: PipelineStageSpec,
         output_owner: bool | None = None,
     ) -> BatchRunnerOutput | None:
-        """Decode on the assigned output owner, joining distributed VAE work when enabled."""
+        """Decode on the assigned output owner."""
         state = self.validate_pipeline_finalization(context, pp_stage_spec)
-        distributed_vae = self.pipeline_has_distributed_vae()
         if output_owner is None:
             output_owner = pp_stage_spec.is_first
         if type(output_owner) is not bool:
             raise TypeError("queued pipeline output_owner must be a bool")
-        if not output_owner and not distributed_vae:
-            raise ValueError("Only the assigned output owner can finalize queued output.")
 
-        decode_owner_override = output_owner and not pp_stage_spec.is_first and not distributed_vae
+        decode_owner_override = output_owner and not pp_stage_spec.is_first
         previous_decode_owner = getattr(self.pipeline, "_queued_pipeline_decode_owner", False)
         try:
             decode_start = time.perf_counter()
@@ -1436,8 +1422,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             decode_ms = (time.perf_counter() - decode_start) * 1000
             if not isinstance(result, DiffusionOutput):
                 raise RuntimeError("Pipeline final decode produced no DiffusionOutput.")
-            if distributed_vae and not pp_stage_spec.is_first:
-                return None
             transport_start = time.perf_counter()
             result = self._prepare_output_for_transport(result, state.sampling)
             transport_ms = (time.perf_counter() - transport_start) * 1000
@@ -1475,10 +1459,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         }:
             raise RuntimeError("Cannot release a non-terminal pipeline batch context.")
         context = self.pipeline_batch_contexts.pop(key)
-        for request_id in context.request_state_ids:
-            owner_key = (request_id, context.task.step_index)
-            if self.pipeline_request_owners.get(owner_key) == key:
-                self.pipeline_request_owners.pop(owner_key)
+        owner_key = (context.state.request_id, context.task.step_index)
+        if self.pipeline_request_owners.get(owner_key) == key:
+            self.pipeline_request_owners.pop(owner_key)
         return context
 
     def cancel_pipeline_batch(self, pp_stage_id: int, batch_id: str) -> PipelineBatchContext:
@@ -1507,15 +1490,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
     @staticmethod
     def _validate_pipeline_context_progress(context: PipelineBatchContext) -> None:
-        mismatched = [
-            (state.request_id, state.step_index)
-            for state in context.states
-            if state.step_index != context.task.step_index
-        ]
-        if mismatched:
+        if context.state.step_index != context.task.step_index:
             raise RuntimeError(
                 f"Pipeline batch {context.task.batch_id!r} was prepared for step {context.task.step_index}, "
-                f"but request progress changed: {mismatched!r}."
+                f"but request progress changed to {context.state.step_index}."
             )
 
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
