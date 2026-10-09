@@ -37,7 +37,6 @@ def _offer(
         batch_id=batch_id,
         step_index=0,
         epoch=1,
-        branch="conditional",
         edge_kind=edge_kind,
         src_rank=src_rank,
         dst_rank=dst_rank,
@@ -53,13 +52,6 @@ def test_transfer_requires_offer_and_receive_readiness() -> None:
     coordinator.mark_receive_ready(offer.identity)
     grant = coordinator.grant_ready()[0]
     assert grant.offer is offer
-    assert coordinator.snapshot() == {
-        "offers": 0,
-        "ready": 0,
-        "grants": 1,
-        "completed": 0,
-        "busy_ranks": (0, 1),
-    }
 
 
 def test_receive_readiness_may_precede_offer_and_is_bound_to_destination() -> None:
@@ -67,7 +59,7 @@ def test_receive_readiness_may_precede_offer_and_is_bound_to_destination() -> No
     offer = _offer("batch-pre-ready")
 
     coordinator.mark_receive_ready(offer.identity, rank=1)
-    assert coordinator.snapshot()["ready"] == 1
+    assert coordinator.grant_ready() == []
 
     coordinator.offer(offer)
     assert coordinator.grant_ready()[0].offer is offer
@@ -150,7 +142,6 @@ def test_opposite_directions_are_serialized_by_endpoint_ownership() -> None:
     grants = coordinator.grant_ready(limit=2)
 
     assert [grant.offer.identity for grant in grants] == [second.identity]
-    assert coordinator.snapshot()["busy_ranks"] == (0, 1)
     assert not coordinator.grant_ready()
 
     coordinator.complete(second.identity, second.src_rank)
@@ -201,7 +192,6 @@ def test_batch_retirement_waits_for_both_transfer_endpoints() -> None:
     assert coordinator.batch_retirement_ready(offer.batch_id, offer.epoch)
 
     coordinator.retire_batch(offer.batch_id, offer.epoch)
-    assert coordinator.snapshot()["grants"] == 0
 
 
 class _Work:
@@ -257,7 +247,6 @@ def _message() -> PipelineMessage:
         batch_id="batch-a",
         step_index=0,
         epoch=1,
-        branch="conditional",
         payload={"hidden_states": "sent"},
     )
 
@@ -294,7 +283,6 @@ def test_distributed_p2p_sender_rejects_metadata_mismatch() -> None:
         batch_id="batch-a",
         step_index=0,
         epoch=1,
-        branch="conditional",
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=2,
         dst_rank=3,
@@ -304,7 +292,6 @@ def test_distributed_p2p_sender_rejects_metadata_mismatch() -> None:
         batch_id="batch-a",
         step_index=0,
         epoch=1,
-        branch="conditional",
         payload={"hidden_states": torch.ones(1)},
     )
 

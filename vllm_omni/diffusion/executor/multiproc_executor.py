@@ -1152,12 +1152,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if rank_progress.rank != update.worker_id:
                 raise RuntimeError("Pipeline StageEngine update has invalid rank-local progress")
             worker_events.extend(update.events)
-            for identity, ready in rank_progress.readiness:
-                if type(ready) is not bool:
-                    raise RuntimeError("Pipeline StageEngine published invalid receive readiness")
-                if ready:
-                    coordinator.mark_receive_ready(identity, rank=update.worker_id)
-                    saw_readiness = True
+            for identity in rank_progress.readiness:
+                coordinator.mark_receive_ready(identity, rank=update.worker_id)
+                saw_readiness = True
 
         for update in updates:
             rank_progress = update.progress

@@ -58,15 +58,12 @@ class PipelineTask:
     request_id: str
     step_index: int
     epoch: int
-    branch: str = "conditional"
 
     def __post_init__(self) -> None:
         if not self.batch_id or not self.request_id:
             raise ValueError("pipeline tasks require a batch id and request id")
         if self.step_index < 0 or self.epoch < 0:
             raise ValueError("step_index and epoch must be non-negative")
-        if self.branch != "conditional":
-            raise ValueError("M2 supports only the conditional pipeline branch")
 
 
 @dataclass(frozen=True)
@@ -140,7 +137,6 @@ class PipelineStageState:
     active_task: PipelineTask | None = None
     awaiting_feedback: dict[str, PipelineTask] = field(default_factory=dict)
     authorized_batches: set[str] = field(default_factory=set)
-    completed_batches: set[str] = field(default_factory=set)
     terminal_statuses: dict[str, PipelineTaskStatus] = field(default_factory=dict)
     retired_batches: set[str] = field(default_factory=set)
 
@@ -188,7 +184,6 @@ class PipelineStageState:
             raise RuntimeError("cannot complete a stage without an active task")
         task = self.active_task
         self.active_task = None
-        self.completed_batches.add(task.batch_id)
         self.terminal_statuses[task.batch_id] = PipelineTaskStatus.COMPLETED
         return task
 
@@ -205,7 +200,6 @@ class PipelineStageState:
         task = self.awaiting_feedback.pop(batch_id, None)
         if task is None:
             raise RuntimeError(f"batch {batch_id!r} is not awaiting feedback")
-        self.completed_batches.add(batch_id)
         self.terminal_statuses[batch_id] = PipelineTaskStatus.COMPLETED
         return task
 
@@ -229,7 +223,6 @@ class PipelineStageState:
         if terminal_status is PipelineTaskStatus.CANCELLED:
             return True
         if terminal_status is PipelineTaskStatus.COMPLETED:
-            self.completed_batches.discard(batch_id)
             self.terminal_statuses[batch_id] = PipelineTaskStatus.CANCELLED
             return True
         if terminal_status is not None:

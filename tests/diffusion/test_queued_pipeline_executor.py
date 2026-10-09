@@ -40,7 +40,6 @@ def _offer(batch_id: str = "batch-a") -> PipelineTransferOffer:
         batch_id=batch_id,
         step_index=0,
         epoch=1,
-        branch="conditional",
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -55,7 +54,7 @@ def test_sparse_readiness_grants_transfer_without_worker_control_rpc(mocker) -> 
         PipelineWorkerUpdate(0, PipelineTransportProgress(rank=0, offers=[offer]), ())
     )
     executor._pipeline_update_buffers[1].put(
-        PipelineWorkerUpdate(1, PipelineTransportProgress(rank=1, readiness=[(offer.identity, True)]), ())
+        PipelineWorkerUpdate(1, PipelineTransportProgress(rank=1, readiness=[offer.identity]), ())
     )
 
     progress = executor.progress_pipeline()

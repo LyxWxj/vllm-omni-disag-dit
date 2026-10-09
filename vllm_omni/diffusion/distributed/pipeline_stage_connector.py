@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import inspect
 from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -21,7 +20,6 @@ class PipelineMessage:
     batch_id: str
     step_index: int
     epoch: int
-    branch: str
     payload: Any
 
 
@@ -62,7 +60,6 @@ class PipelineTransferOffer:
     batch_id: str
     step_index: int
     epoch: int
-    branch: str
     edge_kind: PipelineEdgeKind
     src_rank: int
     dst_rank: int
@@ -71,20 +68,17 @@ class PipelineTransferOffer:
     def __post_init__(self) -> None:
         if not self.batch_id or self.step_index < 0 or self.epoch < 0:
             raise ValueError("invalid pipeline transfer identity")
-        if self.branch != "conditional":
-            raise ValueError("M2 supports only the conditional pipeline branch")
         if not isinstance(self.edge_kind, PipelineEdgeKind):
             raise ValueError("pipeline transfer requires a valid edge kind")
         if self.src_rank < 0 or self.dst_rank < 0 or self.src_rank == self.dst_rank:
             raise ValueError("pipeline transfer endpoints must be distinct non-negative ranks")
 
     @property
-    def identity(self) -> tuple[str, int, int, str, PipelineEdgeKind, int, int]:
+    def identity(self) -> tuple[str, int, int, PipelineEdgeKind, int, int]:
         return (
             self.batch_id,
             self.step_index,
             self.epoch,
-            self.branch,
             self.edge_kind,
             self.src_rank,
             self.dst_rank,
@@ -108,7 +102,7 @@ class PipelineTransportProgress:
     rank: int
     offers: list[PipelineTransferOffer] = field(default_factory=list)
     completions: list[PipelineEndpointCompletion] = field(default_factory=list)
-    readiness: list[tuple[tuple[Any, ...], bool]] = field(default_factory=list)
+    readiness: list[tuple[Any, ...]] = field(default_factory=list)
 
 
 @dataclass
@@ -287,15 +281,6 @@ class PipelineTransferCoordinator:
         self._busy_ranks.difference_update((grant.offer.src_rank, grant.offer.dst_rank))
         return True
 
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "offers": sum(map(len, self._offers.values())),
-            "ready": len(self._ready_ids) + len(self._pre_ready_ids),
-            "grants": len(self._grants),
-            "completed": len(self._completed_ids),
-            "busy_ranks": tuple(sorted(self._busy_ranks)),
-        }
-
     @staticmethod
     def _validate_topology(
         activation_edges: set[tuple[int, int]],
@@ -311,7 +296,7 @@ class PipelineTransferCoordinator:
 
     @staticmethod
     def _offer_from_identity(identity: tuple[Any, ...]) -> PipelineTransferOffer:
-        if not isinstance(identity, tuple) or len(identity) != 7:
+        if not isinstance(identity, tuple) or len(identity) != 6:
             raise ValueError("invalid pipeline transfer identity in receive readiness")
         try:
             return PipelineTransferOffer(*identity)
@@ -324,10 +309,15 @@ class TransferTicket:
     message: PipelineMessage
     started: bool = False
     completed: bool = False
-    released: bool = False
 
 
 class PipelineTransport(Protocol):
+    src_rank: int
+    dst_rank: int
+
+    @property
+    def has_outstanding_operations(self) -> bool: ...
+
     def start_granted_transfer(
         self,
         grant: PipelineTransferGrant,
@@ -338,6 +328,8 @@ class PipelineTransport(Protocol):
 
     def wait(self, ticket: TransferTicket) -> bool: ...
 
+    def is_send_ready(self, ticket: TransferTicket) -> bool: ...
+
     def abort(self, ticket: TransferTicket) -> bool: ...
 
     def close(self) -> None: ...
@@ -346,7 +338,7 @@ class PipelineTransport(Protocol):
 @dataclass
 class _PendingReceive:
     message: PipelineMessage
-    identity: tuple[str, int, int, str]
+    identity: tuple[str, int, int]
     handles: list[Any]
     postprocess: list[Any]
     handles_verified: bool = False
@@ -388,17 +380,16 @@ class DistributedP2PTransport:
         self.dst_rank = dst_rank
         self._src_group_rank = group_ranks.index(src_rank)
         self._dst_group_rank = group_ranks.index(dst_rank)
-        self._send_handles: dict[tuple[str, int, int, str], list[Any] | None] = {}
-        self._completed_send_ids: set[tuple[str, int, int, str]] = set()
+        self._send_handles: dict[tuple[str, int, int], list[Any] | None] = {}
+        self._completed_send_ids: set[tuple[str, int, int]] = set()
         self._pending_receives: deque[_PendingReceive] = deque()
-        self._ready_receives: deque[PipelineMessage] = deque()
-        self._active_receive_ids: set[tuple[str, int, int, str]] = set()
-        self._completed_receive_ids: set[tuple[str, int, int, str]] = set()
+        self._active_receive_ids: set[tuple[str, int, int]] = set()
+        self._completed_receive_ids: set[tuple[str, int, int]] = set()
         self._closed = False
 
     @property
     def has_outstanding_operations(self) -> bool:
-        return bool(self._send_handles or self._pending_receives or self._ready_receives or self._active_receive_ids)
+        return bool(self._send_handles or self._pending_receives or self._active_receive_ids)
 
     def start_granted_transfer(
         self,
@@ -417,7 +408,7 @@ class DistributedP2PTransport:
             return
         if message is not None:
             raise ValueError("receiver must not provide a sender payload")
-        identity = (offer.batch_id, offer.step_index, offer.epoch, offer.branch)
+        identity = (offer.batch_id, offer.step_index, offer.epoch)
         if identity in self._active_receive_ids or identity in self._completed_receive_ids:
             raise ValueError("duplicate distributed P2P receive grant")
         # Register before entering the blocking metadata receive. If the
@@ -425,14 +416,10 @@ class DistributedP2PTransport:
         # so a replay cannot post an unmatched second receive.
         self._active_receive_ids.add(identity)
         if offer.payload_metadata:
-            receive = self.group.irecv_tensor_dict
-            if "metadata_list" in inspect.signature(receive).parameters:
-                tensor_dict, handles, postprocess = receive(
-                    src=self._src_group_rank,
-                    metadata_list=offer.payload_metadata,
-                )
-            else:
-                tensor_dict, handles, postprocess = receive(src=self._src_group_rank)
+            tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(
+                src=self._src_group_rank,
+                metadata_list=offer.payload_metadata,
+            )
         else:
             tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(src=self._src_group_rank)
         self._pending_receives.append(
@@ -441,7 +428,6 @@ class DistributedP2PTransport:
                     batch_id=offer.batch_id,
                     step_index=offer.step_index,
                     epoch=offer.epoch,
-                    branch=offer.branch,
                     payload=tensor_dict,
                 ),
                 identity=identity,
@@ -463,11 +449,11 @@ class DistributedP2PTransport:
         # backend failure retains ownership and prevents replay.
         self._send_handles[identity] = None
         if metadata_list:
-            send = self.group.isend_tensor_dict
-            if "metadata_list" in inspect.signature(send).parameters:
-                handles = send(message.payload, dst=self._dst_group_rank, metadata_list=metadata_list)
-            else:
-                handles = send(message.payload, dst=self._dst_group_rank)
+            handles = self.group.isend_tensor_dict(
+                message.payload,
+                dst=self._dst_group_rank,
+                metadata_list=metadata_list,
+            )
         else:
             handles = self.group.isend_tensor_dict(message.payload, dst=self._dst_group_rank)
         self._send_handles[identity] = list(handles)
@@ -476,9 +462,8 @@ class DistributedP2PTransport:
         self._ensure_open()
         if limit is None or type(limit) is not int or limit <= 0:
             raise ValueError("distributed P2P polling requires a positive limit")
-        if self._ready_receives:
-            return [self._ready_receives.popleft() for _ in range(min(limit, len(self._ready_receives)))]
-        while self._pending_receives and len(self._ready_receives) < limit:
+        ready: list[PipelineMessage] = []
+        while self._pending_receives and len(ready) < limit:
             pending = self._pending_receives[0]
             if pending.failure is not None:
                 raise pending.failure
@@ -499,8 +484,8 @@ class DistributedP2PTransport:
             self._pending_receives.popleft()
             self._active_receive_ids.remove(pending.identity)
             self._completed_receive_ids.add(pending.identity)
-            self._ready_receives.append(pending.message)
-        return [self._ready_receives.popleft() for _ in range(min(limit, len(self._ready_receives)))]
+            ready.append(pending.message)
+        return ready
 
     def wait(self, ticket: TransferTicket) -> bool:
         self._ensure_open()
@@ -545,8 +530,8 @@ class DistributedP2PTransport:
             raise RuntimeError("distributed P2P transport is closed")
 
     @staticmethod
-    def _message_identity(message: PipelineMessage) -> tuple[str, int, int, str]:
-        return (message.batch_id, message.step_index, message.epoch, message.branch)
+    def _message_identity(message: PipelineMessage) -> tuple[str, int, int]:
+        return (message.batch_id, message.step_index, message.epoch)
 
     @staticmethod
     def _validate_message_matches_offer(message: PipelineMessage, offer: PipelineTransferOffer) -> None:
@@ -554,7 +539,6 @@ class DistributedP2PTransport:
             offer.batch_id,
             offer.step_index,
             offer.epoch,
-            offer.branch,
         ):
             raise ValueError("pipeline message identity does not match its transfer grant")
         if offer.payload_metadata and (
@@ -572,7 +556,7 @@ class PipelineStageConnector:
     explicitly retires tickets after consumer completion.
     """
 
-    def __init__(self, *, edge: str, max_slots: int = 1, transport: PipelineTransport | None = None) -> None:
+    def __init__(self, *, edge: str, max_slots: int = 1, transport: PipelineTransport) -> None:
         if not edge:
             raise ValueError("edge must be non-empty")
         if type(max_slots) is not int or max_slots <= 0:
@@ -582,7 +566,6 @@ class PipelineStageConnector:
         self.transport = transport
         self._send_tickets: deque[TransferTicket] = deque()
         self._received: deque[PipelineMessage] = deque()
-        self._transport_pending: deque[PipelineMessage] = deque()
         self._received_leases: dict[int, PipelineMessage] = {}
         self._closed = False
 
@@ -595,10 +578,6 @@ class PipelineStageConnector:
         return len(self._received) + len(self._received_leases)
 
     @property
-    def transport_pending(self) -> int:
-        return len(self._transport_pending)
-
-    @property
     def closed(self) -> bool:
         return self._closed
 
@@ -607,7 +586,7 @@ class PipelineStageConnector:
         self._validate_message(message)
         if self.send_in_use >= self.max_slots:
             raise RuntimeError(f"pipeline edge {self.edge!r} has no send credit")
-        ticket = TransferTicket(message=message, started=self.transport is None)
+        ticket = TransferTicket(message=message)
         self._send_tickets.append(ticket)
         return ticket
 
@@ -618,14 +597,11 @@ class PipelineStageConnector:
             raise ValueError("unknown transfer ticket")
         if ticket.started:
             raise ValueError("transfer ticket has already started")
-        if self.transport is None:
-            raise RuntimeError("connector has no transport for granted send")
         offer = grant.offer
         if self._message_identity(ticket.message) != (
             offer.batch_id,
             offer.step_index,
             offer.epoch,
-            offer.branch,
         ):
             raise ValueError("transfer grant does not match the reserved send")
         # Once control enters the backend, failure is ambiguous: metadata or
@@ -633,14 +609,6 @@ class PipelineStageConnector:
         # the execution group is drained or torn down.
         ticket.started = True
         self.transport.start_granted_transfer(grant, ticket.message)
-
-    def mark_send_complete(self, ticket: TransferTicket) -> None:
-        self._ensure_open()
-        if ticket not in self._send_tickets:
-            raise ValueError("unknown transfer ticket")
-        if not ticket.started:
-            raise RuntimeError("cannot complete a transfer before its grant starts")
-        ticket.completed = True
 
     def wait_send_completion(self, ticket: TransferTicket) -> None:
         """Verify backend completion while retaining connector ownership."""
@@ -651,7 +619,7 @@ class PipelineStageConnector:
             raise RuntimeError("cannot wait for a transfer before its grant starts")
         if ticket.completed:
             return
-        if self.transport is None or not self.transport.wait(ticket):
+        if not self.transport.wait(ticket):
             raise RuntimeError("transport wait did not complete transfer")
         ticket.completed = True
 
@@ -664,8 +632,7 @@ class PipelineStageConnector:
             return False
         if ticket.completed:
             return True
-        is_ready = getattr(self.transport, "is_send_ready", None)
-        if not callable(is_ready) or not is_ready(ticket):
+        if not self.transport.is_send_ready(ticket):
             return False
         self.wait_send_completion(ticket)
         return True
@@ -674,30 +641,22 @@ class PipelineStageConnector:
         self._ensure_open()
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be a positive integer")
-        available = self.max_slots - self.receive_depth - self.transport_pending
-        if self.transport is not None and available > 0 and not self._transport_pending:
+        available = self.max_slots - self.receive_depth
+        if available > 0:
             poll_limit = min(limit, available)
-            parameters = inspect.signature(self.transport.poll).parameters.values()
-            supports_limit = any(
-                parameter.name == "limit" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
-            )
-            if not supports_limit:
-                raise RuntimeError("pipeline transport must support bounded polling") from None
             incoming = self.transport.poll(limit=poll_limit)
             if len(incoming) > poll_limit:
                 raise RuntimeError("pipeline transport exceeded its bounded poll limit")
             incoming_keys = [self._message_identity(message) for message in incoming]
             held_keys = {
                 self._message_identity(message)
-                for message in (*self._received, *self._transport_pending, *self._received_leases.values())
+                for message in (*self._received, *self._received_leases.values())
             }
             if len(set(incoming_keys)) != len(incoming_keys) or held_keys.intersection(incoming_keys):
                 raise RuntimeError("pipeline transport returned a duplicate leased message")
             for message in incoming:
                 self._validate_message(message)
-            self._transport_pending.extend(incoming)
-        while self._transport_pending and len(self._received) < self.max_slots:
-            self._received.append(self._transport_pending.popleft())
+            self._received.extend(incoming)
         messages = [self._received.popleft() for _ in range(min(limit, len(self._received)))]
         for message in messages:
             self._received_leases[id(message)] = message
@@ -716,7 +675,6 @@ class PipelineStageConnector:
         if ticket.started and not ticket.completed:
             raise RuntimeError("cannot release a transfer before transport completion")
         self._send_tickets.remove(ticket)
-        ticket.released = True
 
     def retire_batch(self, batch_id: str, *, discard_results: bool = False) -> None:
         """Retire all local transport state for one batch after dependencies settle."""
@@ -738,23 +696,7 @@ class PipelineStageConnector:
                 self._wait_or_abort(ticket, discard=True)
         for ticket in matching:
             self._send_tickets.remove(ticket)
-            ticket.released = True
         self._received = deque(message for message in self._received if message.batch_id != batch_id)
-        self._transport_pending = deque(message for message in self._transport_pending if message.batch_id != batch_id)
-
-    def health(self) -> dict[str, Any]:
-        health = {
-            "edge": self.edge,
-            "closed": self._closed,
-            "send_in_use": self.send_in_use,
-            "receive_depth": self.receive_depth,
-            "receive_leases": len(self._received_leases),
-            "transport_pending": self.transport_pending,
-            "max_slots": self.max_slots,
-        }
-        transport_outstanding = getattr(self.transport, "has_outstanding_operations", False)
-        health["transport_outstanding"] = bool(transport_outstanding)
-        return health
 
     def close(self, *, drain: bool = False) -> None:
         if self._closed:
@@ -767,25 +709,16 @@ class PipelineStageConnector:
             for ticket in self._send_tickets:
                 if ticket.started and not ticket.completed:
                     self._wait_or_abort(ticket, discard=False)
-        transport_close = getattr(self.transport, "close", None)
-        if self.transport is not None and not callable(transport_close):
-            raise RuntimeError("pipeline transport does not support close")
-        if transport_close is not None:
-            transport_close()
-        for ticket in self._send_tickets:
-            ticket.released = True
+        self.transport.close()
         self._send_tickets.clear()
         self._received.clear()
         self._received_leases.clear()
-        self._transport_pending.clear()
         self._closed = True
 
     def _wait_or_abort(self, ticket: TransferTicket, *, discard: bool) -> None:
-        operation = "abort" if discard else "wait"
-        handler = getattr(self.transport, operation, None)
-        if not callable(handler):
-            raise RuntimeError(f"transport does not support {operation} for incomplete transfers")
-        if not handler(ticket):
+        completed = self.transport.abort(ticket) if discard else self.transport.wait(ticket)
+        if not completed:
+            operation = "abort" if discard else "wait"
             raise RuntimeError(f"transport {operation} did not complete transfer")
         ticket.completed = True
 
@@ -794,11 +727,9 @@ class PipelineStageConnector:
             raise RuntimeError(f"pipeline edge {self.edge!r} is closed")
 
     def _validate_message(self, message: PipelineMessage) -> None:
-        if message.branch != "conditional":
-            raise ValueError("M2 supports only the conditional pipeline branch")
         if not message.batch_id or message.step_index < 0 or message.epoch < 0:
             raise ValueError("invalid pipeline message identity")
 
     @staticmethod
-    def _message_identity(message: PipelineMessage) -> tuple[str, int, int, str]:
-        return (message.batch_id, message.step_index, message.epoch, message.branch)
+    def _message_identity(message: PipelineMessage) -> tuple[str, int, int]:
+        return (message.batch_id, message.step_index, message.epoch)

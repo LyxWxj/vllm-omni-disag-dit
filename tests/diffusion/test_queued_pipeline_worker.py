@@ -3,6 +3,7 @@
 
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -103,7 +104,16 @@ def _worker() -> DiffusionWorker:
     worker.rank = 4
     worker.model_runner = _Runner()
     worker.od_config = SimpleNamespace()
-    worker._pipeline_stages = {}
+    worker.pipeline_stages = {}
+    worker.pipeline_events = []
+    worker.pipeline_connectors = {}
+    worker.pipeline_send_tickets = {}
+    worker.pipeline_receive_reservations = {}
+    worker.pipeline_receive_consumers = {}
+    worker.pipeline_pending_received = {
+        PipelineEdgeKind.ACTIVATION: deque(),
+        PipelineEdgeKind.FEEDBACK: deque(),
+    }
     worker._pipeline_finalization_device_events = {}
     worker._pipeline_finalization_published = set()
     worker._pipeline_finalization_stream = None
@@ -124,7 +134,7 @@ def _spec(stage_id: int) -> PipelineStageSpec:
 
 
 def _reserve_receive(worker: DiffusionWorker, offer: PipelineTransferOffer) -> None:
-    worker.pipeline_receive_reservations[offer.identity] = offer.edge_kind
+    worker.pipeline_receive_reservations[offer.identity] = (offer.edge_kind, False)
 
 
 def test_worker_metadata_agreement_uses_global_cpu_control_group(mocker) -> None:
@@ -218,10 +228,10 @@ def test_non_output_finalization_publishes_completion_metadata(mocker) -> None:
 def test_worker_proc_publishes_readiness_only_updates(mocker) -> None:
     worker_proc = object.__new__(WorkerProc)
     worker_proc._enqueue_result = mocker.Mock()
-    identity = ("batch-a", 0, 2, "conditional", PipelineEdgeKind.ACTIVATION, 0, 1)
+    identity = ("batch-a", 0, 2, PipelineEdgeKind.ACTIVATION, 0, 1)
     update = PipelineWorkerUpdate(
         worker_id=1,
-        progress=PipelineTransportProgress(rank=1, readiness=[(identity, True)]),
+        progress=PipelineTransportProgress(rank=1, readiness=[identity]),
         events=(),
     )
 
@@ -229,7 +239,7 @@ def test_worker_proc_publishes_readiness_only_updates(mocker) -> None:
 
     worker_proc._enqueue_result.assert_called_once()
     published = worker_proc._enqueue_result.call_args.args[0]
-    assert published.progress.readiness == [(identity, True)]
+    assert published.progress.readiness == [identity]
 
 
 def test_selected_non_first_finalization_publishes_its_output(mocker) -> None:
@@ -368,7 +378,7 @@ def test_final_decode_completion_wakes_stage_engine(mocker) -> None:
 
 def test_stage_engine_does_not_poll_running_finalization_future() -> None:
     worker = _worker()
-    worker._pipeline_connectors = {
+    worker.pipeline_connectors = {
         PipelineEdgeKind.ACTIVATION: SimpleNamespace(transport=None),
         PipelineEdgeKind.FEEDBACK: SimpleNamespace(transport=None),
     }
@@ -385,7 +395,7 @@ def test_stage_engine_does_not_poll_running_finalization_future() -> None:
 def test_stage_engine_keeps_polling_pending_received_message() -> None:
     worker = _worker()
     transport = SimpleNamespace(has_outstanding_operations=False)
-    worker._pipeline_connectors = {
+    worker.pipeline_connectors = {
         PipelineEdgeKind.ACTIVATION: SimpleNamespace(transport=transport),
         PipelineEdgeKind.FEEDBACK: SimpleNamespace(transport=transport),
     }
@@ -501,7 +511,7 @@ def test_worker_selects_rank_local_pipeline_descriptor(mocker, rank: int) -> Non
     )
 
     event = worker.enqueue_pipeline_batch(_task(), specs)
-    worker.authorize_pipeline_batch({0: 0, 1: 1}, "batch-a")
+    worker.authorize_pipeline_batch(rank, "batch-a")
 
     assert event.pp_stage_id == rank
     assert worker.pipeline_stages[rank].spec == specs[rank]
@@ -765,7 +775,7 @@ def test_stage_engine_tick_reserves_authorized_activation_before_offer(mocker) -
 
     offer = receiver._make_pipeline_transfer_offer(task, PipelineEdgeKind.ACTIVATION)
     assert update is not None
-    assert update.progress.readiness == [(offer.identity, True)]
+    assert update.progress.readiness == [offer.identity]
     assert offer.identity in receiver.pipeline_receive_reservations
     _reserve_receive(receiver, offer)
 
@@ -785,7 +795,6 @@ def test_cancelling_before_grant_releases_speculative_receive_credit(mocker) -> 
     receiver.cancel_pipeline_batch(1, task.batch_id)
 
     assert receiver.pipeline_receive_reservations == {}
-    assert receiver.pipeline_started_receive_ids == set()
 
 
 def test_stage_engine_tick_reserves_feedback_after_local_compute(mocker) -> None:
@@ -803,7 +812,7 @@ def test_stage_engine_tick_reserves_feedback_after_local_compute(mocker) -> None
     feedback = sender._make_pipeline_transfer_offer(task, PipelineEdgeKind.FEEDBACK)
     assert update is not None
     assert update.progress.offers[0].edge_kind is PipelineEdgeKind.ACTIVATION
-    assert update.progress.readiness == [(feedback.identity, True)]
+    assert update.progress.readiness == [feedback.identity]
     assert feedback.identity in sender.pipeline_receive_reservations
 
 
@@ -825,7 +834,6 @@ def test_worker_starts_only_matching_granted_p2p_endpoint(mocker) -> None:
         batch_id="batch-a",
         step_index=0,
         epoch=1,
-        branch="conditional",
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -916,7 +924,6 @@ def test_first_stage_release_waits_for_feedback_receive_lease(mocker) -> None:
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.FEEDBACK,
         src_rank=1,
         dst_rank=0,
@@ -1176,7 +1183,6 @@ def test_worker_releases_transport_credit_before_consumer_event_completes(mocker
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -1217,7 +1223,6 @@ def test_worker_reserves_next_activation_while_previous_compute_lease_is_active(
             batch_id=task.batch_id,
             step_index=task.step_index,
             epoch=task.epoch,
-            branch=task.branch,
             edge_kind=PipelineEdgeKind.ACTIVATION,
             src_rank=0,
             dst_rank=1,
@@ -1254,7 +1259,6 @@ def test_activation_handoff_keeps_received_payload_alive_for_forward(mocker) -> 
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -1283,7 +1287,6 @@ def test_activation_forward_failure_retains_compute_lease_after_transport_releas
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -1317,7 +1320,6 @@ def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> 
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -1360,7 +1362,6 @@ def test_worker_rejects_stale_activation_identity_before_execution(mocker) -> No
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=1,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -1394,7 +1395,6 @@ def test_worker_rejects_stale_feedback_identity_before_adoption(mocker) -> None:
         batch_id=task.batch_id,
         step_index=task.step_index + 1,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.FEEDBACK,
         src_rank=1,
         dst_rank=0,
@@ -1422,7 +1422,6 @@ def test_cancelled_stage_one_drains_activation_without_execution(mocker) -> None
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
@@ -1457,7 +1456,6 @@ def test_cancelled_stage_zero_drains_feedback_without_adoption(mocker) -> None:
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.FEEDBACK,
         src_rank=1,
         dst_rank=0,
@@ -1495,7 +1493,6 @@ def test_accelerator_consumer_event_failure_retains_receive_ownership(mocker) ->
         batch_id=task.batch_id,
         step_index=task.step_index,
         epoch=task.epoch,
-        branch=task.branch,
         edge_kind=PipelineEdgeKind.ACTIVATION,
         src_rank=0,
         dst_rank=1,
