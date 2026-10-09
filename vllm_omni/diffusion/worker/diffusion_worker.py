@@ -890,74 +890,6 @@ class DiffusionWorker:
         self.pipeline_send_tickets[offer.identity] = connector.enqueue_send(message)
         return offer
 
-    def accept_pipeline_transfer_offer(self, offer: PipelineTransferOffer) -> bool:
-        """Check sender ownership and reserve receive credit, if currently available."""
-        if self.rank not in {offer.src_rank, offer.dst_rank}:
-            return True
-        connector = self._require_pipeline_connector(offer.edge_kind)
-        if self.rank == offer.src_rank:
-            ticket = self.pipeline_send_tickets.get(offer.identity)
-            if ticket is None:
-                raise KeyError("pipeline transfer offer has no reserved sender ticket")
-            if ticket.started or ticket.released:
-                raise RuntimeError("pipeline sender ticket is not available for a new grant")
-            message = ticket.message
-            if not isinstance(message.payload, dict):
-                raise TypeError("pipeline sender payload must be a tensor dictionary")
-            if (message.batch_id, message.step_index, message.epoch, message.branch) != (
-                offer.batch_id,
-                offer.step_index,
-                offer.epoch,
-                offer.branch,
-            ):
-                raise ValueError("pipeline sender ticket identity does not match the transfer offer")
-        else:
-            if offer.identity in self.pipeline_receive_reservations:
-                if self.pipeline_receive_reservations[offer.identity] is not offer.edge_kind:
-                    raise ValueError("pipeline receive reservation has a different edge kind")
-                return True
-            if offer.identity in self.pipeline_receive_consumers:
-                raise ValueError("pipeline receive transfer is still owned by its stage consumer")
-            reserved = sum(edge_kind is offer.edge_kind for edge_kind in self.pipeline_receive_reservations.values())
-            # The reservation covers the transport receive slot only. Once a
-            # message is handed to the stage, its tensor remains tracked by a
-            # separate compute lease and no longer blocks another receive.
-            if reserved >= connector.max_slots:
-                return False
-            self.pipeline_receive_reservations[offer.identity] = offer.edge_kind
-        return True
-
-    def accept_pipeline_transfer_offer_all_ranks(self, offer: PipelineTransferOffer) -> bool:
-        """Return false for temporary receive backpressure; raise on invalid readiness."""
-        rank_results = _run_and_gather_rank_values(
-            "queued pipeline transfer readiness",
-            lambda: (self.rank, self.accept_pipeline_transfer_offer(offer)),
-        )
-        endpoint_results: dict[int, bool] = {}
-        for rank, ready in rank_results:
-            if rank not in {offer.src_rank, offer.dst_rank}:
-                continue
-            if rank in endpoint_results or type(ready) is not bool:
-                raise RuntimeError("pipeline transfer readiness returned invalid endpoint reports")
-            endpoint_results[rank] = ready
-        if set(endpoint_results) != {offer.src_rank, offer.dst_rank}:
-            raise RuntimeError("pipeline transfer readiness did not report both endpoints")
-        return all(endpoint_results.values())
-
-    def accept_pipeline_transfer_offer_rank_local(self, offer: PipelineTransferOffer) -> dict[str, Any]:
-        """Report this Worker's readiness without an in-Worker rank collective."""
-        return {"rank": self.rank, "ready": self.accept_pipeline_transfer_offer(offer)}
-
-    def accept_pipeline_transfer_offers_rank_local(
-        self,
-        offers: tuple[PipelineTransferOffer, ...] | list[PipelineTransferOffer],
-    ) -> dict[str, Any]:
-        """Report readiness for a batch of offers in one rank-local RPC."""
-        if not isinstance(offers, (tuple, list)):
-            raise TypeError("pipeline transfer offers must be a tuple or list")
-        readiness = [(offer.identity, self.accept_pipeline_transfer_offer(offer)) for offer in offers]
-        return {"rank": self.rank, "readiness": readiness}
-
     def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
         """Start only this Worker's endpoint after the Executor grants it."""
         offer = grant.offer
@@ -979,19 +911,6 @@ class DiffusionWorker:
                 raise RuntimeError("pipeline destination does not use distributed P2P transport")
             self.pipeline_started_receive_ids.add(offer.identity)
             transport.start_granted_transfer(grant)
-        return True
-
-    def retire_pipeline_send(self, identity: tuple[Any, ...]) -> bool:
-        """Wait, release connector credit, and drop the retained tensor payload."""
-        ticket = self.pipeline_send_tickets.get(identity)
-        if ticket is None:
-            raise KeyError("unknown pipeline send reservation")
-        if len(identity) < 5 or not isinstance(identity[4], PipelineEdgeKind):
-            raise ValueError("invalid pipeline transfer identity")
-        connector = self._require_pipeline_connector(identity[4])
-        connector.wait_send_completion(ticket)
-        connector.release_send(ticket)
-        self.pipeline_send_tickets.pop(identity)
         return True
 
     def progress_pipeline_transfers(self) -> PipelineTransportProgress:
@@ -1180,27 +1099,6 @@ class DiffusionWorker:
             )
         return False
 
-    def progress_pipeline_transfers_and_poll_events_all_ranks(
-        self,
-    ) -> list[tuple[PipelineTransportProgress, list[Any]]]:
-        """Advance each Worker and collect its events in the same rank agreement."""
-
-        def progress_and_poll() -> tuple[PipelineTransportProgress, list[Any]]:
-            progress = self.progress_pipeline_transfers()
-            return progress, self.poll_pipeline_events()
-
-        return _run_and_gather_rank_values("queued pipeline progress snapshot", progress_and_poll)
-
-    def progress_pipeline_transfers_and_poll_events(
-        self,
-        pending_offers: tuple[PipelineTransferOffer, ...] = (),
-    ) -> tuple[PipelineTransportProgress, list[Any]]:
-        """Advance one local Worker and return only its progress and events."""
-        readiness = [(offer.identity, self.accept_pipeline_transfer_offer(offer)) for offer in pending_offers]
-        progress = self.progress_pipeline_transfers()
-        progress.readiness = readiness
-        return progress, self.poll_pipeline_events()
-
     def _consume_ready_pipeline_message(
         self,
         edge_kind: PipelineEdgeKind,
@@ -1333,13 +1231,6 @@ class DiffusionWorker:
             raise RuntimeError("pipeline receive message has no unique reservation")
         return matching[0]
 
-    def poll_pipeline_received(
-        self,
-        edge_kind: PipelineEdgeKind,
-        limit: int = 1,
-    ) -> list[PipelineMessage]:
-        return self._require_pipeline_connector(edge_kind).poll_received(limit=limit)
-
     def release_pipeline_received(self, edge_kind: PipelineEdgeKind, message: PipelineMessage) -> None:
         connector = self._require_pipeline_connector(edge_kind)
         identity = (message.batch_id, message.step_index, message.epoch, message.branch)
@@ -1431,16 +1322,6 @@ class DiffusionWorker:
         stage = self._require_pipeline_stage(pp_stage_id)
         task = stage.authorize(batch_id)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.AUTHORIZED, task, pp_stage_id))
-
-    def authorize_pipeline_batches(
-        self,
-        authorizations: list[tuple[int | dict[int, int], str]],
-    ) -> list[PipelineEvent]:
-        """Authorize several already-enqueued tasks in one control call."""
-        events = []
-        for pp_stage_id, batch_id in authorizations:
-            events.append(self.authorize_pipeline_batch(pp_stage_id, batch_id))
-        return events
 
     def admit_pipeline_batch(
         self,
@@ -1655,20 +1536,6 @@ class DiffusionWorker:
             )
         )
 
-    def pipeline_batch_release_ready_all_ranks(
-        self,
-        pp_stage_id: int | dict[int, int],
-        batch_id: str,
-    ) -> bool:
-        """Agree on release readiness without mutating batch ownership."""
-        results = _run_and_gather_rank_values(
-            "queued pipeline batch release readiness",
-            lambda: self.pipeline_batch_release_ready(pp_stage_id, batch_id),
-        )
-        if not all(type(result) is bool for result in results):
-            raise RuntimeError("queued pipeline batch release readiness returned invalid reports")
-        return all(results)
-
     def finalize_pipeline_batch(
         self,
         pp_stage_id: int | dict[int, int],
@@ -1803,15 +1670,6 @@ class DiffusionWorker:
                 future.add_done_callback(lambda _completed: wake_stage_engine())
         return batch_id if return_handle else None
 
-    def poll_pipeline_finalization(self, batch_id: str) -> BatchRunnerOutput | None:
-        """Return a completed decode result without blocking the Worker RPC loop."""
-        future = self._pipeline_finalization_futures.get(batch_id)
-        if future is None:
-            raise KeyError(f"Unknown queued pipeline finalization {batch_id!r}.")
-        if not future.done():
-            return None
-        return future.result()
-
     def release_pipeline_batch_all_ranks(
         self,
         pp_stage_id: int | dict[int, int],
@@ -1866,11 +1724,6 @@ class DiffusionWorker:
         dist.all_gather_object(reports, local_report, group=pp_group.cpu_group)
         return [report for report in reports if report is not None]
 
-    def poll_pipeline_events_all_ranks(self) -> list[PipelineEvent]:
-        """Clear every rank's queue and return all events on the reply rank."""
-        rank_events = _all_gather_rank_values(self.poll_pipeline_events())
-        return [event for events in rank_events for event in events]
-
     def cancel_pipeline_requests(self, request_generations: Any) -> list[PipelineEvent]:
         """Cancel all local contexts matching request IDs or (ID, generation)."""
         is_single_pair = (
@@ -1924,37 +1777,6 @@ class DiffusionWorker:
                 local_event_ids = {id(event) for event in local_events}
                 self._pipeline_events = [event for event in self.pipeline_events if id(event) not in local_event_ids]
         return [event for events in rank_events for event in events]
-
-    def drain_pipeline(self, deadline: float | None = None) -> list[PipelineEvent]:
-        """Require all local pipeline contexts to be retired before shutdown."""
-        del deadline
-        if self.model_runner.pipeline_batch_contexts:
-            raise RuntimeError("cannot drain pipeline with unreleased batch contexts")
-        retained_tickets = [ticket for ticket in self.pipeline_send_tickets.values() if not ticket.released]
-        if retained_tickets:
-            raise RuntimeError("cannot drain pipeline with retained send tickets")
-        if self.pipeline_receive_reservations:
-            raise RuntimeError("cannot drain pipeline with reserved receive credit")
-        if self.pipeline_receive_consumers:
-            raise RuntimeError("cannot drain pipeline with active receive consumers")
-        busy_connectors = {
-            edge_kind.value: health
-            for edge_kind, connector in self.pipeline_connectors.items()
-            if (
-                (health := connector.health())["send_in_use"]
-                or health["receive_depth"]
-                or health["transport_pending"]
-                or health["transport_outstanding"]
-            )
-        }
-        if busy_connectors:
-            raise RuntimeError(f"cannot drain pipeline with active connector ownership: {busy_connectors}")
-        return []
-
-    def drain_pipeline_all_ranks(self, deadline: float | None = None) -> list[PipelineEvent]:
-        """Coordinate the drain guard, then gather terminal events from all ranks."""
-        _run_and_gather_rank_values("queued pipeline drain", lambda: self.drain_pipeline(deadline))
-        return self.poll_pipeline_events_all_ranks()
 
     def _require_pipeline_stage(self, pp_stage_id: int) -> PipelineStageState:
         stage = self.pipeline_stages.get(pp_stage_id)
@@ -2801,14 +2623,7 @@ class WorkerProc:
                     rpc_id = msg.get("rpc_id")
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
-                        reply_start = time.perf_counter()
                         self._return_result(result, rpc_id=rpc_id)
-                        if msg.get("method") == "poll_pipeline_finalization" and result is not None:
-                            logger.info(
-                                "Queued pipeline final decode reply packed batch=%s elapsed_ms=%.3f",
-                                msg.get("args", (None,))[0],
-                                (time.perf_counter() - reply_start) * 1000,
-                            )
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)

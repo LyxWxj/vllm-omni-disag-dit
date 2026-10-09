@@ -53,42 +53,37 @@ def _engine(mocker, scheduler_output: DiffusionSchedulerOutput) -> DiffusionEngi
     engine._queued_reserved_bytes = 0
     engine._queued_stage_buffer_budget_bytes = None
     engine._queued_pipeline_epoch = 3
+
+    submit = DiffusionEngine._submit_queued_pipeline_batch
+
+    def submit_with_admission_updates(output, *, authorize=True):
+        batch = submit(engine, output, authorize=authorize)
+        pending = [
+            item
+            for item in engine._queued_pipeline_batches.values()
+            if item.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
+        ]
+        if pending:
+            engine.executor.poll_pipeline_events.return_value = [
+                PipelineEvent(event_type, item.task, stage_id, rank)
+                for item in pending
+                for event_type in (PipelineEventType.ACCEPTED, PipelineEventType.AUTHORIZED)
+                for stage_id, rank in item.stage_physical_ranks.items()
+            ]
+            engine._collect_queued_pipeline_events()
+
+        return batch
+
+    engine._submit_queued_pipeline_batch = submit_with_admission_updates
     return engine
-
-
-def test_queued_submission_records_ownership_before_control_dispatch(mocker) -> None:
-    scheduler_output = _scheduler_output()
-    engine = _engine(mocker, scheduler_output)
-    calls: list[str] = []
-
-    def observe_prepare(_scheduler_output):
-        assert len(engine._queued_pipeline_batches) == 1
-        calls.append("prepare")
-
-    engine.executor.prepare_pipeline_requests.side_effect = observe_prepare
-    engine.executor.submit_pipeline_batch.side_effect = lambda *_args: calls.append("submit")
-    engine.executor.authorize_pipeline_batch.side_effect = lambda *_args: calls.append("authorize")
-
-    batch = engine._submit_queued_pipeline_batch(scheduler_output)
-
-    assert calls == ["prepare", "submit", "authorize"]
-    assert batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
-    assert batch.task.batch_id == "pp-3-7"
-    assert batch.task.request_ids == ("req-a",)
-    assert batch.task.step_index == 0
-    assert engine._queued_pipeline_batches[batch.task.batch_id] is batch
-    assert set(batch.stage_specs) == {0, 1}
-    engine.executor.submit_pipeline_batch.assert_called_once_with(batch.task, batch.stage_specs)
-    engine.executor.authorize_pipeline_batch.assert_called_once_with({0: 0, 1: 1}, batch.task.batch_id)
 
 
 def test_autonomous_admission_waits_for_both_stage_acknowledgements(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
-    engine.executor.uses_autonomous_pipeline_stages.return_value = True
     engine.executor.submit_pipeline_admissions.side_effect = lambda *_args: [True, True]
 
-    batch = engine._submit_queued_pipeline_batch(scheduler_output)
+    batch = DiffusionEngine._submit_queued_pipeline_batch(engine, scheduler_output)
 
     assert batch.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
     assert batch.stage_enqueued is True
@@ -110,7 +105,6 @@ def test_autonomous_admission_waits_for_both_stage_acknowledgements(mocker) -> N
 
 def test_autonomous_admission_batches_prepared_fifo(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
-    engine.executor.uses_autonomous_pipeline_stages.return_value = True
     first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"), authorize=False)
     second = engine._submit_queued_pipeline_batch(_scheduler_output("req-b"), authorize=False)
 
@@ -146,42 +140,6 @@ def test_finalizing_batch_releases_denoise_admission_capacity(mocker) -> None:
 
     assert second.task.request_ids == ("req-b",)
     assert engine._queued_reserved_bytes == first.reserved_bytes + second.reserved_bytes
-
-
-def test_prepared_batch_waits_for_fifo_denoise_slot(mocker) -> None:
-    engine = _engine(mocker, _scheduler_output())
-    engine.od_config.max_inflight_batches = 1
-    engine.scheduler.max_num_running_reqs = 2
-
-    first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
-    second = engine._submit_queued_pipeline_batch(_scheduler_output("req-b"))
-
-    assert first.phase is _QueuedPipelineBatchPhase.AUTHORIZED
-    assert second.phase is _QueuedPipelineBatchPhase.PREPARED
-    assert engine.executor.authorize_pipeline_batch.call_count == 1
-
-    first.phase = _QueuedPipelineBatchPhase.FINALIZING
-    engine._authorize_waiting_queued_batches()
-
-    assert second.phase is _QueuedPipelineBatchPhase.AUTHORIZED
-    assert engine.executor.authorize_pipeline_batch.call_args_list[-1].args == ({0: 0, 1: 1}, second.task.batch_id)
-
-
-def test_prepared_batches_share_one_authorization_rpc(mocker) -> None:
-    engine = _engine(mocker, _scheduler_output())
-    engine.od_config.max_inflight_batches = 2
-
-    first = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"), authorize=False)
-    second = engine._submit_queued_pipeline_batch(_scheduler_output("req-b"), authorize=False)
-
-    engine._authorize_waiting_queued_batches()
-
-    assert first.phase is _QueuedPipelineBatchPhase.AUTHORIZED
-    assert second.phase is _QueuedPipelineBatchPhase.AUTHORIZED
-    engine.executor.authorize_pipeline_batch.assert_not_called()
-    engine.executor.authorize_pipeline_batches.assert_called_once_with(
-        [({0: 0, 1: 1}, first.task.batch_id), ({0: 0, 1: 1}, second.task.batch_id)]
-    )
 
 
 def test_prepared_fifo_prevents_continuation_starvation(mocker) -> None:
@@ -464,7 +422,6 @@ def test_finalizing_batch_does_not_sleep_while_other_requests_are_schedulable(mo
     engine.scheduler.has_queued_admission_candidate = mocker.Mock(return_value=True)
     engine.executor.pipeline_updates_pending.return_value = False
 
-    assert engine._queued_pipeline_waits_on_finalization()
     assert not engine._should_wait_for_queued_pipeline_update()
 
     engine.scheduler.has_queued_admission_candidate.return_value = False
@@ -654,7 +611,6 @@ def test_busy_loop_progresses_worker_update_between_admissions(mocker) -> None:
     engine._wait_for_admission_if_needed_locked = mocker.Mock()
     engine._process_aborts_queue = mocker.Mock()
     engine._process_rpc_queue = mocker.Mock()
-    engine.executor.uses_autonomous_pipeline_stages.return_value = True
     update_pending = [True]
     engine.executor.pipeline_updates_pending.side_effect = lambda: update_pending[0]
     order: list[str] = []
@@ -682,7 +638,6 @@ def test_busy_loop_progresses_worker_update_between_admissions(mocker) -> None:
 
 def test_admission_progress_does_not_wait_for_future_worker_update(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
-    engine.executor.uses_autonomous_pipeline_stages.return_value = True
     engine.executor.pipeline_updates_pending.return_value = False
 
     engine._progress_autonomous_updates_between_admissions()
@@ -692,7 +647,6 @@ def test_admission_progress_does_not_wait_for_future_worker_update(mocker) -> No
 
 def test_admission_progress_drains_fast_followup_worker_update(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
-    engine.executor.uses_autonomous_pipeline_stages.return_value = True
     update_pending = [True]
     engine.executor.pipeline_updates_pending.side_effect = lambda: update_pending[0]
     progress_calls = 0
@@ -941,8 +895,7 @@ def test_queued_completion_uses_nonzero_physical_topology(mocker) -> None:
     assert engine._progress_queued_pipeline_batch(batch)
     assert batch.stage_specs[0].is_first
     assert batch.stage_physical_ranks == {0: 2, 1: 3}
-    engine.executor.submit_pipeline_batch.assert_called_once_with(batch.task, batch.stage_specs)
-    engine.executor.authorize_pipeline_batch.assert_called_once_with({0: 2, 1: 3}, batch.task.batch_id)
+    engine.executor.submit_pipeline_admissions.assert_called_once_with([(batch.task, batch.stage_specs)])
     assert batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED
 
 

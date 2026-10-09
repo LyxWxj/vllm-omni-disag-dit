@@ -117,92 +117,6 @@ def _worker() -> DiffusionWorker:
     return worker
 
 
-def test_progress_snapshot_gathers_local_progress_and_events_once(mocker) -> None:
-    worker = _worker()
-    progress = PipelineTransportProgress(rank=worker.rank)
-    events = [object()]
-    calls: list[str] = []
-    worker.progress_pipeline_transfers = mocker.Mock(return_value=progress)
-    worker.poll_pipeline_events = mocker.Mock(return_value=events)
-
-    def gather(operation, func):
-        calls.append(operation)
-        return [func()]
-
-    mocker.patch.object(diffusion_worker_module, "_run_and_gather_rank_values", side_effect=gather)
-
-    assert worker.progress_pipeline_transfers_and_poll_events_all_ranks() == [(progress, events)]
-    assert calls == ["queued pipeline progress snapshot"]
-    worker.progress_pipeline_transfers.assert_called_once_with()
-    worker.poll_pipeline_events.assert_called_once_with()
-
-
-def test_rank_local_progress_snapshot_does_not_enter_collective(mocker) -> None:
-    worker = _worker()
-    progress = PipelineTransportProgress(rank=worker.rank)
-    events = [object()]
-    worker.progress_pipeline_transfers = mocker.Mock(return_value=progress)
-    worker.poll_pipeline_events = mocker.Mock(return_value=events)
-    gather = mocker.patch.object(diffusion_worker_module, "_run_and_gather_rank_values")
-
-    assert worker.progress_pipeline_transfers_and_poll_events() == (progress, events)
-    worker.progress_pipeline_transfers.assert_called_once_with()
-    worker.poll_pipeline_events.assert_called_once_with()
-    gather.assert_not_called()
-
-
-def test_rank_local_progress_snapshot_reserves_pending_offer_before_progress(mocker) -> None:
-    worker = _worker()
-    progress = PipelineTransportProgress(rank=worker.rank)
-    offer = PipelineTransferOffer(
-        batch_id="batch-a",
-        step_index=0,
-        epoch=1,
-        branch="conditional",
-        edge_kind=PipelineEdgeKind.ACTIVATION,
-        src_rank=0,
-        dst_rank=1,
-    )
-    accept = mocker.patch.object(worker, "accept_pipeline_transfer_offer", return_value=True)
-    local_progress = mocker.patch.object(worker, "progress_pipeline_transfers", return_value=progress)
-    mocker.patch.object(worker, "poll_pipeline_events", return_value=[])
-
-    reported, _ = worker.progress_pipeline_transfers_and_poll_events((offer,))
-
-    assert reported.readiness == [(offer.identity, True)]
-    accept.assert_called_once_with(offer)
-    local_progress.assert_called_once_with()
-
-
-def test_rank_local_transfer_readiness_batch_preserves_offer_order(mocker) -> None:
-    worker = _worker()
-    first = PipelineTransferOffer(
-        batch_id="batch-a",
-        step_index=0,
-        epoch=1,
-        branch="conditional",
-        edge_kind=PipelineEdgeKind.ACTIVATION,
-        src_rank=0,
-        dst_rank=1,
-    )
-    second = PipelineTransferOffer(
-        batch_id="batch-b",
-        step_index=1,
-        epoch=1,
-        branch="conditional",
-        edge_kind=PipelineEdgeKind.FEEDBACK,
-        src_rank=1,
-        dst_rank=0,
-    )
-    accept = mocker.patch.object(worker, "accept_pipeline_transfer_offer", side_effect=[True, False])
-    readiness = worker.accept_pipeline_transfer_offers_rank_local((first, second))
-    assert readiness == {
-        "rank": worker.rank,
-        "readiness": [(first.identity, True), (second.identity, False)],
-    }
-    accept.assert_has_calls([mocker.call(first), mocker.call(second)])
-
-
 def _task(batch_id: str = "batch-a", *, epoch: int = 2) -> PipelineTask:
     return PipelineTask(batch_id=batch_id, request_ids=("req-a",), step_index=0, epoch=epoch)
 
@@ -214,6 +128,10 @@ def _spec(stage_id: int) -> PipelineStageSpec:
         is_first=stage_id == 0,
         is_last=stage_id == 1,
     )
+
+
+def _reserve_receive(worker: DiffusionWorker, offer: PipelineTransferOffer) -> None:
+    worker.pipeline_receive_reservations[offer.identity] = offer.edge_kind
 
 
 def test_worker_metadata_agreement_uses_global_cpu_control_group(mocker) -> None:
@@ -259,8 +177,7 @@ def test_final_decode_runs_only_on_output_owner_without_rank_collective(mocker, 
 
     result = worker.finalize_pipeline_batch(stage_id, task.batch_id)
     if stage_id == 0:
-        worker._pipeline_finalization_futures[task.batch_id].result(timeout=1)
-        result = worker.poll_pipeline_finalization(result)
+        result = worker._pipeline_finalization_futures[task.batch_id].result(timeout=1)
 
     assert result == expected
     agreement.assert_not_called()
@@ -511,35 +428,6 @@ def test_release_readiness_waits_for_local_distributed_vae_decode(mocker) -> Non
     assert worker.pipeline_batch_release_ready(1, task.batch_id)
 
 
-def test_final_decode_submission_is_nonblocking_and_pollable() -> None:
-    worker = _worker()
-    task = _task()
-    worker.enqueue_pipeline_batch(task, _spec(0))
-    worker.model_runner.pipeline_batch_contexts[(0, task.batch_id)].status = PipelineTaskStatus.COMPLETED
-    started = threading.Event()
-    release = threading.Event()
-
-    def delayed_finalize(_context, _spec, **_kwargs):
-        started.set()
-        release.wait(timeout=2)
-        return "decoded-output"
-
-    worker.model_runner.finalize_pipeline_batch = delayed_finalize
-    handle = worker.finalize_pipeline_batch(0, task.batch_id)
-    assert started.wait(timeout=1)
-    assert worker.poll_pipeline_finalization(handle) is None
-
-    release.set()
-    result = None
-    for _ in range(100):
-        result = worker.poll_pipeline_finalization(handle)
-        if result is not None:
-            break
-        time.sleep(0.001)
-    assert result == "decoded-output"
-    worker._pipeline_finalization_executor.shutdown(wait=True)
-
-
 def test_final_decode_completion_wakes_stage_engine(mocker) -> None:
     worker = _worker()
     task = _task("finalize-wake")
@@ -663,20 +551,6 @@ def test_worker_requires_execute_authorization_before_progress(mocker) -> None:
     assert isinstance(progress.output, PipelineTransferOffer)
 
 
-def test_worker_authorizes_batches_in_fifo_order() -> None:
-    worker = _worker()
-    first = _task()
-    second = _task("batch-b")
-    worker.enqueue_pipeline_batch(first, _spec(0))
-    worker.enqueue_pipeline_batch(second, _spec(0))
-
-    events = worker.authorize_pipeline_batches([(0, first.batch_id), (0, second.batch_id)])
-
-    assert [event.event_type for event in events] == [PipelineEventType.AUTHORIZED, PipelineEventType.AUTHORIZED]
-    assert [event.task.batch_id for event in events] == [first.batch_id, second.batch_id]
-    assert worker.pipeline_stages[0].start_next() is first
-
-
 def test_worker_rejects_progress_before_transport_initialization_without_advancing() -> None:
     worker = _worker()
     task = _task()
@@ -711,21 +585,6 @@ def test_worker_selects_rank_local_pipeline_descriptor(mocker, rank: int) -> Non
     assert worker.model_runner.pipeline_batch_contexts[(rank, "batch-a")].states == (
         worker.model_runner.state_cache["req-a"],
     )
-
-
-def test_worker_all_rank_event_poll_clears_every_rank(mocker) -> None:
-    worker = _worker()
-    local = worker._pipeline_event(PipelineEventType.ACCEPTED, _task(), 0)
-    remote = worker._pipeline_event(PipelineEventType.ACCEPTED, _task("batch-b"), 1)
-    worker._pipeline_events = [local]
-    gather = mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker._all_gather_rank_values",
-        return_value=[[local], [remote]],
-    )
-
-    assert worker.poll_pipeline_events_all_ranks() == [local, remote]
-    gather.assert_called_once_with([local])
-    assert worker.poll_pipeline_events() == []
 
 
 def test_pipeline_memory_budget_gathers_the_pp_group(mocker) -> None:
@@ -763,7 +622,7 @@ def test_first_stage_emits_step_completion_only_after_feedback(mocker) -> None:
     progress = worker.progress_pipeline(0)
     assert progress is not None
     worker.start_pipeline_transfer(PipelineTransferGrant(progress.output))
-    worker.retire_pipeline_send(progress.output.identity)
+    worker.progress_pipeline_transfers()
 
     event = worker.complete_pipeline_feedback(0, task.batch_id, torch.tensor([11.0]))
 
@@ -788,7 +647,7 @@ def test_last_stage_completes_numerical_step_but_not_global_step(mocker) -> None
     assert isinstance(progress.output, PipelineTransferOffer)
     assert worker.pipeline_stages[1].active_task is None
     worker.start_pipeline_transfer(PipelineTransferGrant(progress.output))
-    worker.retire_pipeline_send(progress.output.identity)
+    worker.progress_pipeline_transfers()
     assert worker.release_pipeline_batch(1, task.batch_id).event_type is PipelineEventType.RELEASED
 
 
@@ -1013,7 +872,7 @@ def test_stage_engine_tick_reserves_authorized_activation_before_offer(mocker) -
     assert update is not None
     assert update.progress.readiness == [(offer.identity, True)]
     assert offer.identity in receiver.pipeline_receive_reservations
-    assert receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
 
 
 def test_cancelling_before_grant_releases_speculative_receive_credit(mocker) -> None:
@@ -1079,7 +938,7 @@ def test_worker_starts_only_matching_granted_p2p_endpoint(mocker) -> None:
     payload = {"hidden_states": torch.tensor([2.0])}
     sender.reserve_pipeline_send(offer, payload)
     assert sender_group.send_calls == []
-    assert receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     grant = PipelineTransferGrant(offer)
 
     assert sender.start_pipeline_transfer(grant)
@@ -1137,7 +996,7 @@ def test_last_stage_progress_reserves_feedback_without_returning_latents(mocker)
     assert (1, task.batch_id) in worker.model_runner.pipeline_batch_contexts
 
     worker.start_pipeline_transfer(PipelineTransferGrant(progress.output))
-    assert worker.retire_pipeline_send(progress.output.identity)
+    worker.progress_pipeline_transfers()
     assert progress.output.identity not in worker.pipeline_send_tickets
     assert worker.release_pipeline_batch(1, task.batch_id).event_type is PipelineEventType.RELEASED
 
@@ -1167,9 +1026,9 @@ def test_first_stage_release_waits_for_feedback_receive_lease(mocker) -> None:
         src_rank=1,
         dst_rank=0,
     )
-    assert worker.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(worker, offer)
     worker.start_pipeline_transfer(PipelineTransferGrant(offer))
-    messages = worker.poll_pipeline_received(PipelineEdgeKind.FEEDBACK)
+    messages = worker.pipeline_connectors[PipelineEdgeKind.FEEDBACK].poll_received()
     assert len(messages) == 1
     worker.complete_pipeline_feedback(0, task.batch_id, messages[0].payload["latents"])
 
@@ -1181,109 +1040,6 @@ def test_first_stage_release_waits_for_feedback_receive_lease(mocker) -> None:
     worker.release_pipeline_received(PipelineEdgeKind.FEEDBACK, messages[0])
     assert worker.pipeline_batch_release_ready(0, task.batch_id)
     assert worker.release_pipeline_batch(0, task.batch_id).event_type is PipelineEventType.RELEASED
-
-
-def test_worker_readiness_rejects_missing_sender_reservation_before_receive(mocker) -> None:
-    sender = _worker()
-    receiver = _worker()
-    sender.rank = 0
-    receiver.rank = 1
-    sender_group = _PPGroup(0)
-    receiver_group = _PPGroup(1)
-    mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
-        side_effect=[sender_group, receiver_group],
-    )
-    sender.initialize_pipeline_transports()
-    receiver.initialize_pipeline_transports()
-    offer = PipelineTransferOffer(
-        batch_id="batch-a",
-        step_index=0,
-        epoch=1,
-        branch="conditional",
-        edge_kind=PipelineEdgeKind.ACTIVATION,
-        src_rank=0,
-        dst_rank=1,
-    )
-
-    with pytest.raises(KeyError, match="no reserved sender ticket"):
-        sender.accept_pipeline_transfer_offer(offer)
-
-    assert receiver_group.recv_calls == []
-
-
-def test_worker_readiness_reserves_receive_credit_until_release(mocker) -> None:
-    receiver = _worker()
-    receiver.rank = 1
-    receiver_group = _PPGroup(1)
-    mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
-        return_value=receiver_group,
-    )
-    receiver.initialize_pipeline_transports(max_slots=1)
-    first = PipelineTransferOffer(
-        batch_id="batch-a",
-        step_index=0,
-        epoch=1,
-        branch="conditional",
-        edge_kind=PipelineEdgeKind.ACTIVATION,
-        src_rank=0,
-        dst_rank=1,
-    )
-    second = PipelineTransferOffer(
-        batch_id="batch-b",
-        step_index=0,
-        epoch=1,
-        branch="conditional",
-        edge_kind=PipelineEdgeKind.ACTIVATION,
-        src_rank=0,
-        dst_rank=1,
-    )
-
-    assert receiver.accept_pipeline_transfer_offer(first)
-    assert not receiver.accept_pipeline_transfer_offer(second)
-    with pytest.raises(RuntimeError, match="reserved receive credit"):
-        receiver.drain_pipeline()
-
-    receiver.start_pipeline_transfer(PipelineTransferGrant(first))
-    messages = receiver.poll_pipeline_received(PipelineEdgeKind.ACTIVATION)
-    assert len(messages) == 1
-    receiver.release_pipeline_received(PipelineEdgeKind.ACTIVATION, messages[0])
-    assert receiver.accept_pipeline_transfer_offer(second)
-
-
-def test_worker_two_receive_slots_do_not_double_count_leased_message(mocker) -> None:
-    receiver = _worker()
-    receiver.rank = 1
-    receiver_group = _PPGroup(1)
-    mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker.get_pp_group",
-        return_value=receiver_group,
-    )
-    receiver.initialize_pipeline_transports(max_slots=2)
-
-    def offer(batch_id: str) -> PipelineTransferOffer:
-        return PipelineTransferOffer(
-            batch_id=batch_id,
-            step_index=0,
-            epoch=1,
-            branch="conditional",
-            edge_kind=PipelineEdgeKind.ACTIVATION,
-            src_rank=0,
-            dst_rank=1,
-        )
-
-    first, second, third = offer("batch-a"), offer("batch-b"), offer("batch-c")
-    assert receiver.accept_pipeline_transfer_offer(first)
-    receiver.start_pipeline_transfer(PipelineTransferGrant(first))
-    leased = receiver.poll_pipeline_received(PipelineEdgeKind.ACTIVATION)
-    assert len(leased) == 1
-
-    assert receiver.accept_pipeline_transfer_offer(second)
-    assert not receiver.accept_pipeline_transfer_offer(third)
-
-    receiver.release_pipeline_received(PipelineEdgeKind.ACTIVATION, leased[0])
-    assert receiver.accept_pipeline_transfer_offer(third)
 
 
 def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> None:
@@ -1314,8 +1070,7 @@ def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> N
 
     activation = first.progress_pipeline(0).output
     assert isinstance(activation, PipelineTransferOffer)
-    assert first.accept_pipeline_transfer_offer(activation)
-    assert last.accept_pipeline_transfer_offer(activation)
+    _reserve_receive(last, activation)
     activation_grant = PipelineTransferGrant(activation)
     first.start_pipeline_transfer(activation_grant)
     last_group.receive_payload = first.pipeline_send_tickets[activation.identity].message.payload
@@ -1328,8 +1083,7 @@ def test_worker_progresses_one_step_through_activation_and_feedback(mocker) -> N
     feedback = last_activation_progress.offers[0]
     assert feedback.edge_kind is PipelineEdgeKind.FEEDBACK
 
-    assert first.accept_pipeline_transfer_offer(feedback)
-    assert last.accept_pipeline_transfer_offer(feedback)
+    _reserve_receive(first, feedback)
     feedback_grant = PipelineTransferGrant(feedback)
     last.start_pipeline_transfer(feedback_grant)
     first_group.receive_payload = last.pipeline_send_tickets[feedback.identity].message.payload
@@ -1367,7 +1121,6 @@ def test_progress_poll_executes_next_first_stage_batch_while_prior_feedback_is_p
     assert worker.pipeline_stages[0].awaiting_feedback == {first.batch_id: first}
 
     grant = PipelineTransferGrant(first_offer)
-    worker.accept_pipeline_transfer_offer(first_offer)
     worker.start_pipeline_transfer(grant)
     second_progress = worker.progress_pipeline_transfers()
 
@@ -1418,8 +1171,7 @@ def test_two_batch_progress_runs_stage0_b_while_stage1_consumes_a(mocker) -> Non
             worker.authorize_pipeline_batch(worker.rank, task.batch_id)
 
     def start_transfer(sender, receiver, receiver_group, offer) -> None:
-        sender.accept_pipeline_transfer_offer(offer)
-        receiver.accept_pipeline_transfer_offer(offer)
+        _reserve_receive(receiver, offer)
         grant = PipelineTransferGrant(offer)
         sender.start_pipeline_transfer(grant)
         receiver_group.receive_payload = sender.pipeline_send_tickets[offer.identity].message.payload
@@ -1534,7 +1286,7 @@ def test_worker_releases_transport_credit_before_consumer_event_completes(mocker
         src_rank=0,
         dst_rank=1,
     )
-    receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
 
     first_progress = receiver.progress_pipeline_transfers()
@@ -1546,7 +1298,7 @@ def test_worker_releases_transport_credit_before_consumer_event_completes(mocker
     assert offer.identity not in receiver.pipeline_receive_consumers
 
 
-def test_worker_accepts_next_activation_while_previous_compute_lease_is_active(mocker) -> None:
+def test_worker_reserves_next_activation_while_previous_compute_lease_is_active(mocker) -> None:
     receiver = _worker()
     receiver.rank = 1
     group = _PPGroup(1)
@@ -1577,13 +1329,13 @@ def test_worker_accepts_next_activation_while_previous_compute_lease_is_active(m
         )
 
     first_offer = activation(first)
-    receiver.accept_pipeline_transfer_offer(first_offer)
+    _reserve_receive(receiver, first_offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(first_offer))
     receiver.progress_pipeline_transfers()
     assert first_offer.identity in receiver.pipeline_receive_consumers
 
     second_offer = activation(second)
-    assert receiver.accept_pipeline_transfer_offer(second_offer)
+    _reserve_receive(receiver, second_offer)
 
 
 def test_activation_handoff_keeps_received_payload_alive_for_forward(mocker) -> None:
@@ -1612,7 +1364,7 @@ def test_activation_handoff_keeps_received_payload_alive_for_forward(mocker) -> 
         src_rank=0,
         dst_rank=1,
     )
-    receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
 
     receiver.progress_pipeline_transfers()
@@ -1641,7 +1393,7 @@ def test_activation_forward_failure_retains_compute_lease_after_transport_releas
         src_rank=0,
         dst_rank=1,
     )
-    receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
 
     with pytest.raises(RuntimeError, match="forward failed"):
@@ -1675,7 +1427,7 @@ def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> 
         src_rank=0,
         dst_rank=1,
     )
-    receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
 
     before_authorization = receiver.progress_pipeline_transfers()
@@ -1718,7 +1470,7 @@ def test_worker_rejects_stale_activation_identity_before_execution(mocker) -> No
         src_rank=0,
         dst_rank=1,
     )
-    receiver.accept_pipeline_transfer_offer(stale)
+    _reserve_receive(receiver, stale)
     receiver.start_pipeline_transfer(PipelineTransferGrant(stale))
 
     with pytest.raises(RuntimeError, match="Stale pipeline message identity"):
@@ -1752,7 +1504,7 @@ def test_worker_rejects_stale_feedback_identity_before_adoption(mocker) -> None:
         src_rank=1,
         dst_rank=0,
     )
-    receiver.accept_pipeline_transfer_offer(stale)
+    _reserve_receive(receiver, stale)
     receiver.start_pipeline_transfer(PipelineTransferGrant(stale))
 
     with pytest.raises(RuntimeError, match="Stale pipeline message identity"):
@@ -1780,7 +1532,7 @@ def test_cancelled_stage_one_drains_activation_without_execution(mocker) -> None
         src_rank=0,
         dst_rank=1,
     )
-    receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
     receiver.cancel_pipeline_batch(1, task.batch_id)
 
@@ -1815,7 +1567,7 @@ def test_cancelled_stage_zero_drains_feedback_without_adoption(mocker) -> None:
         src_rank=1,
         dst_rank=0,
     )
-    receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
     receiver.cancel_pipeline_batch(0, task.batch_id)
 
@@ -1853,7 +1605,7 @@ def test_accelerator_consumer_event_failure_retains_receive_ownership(mocker) ->
         src_rank=0,
         dst_rank=1,
     )
-    receiver.accept_pipeline_transfer_offer(offer)
+    _reserve_receive(receiver, offer)
     receiver.start_pipeline_transfer(PipelineTransferGrant(offer))
 
     with pytest.raises(RuntimeError, match="failed to record.*consumer completion"):

@@ -80,7 +80,6 @@ logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
-_QUEUED_FINALIZATION_POLL_INTERVAL_S = 0.005
 _QUEUED_ADMISSION_PROGRESS_DRAIN_S = 0.012
 
 
@@ -229,7 +228,6 @@ class _QueuedPipelineBatchPhase(str, Enum):
     RESERVED = "reserved"
     PREPARED = "prepared"
     ADMISSION_PENDING = "admission_pending"
-    SUBMITTED = "submitted"
     AUTHORIZED = "authorized"
     STEP_COMPLETED = "step_completed"
     STEP_COMMITTED = "step_committed"
@@ -710,12 +708,7 @@ class DiffusionEngine:
                 if expected.issubset(batch.admission_acknowledgements):
                     if event.event_type is PipelineEventType.ACCEPTED:
                         batch.stage_enqueued = True
-                        if batch.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING:
-                            batch.phase = _QueuedPipelineBatchPhase.SUBMITTED
-                    elif batch.phase in {
-                        _QueuedPipelineBatchPhase.ADMISSION_PENDING,
-                        _QueuedPipelineBatchPhase.SUBMITTED,
-                    }:
+                    elif batch.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING:
                         batch.stage_enqueued = True
                         batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
         if logger.isEnabledFor(logging.DEBUG):
@@ -726,16 +719,11 @@ class DiffusionEngine:
 
     def _progress_autonomous_updates_between_admissions(self) -> None:
         """Drain already-published Worker updates without delaying admission."""
-        uses_autonomous = getattr(self.executor, "uses_autonomous_pipeline_stages", None)
-        updates_pending = getattr(self.executor, "pipeline_updates_pending", None)
-        if not callable(uses_autonomous) or uses_autonomous() is not True or not callable(updates_pending):
-            return
-
-        if not updates_pending():
+        if not self.executor.pipeline_updates_pending():
             return
 
         drain_deadline = time.monotonic() + _QUEUED_ADMISSION_PROGRESS_DRAIN_S
-        while updates_pending() and time.monotonic() < drain_deadline:
+        while self.executor.pipeline_updates_pending() and time.monotonic() < drain_deadline:
             self.executor.progress_pipeline()
 
     def _has_queued_pipeline_work(self) -> bool:
@@ -773,20 +761,9 @@ class DiffusionEngine:
             batch.phase
             in {
                 _QueuedPipelineBatchPhase.ADMISSION_PENDING,
-                _QueuedPipelineBatchPhase.SUBMITTED,
                 _QueuedPipelineBatchPhase.AUTHORIZED,
             }
             for batch in self._queued_pipeline_batches.values()
-        )
-
-    def _queued_pipeline_waits_on_finalization(self) -> bool:
-        """Avoid spinning while every retained batch is completing finalization."""
-        batches = tuple(self._queued_pipeline_batches.values())
-        if not batches or not any(batch.phase is _QueuedPipelineBatchPhase.FINALIZING for batch in batches):
-            return False
-        return all(
-            batch.phase in {_QueuedPipelineBatchPhase.FINALIZING, _QueuedPipelineBatchPhase.CANCELLING}
-            for batch in batches
         )
 
     def _queued_pipeline_uses_distributed_vae(self) -> bool:
@@ -837,7 +814,7 @@ class DiffusionEngine:
             has_waiting = getattr(self.scheduler, "has_queued_waiting_request", None)
             if not callable(has_waiting) or self._queued_denoise_batch_count() < max_inflight or not has_waiting():
                 return False
-        if bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)()):
+        if self.executor.pipeline_updates_pending():
             return False
         return not any(
             batch.failure is not None or batch.abort_requested for batch in self._queued_pipeline_batches.values()
@@ -999,35 +976,17 @@ class DiffusionEngine:
             for batch in self._queued_pipeline_batches.values()
             if batch.phase is _QueuedPipelineBatchPhase.PREPARED
         ]
-        batches_to_authorize = []
-        autonomous = getattr(self.executor, "uses_autonomous_pipeline_stages", lambda: False)() is True
         autonomous_admissions: list[tuple[PipelineTask, dict[int, PipelineStageSpec]]] = []
         for batch in ordered:
             if available_slots <= 0:
                 break
-            if autonomous:
-                autonomous_admissions.append((batch.task, batch.stage_specs))
-            else:
-                self.executor.submit_pipeline_batch(batch.task, batch.stage_specs)
-                batch.stage_enqueued = True
-                batch.phase = _QueuedPipelineBatchPhase.SUBMITTED
-            batches_to_authorize.append(batch)
+            autonomous_admissions.append((batch.task, batch.stage_specs))
             available_slots -= 1
         if autonomous_admissions:
             self.executor.submit_pipeline_admissions(autonomous_admissions)
-            for batch in batches_to_authorize:
+            for batch in ordered[: len(autonomous_admissions)]:
                 batch.stage_enqueued = True
                 batch.phase = _QueuedPipelineBatchPhase.ADMISSION_PENDING
-        else:
-            if len(batches_to_authorize) == 1:
-                batch = batches_to_authorize[0]
-                self.executor.authorize_pipeline_batch(batch.stage_physical_ranks, batch.task.batch_id)
-            elif batches_to_authorize:
-                self.executor.authorize_pipeline_batches(
-                    [(batch.stage_physical_ranks, batch.task.batch_id) for batch in batches_to_authorize]
-                )
-            for batch in batches_to_authorize:
-                batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
 
     def _distributed_vae_finalization_is_quiescent(self, batch: _QueuedPipelineBatch) -> bool:
         """Wait until no other queued batch can issue PP collectives."""
@@ -1282,7 +1241,6 @@ class DiffusionEngine:
         if batch.phase in {
             _QueuedPipelineBatchPhase.PREPARED,
             _QueuedPipelineBatchPhase.ADMISSION_PENDING,
-            _QueuedPipelineBatchPhase.SUBMITTED,
         }:
             return None
         if batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED:
@@ -1499,7 +1457,9 @@ class DiffusionEngine:
                     and not self._has_queued_pipeline_work()
                     and self._rpc_queue.empty()
                     and self.abort_queue.empty()
-                    and not bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
+                    and not (
+                        self.od_config.mode == "queued" and self.executor.pipeline_updates_pending()
+                    )
                     and not self.stop_event.is_set()
                 ):
                     self._cv.wait(timeout=1.0)
@@ -1508,7 +1468,7 @@ class DiffusionEngine:
                     break
 
                 if not self.scheduler.has_requests() and not self._has_queued_pipeline_work():
-                    if bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)()):
+                    if self.od_config.mode == "queued" and self.executor.pipeline_updates_pending():
                         try:
                             self.executor.progress_pipeline()
                             orphan_events = self.executor.poll_pipeline_events()
@@ -1601,7 +1561,7 @@ class DiffusionEngine:
                     should_progress = (
                         bool(admitted_outputs)
                         or self._has_unhandled_authorized_queued_batch(handled_request_ids)
-                        or bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
+                        or self.executor.pipeline_updates_pending()
                     )
                     events_by_batch = self._collect_queued_pipeline_events() if should_progress else {}
                 except Exception as exc:
@@ -1626,22 +1586,15 @@ class DiffusionEngine:
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
                 self._advance_unhandled_queued_batches(handled_request_ids, events_by_batch)
-                waiting_on_finalization = self._queued_pipeline_waits_on_finalization()
                 if self._should_wait_for_queued_pipeline_update():
                     with self._cv:
-                        timeout = (
-                            _QUEUED_FINALIZATION_POLL_INTERVAL_S
-                            if waiting_on_finalization
-                            and not getattr(self.executor, "uses_autonomous_pipeline_stages", lambda: False)()
-                            else None
-                        )
                         if (
                             not self.stop_event.is_set()
                             and self._rpc_queue.empty()
                             and self.abort_queue.empty()
-                            and not bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)())
+                            and not self.executor.pipeline_updates_pending()
                         ):
-                            self._cv.wait(timeout=timeout)
+                            self._cv.wait()
                 continue
 
             try:

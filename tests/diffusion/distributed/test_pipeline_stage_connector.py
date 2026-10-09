@@ -67,7 +67,6 @@ def test_receive_readiness_may_precede_offer_and_is_bound_to_destination() -> No
     offer = _offer("batch-pre-ready")
 
     coordinator.mark_receive_ready(offer.identity, rank=1)
-    assert coordinator.pending_readiness_offers() == []
     assert coordinator.snapshot()["ready"] == 1
 
     coordinator.offer(offer)

@@ -200,18 +200,6 @@ def test_retirement_keeps_finalizing_batch_until_receive_ownership_retires(mocke
     engine.executor.release_pipeline_batch.assert_not_called()
 
 
-def test_busy_loop_backoff_only_applies_to_background_finalization(mocker) -> None:
-    engine = _engine(mocker, _scheduler_output())
-    batch = engine._submit_queued_pipeline_batch(_scheduler_output())
-    batch.phase = _QueuedPipelineBatchPhase.FINALIZING
-    batch.finalization_handle = "decode-handle"
-
-    assert engine._queued_pipeline_waits_on_finalization()
-
-    batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
-    assert not engine._queued_pipeline_waits_on_finalization()
-
-
 def test_final_retirement_cleans_persistent_worker_state(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
