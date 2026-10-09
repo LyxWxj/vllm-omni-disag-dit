@@ -82,7 +82,7 @@ def test_transfer_completion_waits_for_both_endpoint_updates(mocker) -> None:
             (),
         )
     )
-    assert executor.progress_pipeline().completed == []
+    executor.progress_pipeline()
     assert grant.completed_ranks == {0}
 
     executor._pipeline_update_buffers[1].put(
@@ -95,7 +95,7 @@ def test_transfer_completion_waits_for_both_endpoint_updates(mocker) -> None:
             (),
         )
     )
-    assert executor.progress_pipeline().completed == [offer.identity]
+    executor.progress_pipeline()
     assert grant.completed_ranks == {0, 1}
 
 
@@ -107,9 +107,8 @@ def test_sparse_update_drain_is_fair_and_bounded(mocker) -> None:
         PipelineWorkerUpdate(1, None, ("rank-1",))
     )
 
-    progress = executor.progress_pipeline()
+    executor.progress_pipeline()
 
-    assert progress.completed == []
     assert len(executor._pipeline_cached_events) == 33
     assert executor._pipeline_update_buffers[0].qsize() == 8
     assert executor._pipeline_update_buffers[1].empty()

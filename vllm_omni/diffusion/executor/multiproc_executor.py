@@ -1161,8 +1161,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if rank_progress is None:
                 continue
             for completion in rank_progress.completions:
-                if coordinator.complete(completion.identity, completion.rank):
-                    progress.completed.append(completion.identity)
+                coordinator.complete(completion.identity, completion.rank)
                 saw_completion = True
             for offer in rank_progress.offers:
                 if coordinator.offer(offer):

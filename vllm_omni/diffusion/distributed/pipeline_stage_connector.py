@@ -108,7 +108,6 @@ class PipelineTransportProgress:
 @dataclass
 class PipelineCoordinatorProgress:
     grants: list[PipelineTransferGrant] = field(default_factory=list)
-    completed: list[tuple[Any, ...]] = field(default_factory=list)
 
 
 class PipelineTransferCoordinator:
