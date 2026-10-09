@@ -63,14 +63,14 @@ def _engine(mocker, scheduler_output: DiffusionSchedulerOutput) -> DiffusionEngi
             for item in engine._queued_pipeline_batches.values()
             if item.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
         ]
-        if pending:
-            engine.executor.poll_pipeline_events.return_value = [
-                PipelineEvent(event_type, item.task, stage_id, rank)
-                for item in pending
+        for item in pending:
+            item.stage_enqueued = True
+            item.phase = _QueuedPipelineBatchPhase.AUTHORIZED
+            item.admission_acknowledgements = {
+                (event_type, stage_id, rank)
                 for event_type in (PipelineEventType.ACCEPTED, PipelineEventType.AUTHORIZED)
                 for stage_id, rank in item.stage_physical_ranks.items()
-            ]
-            engine._collect_queued_pipeline_events()
+            }
 
         return batch
 
