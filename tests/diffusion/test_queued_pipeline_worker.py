@@ -1008,6 +1008,29 @@ def test_stage_engine_tick_reserves_authorized_activation_before_offer(mocker) -
     assert receiver.accept_pipeline_transfer_offer(offer)
 
 
+def test_stage_engine_reserves_next_activation_while_stage1_is_active(mocker) -> None:
+    receiver = _worker()
+    receiver.rank = 1
+    group = _PPGroup(1)
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=group)
+    receiver.initialize_pipeline_transports(max_slots=2)
+    first = _task("active-activation")
+    second = PipelineTask(batch_id="queued-activation", request_ids=("req-b",), step_index=0, epoch=3)
+    receiver.model_runner.state_cache["req-b"] = object()
+    for task in (first, second):
+        receiver.enqueue_pipeline_batch(task, _spec(1))
+        receiver.authorize_pipeline_batch(1, task.batch_id)
+
+    stage = receiver.pipeline_stages[1]
+    assert stage.start_next() is first
+    progress = PipelineTransportProgress(rank=1)
+    receiver._get_queued_worker_runtime()._reserve_expected_pipeline_receives(progress)
+
+    offer = receiver._make_pipeline_transfer_offer(second, PipelineEdgeKind.ACTIVATION)
+    assert progress.readiness == [(offer.identity, True)]
+    assert offer.identity in receiver.pipeline_receive_reservations
+
+
 def test_cancelling_before_grant_releases_speculative_receive_credit(mocker) -> None:
     receiver = _worker()
     receiver.rank = 1
@@ -1452,7 +1475,7 @@ def test_two_batch_progress_runs_stage0_b_while_stage1_consumes_a(mocker) -> Non
     assert last.pipeline_stages[1].terminal_statuses[batch_b.batch_id] is PipelineTaskStatus.COMPLETED
 
 
-def test_stage0_waits_for_activation_grant_before_next_forward(mocker) -> None:
+def test_stage0_fills_activation_send_window_before_waiting_for_grants(mocker) -> None:
     worker = _worker()
     worker.rank = 0
     mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_pp_group", return_value=_PPGroup(0))
@@ -1471,8 +1494,13 @@ def test_stage0_waits_for_activation_grant_before_next_forward(mocker) -> None:
 
     second_progress = worker.progress_pipeline_transfers()
 
-    assert second_progress.offers == []
-    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 1
+    assert [offer.batch_id for offer in second_progress.offers] == [second.batch_id]
+    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 2
+
+    third_progress = worker.progress_pipeline_transfers()
+
+    assert third_progress.offers == []
+    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 2
 
 
 def test_release_rpc_consumes_acknowledgement_without_dropping_next_batch_event() -> None:

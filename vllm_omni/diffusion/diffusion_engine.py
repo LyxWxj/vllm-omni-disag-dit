@@ -50,6 +50,7 @@ from vllm_omni.diffusion.output_formatter import (
     normalize_diffusion_postprocess_output,
 )
 from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
+from vllm_omni.diffusion.queued_pp.queue_config import resolve_queued_queue_depth
 from vllm_omni.diffusion.queued_pp.runtime import QueuedPipelineBatch as _QueuedPipelineBatch
 from vllm_omni.diffusion.queued_pp.runtime import QueuedPipelineBatchPhase as _QueuedPipelineBatchPhase
 from vllm_omni.diffusion.queued_pp.runtime import distributed_vae_finalization_is_quiescent, select_output_owner_rank
@@ -391,8 +392,8 @@ class DiffusionEngine:
         else:
             self.dp_concurrent = False
         if getattr(self.od_config, "mode", "static") == "queued":
-            self.scheduler.max_num_running_reqs = _max_num_seqs(self.od_config) * int(
-                getattr(self.od_config, "max_inflight_batches", 1)
+            self.scheduler.max_num_running_reqs = _max_num_seqs(self.od_config) * resolve_queued_queue_depth(
+                self.od_config
             )
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
@@ -417,6 +418,7 @@ class DiffusionEngine:
         self._queued_reserved_bytes = 0
         self._queued_stage_buffer_budget_bytes: int | None = None
         self._queued_pipeline_epoch = 0
+        self._queued_pipeline_decode_barrier_batch_ids: set[str] = set()
         set_update_callback = getattr(self.executor, "set_pipeline_update_callback", None)
         if callable(set_update_callback):
             set_update_callback(self._notify_queued_pipeline_update)
@@ -725,7 +727,7 @@ class DiffusionEngine:
         """Bound prepared tasks by scheduler capacity, including finalizing rows."""
         scheduler_capacity = getattr(self.scheduler, "max_num_running_reqs", None)
         if type(scheduler_capacity) is not int or scheduler_capacity <= 0:
-            scheduler_capacity = _max_num_seqs(self.od_config) * int(self.od_config.max_inflight_batches)
+            scheduler_capacity = _max_num_seqs(self.od_config) * resolve_queued_queue_depth(self.od_config)
         finalizing_batches = sum(
             batch.phase is _QueuedPipelineBatchPhase.FINALIZING for batch in self._queued_pipeline_batches.values()
         )
@@ -752,6 +754,71 @@ class DiffusionEngine:
             batch.phase in {_QueuedPipelineBatchPhase.FINALIZING, _QueuedPipelineBatchPhase.CANCELLING}
             for batch in batches
         )
+
+    def _queued_pipeline_has_pending_finalization_submission(self) -> bool:
+        """Return whether the Engine still has a Decode submission to issue.
+
+        ``FINALIZATION_PENDING`` is an Engine state, not a Worker completion
+        state. Sleeping while it is present can leave one rank decoding while
+        the other rank's Decode submission remains queued behind the next
+        Engine wake-up.
+        """
+        return any(
+            batch.phase is _QueuedPipelineBatchPhase.FINALIZATION_PENDING
+            or (batch.phase is _QueuedPipelineBatchPhase.FINALIZING and batch.finalization_handle is None)
+            for batch in self._queued_pipeline_batches.values()
+        )
+
+    def _queued_pipeline_finalization_batches(self) -> tuple[_QueuedPipelineBatch, ...]:
+        return tuple(
+            batch
+            for batch in self._queued_pipeline_batches.values()
+            if batch.finalizing_request_ids
+            and batch.phase
+            in {
+                _QueuedPipelineBatchPhase.FINALIZATION_PENDING,
+                _QueuedPipelineBatchPhase.FINALIZING,
+            }
+        )
+
+    def _queued_pipeline_has_other_work(self) -> bool:
+        """Return whether non-finalizing request work remains in the Engine."""
+        finalization_phases = {
+            _QueuedPipelineBatchPhase.FINALIZATION_PENDING,
+            _QueuedPipelineBatchPhase.FINALIZING,
+            _QueuedPipelineBatchPhase.CANCELLING,
+        }
+        if any(batch.phase not in finalization_phases for batch in self._queued_pipeline_batches.values()):
+            return True
+        has_waiting = getattr(self.scheduler, "has_queued_waiting_request", None)
+        return bool(has_waiting()) if callable(has_waiting) else False
+
+    def _queued_pipeline_denoise_quiescent(self) -> bool:
+        return not any(
+            batch.phase
+            in {
+                _QueuedPipelineBatchPhase.ADMISSION_PENDING,
+                _QueuedPipelineBatchPhase.SUBMITTED,
+                _QueuedPipelineBatchPhase.AUTHORIZED,
+                _QueuedPipelineBatchPhase.STEP_COMPLETED,
+            }
+            for batch in self._queued_pipeline_batches.values()
+        )
+
+    def _maybe_enter_queued_pipeline_decode_barrier(self) -> None:
+        """Freeze new DiT admission once a complete decode group is ready."""
+        barrier_ids = getattr(self, "_queued_pipeline_decode_barrier_batch_ids", None)
+        if barrier_ids is None:
+            barrier_ids = self._queued_pipeline_decode_barrier_batch_ids = set()
+        if barrier_ids:
+            return
+        finalizing = self._queued_pipeline_finalization_batches()
+        if not finalizing:
+            return
+        max_inflight = resolve_queued_queue_depth(self.od_config)
+        if len(finalizing) < max_inflight and self._queued_pipeline_has_other_work():
+            return
+        barrier_ids.update(batch.task.batch_id for batch in finalizing)
 
     def _queued_pipeline_uses_distributed_vae(self) -> bool:
         parallel_config = getattr(self.od_config, "parallel_config", None)
@@ -783,10 +850,12 @@ class DiffusionEngine:
                 # A waiting request can be prepared while denoise slots are
                 # occupied; the prepared FIFO will be authorized later.
                 return False
-            max_inflight = int(getattr(self.od_config, "max_inflight_batches", 1))
+            max_inflight = resolve_queued_queue_depth(self.od_config)
             has_waiting = getattr(self.scheduler, "has_queued_waiting_request", None)
             if not callable(has_waiting) or self._queued_denoise_batch_count() < max_inflight or not has_waiting():
                 return False
+        if self._queued_pipeline_has_pending_finalization_submission():
+            return False
         if bool(getattr(self.executor, "pipeline_updates_pending", lambda: False)()):
             return False
         return not any(
@@ -936,12 +1005,14 @@ class DiffusionEngine:
 
     def _authorize_waiting_queued_batches(self) -> None:
         """Enqueue prepared tasks in admission order as denoise slots open."""
+        if getattr(self, "_queued_pipeline_decode_barrier_batch_ids", set()):
+            return
         if self._queued_pipeline_uses_distributed_vae() and any(
             batch.phase in {_QueuedPipelineBatchPhase.FINALIZATION_PENDING, _QueuedPipelineBatchPhase.FINALIZING}
             for batch in self._queued_pipeline_batches.values()
         ):
             return
-        available_slots = int(self.od_config.max_inflight_batches) - self._queued_denoise_batch_count()
+        available_slots = resolve_queued_queue_depth(self.od_config) - self._queued_denoise_batch_count()
         if available_slots <= 0:
             return
         ordered = [
@@ -1041,16 +1112,12 @@ class DiffusionEngine:
                 raise RuntimeError("Scheduler finalized a request outside the queued pipeline batch.")
             batch.finalizing_request_ids = finalizing
             if finalizing:
-                has_active_finalization = self._queued_pipeline_uses_distributed_vae() and any(
-                    candidate.phase is _QueuedPipelineBatchPhase.FINALIZING
-                    for candidate in self._queued_pipeline_batches.values()
-                    if candidate is not batch
-                )
-                batch.phase = (
-                    _QueuedPipelineBatchPhase.FINALIZATION_PENDING
-                    if has_active_finalization
-                    else _QueuedPipelineBatchPhase.FINALIZING
-                )
+                batch.phase = _QueuedPipelineBatchPhase.FINALIZATION_PENDING
+                self._maybe_enter_queued_pipeline_decode_barrier()
+                if getattr(self, "_queued_pipeline_decode_barrier_batch_ids", set()) and (
+                    self._queued_pipeline_denoise_quiescent()
+                ):
+                    batch.phase = _QueuedPipelineBatchPhase.FINALIZING
             else:
                 batch.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
             self._authorize_waiting_queued_batches()
@@ -1099,6 +1166,19 @@ class DiffusionEngine:
             batch.phase = _QueuedPipelineBatchPhase.FAILED
             raise
 
+    def _queued_pipeline_decode_group_ready_to_retire(self, batch: _QueuedPipelineBatch) -> bool:
+        """Keep a Decode group alive until every member has completed Decode."""
+        group_ids = getattr(self, "_queued_pipeline_decode_barrier_batch_ids", set())
+        if batch.task.batch_id not in group_ids:
+            return True
+        for batch_id in group_ids:
+            candidate = self._queued_pipeline_batches.get(batch_id)
+            if candidate is None or candidate.cancelled or candidate.failure is not None:
+                continue
+            if candidate.decoded_output is None:
+                return False
+        return True
+
     def _retire_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
         if not batch.stage_enqueued:
             if not (batch.abort_requested or batch.failure is not None or batch.cancelled):
@@ -1115,6 +1195,8 @@ class DiffusionEngine:
             _QueuedPipelineBatchPhase.CANCELLING,
         }:
             raise RuntimeError("Queued pipeline batch is not ready for retirement.")
+        if not self._queued_pipeline_decode_group_ready_to_retire(batch):
+            return
         if batch.stage_enqueued and not batch.release_acknowledged:
             # Finalization can complete without another scheduler progress
             # round. Give Workers one transport-only tick so completed device
@@ -1168,6 +1250,7 @@ class DiffusionEngine:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
                 batch.scheduler_completed_request_ids.add(request_id)
         self._queued_pipeline_batches.pop(batch.task.batch_id, None)
+        getattr(self, "_queued_pipeline_decode_barrier_batch_ids", set()).discard(batch.task.batch_id)
         self._queued_reserved_bytes -= batch.reserved_bytes
         if self._queued_reserved_bytes < 0:
             raise RuntimeError("queued pipeline byte reservation accounting underflow")
@@ -1229,6 +1312,11 @@ class DiffusionEngine:
         if batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED:
             self._commit_queued_pipeline_step(batch)
         if batch.phase is _QueuedPipelineBatchPhase.FINALIZATION_PENDING:
+            self._maybe_enter_queued_pipeline_decode_barrier()
+            if not getattr(self, "_queued_pipeline_decode_barrier_batch_ids", set()):
+                return None
+            if not self._queued_pipeline_denoise_quiescent():
+                return None
             if not self._distributed_vae_finalization_is_quiescent(batch):
                 return None
             batch.phase = _QueuedPipelineBatchPhase.FINALIZING
@@ -1458,7 +1546,12 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                if self.od_config.mode == "queued" and self._queued_pipeline_can_advance_without_schedule():
+                if self.od_config.mode == "queued" and getattr(
+                    self, "_queued_pipeline_decode_barrier_batch_ids", set()
+                ):
+                    sched_output = None
+                    self._scheduler_num_waiting_reqs = self.scheduler.num_waiting_requests()
+                elif self.od_config.mode == "queued" and self._queued_pipeline_can_advance_without_schedule():
                     sched_output = None
                     self._scheduler_num_waiting_reqs = self.scheduler.num_waiting_requests()
                 else:

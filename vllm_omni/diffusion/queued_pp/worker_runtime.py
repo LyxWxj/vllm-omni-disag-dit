@@ -480,10 +480,7 @@ class QueuedWorkerRuntime:
         first_stage = self.pipeline_stages.get(0)
         if first_stage is not None and first_stage.spec.is_first:
             activation_connector = self._require_pipeline_connector(PipelineEdgeKind.ACTIVATION)
-            if (
-                activation_connector.send_in_use < activation_connector.max_slots
-                and not self._pipeline_stage_engine_has_unstarted_send(PipelineEdgeKind.ACTIVATION)
-            ):
+            if activation_connector.send_in_use < activation_connector.max_slots:
                 stage_progress = self.progress_pipeline(0)
                 if stage_progress is not None:
                     if not isinstance(stage_progress.output, PipelineTransferOffer):
@@ -546,7 +543,6 @@ class QueuedWorkerRuntime:
         if (
             last_stage is not None
             and last_stage.spec.is_last
-            and last_stage.active_task is None
             and last_stage.pending_tasks
         ):
             task = last_stage.pending_tasks[0]
@@ -610,13 +606,6 @@ class QueuedWorkerRuntime:
         return (
             task.batch_id in stage.authorized_batches
             and connector.send_in_use < connector.max_slots
-            and not self._pipeline_stage_engine_has_unstarted_send(PipelineEdgeKind.ACTIVATION)
-        )
-
-    def _pipeline_stage_engine_has_unstarted_send(self, edge_kind: PipelineEdgeKind) -> bool:
-        return any(
-            identity[4] is edge_kind and not ticket.started
-            for identity, ticket in self.pipeline_send_tickets.items()
         )
 
     def _pipeline_stage_engine_has_expected_receive(self) -> bool:
@@ -625,7 +614,6 @@ class QueuedWorkerRuntime:
         if (
             stage is not None
             and stage.spec.is_last
-            and stage.active_task is None
             and stage.pending_tasks
             and stage.pending_tasks[0].batch_id in stage.authorized_batches
         ):

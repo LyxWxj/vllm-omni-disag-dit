@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -9,6 +10,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import PipelineTransportProgress
+from vllm_omni.diffusion.queued_pp.queue_config import submit_step_future
 
 PIPELINE_GRANT_START_TIMEOUT_S = 30.0
 
@@ -227,6 +229,24 @@ class DiffusionExecutor(ABC):
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute step-mode work from a scheduler output."""
         pass
+
+    def execute_model(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        *,
+        non_block: bool = False,
+    ) -> BaseRunnerOutput | Future[BaseRunnerOutput]:
+        """Expose the vLLM-style step entry without changing old executors.
+
+        The queued adapter owns the Future queue. Existing synchronous callers
+        continue to use ``execute_step`` directly.
+        """
+        if non_block:
+            ensure_open = getattr(self, "_ensure_open", None)
+            if callable(ensure_open):
+                ensure_open()
+            return submit_step_future(self, scheduler_output)
+        return self.execute_step(scheduler_output)
 
     @abstractmethod
     def collective_rpc(

@@ -752,11 +752,11 @@ class DiffusionWorker:
 
     def execute_model(
         self,
-        req: OmniDiffusionRequest | list[NewRequestData],
-        od_config: OmniDiffusionConfig,
+        req: OmniDiffusionRequest | list[NewRequestData] | DiffusionSchedulerOutput,
+        od_config: OmniDiffusionConfig | None = None,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
-    ) -> DiffusionOutput:
+    ) -> DiffusionOutput | BaseRunnerOutput:
         """Execute a forward pass by delegating to the model runner.
 
         If *req* is a list (DP multi-concurrency), each rank picks one complete
@@ -769,7 +769,14 @@ class DiffusionWorker:
         Each rank returns its OWN DiffusionOutput (no gather). The executor
         collects N responses via the per-worker result queues.
         """
+        # The vLLM-shaped executor entry uses ``execute_model`` for one
+        # scheduler tick. Keep the legacy request API on the same method while
+        # routing scheduler outputs to the existing step implementation.
+        if isinstance(req, DiffusionSchedulerOutput):
+            return self.execute_stepwise(req)
+
         assert self.model_runner is not None, "Model runner not initialized"
+        od_config = self.od_config if od_config is None else od_config
 
         # DP multi-concurrency: pick one request per DP rank.
         # Use rank_in_group (DP rank) not global rank, so that SP/TP/CFG
@@ -2178,11 +2185,11 @@ class WorkerWrapperBase:
 
     def execute_model(
         self,
-        req: OmniDiffusionRequest | list[NewRequestData],
-        od_config: OmniDiffusionConfig,
+        req: OmniDiffusionRequest | list[NewRequestData] | DiffusionSchedulerOutput,
+        od_config: OmniDiffusionConfig | None = None,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
-    ) -> DiffusionOutput:
+    ) -> DiffusionOutput | BaseRunnerOutput:
         """
         Execute a forward pass.
 
@@ -2194,6 +2201,10 @@ class WorkerWrapperBase:
         Returns:
             DiffusionOutput with generated results
         """
+        if isinstance(req, DiffusionSchedulerOutput):
+            return self.worker.execute_model(req)
+
+        od_config = self.od_config if od_config is None else od_config
         kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
         if diffusion_kv_metadata is not None:
             kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata

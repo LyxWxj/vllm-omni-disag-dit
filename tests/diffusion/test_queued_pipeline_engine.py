@@ -471,6 +471,17 @@ def test_finalizing_batch_does_not_sleep_while_other_requests_are_schedulable(mo
     assert engine._should_wait_for_queued_pipeline_update()
 
 
+def test_pending_finalization_submission_keeps_engine_awake(mocker) -> None:
+    engine = _engine(mocker, _scheduler_output())
+    batch = engine._submit_queued_pipeline_batch(_scheduler_output("req-a"))
+    batch.phase = _QueuedPipelineBatchPhase.FINALIZATION_PENDING
+    engine.scheduler.has_queued_admission_candidate = mocker.Mock(return_value=False)
+    engine.executor.pipeline_updates_pending.return_value = False
+
+    assert engine._queued_pipeline_has_pending_finalization_submission()
+    assert not engine._should_wait_for_queued_pipeline_update()
+
+
 def test_full_queued_capacity_waits_for_worker_update_before_rescheduling(mocker) -> None:
     engine = _engine(mocker, _scheduler_output())
     engine.od_config.max_inflight_batches = 1

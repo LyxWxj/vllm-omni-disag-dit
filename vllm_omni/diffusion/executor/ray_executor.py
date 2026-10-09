@@ -36,6 +36,7 @@ from vllm_omni.diffusion.offloader.config import (
     any_selected_component_uses_allgather,
     resolve_offload,
 )
+from vllm_omni.diffusion.queued_pp.queue_config import shutdown_step_futures
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 
 if TYPE_CHECKING:
@@ -707,6 +708,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
             raise EngineDeadError() from exc
 
     def shutdown(self) -> None:
+        shutdown_step_futures(self)
         self._shutdown(graceful=True)
 
     def _shutdown(self, graceful: bool) -> None:

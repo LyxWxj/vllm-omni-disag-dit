@@ -142,7 +142,6 @@ class PipelineTransferCoordinator:
         self._cancelled_batches: set[tuple[str, int]] = set()
         self._grants: dict[tuple[Any, ...], PipelineTransferGrant] = {}
         self._completed_ids: set[tuple[Any, ...]] = set()
-        self._busy_ranks: set[int] = set()
         self._next_edge = PipelineEdgeKind.FEEDBACK
         self._edge_cursor = {
             PipelineEdgeKind.ACTIVATION: 0,
@@ -244,6 +243,20 @@ class PipelineTransferCoordinator:
         """Return FIFO heads whose endpoint readiness has not been confirmed."""
         return [queue[0] for queue in self._offers.values() if queue and queue[0].identity not in self._ready_ids]
 
+    def _edge_has_active_grant(self, edge_kind: PipelineEdgeKind) -> bool:
+        return any(grant.offer.edge_kind is edge_kind for grant in self._grants.values())
+
+    def _active_ranks(self) -> tuple[int, ...]:
+        return tuple(
+            sorted(
+                {
+                    rank
+                    for grant in self._grants.values()
+                    for rank in (grant.offer.src_rank, grant.offer.dst_rank)
+                }
+            )
+        )
+
     def grant_ready(self, limit: int = 1) -> list[PipelineTransferGrant]:
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be a positive integer")
@@ -270,7 +283,7 @@ class PipelineTransferCoordinator:
                     candidate = queue[0]
                     if candidate.identity not in self._ready_ids:
                         continue
-                    if candidate.src_rank in self._busy_ranks or candidate.dst_rank in self._busy_ranks:
+                    if self._edge_has_active_grant(edge_kind):
                         continue
                     selected = candidate
                     self._edge_cursor[edge_kind] = (edge_index + 1) % len(edge_keys)
@@ -286,7 +299,6 @@ class PipelineTransferCoordinator:
             self._ready_ids.remove(identity)
             grant = PipelineTransferGrant(offer=offer)
             self._grants[identity] = grant
-            self._busy_ranks.update((offer.src_rank, offer.dst_rank))
             grants.append(grant)
             self._next_edge = (
                 PipelineEdgeKind.ACTIVATION
@@ -308,7 +320,6 @@ class PipelineTransferCoordinator:
             return False
         self._grants.pop(identity)
         self._completed_ids.add(identity)
-        self._busy_ranks.difference_update((grant.offer.src_rank, grant.offer.dst_rank))
         return True
 
     def snapshot(self) -> dict[str, Any]:
@@ -317,7 +328,7 @@ class PipelineTransferCoordinator:
             "ready": len(self._ready_ids) + len(self._pre_ready_ids),
             "grants": len(self._grants),
             "completed": len(self._completed_ids),
-            "busy_ranks": tuple(sorted(self._busy_ranks)),
+            "busy_ranks": self._active_ranks(),
         }
 
     @staticmethod

@@ -1139,8 +1139,8 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
-    # Queued pipeline-parallel capacity settings. These are inert in static
-    # mode and deliberately narrow in M2 until stage-local scheduling lands.
+    # Queued pipeline-parallel capacity. This is the bounded Future queue
+    # depth; stage transport slots and byte reservations are separate internals.
     max_inflight_batches: int = 1
     edge_buffer_slots: int = 2
     stage_buffer_bytes: int | None = None

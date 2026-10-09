@@ -47,6 +47,7 @@ from vllm_omni.diffusion.queued_pp.executor_adapter import (
     unwrap_nested_pipeline_result,
     unwrap_singleton_pipeline_result,
 )
+from vllm_omni.diffusion.queued_pp.queue_config import shutdown_step_futures
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -500,6 +501,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
 
     def shutdown(self) -> None:
+        shutdown_step_futures(self)
         if self._closed:
             return
         self._closed = True

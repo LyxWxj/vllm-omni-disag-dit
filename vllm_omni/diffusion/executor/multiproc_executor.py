@@ -48,6 +48,7 @@ from vllm_omni.diffusion.queued_pp.executor_adapter import (
     unwrap_nested_pipeline_result,
     unwrap_singleton_pipeline_result,
 )
+from vllm_omni.diffusion.queued_pp.queue_config import shutdown_step_futures
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
@@ -1180,7 +1181,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
         coordinator = self._pipeline_transfer_coordinator
-        grant_limit = max(1, len(coordinator.endpoint_ranks) // 2)
+        # One activation and one feedback transfer may be in flight for each
+        # PP2 endpoint pair.  This lets a ready activation use the freed send
+        # slot while the reverse feedback transfer is still completing.
+        grant_limit = max(1, len(coordinator.endpoint_ranks))
         grants = coordinator.grant_ready(limit=grant_limit)
         for grant in grants:
             if self._uses_autonomous_pipeline_stages():
@@ -1781,6 +1785,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 raise EngineDeadError(f"Worker process {p.name} is dead")
 
     def shutdown(self) -> None:
+        shutdown_step_futures(self)
         self._closed = True
         self._pump_stop.set()
         cleaner = self._shutdown_cleaner
