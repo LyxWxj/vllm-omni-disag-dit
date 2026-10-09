@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 
@@ -310,30 +310,6 @@ class TransferTicket:
     completed: bool = False
 
 
-class PipelineTransport(Protocol):
-    src_rank: int
-    dst_rank: int
-
-    @property
-    def has_outstanding_operations(self) -> bool: ...
-
-    def start_granted_transfer(
-        self,
-        grant: PipelineTransferGrant,
-        message: PipelineMessage | None = None,
-    ) -> None: ...
-
-    def poll(self, limit: int | None = None) -> list[PipelineMessage]: ...
-
-    def wait(self, ticket: TransferTicket) -> bool: ...
-
-    def is_send_ready(self, ticket: TransferTicket) -> bool: ...
-
-    def abort(self, ticket: TransferTicket) -> bool: ...
-
-    def close(self) -> None: ...
-
-
 @dataclass
 class _PendingReceive:
     message: PipelineMessage
@@ -559,7 +535,7 @@ class PipelineStageConnector:
     explicitly retires tickets after consumer completion.
     """
 
-    def __init__(self, *, edge: str, max_slots: int = 1, transport: PipelineTransport) -> None:
+    def __init__(self, *, edge: str, max_slots: int = 1, transport: DistributedP2PTransport) -> None:
         if not edge:
             raise ValueError("edge must be non-empty")
         if type(max_slots) is not int or max_slots <= 0:
