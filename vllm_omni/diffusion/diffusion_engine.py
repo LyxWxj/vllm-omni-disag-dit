@@ -1903,10 +1903,6 @@ class DiffusionEngine:
             )
             self._put_output(request_id, out)
 
-    def _has_output_stream(self, request_id: str) -> bool:
-        with self._cv:
-            return request_id in self._out_streams
-
     @staticmethod
     def resolve_engine_class(config: OmniDiffusionConfig) -> type[DiffusionEngine]:
         """Resolve the engine class selected by ``config.engine_backend``.

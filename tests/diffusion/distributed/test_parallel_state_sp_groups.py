@@ -150,8 +150,7 @@ def test_set_seq_parallel_pg_validates_sp_group_ranks(monkeypatch):
 
 @pytest.mark.parametrize("rank", [1, 3])
 def test_tensor_dict_broadcast_preserves_subgroup_source(rank, monkeypatch):
-    from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
-    from vllm_omni.diffusion.distributed.transport_schema import TensorMetadata
+    from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator, TensorMetadata
 
     coordinator = object.__new__(GroupCoordinator)
     coordinator.rank = rank

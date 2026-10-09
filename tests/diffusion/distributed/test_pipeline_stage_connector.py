@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm_omni.diffusion.distributed.group_coordinator import TensorMetadata
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     DistributedP2PTransport,
     PipelineEdgeKind,
@@ -14,13 +15,15 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineTransferOffer,
     TransferTicket,
 )
-from vllm_omni.diffusion.distributed.transport_schema import TensorMetadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def _coordinator(activation_edge: tuple[int, int] = (0, 1)) -> PipelineTransferCoordinator:
-    return PipelineTransferCoordinator(activation_edge=activation_edge)
+    return PipelineTransferCoordinator(
+        activation_edges={activation_edge},
+        feedback_edges={(activation_edge[1], activation_edge[0])},
+    )
 
 
 def _offer(
@@ -160,8 +163,8 @@ def test_transfer_rejects_reversed_activation_direction() -> None:
 
 
 def test_coordinator_rejects_invalid_activation_edge() -> None:
-    with pytest.raises(ValueError, match="one activation edge pair"):
-        PipelineTransferCoordinator(activation_edge=(0, 1, 2))
+    with pytest.raises(ValueError, match="feedback edges must exactly reverse"):
+        PipelineTransferCoordinator(activation_edges={(0, 1)}, feedback_edges={(0, 1)})
 
 
 def test_transfer_identity_rejects_replay_and_duplicate_completion() -> None:
