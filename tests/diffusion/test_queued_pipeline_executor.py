@@ -19,6 +19,7 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
 from vllm_omni.diffusion.executor.abstract import PIPELINE_GRANT_START_TIMEOUT_S
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
+from vllm_omni.diffusion.queued_pp.queue_config import shutdown_step_futures, submit_step_future
 from vllm_omni.diffusion.worker.pipeline_state import PipelineWorkerUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -63,6 +64,32 @@ def test_submit_pipeline_batch_passes_rank_local_maps_through_aggregated_rpc(exe
         "enqueue_pipeline_batch",
         args=("task", specs),
     )
+
+
+def test_queued_step_future_prefers_executor_async_submission(mocker) -> None:
+    executor = SimpleNamespace(
+        od_config=SimpleNamespace(max_inflight_batches=2),
+        submit_queued_step=mocker.Mock(),
+    )
+    expected = mocker.Mock()
+    executor.submit_queued_step.return_value = expected
+
+    future = submit_step_future(executor, "scheduler-output")
+
+    assert future is expected
+    executor.submit_queued_step.assert_called_once_with("scheduler-output")
+    shutdown_step_futures(executor)
+
+
+def test_queued_step_future_fallback_is_bounded(mocker) -> None:
+    executor = SimpleNamespace(
+        od_config=SimpleNamespace(max_inflight_batches=1),
+        execute_step=mocker.Mock(side_effect=lambda value: value),
+    )
+
+    future = submit_step_future(executor, "scheduler-output")
+    assert future.result(timeout=1.0) == "scheduler-output"
+    shutdown_step_futures(executor)
 
 
 def test_submission_failure_does_not_issue_authorization(executor) -> None:

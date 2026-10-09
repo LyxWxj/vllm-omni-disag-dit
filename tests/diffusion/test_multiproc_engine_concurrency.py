@@ -18,7 +18,7 @@ import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
@@ -137,6 +137,38 @@ def _start_worker(req_q, res_q, count=2):
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return t
+
+
+def test_submit_queued_step_returns_future_for_packed_runner_output(mocker) -> None:
+    executor, req_q, _ = _make_executor()
+    executor._futures_lock = threading.RLock()
+    executor._rpc_futures = {}
+    executor._rpc_id_counter = 0
+    executor._rpc_id_lock = threading.Lock()
+    executor._pump_running = True
+    executor._ensure_open = Mock()
+
+    mocker.patch(
+        "vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm",
+    )
+    runner_output = BatchRunnerOutput.from_list([RunnerOutput(request_id="req", finished=False)])
+
+    future = executor.submit_queued_step(_make_sched_output("req"))
+    request = req_q.get(timeout=1.0)
+    assert request["method"] == "execute_model"
+    assert request["rpc_id"] == "1"
+    assert request["exec_all_ranks"] is True
+    assert request["output_rank"] == 0
+
+    raw_future = executor._rpc_futures["1"]
+    raw_future.set_result(
+        AsyncDiffusionOutput(
+            kind=AsyncOutputKind.RPC_RESULT,
+            rpc_id="1",
+            result=runner_output,
+        )
+    )
+    assert future.result(timeout=1.0) is runner_output
 
 
 def _inject_interleave(executor):

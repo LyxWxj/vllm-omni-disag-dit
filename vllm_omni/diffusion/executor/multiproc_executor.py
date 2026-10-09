@@ -824,6 +824,59 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def submit_queued_step(self, scheduler_output: DiffusionSchedulerOutput) -> concurrent.futures.Future:
+        """Submit a queued step without waiting for the Worker RPC result.
+
+        The Worker executes ``execute_model(scheduler_output)`` on every rank;
+        rank 0 publishes one packed ``BaseRunnerOutput`` through the existing
+        result pump. This is the queued adapter's non-blocking control-plane
+        boundary; legacy ``execute_step`` remains synchronous.
+        """
+        self._ensure_open()
+        with self._futures_lock:
+            if not self._pump_running:
+                self._start_result_pump()
+
+        rpc_id = self._next_rpc_id()
+        rpc_future: concurrent.futures.Future = concurrent.futures.Future()
+        result_future: concurrent.futures.Future = concurrent.futures.Future()
+        with self._futures_lock:
+            self._rpc_futures[rpc_id] = rpc_future
+
+        def resolve_result(future: concurrent.futures.Future) -> None:
+            try:
+                message = future.result()
+                if not isinstance(message, AsyncDiffusionOutput):
+                    raise RuntimeError(f"Queued step returned an invalid async envelope: {type(message)!r}")
+                if message.kind is not AsyncOutputKind.RPC_RESULT:
+                    raise RuntimeError(f"Queued step returned unexpected async kind: {message.kind!r}")
+                if message.result is None:
+                    raise RuntimeError("Queued step returned no runner output")
+                unpack_diffusion_output_shm(message.result)
+                try_set_result(result_future, message.result)
+            except BaseException as exc:
+                try_set_exception(result_future, exc)
+
+        rpc_future.add_done_callback(resolve_result)
+        request = {
+            "type": "rpc",
+            "method": "execute_model",
+            "args": (scheduler_output,),
+            "kwargs": {},
+            "output_rank": 0,
+            "exec_all_ranks": True,
+            "collect_rank_status": False,
+            "reply_all_ranks": False,
+            "rpc_id": rpc_id,
+        }
+        try:
+            self._broadcast_mq.enqueue(request)  # pyright: ignore[reportOptionalMemberAccess]
+        except BaseException as exc:
+            with self._futures_lock:
+                self._rpc_futures.pop(rpc_id, None)
+            try_set_exception(result_future, exc)
+        return result_future
+
     def _fail_queued_control(self, operation: str, exc: BaseException) -> None:
         if getattr(self, "_queued_control_failure", None) is None:
             self._queued_control_failure = exc

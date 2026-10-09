@@ -192,6 +192,22 @@ class TestReturnResultSyncPath:
         mock_pack.assert_called_once_with(output)
         proc.result_mq.enqueue.assert_called_once_with(output)
 
+    def test_queued_step_runner_output_uses_async_rpc_envelope(self, mocker):
+        proc = _make_worker_proc(step_execution=True)
+        output = BatchRunnerOutput.from_list([RunnerOutput(request_id="req", finished=False)])
+        mock_pack = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm",
+        )
+
+        proc._return_result(output, rpc_id="queued-step-1")
+
+        mock_pack.assert_called_once_with(output)
+        message = proc.result_mq.enqueue.call_args.args[0]
+        assert isinstance(message, AsyncDiffusionOutput)
+        assert message.kind is AsyncOutputKind.RPC_RESULT
+        assert message.rpc_id == "queued-step-1"
+        assert message.result is output
+
     def test_media_contract_error_is_not_sent_as_an_unpacked_result(self, mocker):
         proc = _make_worker_proc(step_execution=True)
         proc._async_output_queue = None

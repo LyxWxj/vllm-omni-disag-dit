@@ -1575,6 +1575,21 @@ class WorkerProc:
             self._enqueue_result(msg)
             return
 
+        # Queued step submissions use the result pump even though ordinary
+        # step execution remains synchronous. Pack the runner output before
+        # placing it in the IPC envelope so CUDA tensors never cross the
+        # MessageQueue directly.
+        if rpc_id is not None and isinstance(output, BaseRunnerOutput):
+            pack_diffusion_output_shm(output)
+            self._enqueue_result(
+                AsyncDiffusionOutput(
+                    kind=AsyncOutputKind.RPC_RESULT,
+                    rpc_id=rpc_id,
+                    result=output,
+                )
+            )
+            return
+
         # Sync path (original, or async fallback).
         try:
             pack_diffusion_output_shm(output)

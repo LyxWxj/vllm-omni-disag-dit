@@ -35,7 +35,7 @@ def resolve_queued_queue_depth(config: object, vllm_config: object | None = None
 
 @dataclass
 class _StepFutureQueue:
-    pool: ThreadPoolExecutor
+    pool: ThreadPoolExecutor | None
     depth: int
     lock: Lock = field(default_factory=Lock)
     pending: int = 0
@@ -49,7 +49,13 @@ class _StepFutureQueue:
                 )
             self.pending += 1
         try:
-            future = self.pool.submit(executor.execute_step, scheduler_output)
+            submit = getattr(executor, "submit_queued_step", None)
+            if callable(submit):
+                future = submit(scheduler_output)
+            else:
+                if self.pool is None:
+                    raise RuntimeError("Queued step Future fallback pool is not initialized")
+                future = self.pool.submit(executor.execute_step, scheduler_output)
         except BaseException:
             with self.lock:
                 self.pending -= 1
@@ -81,7 +87,11 @@ def submit_step_future(executor: Any, scheduler_output: Any) -> Future:
             if queue is None:
                 config = getattr(executor, "od_config", executor)
                 queue = _StepFutureQueue(
-                    pool=ThreadPoolExecutor(max_workers=1, thread_name_prefix="diffusion-step-queue"),
+                    pool=(
+                        None
+                        if callable(getattr(executor, "submit_queued_step", None))
+                        else ThreadPoolExecutor(max_workers=1, thread_name_prefix="diffusion-step-queue")
+                    ),
                     depth=resolve_queued_queue_depth(config),
                 )
                 setattr(executor, "_queued_step_future_queue", queue)
@@ -106,5 +116,6 @@ def shutdown_step_futures(executor: Any) -> None:
     """Drain and close the private step Future queue during executor shutdown."""
     queue = getattr(executor, "_queued_step_future_queue", None)
     if queue is not None:
-        queue.pool.shutdown(wait=True, cancel_futures=True)
+        if queue.pool is not None:
+            queue.pool.shutdown(wait=True, cancel_futures=True)
         setattr(executor, "_queued_step_future_queue", None)
