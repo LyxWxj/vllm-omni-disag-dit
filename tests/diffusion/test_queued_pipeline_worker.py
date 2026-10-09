@@ -505,9 +505,7 @@ def test_worker_selects_rank_local_pipeline_descriptor(mocker, rank: int) -> Non
 
     assert event.pp_stage_id == rank
     assert worker.pipeline_stages[rank].spec == specs[rank]
-    assert worker.model_runner.pipeline_batch_contexts[(rank, "batch-a")].states == (
-        worker.model_runner.state_cache["req-a"],
-    )
+    assert worker.model_runner.pipeline_batch_contexts[(rank, "batch-a")].state is worker.model_runner.state_cache["req-a"]
 
 
 def test_first_stage_emits_step_completion_only_after_feedback(mocker) -> None:
