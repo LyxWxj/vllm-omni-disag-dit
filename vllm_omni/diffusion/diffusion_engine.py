@@ -460,7 +460,7 @@ class DiffusionEngine:
 
     def _ensure_queued_pipeline_transports(self) -> None:
         """Initialize the M2 two-stage transport lazily after engine startup."""
-        if getattr(self.executor, "_pipeline_transfer_coordinator", None) is not None:
+        if getattr(self.executor, "_pipeline_stage_ranks", None) is not None:
             return
         self.executor.initialize_pipeline_transfers(
             activation_edges={(0, 1)},

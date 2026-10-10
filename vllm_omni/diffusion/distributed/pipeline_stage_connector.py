@@ -582,6 +582,21 @@ class PipelineStageConnector:
         ticket.started = True
         self.transport.start_granted_transfer(grant, ticket.message)
 
+    def start_send(self, ticket: TransferTicket, offer: PipelineTransferOffer) -> None:
+        """Launch a reserved send from the Worker-local FIFO."""
+        self.start_granted_send(ticket, PipelineTransferGrant(offer=offer))
+
+    def start_receive(self, offer: PipelineTransferOffer) -> None:
+        """Post a receive directly through the vLLM group coordinator."""
+        self._ensure_open()
+        if (
+            offer.edge_kind is not self.transport.edge_kind
+            or offer.src_rank != self.transport.src_rank
+            or offer.dst_rank != self.transport.dst_rank
+        ):
+            raise ValueError("pipeline receive offer does not match this connector")
+        self.transport.start_granted_transfer(PipelineTransferGrant(offer=offer))
+
     def wait_send_completion(self, ticket: TransferTicket) -> None:
         """Verify backend completion while retaining connector ownership."""
         self._ensure_open()
