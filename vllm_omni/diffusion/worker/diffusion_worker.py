@@ -865,14 +865,11 @@ class DiffusionWorker:
             PipelineEdgeKind.FEEDBACK,
         }:
             return None
-        progress = PipelineTransportProgress()
-        self._reserve_expected_pipeline_receives(progress)
-        transfer_progress = self.progress_pipeline_transfers()
-        progress.offers.extend(transfer_progress.offers)
-        progress.completions.extend(transfer_progress.completions)
+        self._reserve_expected_pipeline_receives()
+        self.progress_pipeline_transfers()
         events = tuple(self.poll_pipeline_events())
         finalizations = self._collect_completed_pipeline_finalizations()
-        if not (progress.offers or progress.completions or progress.readiness or events or finalizations):
+        if not (events or finalizations):
             return None
         return PipelineWorkerUpdate(
             worker_id=self.rank,
@@ -908,7 +905,7 @@ class DiffusionWorker:
                 return True
         return self._pipeline_stage_engine_has_runnable_forward() or self._pipeline_stage_engine_has_expected_receive()
 
-    def _reserve_expected_pipeline_receives(self, progress: PipelineTransportProgress) -> None:
+    def _reserve_expected_pipeline_receives(self) -> None:
         """Reserve identity-specific credit for stage work already admitted locally."""
         candidates: list[tuple[PipelineEdgeKind, PipelineTask]] = []
         last_stage = self.pipeline_stages.get(1)
@@ -940,7 +937,6 @@ class DiffusionWorker:
                     continue
                 self.pipeline_receive_reservations[offer.identity] = True
                 connector.start_receive(offer)
-                progress.readiness.append(offer.identity)
                 available -= 1
 
     def _collect_completed_pipeline_finalizations(self) -> tuple[PipelineFinalizationUpdate, ...]:
