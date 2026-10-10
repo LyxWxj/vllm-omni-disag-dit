@@ -442,7 +442,6 @@ def test_shared_progress_delivers_events_to_retained_batch(mocker) -> None:
         first.task.batch_id: events_by_batch[first.task.batch_id],
         second.task.batch_id: events_by_batch[second.task.batch_id],
     }
-    engine.executor.progress_pipeline.assert_called_once_with()
     engine.executor.poll_pipeline_events.assert_called_once_with()
 
 
@@ -467,7 +466,6 @@ def test_retained_authorized_batch_forces_progress_when_all_admission_deferred(m
     engine._advance_unhandled_queued_batches(handled_request_ids, events_by_batch)
 
     assert received == [event]
-    engine.executor.progress_pipeline.assert_called_once_with()
     engine.executor.poll_pipeline_events.assert_called_once_with()
 
 
@@ -596,8 +594,8 @@ def test_busy_loop_progresses_worker_update_between_admissions(mocker) -> None:
 
     engine._busy_loop()
 
-    assert order.index("progress") < order.index("admit:req-b")
-    assert order[:3] == ["admit:req-a", "progress", "admit:req-b"]
+    assert "progress" not in order
+    assert order[:2] == ["admit:req-a", "admit:req-b"]
     engine.executor.poll_pipeline_events.assert_called_once_with()
 
 
@@ -626,7 +624,7 @@ def test_admission_progress_drains_fast_followup_worker_update(mocker) -> None:
 
     engine._progress_autonomous_updates_between_admissions()
 
-    assert progress_calls == 2
+    assert progress_calls == 0
 
 
 def test_busy_loop_progresses_cached_retained_batch_after_deferred_new_tail(mocker) -> None:
@@ -702,7 +700,6 @@ def test_malformed_shared_snapshot_does_not_repoll_retained_batch(mocker) -> Non
     assert retained_progress == [(retained, [])]
     assert admitted.task.batch_id in engine._queued_pipeline_batches
     assert retained.task.batch_id in engine._queued_pipeline_batches
-    engine.executor.progress_pipeline.assert_called_once_with()
     engine.executor.poll_pipeline_events.assert_called_once_with()
 
 
