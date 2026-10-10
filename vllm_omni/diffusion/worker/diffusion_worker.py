@@ -1257,22 +1257,15 @@ class DiffusionWorker:
         task = stage.authorize(batch_id)
         return self._record_pipeline_event(self._pipeline_event(PipelineEventType.AUTHORIZED, task, pp_stage_id))
 
-    def admit_pipeline_batch(
-        self,
-        task: PipelineTask,
-        pp_stage_spec: PipelineStageSpec | dict[int, PipelineStageSpec],
-    ) -> tuple[PipelineEvent, PipelineEvent]:
-        accepted = self.enqueue_pipeline_batch(task, pp_stage_spec)
-        authorized = self.authorize_pipeline_batch(accepted.pp_stage_id, task.batch_id)
-        return accepted, authorized
-
     def admit_pipeline_batches(
         self,
         admissions: list[tuple[PipelineTask, PipelineStageSpec | dict[int, PipelineStageSpec]]],
     ) -> tuple[PipelineEvent, ...]:
         events: list[PipelineEvent] = []
         for task, pp_stage_spec in admissions:
-            events.extend(self.admit_pipeline_batch(task, pp_stage_spec))
+            accepted = self.enqueue_pipeline_batch(task, pp_stage_spec)
+            events.append(accepted)
+            events.append(self.authorize_pipeline_batch(accepted.pp_stage_id, task.batch_id))
         return tuple(events)
 
     @staticmethod
@@ -2357,10 +2350,7 @@ class WorkerProc:
                     return self.worker.execute_method(method, *args, **kwargs)
 
                 result = preparation_executor.submit(prepare_pipeline_request).result()
-            elif stage_engine is not None and method in {
-                "admit_pipeline_batch",
-                "admit_pipeline_batches",
-            }:
+            elif stage_engine is not None and method == "admit_pipeline_batches":
                 stage_engine.submit(
                     method,
                     *args,

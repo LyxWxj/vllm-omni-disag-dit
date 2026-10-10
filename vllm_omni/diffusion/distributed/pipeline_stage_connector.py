@@ -311,11 +311,6 @@ class DistributedP2PTransport:
         tensor_handles = handles[1:] if handles and getattr(handles[0], "_is_metadata_handle", False) else handles
         return all(handle.is_completed() for handle in tensor_handles)
 
-    def abort(self, ticket: TransferTicket) -> bool:
-        # NCCL P2P has no safe per-operation cancellation. Discard therefore
-        # drains the send before allowing its source tensor to be released.
-        return self.wait(ticket)
-
     def close(self) -> None:
         if self._closed:
             return
@@ -375,10 +370,6 @@ class PipelineStageConnector:
     @property
     def receive_depth(self) -> int:
         return len(self._received) + len(self._received_leases)
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
 
     def enqueue_send(self, message: PipelineMessage) -> TransferTicket:
         self._ensure_open()
@@ -485,26 +476,6 @@ class PipelineStageConnector:
             raise RuntimeError("cannot release a transfer before transport completion")
         self._send_tickets.remove(ticket)
 
-    def retire_batch(self, batch_id: str, *, discard_results: bool = False) -> None:
-        """Retire all local transport state for one batch after dependencies settle."""
-        self._ensure_open()
-        if not batch_id:
-            raise ValueError("batch_id must be non-empty")
-        matching = [ticket for ticket in self._send_tickets if ticket.message.batch_id == batch_id]
-        leased = [message for message in self._received_leases.values() if message.batch_id == batch_id]
-        if leased:
-            raise RuntimeError("cannot retire a batch before receive consumers complete")
-        if matching and not discard_results:
-            unreleased = [ticket for ticket in matching if ticket.started and not ticket.completed]
-            if unreleased:
-                raise RuntimeError("cannot retire a batch before transport completion")
-        for ticket in matching:
-            if ticket.started and not ticket.completed:
-                self._wait_or_abort(ticket, discard=True)
-        for ticket in matching:
-            self._send_tickets.remove(ticket)
-        self._received = deque(message for message in self._received if message.batch_id != batch_id)
-
     def close(self, *, drain: bool = False) -> None:
         if self._closed:
             return
@@ -515,19 +486,13 @@ class PipelineStageConnector:
         if drain:
             for ticket in self._send_tickets:
                 if ticket.started and not ticket.completed:
-                    self._wait_or_abort(ticket, discard=False)
+                    self.transport.wait(ticket)
+                    ticket.completed = True
         self.transport.close()
         self._send_tickets.clear()
         self._received.clear()
         self._received_leases.clear()
         self._closed = True
-
-    def _wait_or_abort(self, ticket: TransferTicket, *, discard: bool) -> None:
-        completed = self.transport.abort(ticket) if discard else self.transport.wait(ticket)
-        if not completed:
-            operation = "abort" if discard else "wait"
-            raise RuntimeError(f"transport {operation} did not complete transfer")
-        ticket.completed = True
 
     def _ensure_open(self) -> None:
         if self._closed:

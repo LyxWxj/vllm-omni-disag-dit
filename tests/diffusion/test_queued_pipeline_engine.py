@@ -599,34 +599,6 @@ def test_busy_loop_progresses_worker_update_between_admissions(mocker) -> None:
     engine.executor.poll_pipeline_events.assert_called_once_with()
 
 
-def test_admission_progress_does_not_wait_for_future_worker_update(mocker) -> None:
-    engine = _engine(mocker, _scheduler_output())
-    engine.executor.pipeline_updates_pending.return_value = False
-
-    engine._progress_autonomous_updates_between_admissions()
-
-    engine.executor.progress_pipeline.assert_not_called()
-
-
-def test_admission_progress_drains_fast_followup_worker_update(mocker) -> None:
-    engine = _engine(mocker, _scheduler_output())
-    update_pending = [True]
-    engine.executor.pipeline_updates_pending.side_effect = lambda: update_pending[0]
-    progress_calls = 0
-
-    def progress_pipeline():
-        nonlocal progress_calls
-        progress_calls += 1
-        if progress_calls == 2:
-            update_pending[0] = False
-
-    engine.executor.progress_pipeline.side_effect = progress_pipeline
-
-    engine._progress_autonomous_updates_between_admissions()
-
-    assert progress_calls == 0
-
-
 def test_busy_loop_progresses_cached_retained_batch_after_deferred_new_tail(mocker) -> None:
     engine = _engine(mocker, _scheduler_output("req-a"))
     engine.od_config.mode = "queued"

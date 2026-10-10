@@ -705,10 +705,6 @@ class DiffusionEngine:
             )
         return grouped
 
-    def _progress_autonomous_updates_between_admissions(self) -> None:
-        """Leave autonomous Worker progress to the Executor pump."""
-        return
-
     def _has_queued_pipeline_work(self) -> bool:
         """Return whether retained queued ownership still needs an Engine round."""
         return self.od_config.mode == "queued" and bool(self._queued_pipeline_batches)
@@ -1395,14 +1391,11 @@ class DiffusionEngine:
                 handled_request_ids: set[str] = set()
                 task_outputs = self._split_queued_scheduler_output(sched_output) if sched_output is not None else []
                 admitted_outputs: list[Any] = []
-                admission_progress_failed = False
                 for output_index, task_output in enumerate(task_outputs):
-                    admitted = False
                     try:
                         self._run_queued_pipeline_iteration(task_output, submit_only=True)
                         admitted_outputs.append(task_output)
                         handled_request_ids.update(task_output.scheduled_request_ids)
-                        admitted = True
                     except _QueuedAdmissionDeferredError:
                         deferred_outputs = task_outputs[output_index:]
                         self._defer_queued_admission_tail(deferred_outputs)
@@ -1423,20 +1416,6 @@ class DiffusionEngine:
                                 break
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
-                    if admitted and output_index + 1 < len(task_outputs):
-                        try:
-                            self._progress_autonomous_updates_between_admissions()
-                        except Exception as exc:
-                            self._defer_queued_admission_tail(task_outputs[output_index + 1 :])
-                            self._handle_queued_progress_snapshot_failure(
-                                admitted_outputs,
-                                handled_request_ids,
-                                exc,
-                            )
-                            admission_progress_failed = True
-                            break
-                if admission_progress_failed:
-                    continue
                 self._authorize_waiting_queued_batches()
                 try:
                     should_progress = (
