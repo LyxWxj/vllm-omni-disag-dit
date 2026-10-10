@@ -42,8 +42,13 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
-from vllm_omni.diffusion.worker.pipeline_state import PipelineWorkerUpdate
-from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.diffusion.worker.pipeline_state import (
+    PipelineEvent,
+    PipelineEventType,
+    PipelineTask,
+    PipelineWorkerUpdate,
+)
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -219,9 +224,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pipeline_update_lock = threading.Lock()
         self._pipeline_update_callback: Callable[[], None] | None = None
         self._pipeline_progress_lock = threading.Lock()
+        self._pipeline_progress_wake = threading.Event()
+        self._pipeline_progress_stop = threading.Event()
+        self._pipeline_step_futures: dict[str, concurrent.futures.Future[BaseRunnerOutput]] = {}
+        self._pipeline_progress_thread: threading.Thread | None = None
         self._collective_rpc_lock = threading.RLock()
         if not self.od_config.step_execution or self._uses_autonomous_pipeline_stages():
             self._start_result_pump()
+        if self._uses_autonomous_pipeline_stages():
+            self._start_pipeline_progress_pump()
 
         self._start_worker_monitor()
 
@@ -260,8 +271,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             not updates.empty() for updates in self._pipeline_update_buffers.values()
         ):
             return True
+        with self._pipeline_update_lock:
+            if getattr(self, "_pipeline_cached_events", []):
+                return True
         with self._futures_lock:
-            return any(future.done() for future in self._pipeline_finalization_outputs.values())
+            return any(future.done() for future in self._pipeline_finalization_outputs.values()) or any(
+                future.done() for future in self._pipeline_step_futures.values()
+            )
 
     def _publish_pipeline_update(self, update: PipelineWorkerUpdate) -> None:
         update_buffer = self._pipeline_update_buffers.get(update.worker_id)
@@ -282,6 +298,46 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         callback = self._pipeline_update_callback
         if callback is not None:
             callback()
+        if self._uses_autonomous_pipeline_stages():
+            self._pipeline_progress_wake.set()
+
+    def _start_pipeline_progress_pump(self) -> None:
+        self._pipeline_progress_thread = threading.Thread(
+            target=self._pipeline_progress_loop,
+            daemon=True,
+            name="DiffusionPipelineProgressPump",
+        )
+        self._pipeline_progress_thread.start()
+
+    def _pipeline_progress_loop(self) -> None:
+        while not self._pipeline_progress_stop.is_set():
+            self._pipeline_progress_wake.wait(0.008)
+            self._pipeline_progress_wake.clear()
+            if self._pipeline_progress_stop.is_set():
+                break
+            if getattr(self, "_pipeline_transfer_coordinator", None) is None:
+                continue
+            try:
+                self.progress_pipeline()
+                callback = self._pipeline_update_callback
+                if callback is not None:
+                    callback()
+            except Exception as exc:
+                if not self._is_failed:
+                    self._pipeline_update_error = exc
+                    logger.exception("Autonomous queued pipeline progress failed")
+                    self._fail_queued_control("pipeline progress pump", exc)
+
+    def submit_pipeline_step(self, task: PipelineTask) -> concurrent.futures.Future[BaseRunnerOutput]:
+        """Register a Future completed by the first-stage STEP_COMPLETED event."""
+        self._ensure_open()
+        future: concurrent.futures.Future[BaseRunnerOutput] = concurrent.futures.Future()
+        with self._futures_lock:
+            if task.batch_id in self._pipeline_step_futures:
+                raise ValueError(f"queued pipeline Future already exists for {task.batch_id!r}")
+            self._pipeline_step_futures[task.batch_id] = future
+        self._pipeline_progress_wake.set()
+        return future
 
     def _dequeue_one_with_failure_polling(
         self,
@@ -788,11 +844,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
         return result
 
-    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+    def execute_step(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        non_block: bool = False,
+    ) -> BaseRunnerOutput | concurrent.futures.Future[BaseRunnerOutput]:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()
+        if non_block:
+            raise ValueError("non_block execute_step requires a queued PipelineTask; call submit_pipeline_step")
         result = self.collective_rpc(
             "execute_stepwise",
             args=(scheduler_output,),
@@ -899,6 +961,26 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise ValueError("pipeline admission batch must not be empty")
         return self._queued_rank_local_rpc("admit_pipeline_batches", args=(admissions,))
 
+    def enqueue_pipeline_admissions(self, admissions: list[tuple[Any, Any]]) -> None:
+        """Dispatch queued admission without waiting for rank acknowledgements."""
+        if not admissions:
+            raise ValueError("pipeline admission batch must not be empty")
+        self._ensure_open()
+        if self._broadcast_mq is None:
+            raise RuntimeError("broadcast queue is closed")
+        self._broadcast_mq.enqueue(
+            {
+                "type": "rpc",
+                "method": "admit_pipeline_batches",
+                "args": (admissions,),
+                "kwargs": {},
+                "output_rank": -1,
+                "exec_all_ranks": True,
+                "collect_rank_status": False,
+                "reply_all_ranks": False,
+            }
+        )
+
     def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
         coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
         if coordinator is None:
@@ -994,8 +1076,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def poll_pipeline_events(self) -> list[Any]:
         self._ensure_open()
-        cached_events = getattr(self, "_pipeline_cached_events", [])
-        self._pipeline_cached_events = []
+        with self._pipeline_update_lock:
+            cached_events = getattr(self, "_pipeline_cached_events", [])
+            self._pipeline_cached_events = []
         return cached_events
 
     def cancel_pipeline_requests(self, request_generations: Any) -> Any:
@@ -1028,6 +1111,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._fail_queued_control("pipeline topology validation", exc)
             raise
         self._pipeline_transfer_coordinator = coordinator
+        self._pipeline_progress_wake.set()
         return result
 
     def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
@@ -1165,8 +1249,27 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if coordinator.offer(offer):
                     saw_new_offer = True
 
-        cached_events = getattr(self, "_pipeline_cached_events", [])
-        self._pipeline_cached_events = [*cached_events, *worker_events]
+        for event in worker_events:
+            if not isinstance(event, PipelineEvent) or event.event_type is not PipelineEventType.STEP_COMPLETED:
+                continue
+            with self._futures_lock:
+                future = getattr(self, "_pipeline_step_futures", {}).pop(event.task.batch_id, None)
+            if future is None or future.done():
+                continue
+            result = BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(
+                        request_id=event.task.request_id,
+                        step_index=event.task.step_index + 1,
+                        finished=False,
+                    )
+                ]
+            )
+            future.set_result(result)
+
+        with self._pipeline_update_lock:
+            cached_events = getattr(self, "_pipeline_cached_events", [])
+            self._pipeline_cached_events = [*cached_events, *worker_events]
         if saw_new_offer or saw_completion or saw_readiness:
             progress.grants.extend(self._start_ready_pipeline_transfers())
         return progress
@@ -1591,6 +1694,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def shutdown(self) -> None:
         self._closed = True
         self._pump_stop.set()
+        pipeline_progress_stop = getattr(self, "_pipeline_progress_stop", None)
+        if pipeline_progress_stop is not None:
+            pipeline_progress_stop.set()
+        pipeline_progress_wake = getattr(self, "_pipeline_progress_wake", None)
+        if pipeline_progress_wake is not None:
+            pipeline_progress_wake.set()
+        progress_thread = getattr(self, "_pipeline_progress_thread", None)
+        if progress_thread is not None and progress_thread is not threading.current_thread():
+            progress_thread.join(timeout=_RESULT_PUMP_JOIN_TIMEOUT_S)
         cleaner = self._shutdown_cleaner
         try:
             if self._finalizer.alive:
@@ -1620,6 +1732,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
+                for fut in getattr(self, "_pipeline_step_futures", {}).values():
+                    if not fut.done():
+                        try_set_exception(fut, RuntimeError("Executor shut down"))
+                if hasattr(self, "_pipeline_step_futures"):
+                    self._pipeline_step_futures.clear()
             self._processes = (cleaner.processes or []) if cleaner is not None else []
             if not self._processes:
                 self._shutdown_cleaner = None

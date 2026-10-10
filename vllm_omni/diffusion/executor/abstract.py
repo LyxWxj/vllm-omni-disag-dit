@@ -133,9 +133,17 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
-    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+    def execute_step(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        non_block: bool = False,
+    ) -> BaseRunnerOutput | Any:
         """Execute step-mode work from a scheduler output."""
         pass
+
+    def submit_pipeline_step(self, task: Any) -> Any:
+        """Return a Future resolved by autonomous queued PP progress."""
+        raise NotImplementedError("queued pipeline Future submission is not wired for this executor")
 
     @abstractmethod
     def collective_rpc(

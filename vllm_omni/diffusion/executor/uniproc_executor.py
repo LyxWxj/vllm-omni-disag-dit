@@ -170,7 +170,9 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
         return result
 
-    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput, non_block: bool = False) -> BaseRunnerOutput:
+        if non_block:
+            raise NotImplementedError("non-blocking queued PP is only supported by the multiprocess executor")
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()

@@ -259,6 +259,7 @@ class _QueuedPipelineBatch:
     request_prepared: bool = False
     stage_enqueued: bool = False
     request_cleanup_completed: bool = False
+    step_future: concurrent.futures.Future[BaseRunnerOutput] | None = None
     admission_acknowledgements: set[tuple[PipelineEventType, int, int]] = field(default_factory=set)
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
@@ -666,7 +667,6 @@ class DiffusionEngine:
     def _collect_queued_pipeline_events(self) -> dict[str, list[PipelineEvent]]:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Queued pipeline progress begin: retained=%s", sorted(self._queued_pipeline_batches))
-        self.executor.progress_pipeline()
         events = self.executor.poll_pipeline_events()
         grouped: dict[str, list[PipelineEvent]] = {}
         known_batches = set(self._queued_pipeline_batches)
@@ -696,13 +696,8 @@ class DiffusionEngine:
         return grouped
 
     def _progress_autonomous_updates_between_admissions(self) -> None:
-        """Drain already-published Worker updates without delaying admission."""
-        if not self.executor.pipeline_updates_pending():
-            return
-
-        drain_deadline = time.monotonic() + _QUEUED_ADMISSION_PROGRESS_DRAIN_S
-        while self.executor.pipeline_updates_pending() and time.monotonic() < drain_deadline:
-            self.executor.progress_pipeline()
+        """Leave autonomous Worker progress to the Executor pump."""
+        return
 
     def _has_queued_pipeline_work(self) -> bool:
         """Return whether retained queued ownership still needs an Engine round."""
@@ -893,6 +888,12 @@ class DiffusionEngine:
             autonomous_admissions.append((batch.task, batch.stage_specs))
             available_slots -= 1
         if autonomous_admissions:
+            submit_step = getattr(self.executor, "submit_pipeline_step", None)
+            if callable(submit_step):
+                for batch in ordered[: len(autonomous_admissions)]:
+                    future = submit_step(batch.task)
+                    if isinstance(future, concurrent.futures.Future):
+                        batch.step_future = future
             self.executor.submit_pipeline_admissions(autonomous_admissions)
             for batch in ordered[: len(autonomous_admissions)]:
                 batch.stage_enqueued = True
@@ -1111,7 +1112,16 @@ class DiffusionEngine:
             _QueuedPipelineBatchPhase.ADMISSION_PENDING,
         }:
             return None
-        if batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED:
+        if batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED and batch.step_future is not None:
+            if not batch.step_future.done():
+                return None
+            try:
+                batch.step_future.result()
+            except BaseException:
+                batch.phase = _QueuedPipelineBatchPhase.FAILED
+                raise
+            batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
+        elif batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED:
             if not self._progress_queued_pipeline_batch(batch, pipeline_events):
                 return None
         if batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED:
