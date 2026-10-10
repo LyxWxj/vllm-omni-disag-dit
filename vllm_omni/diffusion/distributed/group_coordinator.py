@@ -4,8 +4,8 @@
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
-from collections import namedtuple
-from typing import Any
+from collections import deque, namedtuple
+from typing import Any, Protocol
 
 import torch
 import torch.distributed
@@ -19,6 +19,32 @@ logger = init_logger(__name__)
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+
+class Handle(Protocol):
+    def is_completed(self) -> bool: ...
+
+    def wait(self) -> None: ...
+
+
+class _RetainedHandle:
+    """Idempotent handle that keeps serialized metadata alive until send end."""
+
+    def __init__(self, works: list[Any], retained: tuple[torch.Tensor, ...]) -> None:
+        self._works = works
+        self._retained = retained
+        self._waited = False
+
+    def is_completed(self) -> bool:
+        return all(work.is_completed() for work in self._works)
+
+    def wait(self) -> None:
+        if self._waited:
+            return
+        for work in self._works:
+            work.wait()
+        self._waited = True
+        self._retained = ()
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
 
@@ -122,6 +148,7 @@ class GroupCoordinator:
         assert self.device_group is not None
 
         self.device = current_omni_platform.get_torch_device(local_rank)
+        self._pending_isends: deque[tuple[list[Handle], list[torch.Tensor]]] = deque()
 
     @property
     def first_rank(self):
@@ -373,6 +400,36 @@ class GroupCoordinator:
 
         return obj
 
+    def isend_object(self, obj: Any, dst: int, group: ProcessGroup | None = None) -> Handle:
+        """Send a pickled object without waiting for the peer to post recv."""
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+        assert dst != self.rank_in_group, "Invalid destination rank. Destination rank is the same as the current rank."
+        if group is None:
+            group = self.cpu_group
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long, device="cpu")
+        retained = (size_tensor, object_tensor)
+        works = [
+            work
+            for tensor in retained
+            if (work := torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)) is not None
+        ]
+        return _RetainedHandle(works, retained)
+
+    def _reap_completed_isends(self) -> None:
+        """Release fire-and-forget send buffers in FIFO order."""
+        while self._pending_isends:
+            handles, _ = self._pending_isends[0]
+            tensor_handles = handles[1:]
+            if not tensor_handles:
+                self._pending_isends.popleft()
+                continue
+            if not all(handle.is_completed() for handle in tensor_handles):
+                break
+            if handles:
+                handles[0].wait()
+            self._pending_isends.popleft()
+
     def broadcast_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any] | None = None,
@@ -450,16 +507,8 @@ class GroupCoordinator:
         tensor_dict: dict[str, torch.Tensor | Any],
         dst: int | None = None,
         metadata_list: list[tuple[str, Any]] | tuple[tuple[str, Any], ...] | None = None,
-    ) -> list[torch.distributed.Work]:
-        """Non-blocking send of a tensor dictionary.
-
-        Sends metadata via the Gloo CPU group (blocking) then starts a
-        non-blocking NCCL isend for each GPU tensor.  Returns the list of
-        Work handles; the caller must call handle.wait() before the tensors
-        can be safely reused or freed.
-
-        NOTE: `dst` is the group rank of the destination.
-        """
+    ) -> list[Handle]:
+        """Send metadata and tensors asynchronously, matching vLLM's PP path."""
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return []
 
@@ -469,12 +518,15 @@ class GroupCoordinator:
 
         device_group, cpu_group = self._tensor_dict_comm_groups(self.rank_in_group)
 
+        self._reap_completed_isends()
         payload_metadata, tensor_list = _split_tensor_dict(tensor_dict)
+        handles: list[Handle] = []
+        metadata_handle: Handle | None = None
         if metadata_list is None:
             metadata_list = payload_metadata
-            self.send_object(metadata_list, dst=dst, group=cpu_group)
+            metadata_handle = self.isend_object(metadata_list, dst=dst, group=cpu_group)
+            handles.append(metadata_handle)
 
-        handles: list[torch.distributed.Work] = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
@@ -484,6 +536,8 @@ class GroupCoordinator:
                 # Keep allocator from reusing this CUDA buffer before the async send finishes.
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
+        if metadata_handle is not None:
+            self._pending_isends.append((handles, [tensor for tensor in tensor_list if tensor.numel() > 0]))
         return handles
 
     def irecv_tensor_dict(

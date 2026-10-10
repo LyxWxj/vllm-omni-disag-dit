@@ -26,7 +26,6 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineCoordinatorProgress,
-    PipelineTransferCoordinator,
 )
 from vllm_omni.diffusion.executor.abstract import (
     DiffusionExecutor,
@@ -228,6 +227,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pipeline_progress_stop = threading.Event()
         self._pipeline_step_futures: dict[str, concurrent.futures.Future[BaseRunnerOutput]] = {}
         self._pipeline_progress_thread: threading.Thread | None = None
+        self._pipeline_stage_ranks: dict[int, int] | None = None
         self._collective_rpc_lock = threading.RLock()
         if not self.od_config.step_execution or self._uses_autonomous_pipeline_stages():
             self._start_result_pump()
@@ -315,7 +315,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._pipeline_progress_wake.clear()
             if self._pipeline_progress_stop.is_set():
                 break
-            if getattr(self, "_pipeline_transfer_coordinator", None) is None:
+            if getattr(self, "_pipeline_stage_ranks", None) is None:
                 continue
             try:
                 self.progress_pipeline()
@@ -982,9 +982,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         )
 
     def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        if self._pipeline_stage_ranks is None:
+            raise RuntimeError("pipeline stage ranks are not initialized")
         expected_request_ids = tuple(request.request_id for request in scheduler_output.scheduled_new_reqs)
         expected_request_ids += tuple(
             getattr(getattr(scheduler_output, "scheduled_cached_reqs", None), "request_ids", ())
@@ -995,7 +994,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             result = self._queued_control_rpc("prepare_pipeline_requests_all_ranks", args=(scheduler_output,))
             return normalize_pipeline_preparation_reports(
                 result,
-                coordinator.endpoint_ranks,
+                frozenset(self._pipeline_stage_ranks.values()),
                 expected_request_ids,
             )
         except BaseException as exc:
@@ -1098,39 +1097,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         feedback_edges: set[tuple[int, int]],
         max_slots: int = 1,
     ) -> Any:
-        if hasattr(self, "_pipeline_transfer_coordinator"):
+        if self._pipeline_stage_ranks is not None:
             raise RuntimeError("pipeline transfer coordinator is already initialized")
-        coordinator = PipelineTransferCoordinator(
-            activation_edges=activation_edges,
-            feedback_edges=feedback_edges,
-        )
         result = self._queued_control_rpc("initialize_pipeline_transports_all_ranks", args=(max_slots,))
         try:
             validate_pipeline_topology_reports(result, activation_edges, feedback_edges)
         except BaseException as exc:
             self._fail_queued_control("pipeline topology validation", exc)
             raise
-        self._pipeline_transfer_coordinator = coordinator
+        activation_src, activation_dst = next(iter(activation_edges))
+        self._pipeline_stage_ranks = {0: activation_src, 1: activation_dst}
         self._pipeline_progress_wake.set()
         return result
 
     def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        coordinator.cancel_batch(batch_id, epoch)
+        del batch_id, epoch
 
     def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        coordinator.retire_batch(batch_id, epoch)
+        del batch_id, epoch
 
     def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        return coordinator.batch_retirement_ready(batch_id, epoch)
+        del batch_id, epoch
+        return True
 
     def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
         """Broadcast a nonblocking StageEngine transfer-start command."""
@@ -1156,12 +1144,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def _start_ready_pipeline_transfers(self) -> list[Any]:
-        coordinator = self._pipeline_transfer_coordinator
-        grant_limit = max(1, len(coordinator.endpoint_ranks) // 2)
-        grants = coordinator.grant_ready(limit=grant_limit)
-        for grant in grants:
-            self.enqueue_pipeline_transfer_start(grant)
-        return grants
+        return []
 
     def progress_pipeline(self) -> PipelineCoordinatorProgress:
         progress_lock = getattr(self, "_pipeline_progress_lock", None)
@@ -1172,20 +1155,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return self._progress_pipeline_unlocked()
 
     def _progress_pipeline_unlocked(self) -> PipelineCoordinatorProgress:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
+        if self._pipeline_stage_ranks is None:
+            raise RuntimeError("pipeline stage ranks are not initialized")
         try:
-            return self._progress_autonomous_pipeline_stages(coordinator)
+            return self._progress_autonomous_pipeline_stages()
         except BaseException as exc:
             if not self._is_failed:
                 self._fail_queued_control("pipeline progress", exc)
             raise
 
-    def _progress_autonomous_pipeline_stages(
-        self,
-        coordinator: PipelineTransferCoordinator,
-    ) -> PipelineCoordinatorProgress:
+    def _progress_autonomous_pipeline_stages(self) -> PipelineCoordinatorProgress:
         """Consume sparse Worker updates and run control only when edges change."""
         with self._pipeline_update_lock:
             update_error = self._pipeline_update_error
@@ -1220,10 +1199,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         progress = PipelineCoordinatorProgress()
         worker_events: list[Any] = []
-        saw_new_offer = False
-        saw_completion = False
-        saw_readiness = False
-        expected_workers = coordinator.endpoint_ranks
+        expected_workers = frozenset(self._pipeline_stage_ranks.values())
         for update in updates:
             if not isinstance(update, PipelineWorkerUpdate) or update.worker_id not in expected_workers:
                 raise RuntimeError("Pipeline StageEngine published an update for an unknown Worker rank")
@@ -1234,20 +1210,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 worker_events.extend(update.events)
                 continue
             worker_events.extend(update.events)
-            for identity in rank_progress.readiness:
-                coordinator.mark_receive_ready(identity, rank=update.worker_id)
-                saw_readiness = True
 
         for update in updates:
             rank_progress = update.progress
             if rank_progress is None:
                 continue
-            for identity in rank_progress.completions:
-                coordinator.complete(identity, update.worker_id)
-                saw_completion = True
-            for offer in rank_progress.offers:
-                if coordinator.offer(offer):
-                    saw_new_offer = True
 
         for event in worker_events:
             if not isinstance(event, PipelineEvent) or event.event_type is not PipelineEventType.STEP_COMPLETED:
@@ -1270,15 +1237,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         with self._pipeline_update_lock:
             cached_events = getattr(self, "_pipeline_cached_events", [])
             self._pipeline_cached_events = [*cached_events, *worker_events]
-        if saw_new_offer or saw_completion or saw_readiness:
-            progress.grants.extend(self._start_ready_pipeline_transfers())
         return progress
 
     def pipeline_stage_physical_ranks(self) -> dict[int, int]:
-        coordinator = getattr(self, "_pipeline_transfer_coordinator", None)
-        if coordinator is None:
-            raise RuntimeError("pipeline transfer coordinator is not initialized")
-        return coordinator.stage_physical_ranks
+        if self._pipeline_stage_ranks is None:
+            raise RuntimeError("pipeline stage ranks are not initialized")
+        return dict(self._pipeline_stage_ranks)
 
     def collective_rpc(
         self,

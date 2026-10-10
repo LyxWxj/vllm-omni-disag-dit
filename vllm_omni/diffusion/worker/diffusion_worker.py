@@ -858,6 +858,8 @@ class DiffusionWorker:
 
         for identity, ticket in list(self.pipeline_send_tickets.items()):
             connector = self._require_pipeline_connector(identity[3])
+            if not ticket.started:
+                connector.start_send(ticket, self._pipeline_offer_for_message(identity[3], ticket.message))
             if connector.poll_send_completion(ticket):
                 connector.release_send(ticket)
                 self.pipeline_send_tickets.pop(identity)
@@ -884,6 +886,8 @@ class DiffusionWorker:
                 if stage_progress is not None:
                     if not isinstance(stage_progress.output, PipelineTransferOffer):
                         raise RuntimeError("first pipeline stage did not reserve an activation transfer")
+                    activation_ticket = self.pipeline_send_tickets[stage_progress.output.identity]
+                    activation_connector.start_send(activation_ticket, stage_progress.output)
                     progress.offers.append(stage_progress.output)
         return progress
 
@@ -894,8 +898,11 @@ class DiffusionWorker:
             PipelineEdgeKind.FEEDBACK,
         }:
             return None
-        progress = self.progress_pipeline_transfers()
+        progress = PipelineTransportProgress()
         self._reserve_expected_pipeline_receives(progress)
+        transfer_progress = self.progress_pipeline_transfers()
+        progress.offers.extend(transfer_progress.offers)
+        progress.completions.extend(transfer_progress.completions)
         events = tuple(self.poll_pipeline_events())
         finalizations = self._collect_completed_pipeline_finalizations()
         if not (progress.offers or progress.completions or progress.readiness or events or finalizations):
@@ -965,7 +972,8 @@ class DiffusionWorker:
                 offer = self._make_pipeline_transfer_offer(task, edge_kind)
                 if offer.identity in self.pipeline_receive_reservations:
                     continue
-                self.pipeline_receive_reservations[offer.identity] = False
+                self.pipeline_receive_reservations[offer.identity] = True
+                connector.start_receive(offer)
                 progress.readiness.append(offer.identity)
                 available -= 1
 
@@ -1073,6 +1081,10 @@ class DiffusionWorker:
                 )
                 if stage_progress is None or not isinstance(stage_progress.output, PipelineTransferOffer):
                     raise RuntimeError("runnable pipeline activation made no local stage progress")
+                feedback_ticket = self.pipeline_send_tickets[stage_progress.output.identity]
+                self._require_pipeline_connector(PipelineEdgeKind.FEEDBACK).start_send(
+                    feedback_ticket, stage_progress.output
+                )
                 progress.offers.append(stage_progress.output)
             else:
                 latents = message.payload.get("latents") if isinstance(message.payload, dict) else None
@@ -1094,6 +1106,22 @@ class DiffusionWorker:
             )
             raise RuntimeError("failed to record pipeline receive consumer completion event")
         self.pipeline_receive_consumers[reservation] = (message, consumer_event)
+
+    def _pipeline_offer_for_message(
+        self,
+        edge_kind: PipelineEdgeKind,
+        message: PipelineMessage,
+    ) -> PipelineTransferOffer:
+        transport = self._require_pipeline_connector(edge_kind).transport
+        return PipelineTransferOffer(
+            batch_id=message.batch_id,
+            step_index=message.step_index,
+            epoch=message.epoch,
+            edge_kind=edge_kind,
+            src_rank=transport.src_rank,
+            dst_rank=transport.dst_rank,
+            payload_metadata=pipeline_payload_metadata(message.payload),
+        )
 
     def _cancelled_pipeline_message_context(
         self,
