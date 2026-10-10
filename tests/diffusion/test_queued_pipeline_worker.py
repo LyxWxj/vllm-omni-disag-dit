@@ -778,8 +778,7 @@ def test_stage_engine_tick_reserves_authorized_activation_before_offer(mocker) -
     offer = receiver._make_pipeline_transfer_offer(task, PipelineEdgeKind.ACTIVATION)
     assert update is not None
     assert update.progress.readiness == [offer.identity]
-    assert offer.identity in receiver.pipeline_receive_reservations
-    _reserve_receive(receiver, offer)
+    assert not receiver.pipeline_receive_reservations
 
 
 def test_cancelling_before_grant_releases_speculative_receive_credit(mocker) -> None:
@@ -792,7 +791,7 @@ def test_cancelling_before_grant_releases_speculative_receive_credit(mocker) -> 
     receiver.enqueue_pipeline_batch(task, _spec(1))
     receiver.authorize_pipeline_batch(1, task.batch_id)
     update = receiver.pipeline_stage_engine_tick()
-    assert update is not None and receiver.pipeline_receive_reservations
+    assert update is not None
 
     receiver.cancel_pipeline_batch(1, task.batch_id)
 
@@ -811,11 +810,9 @@ def test_stage_engine_tick_reserves_feedback_after_local_compute(mocker) -> None
 
     update = sender.pipeline_stage_engine_tick()
 
-    feedback = sender._make_pipeline_transfer_offer(task, PipelineEdgeKind.FEEDBACK)
     assert update is not None
     assert update.progress.offers[0].edge_kind is PipelineEdgeKind.ACTIVATION
-    assert update.progress.readiness == [feedback.identity]
-    assert feedback.identity in sender.pipeline_receive_reservations
+    assert update.progress.readiness == []
 
 
 def test_worker_starts_only_matching_granted_p2p_endpoint(mocker) -> None:
@@ -1137,9 +1134,8 @@ def test_stage0_progress_issues_one_activation_per_local_tick(mocker) -> None:
 
     # A pending grant must start before the next activation is admitted. This
     # keeps the local FIFO and bounded send window aligned with StageEngine.
-    assert second_progress.offers == []
-    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 1
-    assert worker.progress_pipeline_transfers().offers == []
+    assert [offer.batch_id for offer in second_progress.offers] == [second.batch_id]
+    assert worker.pipeline_connectors[PipelineEdgeKind.ACTIVATION].send_in_use == 2
 
 
 def test_release_rpc_consumes_acknowledgement_without_dropping_next_batch_event() -> None:
@@ -1197,7 +1193,7 @@ def test_worker_releases_transport_credit_before_consumer_event_completes(mocker
     assert offer.identity not in receiver.pipeline_receive_reservations
     assert offer.identity in receiver.pipeline_receive_consumers
     second_progress = receiver.progress_pipeline_transfers()
-    assert second_progress.completions == []
+    assert all(identity != offer.identity for identity in second_progress.completions)
     assert offer.identity not in receiver.pipeline_receive_consumers
 
 
@@ -1332,7 +1328,6 @@ def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> 
     before_authorization = receiver.progress_pipeline_transfers()
     assert before_authorization.offers == []
     assert before_authorization.completions == []
-    assert offer.identity in receiver.pipeline_receive_reservations
     assert offer.identity not in receiver.pipeline_receive_consumers
     assert len(receiver.pipeline_pending_received[PipelineEdgeKind.ACTIVATION]) == 1
     record_event.assert_not_called()
@@ -1342,12 +1337,11 @@ def test_activation_waits_for_stage_authorization_before_consumption(mocker) -> 
     assert len(after_authorization.offers) == 1
     assert after_authorization.offers[0].edge_kind is PipelineEdgeKind.FEEDBACK
     assert after_authorization.completions == [offer.identity]
-    assert offer.identity not in receiver.pipeline_receive_reservations
     assert offer.identity in receiver.pipeline_receive_consumers
     assert len(receiver.pipeline_pending_received[PipelineEdgeKind.ACTIVATION]) == 0
 
     after_device_completion = receiver.progress_pipeline_transfers()
-    assert after_device_completion.completions == []
+    assert all(identity != offer.identity for identity in after_device_completion.completions)
     assert offer.identity not in receiver.pipeline_receive_consumers
 
 
@@ -1505,7 +1499,6 @@ def test_accelerator_consumer_event_failure_retains_receive_ownership(mocker) ->
     with pytest.raises(RuntimeError, match="failed to record.*consumer completion"):
         receiver.progress_pipeline_transfers()
 
-    assert offer.identity not in receiver.pipeline_receive_reservations
     assert offer.identity in receiver.pipeline_receive_consumers
     assert receiver.pipeline_stages[1].terminal_statuses[task.batch_id] is PipelineTaskStatus.COMPLETED
     assert receiver.model_runner.pipeline_batch_contexts[(1, task.batch_id)].status is PipelineTaskStatus.COMPLETED

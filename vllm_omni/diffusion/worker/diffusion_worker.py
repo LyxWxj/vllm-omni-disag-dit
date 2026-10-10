@@ -840,13 +840,15 @@ class DiffusionWorker:
             ticket = self.pipeline_send_tickets.get(offer.identity)
             if ticket is None:
                 raise KeyError("pipeline transfer grant has no reserved sender ticket")
+            if ticket.started:
+                return True
             connector.start_granted_send(ticket, grant)
         else:
             reservation = self.pipeline_receive_reservations.get(offer.identity)
             if reservation is None:
                 raise KeyError("pipeline transfer grant has no reserved receive credit")
             if reservation:
-                raise ValueError("pipeline transfer receive has already started")
+                return True
             transport = connector.transport
             self.pipeline_receive_reservations[offer.identity] = True
             transport.start_granted_transfer(grant)
