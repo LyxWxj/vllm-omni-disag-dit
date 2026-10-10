@@ -373,7 +373,7 @@ class DistributedP2PTransport:
             if message is None:
                 raise ValueError("sender requires a pipeline message payload")
             self._validate_message_matches_offer(message, offer)
-            self._start_send(message, offer.payload_metadata)
+            self._start_send(message)
             return
         if message is not None:
             raise ValueError("receiver must not provide a sender payload")
@@ -384,13 +384,10 @@ class DistributedP2PTransport:
         # backend raises after partially posting work, keep the identity active
         # so a replay cannot post an unmatched second receive.
         self._active_receive_ids.add(identity)
-        if offer.payload_metadata:
-            tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(
-                src=self._src_group_rank,
-                metadata_list=offer.payload_metadata,
-            )
-        else:
-            tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(src=self._src_group_rank)
+        # Metadata is carried by the vLLM coordinator's asynchronous object
+        # send. The offer only validates identity and payload shape; it is not
+        # an out-of-band metadata transport.
+        tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(src=self._src_group_rank)
         self._pending_receives.append(
             _PendingReceive(
                 message=PipelineMessage(
@@ -405,7 +402,7 @@ class DistributedP2PTransport:
             )
         )
 
-    def _start_send(self, message: PipelineMessage, metadata_list: tuple[tuple[str, Any], ...]) -> None:
+    def _start_send(self, message: PipelineMessage) -> None:
         self._ensure_open()
         if self.local_rank != self.src_rank:
             raise RuntimeError("only the source endpoint can send")
@@ -417,14 +414,9 @@ class DistributedP2PTransport:
         # Register before entering the blocking metadata send. Ambiguous
         # backend failure retains ownership and prevents replay.
         self._send_handles[identity] = None
-        if metadata_list:
-            handles = self.group.isend_tensor_dict(
-                message.payload,
-                dst=self._dst_group_rank,
-                metadata_list=metadata_list,
-            )
-        else:
-            handles = self.group.isend_tensor_dict(message.payload, dst=self._dst_group_rank)
+        # Always let the coordinator send metadata asynchronously. The offer's
+        # metadata is a validation contract, not a second communication path.
+        handles = self.group.isend_tensor_dict(message.payload, dst=self._dst_group_rank)
         self._send_handles[identity] = list(handles)
 
     def poll(self, limit: int | None = None) -> list[PipelineMessage]:
