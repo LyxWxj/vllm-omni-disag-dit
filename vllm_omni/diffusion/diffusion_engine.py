@@ -671,7 +671,15 @@ class DiffusionEngine:
         grouped: dict[str, list[PipelineEvent]] = {}
         known_batches = set(self._queued_pipeline_batches)
         for event in events:
-            if not isinstance(event, PipelineEvent) or event.task.batch_id not in known_batches:
+            if not isinstance(event, PipelineEvent):
+                raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
+            if event.task.batch_id not in known_batches:
+                # Stage completion and retirement acknowledgements are
+                # metadata-only after the step Future has been resolved. A
+                # Worker can publish them after Engine ownership is retired;
+                # STEP_COMPLETED remains strict because it drives the Future.
+                if event.event_type is not PipelineEventType.STEP_COMPLETED:
+                    continue
                 raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
             batch = self._queued_pipeline_batches[event.task.batch_id]
             if event.task != batch.task:
