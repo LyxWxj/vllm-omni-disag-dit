@@ -78,8 +78,6 @@ def _engine(mocker, scheduler_output: DiffusionSchedulerOutput) -> DiffusionEngi
 def test_autonomous_admission_waits_for_both_stage_acknowledgements(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
-    engine.executor.submit_pipeline_admissions.side_effect = lambda *_args: [True, True]
-
     batch = DiffusionEngine._submit_queued_pipeline_batch(engine, scheduler_output)
 
     assert batch.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING

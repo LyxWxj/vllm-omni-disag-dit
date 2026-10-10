@@ -81,7 +81,6 @@ class PipelineWorkerUpdate:
     """Sparse stage update; finalization payloads are split before process IPC."""
 
     worker_id: int
-    progress: Any
     events: tuple[PipelineEvent, ...]
     finalizations: tuple[PipelineFinalizationUpdate, ...] = ()
     error: str | None = None
@@ -113,16 +112,11 @@ class PipelineBatchContext:
     stage_spec: PipelineStageSpec
     state: Any
     input_batch: Any
-    tensors: dict[str, Any] = field(default_factory=dict)
     result: Any | None = None
     status: PipelineTaskStatus = PipelineTaskStatus.PENDING
 
-    @property
-    def pp_stage_id(self) -> int:
-        return self.stage_spec.pp_stage_id
-
     def __post_init__(self) -> None:
-        if self.pp_stage_id < 0:
+        if self.stage_spec.pp_stage_id < 0:
             raise ValueError("pp_stage_id must be non-negative")
         if self.task.request_id != self.state.request_id:
             raise ValueError("pipeline context request id must match its state")

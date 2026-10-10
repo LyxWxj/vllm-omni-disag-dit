@@ -953,11 +953,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._fail_queued_control(method, exc)
             raise
 
-    def submit_pipeline_admissions(self, admissions: list[tuple[Any, Any]]) -> Any:
-        if not admissions:
-            raise ValueError("pipeline admission batch must not be empty")
-        return self._queued_rank_local_rpc("admit_pipeline_batches", args=(admissions,))
-
     def enqueue_pipeline_admissions(self, admissions: list[tuple[Any, Any]]) -> None:
         """Dispatch queued admission without waiting for rank acknowledgements."""
         if not admissions:
@@ -1165,10 +1160,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 raise RuntimeError("Pipeline StageEngine published an update for an unknown Worker rank")
             if update.error is not None:
                 raise RuntimeError(f"Pipeline StageEngine failed on Worker {update.worker_id}: {update.error}")
-            rank_progress = update.progress
-            if rank_progress is None:
-                worker_events.extend(update.events)
-                continue
             worker_events.extend(update.events)
 
         for event in worker_events:

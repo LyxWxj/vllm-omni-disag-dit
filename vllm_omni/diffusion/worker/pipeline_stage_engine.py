@@ -75,7 +75,7 @@ class PipelineStageEngine:
                 raise RuntimeError("Pipeline StageEngine command queue is full") from exc
         return result.result()
 
-    def submit(self, method: str, *args: Any, publish_result_events: bool = False, **kwargs: Any) -> None:
+    def submit(self, method: str, *args: Any, **kwargs: Any) -> None:
         """Queue a command and return once it is owned by the StageEngine."""
         result: Future[Any] = Future()
         with self._state_lock:
@@ -90,16 +90,13 @@ class PipelineStageEngine:
 
         def report_failure(completed: Future[Any]) -> None:
             try:
-                result = completed.result()
-                if not publish_result_events:
-                    return
-                events = result if isinstance(result, tuple) else (result,)
+                events = completed.result()
+                events = events if isinstance(events, tuple) else (events,)
                 if not all(isinstance(event, PipelineEvent) for event in events):
                     raise RuntimeError(f"StageEngine command {method!r} returned invalid pipeline events")
                 self._publish_update(
                     PipelineWorkerUpdate(
                         worker_id=self._worker_id,
-                        progress=None,
                         events=tuple(events),
                     )
                 )
@@ -108,7 +105,6 @@ class PipelineStageEngine:
                     self._publish_update(
                         PipelineWorkerUpdate(
                             worker_id=self._worker_id,
-                            progress=None,
                             events=(),
                             error=f"{type(exc).__name__}: {exc}",
                         )
@@ -177,7 +173,6 @@ class PipelineStageEngine:
                 self._publish_update(
                     PipelineWorkerUpdate(
                         worker_id=self._worker_id,
-                        progress=None,
                         events=(),
                         error=f"{type(fatal_error).__name__}: {fatal_error}",
                     )
@@ -234,7 +229,6 @@ class PipelineStageEngine:
                     self._publish_update(
                         PipelineWorkerUpdate(
                             worker_id=self._worker_id,
-                            progress=None,
                             events=(),
                             error=f"{type(fatal_error).__name__}: {fatal_error}",
                         )

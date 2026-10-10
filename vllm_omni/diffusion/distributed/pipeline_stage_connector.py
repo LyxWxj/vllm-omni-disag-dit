@@ -219,9 +219,6 @@ class DistributedP2PTransport:
         )
 
     def _start_send(self, message: PipelineMessage) -> None:
-        self._ensure_open()
-        if self.local_rank != self.src_rank:
-            raise RuntimeError("only the source endpoint can send")
         if not isinstance(message.payload, dict):
             raise TypeError("distributed P2P payload must be a tensor dictionary")
         identity = self._message_identity(message)
@@ -367,10 +364,6 @@ class PipelineStageConnector:
     def send_in_use(self) -> int:
         return len(self._send_tickets)
 
-    @property
-    def receive_depth(self) -> int:
-        return len(self._received) + len(self._received_leases)
-
     def enqueue_send(self, message: PipelineMessage) -> TransferTicket:
         self._ensure_open()
         self._validate_message(message)
@@ -402,12 +395,6 @@ class PipelineStageConnector:
     def start_receive(self, offer: PipelineTransferOffer) -> None:
         """Post a receive directly through the PP group coordinator."""
         self._ensure_open()
-        if (
-            offer.edge_kind is not self.transport.edge_kind
-            or offer.src_rank != self.transport.src_rank
-            or offer.dst_rank != self.transport.dst_rank
-        ):
-            raise ValueError("pipeline receive offer does not match this connector")
         self.transport.start_transfer(offer)
 
     def wait_send_completion(self, ticket: TransferTicket) -> None:
@@ -441,7 +428,7 @@ class PipelineStageConnector:
         self._ensure_open()
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be a positive integer")
-        available = self.max_slots - self.receive_depth
+        available = self.max_slots - len(self._received) - len(self._received_leases)
         if available > 0:
             poll_limit = min(limit, available)
             incoming = self.transport.poll(limit=poll_limit)

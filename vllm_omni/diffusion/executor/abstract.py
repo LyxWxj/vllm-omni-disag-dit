@@ -171,9 +171,6 @@ class DiffusionExecutor(ABC):
         """
         return None
 
-    def submit_pipeline_admissions(self, admissions: list[tuple[Any, Any]]) -> Any:
-        raise NotImplementedError("queued pipeline admission is not wired for this executor")
-
     def prepare_pipeline_requests(self, scheduler_output: Any) -> Any:
         """Prepare rank-local request state at a coordinated drained boundary."""
         raise NotImplementedError("queued pipeline preparation is not wired for this executor")

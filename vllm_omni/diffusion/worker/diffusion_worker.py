@@ -127,7 +127,6 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
-_PIPELINE_PREPARATION_METHODS = frozenset({"prepare_pipeline_requests_all_ranks"})
 _PIPELINE_CONSUMER_EVENT_FAILED = object()
 
 
@@ -164,22 +163,6 @@ def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list
     if failures:
         raise RuntimeError(f"{operation} failed on " + "; ".join(failures))
     return [result for _, result in rank_results]
-
-
-def _run_and_agree_rank_status(operation: str, func: Callable[[], Any]) -> Any:
-    """Run locally, agree on failures, and retain the local result in place."""
-    local_result: Any = None
-    try:
-        local_result = func()
-        local_status = (True, None)
-    except Exception as exc:
-        logger.exception("%s failed on this Worker rank", operation)
-        local_status = (False, f"{type(exc).__name__}: {exc}")
-    rank_statuses = _all_gather_rank_values(local_status)
-    failures = [f"rank {rank}: {error}" for rank, (ok, error) in enumerate(rank_statuses) if not ok]
-    if failures:
-        raise RuntimeError(f"{operation} failed on " + "; ".join(failures))
-    return local_result
 
 
 def _setup_diffusion_worker_proc_title_and_log_prefix(
@@ -893,7 +876,6 @@ class DiffusionWorker:
             return None
         return PipelineWorkerUpdate(
             worker_id=self.rank,
-            progress=progress,
             events=events,
             finalizations=finalizations,
         )
@@ -2082,21 +2064,11 @@ class WorkerProc:
         if update.error is not None:
             self._enqueue_result(update)
             return
-        if update.progress is None:
-            return
-        if not (
-            update.progress.offers
-            or update.progress.completions
-            or update.progress.readiness
-            or update.events
-            or update.error
-            or finalization_updates
-        ):
+        if not (update.events or finalization_updates):
             return
         self._enqueue_result(
             PipelineWorkerUpdate(
                 worker_id=update.worker_id,
-                progress=update.progress,
                 events=update.events,
                 finalizations=finalization_updates,
                 error=update.error,
@@ -2339,7 +2311,7 @@ class WorkerProc:
             profiler_enabled = bool(getattr(pipeline, "enable_diffusion_pipeline_profiler", False))
             stage_engine = getattr(self, "_stage_engine", None)
             preparation_executor = getattr(self, "_pipeline_prepare_executor", None)
-            if stage_engine is not None and method in _PIPELINE_PREPARATION_METHODS and not profiler_enabled:
+            if stage_engine is not None and method == "prepare_pipeline_requests_all_ranks" and not profiler_enabled:
                 if preparation_executor is None:
                     raise RuntimeError("Queued pipeline preparation executor is not initialized")
 
@@ -2354,7 +2326,6 @@ class WorkerProc:
                 stage_engine.submit(
                     method,
                     *args,
-                    publish_result_events=method.startswith("admit_pipeline"),
                     **kwargs,
                 )
                 result = True

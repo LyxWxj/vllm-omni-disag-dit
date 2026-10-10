@@ -80,7 +80,6 @@ logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
-_QUEUED_ADMISSION_PROGRESS_DRAIN_S = 0.012
 
 
 def _async_output_timeout() -> float:
@@ -900,11 +899,7 @@ class DiffusionEngine:
                     future = submit_step(batch.task)
                     if isinstance(future, concurrent.futures.Future):
                         batch.step_future = future
-            enqueue_admissions = getattr(self.executor, "enqueue_pipeline_admissions", None)
-            if callable(enqueue_admissions):
-                enqueue_admissions(autonomous_admissions)
-            else:
-                self.executor.submit_pipeline_admissions(autonomous_admissions)
+            self.executor.enqueue_pipeline_admissions(autonomous_admissions)
             for batch in ordered[: len(autonomous_admissions)]:
                 batch.stage_enqueued = True
                 batch.phase = _QueuedPipelineBatchPhase.ADMISSION_PENDING

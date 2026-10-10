@@ -489,7 +489,6 @@ class StageDeployConfig:
     mode: str | None = None
     max_inflight_batches: int | None = None
     edge_buffer_slots: int | None = None
-    stage_buffer_bytes: int | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
     vae_fast_path: str | None = None
