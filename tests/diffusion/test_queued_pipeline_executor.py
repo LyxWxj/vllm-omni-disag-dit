@@ -20,9 +20,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _executor(mocker) -> MultiprocDiffusionExecutor:
     executor = object.__new__(MultiprocDiffusionExecutor)
-    executor._closed = False
-    executor._result_mq = object()
-    executor._broadcast_mq = object()
     executor._pipeline_update_error = None
     executor._pipeline_update_lock = threading.Lock()
     executor._pipeline_update_cursor = 0
