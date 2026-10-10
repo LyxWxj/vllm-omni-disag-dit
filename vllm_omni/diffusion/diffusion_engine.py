@@ -251,7 +251,6 @@ class _QueuedPipelineBatch:
     finalization_handle: str | None = None
     finalization_output_rank: int | None = None
     release_acknowledged: bool = False
-    transfer_retired: bool = False
     scheduler_completed: bool = False
     cancelled: bool = False
     failure: BaseException | None = None
@@ -462,7 +461,7 @@ class DiffusionEngine:
         """Initialize the M2 two-stage transport lazily after engine startup."""
         if getattr(self.executor, "_pipeline_stage_ranks", None) is not None:
             return
-        self.executor.initialize_pipeline_transfers(
+        self.executor.initialize_pipeline_transports(
             activation_edges={(0, 1)},
             feedback_edges={(1, 0)},
             max_slots=int(getattr(self.od_config, "edge_buffer_slots", 1)),
@@ -1057,12 +1056,6 @@ class DiffusionEngine:
                     f"expected={expected}, actual={actual}"
                 )
             batch.release_acknowledged = True
-        if batch.stage_enqueued and not batch.transfer_retired:
-            self.executor.progress_pipeline()
-            if not self.executor.pipeline_transfer_batch_retirement_ready(batch.task.batch_id, batch.task.epoch):
-                return
-            self.executor.retire_pipeline_transfer_batch(batch.task.batch_id, batch.task.epoch)
-            batch.transfer_retired = True
         request_id = batch.task.request_id
         if batch.finalizing and not batch.request_cleanup_completed:
             cleanup = self.executor.cleanup_finalized_pipeline_request(request_id)
@@ -1116,7 +1109,6 @@ class DiffusionEngine:
                 "Queued pipeline cancellation acknowledgements do not match topology: "
                 f"expected={expected}, actual={actual}"
             )
-        self.executor.cancel_pipeline_transfer_batch(batch.task.batch_id, batch.task.epoch)
         batch.cancelled = True
         batch.phase = _QueuedPipelineBatchPhase.CANCELLING
 

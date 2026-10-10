@@ -73,7 +73,6 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineEdgeKind,
     PipelineMessage,
     PipelineStageConnector,
-    PipelineTransferGrant,
     PipelineTransferOffer,
     PipelineTransportProgress,
     TransferTicket,
@@ -831,26 +830,6 @@ class DiffusionWorker:
         )
         self.pipeline_send_tickets[offer.identity] = connector.enqueue_send(message)
         return offer
-
-    def start_pipeline_transfer(self, grant: PipelineTransferGrant) -> bool:
-        """Start only this Worker's endpoint after the Executor grants it."""
-        offer = grant.offer
-        connector = self._require_pipeline_connector(offer.edge_kind)
-        if self.rank == offer.src_rank:
-            ticket = self.pipeline_send_tickets.get(offer.identity)
-            if ticket is None:
-                raise KeyError("pipeline transfer grant has no reserved sender ticket")
-            connector.start_granted_send(ticket, grant)
-        else:
-            reservation = self.pipeline_receive_reservations.get(offer.identity)
-            if reservation is None:
-                raise KeyError("pipeline transfer grant has no reserved receive credit")
-            if reservation:
-                raise ValueError("pipeline transfer receive has already started")
-            transport = connector.transport
-            self.pipeline_receive_reservations[offer.identity] = True
-            transport.start_granted_transfer(grant)
-        return True
 
     def progress_pipeline_transfers(self) -> PipelineTransportProgress:
         """Advance one local FIFO compute task and bounded transport work."""
@@ -2374,7 +2353,6 @@ class WorkerProc:
 
                 result = preparation_executor.submit(prepare_pipeline_request).result()
             elif stage_engine is not None and method in {
-                "start_pipeline_transfer",
                 "admit_pipeline_batch",
                 "admit_pipeline_batches",
             }:

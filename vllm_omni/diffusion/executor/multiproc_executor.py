@@ -24,9 +24,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
-from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
-    PipelineCoordinatorProgress,
-)
 from vllm_omni.diffusion.executor.abstract import (
     DiffusionExecutor,
     normalize_pipeline_preparation_reports,
@@ -1091,14 +1088,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result[0]
         return result
 
-    def initialize_pipeline_transfers(
+    def initialize_pipeline_transports(
         self,
         activation_edges: set[tuple[int, int]],
         feedback_edges: set[tuple[int, int]],
         max_slots: int = 1,
     ) -> Any:
         if self._pipeline_stage_ranks is not None:
-            raise RuntimeError("pipeline transfer coordinator is already initialized")
+            raise RuntimeError("pipeline transports are already initialized")
         result = self._queued_control_rpc("initialize_pipeline_transports_all_ranks", args=(max_slots,))
         try:
             validate_pipeline_topology_reports(result, activation_edges, feedback_edges)
@@ -1110,43 +1107,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pipeline_progress_wake.set()
         return result
 
-    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        del batch_id, epoch
-
-    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        del batch_id, epoch
-
-    def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
-        del batch_id, epoch
-        return True
-
-    def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
-        """Broadcast a nonblocking StageEngine transfer-start command."""
-        self._ensure_open()
-        try:
-            if self._broadcast_mq is None:
-                raise RuntimeError("broadcast queue is closed")
-            self._broadcast_mq.enqueue(
-                {
-                    "type": "rpc",
-                    "method": "start_pipeline_transfer",
-                    "args": (grant,),
-                    "kwargs": {},
-                    "output_rank": -1,
-                    "exec_all_ranks": True,
-                    "collect_rank_status": False,
-                    "reply_all_ranks": False,
-                }
-            )
-        except BaseException as exc:
-            if not self._is_failed:
-                self._fail_queued_control("pipeline transfer start enqueue", exc)
-            raise
-
-    def _start_ready_pipeline_transfers(self) -> list[Any]:
-        return []
-
-    def progress_pipeline(self) -> PipelineCoordinatorProgress:
+    def progress_pipeline(self) -> None:
         progress_lock = getattr(self, "_pipeline_progress_lock", None)
         if progress_lock is None:
             progress_lock = threading.Lock()
@@ -1154,7 +1115,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         with progress_lock:
             return self._progress_pipeline_unlocked()
 
-    def _progress_pipeline_unlocked(self) -> PipelineCoordinatorProgress:
+    def _progress_pipeline_unlocked(self) -> None:
         if self._pipeline_stage_ranks is None:
             raise RuntimeError("pipeline stage ranks are not initialized")
         try:
@@ -1164,7 +1125,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._fail_queued_control("pipeline progress", exc)
             raise
 
-    def _progress_autonomous_pipeline_stages(self) -> PipelineCoordinatorProgress:
+    def _progress_autonomous_pipeline_stages(self) -> None:
         """Consume sparse Worker updates and run control only when edges change."""
         with self._pipeline_update_lock:
             update_error = self._pipeline_update_error
@@ -1197,7 +1158,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 cursor = (round_start + 1) % len(worker_ids)
             self._pipeline_update_cursor = cursor
 
-        progress = PipelineCoordinatorProgress()
         worker_events: list[Any] = []
         expected_workers = frozenset(self._pipeline_stage_ranks.values())
         for update in updates:
@@ -1210,11 +1170,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 worker_events.extend(update.events)
                 continue
             worker_events.extend(update.events)
-
-        for update in updates:
-            rank_progress = update.progress
-            if rank_progress is None:
-                continue
 
         for event in worker_events:
             if not isinstance(event, PipelineEvent) or event.event_type is not PipelineEventType.STEP_COMPLETED:
@@ -1237,7 +1192,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         with self._pipeline_update_lock:
             cached_events = getattr(self, "_pipeline_cached_events", [])
             self._pipeline_cached_events = [*cached_events, *worker_events]
-        return progress
+        return None
 
     def pipeline_stage_physical_ranks(self) -> dict[int, int]:
         if self._pipeline_stage_ranks is None:
@@ -1439,12 +1394,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
             result = responses[0] if unique_reply_rank is not None else responses
             if self._uses_autonomous_pipeline_stages():
-                if (
-                    method == "start_pipeline_transfer"
-                    and reply_all_ranks
-                    and (len(result) != 2 or any(report is not True for report in result))
-                ):
-                    raise RuntimeError("Pipeline transfer start did not succeed on both Workers.")
                 self._wake_pipeline_stages()
             return result
         except Exception as e:

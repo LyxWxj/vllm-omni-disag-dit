@@ -89,214 +89,10 @@ class PipelineTransferOffer:
 
 
 @dataclass
-class PipelineTransferGrant:
-    offer: PipelineTransferOffer
-    completed_ranks: set[int] = field(default_factory=set)
-
-
-@dataclass
 class PipelineTransportProgress:
     offers: list[PipelineTransferOffer] = field(default_factory=list)
     completions: list[tuple[Any, ...]] = field(default_factory=list)
     readiness: list[tuple[Any, ...]] = field(default_factory=list)
-
-
-@dataclass
-class PipelineCoordinatorProgress:
-    grants: list[PipelineTransferGrant] = field(default_factory=list)
-
-
-class PipelineTransferCoordinator:
-    """FIFO control-plane grants for matched P2P endpoint readiness."""
-
-    def __init__(
-        self,
-        *,
-        activation_edges: set[tuple[int, int]],
-        feedback_edges: set[tuple[int, int]],
-    ) -> None:
-        self._validate_topology(activation_edges, feedback_edges)
-        self._edges = {
-            PipelineEdgeKind.ACTIVATION: next(iter(activation_edges)),
-            PipelineEdgeKind.FEEDBACK: next(iter(feedback_edges)),
-        }
-        self._offers = {edge_kind: deque() for edge_kind in PipelineEdgeKind}
-        self._offer_ids: set[tuple[Any, ...]] = set()
-        self._ready_ids: set[tuple[Any, ...]] = set()
-        self._pre_ready_ids: set[tuple[Any, ...]] = set()
-        self._cancelled_batches: set[tuple[str, int]] = set()
-        self._grants: dict[tuple[Any, ...], PipelineTransferGrant] = {}
-        self._completed_ids: set[tuple[Any, ...]] = set()
-        self._busy_ranks: set[int] = set()
-        self._next_edge = PipelineEdgeKind.FEEDBACK
-
-    @property
-    def endpoint_ranks(self) -> frozenset[int]:
-        return frozenset(self._edges[PipelineEdgeKind.ACTIVATION])
-
-    @property
-    def stage_physical_ranks(self) -> dict[int, int]:
-        """Return the physical rank for logical stages in the single M2 replica."""
-        src_rank, dst_rank = self._edges[PipelineEdgeKind.ACTIVATION]
-        return {0: src_rank, 1: dst_rank}
-
-    def offer(self, offer: PipelineTransferOffer) -> bool:
-        identity = offer.identity
-        if (offer.src_rank, offer.dst_rank) != self._edges[offer.edge_kind]:
-            raise ValueError("pipeline transfer offer does not match the configured edge topology")
-        if (offer.batch_id, offer.epoch) in self._cancelled_batches:
-            return False
-        if identity in self._offer_ids or identity in self._grants or identity in self._completed_ids:
-            raise ValueError("duplicate pipeline transfer offer")
-        self._offers[offer.edge_kind].append(offer)
-        self._offer_ids.add(identity)
-        if identity in self._pre_ready_ids:
-            self._pre_ready_ids.remove(identity)
-            self._ready_ids.add(identity)
-        return True
-
-    def mark_receive_ready(self, identity: tuple[Any, ...], rank: int | None = None) -> None:
-        """Record destination credit, including announcements preceding an offer."""
-        offer = self._offer_from_identity(identity)
-        if (offer.src_rank, offer.dst_rank) != self._edges[offer.edge_kind]:
-            raise ValueError("pipeline receive readiness does not match the configured edge topology")
-        if rank is not None and rank != offer.dst_rank:
-            raise ValueError("pipeline receive readiness must be reported by the destination rank")
-        if (offer.batch_id, offer.epoch) in self._cancelled_batches:
-            return
-        if identity in self._grants or identity in self._completed_ids:
-            raise ValueError("pipeline receive readiness arrived after transfer grant")
-        if identity in self._ready_ids or identity in self._pre_ready_ids:
-            return
-        if identity in self._offer_ids:
-            self._ready_ids.add(identity)
-        else:
-            self._pre_ready_ids.add(identity)
-
-    def cancel_batch(self, batch_id: str, epoch: int) -> None:
-        """Discard ungranted transfers and readiness after Worker cancellation."""
-        if not batch_id or type(epoch) is not int or epoch < 0:
-            raise ValueError("invalid pipeline batch cancellation identity")
-        self._cancelled_batches.add((batch_id, epoch))
-        for edge_kind, offers in self._offers.items():
-            retained = deque(offer for offer in offers if (offer.batch_id, offer.epoch) != (batch_id, epoch))
-            removed = {
-                offer.identity
-                for offer in offers
-                if (offer.batch_id, offer.epoch) == (batch_id, epoch)
-            }
-            self._offers[edge_kind] = retained
-            self._offer_ids.difference_update(removed)
-            self._ready_ids.difference_update(removed)
-        self._pre_ready_ids = {
-            identity for identity in self._pre_ready_ids if (identity[0], identity[2]) != (batch_id, epoch)
-        }
-
-    def retire_batch(self, batch_id: str, epoch: int) -> None:
-        """Drop per-batch replay state once Worker ownership has been released."""
-        if any(
-            (offer.batch_id, offer.epoch) == (batch_id, epoch) for offers in self._offers.values() for offer in offers
-        ):
-            raise RuntimeError("cannot retire pipeline batch with pending transfer offers")
-        if any((grant.offer.batch_id, grant.offer.epoch) == (batch_id, epoch) for grant in self._grants.values()):
-            raise RuntimeError("cannot retire pipeline batch with active transfer grants")
-        self._cancelled_batches.discard((batch_id, epoch))
-        self._completed_ids = {
-            identity for identity in self._completed_ids if (identity[0], identity[2]) != (batch_id, epoch)
-        }
-        self._pre_ready_ids = {
-            identity for identity in self._pre_ready_ids if (identity[0], identity[2]) != (batch_id, epoch)
-        }
-
-    def batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
-        """Return whether this batch has no queued offer or active grant."""
-        if any(
-            (offer.batch_id, offer.epoch) == (batch_id, epoch) for offers in self._offers.values() for offer in offers
-        ):
-            return False
-        return not any(
-            (grant.offer.batch_id, grant.offer.epoch) == (batch_id, epoch) for grant in self._grants.values()
-        )
-
-    def grant_ready(self, limit: int = 1) -> list[PipelineTransferGrant]:
-        if type(limit) is not int or limit <= 0:
-            raise ValueError("limit must be a positive integer")
-        grants: list[PipelineTransferGrant] = []
-        while len(grants) < limit:
-            edge_order = (
-                self._next_edge,
-                PipelineEdgeKind.ACTIVATION
-                if self._next_edge is PipelineEdgeKind.FEEDBACK
-                else PipelineEdgeKind.FEEDBACK,
-            )
-            selected: PipelineTransferOffer | None = None
-            for edge_kind in edge_order:
-                offers = self._offers[edge_kind]
-                if not offers:
-                    continue
-                candidate = offers[0]
-                if (
-                    candidate.identity in self._ready_ids
-                    and candidate.src_rank not in self._busy_ranks
-                    and candidate.dst_rank not in self._busy_ranks
-                ):
-                    selected = candidate
-                    break
-            if selected is None:
-                break
-            offer = selected
-            identity = offer.identity
-            self._offers[offer.edge_kind].popleft()
-            self._offer_ids.remove(identity)
-            self._ready_ids.remove(identity)
-            grant = PipelineTransferGrant(offer=offer)
-            self._grants[identity] = grant
-            self._busy_ranks.update((offer.src_rank, offer.dst_rank))
-            grants.append(grant)
-            self._next_edge = (
-                PipelineEdgeKind.ACTIVATION
-                if offer.edge_kind is PipelineEdgeKind.FEEDBACK
-                else PipelineEdgeKind.FEEDBACK
-            )
-        return grants
-
-    def complete(self, identity: tuple[Any, ...], rank: int) -> bool:
-        grant = self._grants.get(identity)
-        if grant is None:
-            raise KeyError("unknown pipeline transfer grant")
-        if rank not in {grant.offer.src_rank, grant.offer.dst_rank}:
-            raise ValueError("completion rank is not a transfer endpoint")
-        if rank in grant.completed_ranks:
-            raise ValueError("duplicate pipeline transfer completion")
-        grant.completed_ranks.add(rank)
-        if grant.completed_ranks != {grant.offer.src_rank, grant.offer.dst_rank}:
-            return False
-        self._grants.pop(identity)
-        self._completed_ids.add(identity)
-        self._busy_ranks.difference_update((grant.offer.src_rank, grant.offer.dst_rank))
-        return True
-
-    @staticmethod
-    def _validate_topology(
-        activation_edges: set[tuple[int, int]],
-        feedback_edges: set[tuple[int, int]],
-    ) -> None:
-        if len(activation_edges) != 1 or len(feedback_edges) != 1:
-            raise ValueError("pipeline transfer coordinator requires one activation/feedback edge pair")
-        src_rank, dst_rank = next(iter(activation_edges))
-        if feedback_edges != {(dst_rank, src_rank)}:
-            raise ValueError("feedback edges must exactly reverse the activation edges")
-        if src_rank < 0 or dst_rank < 0 or src_rank == dst_rank:
-            raise ValueError("pipeline topology endpoints must be distinct non-negative ranks")
-
-    @staticmethod
-    def _offer_from_identity(identity: tuple[Any, ...]) -> PipelineTransferOffer:
-        if not isinstance(identity, tuple) or len(identity) != 6:
-            raise ValueError("invalid pipeline transfer identity in receive readiness")
-        try:
-            return PipelineTransferOffer(*identity)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("invalid pipeline transfer identity in receive readiness") from exc
 
 
 @dataclass
@@ -386,15 +182,10 @@ class DistributedP2PTransport:
     def has_outstanding_operations(self) -> bool:
         return bool(self._send_handles or self._pending_receives or self._ready_receives or self._active_receive_ids)
 
-    def start_granted_transfer(
-        self,
-        grant: PipelineTransferGrant,
-        message: PipelineMessage | None = None,
-    ) -> None:
+    def start_transfer(self, offer: PipelineTransferOffer, message: PipelineMessage | None = None) -> None:
         self._ensure_open()
-        offer = grant.offer
         if offer.edge_kind is not self.edge_kind or offer.src_rank != self.src_rank or offer.dst_rank != self.dst_rank:
-            raise ValueError("transfer grant does not match this P2P transport")
+            raise ValueError("pipeline transfer offer does not match this P2P transport")
         if self.local_rank == self.src_rank:
             if message is None:
                 raise ValueError("sender requires a pipeline message payload")
@@ -405,7 +196,7 @@ class DistributedP2PTransport:
             raise ValueError("receiver must not provide a sender payload")
         identity = (offer.batch_id, offer.step_index, offer.epoch)
         if identity in self._active_receive_ids or identity in self._completed_receive_ids:
-            raise ValueError("duplicate distributed P2P receive grant")
+            raise ValueError("duplicate distributed P2P receive")
         # Register before posting the receive. Metadata is blocking inside the
         # coordinator, so keep it off the StageEngine owner thread.
         self._active_receive_ids.add(identity)
@@ -598,29 +389,24 @@ class PipelineStageConnector:
         self._send_tickets.append(ticket)
         return ticket
 
-    def start_granted_send(self, ticket: TransferTicket, grant: PipelineTransferGrant) -> None:
-        """Launch one reserved send only after its coordinator grant arrives."""
+    def start_send(self, ticket: TransferTicket, offer: PipelineTransferOffer) -> None:
+        """Launch one reserved send from the Worker-local FIFO."""
         self._ensure_open()
         if ticket not in self._send_tickets:
             raise ValueError("unknown transfer ticket")
         if ticket.started:
             raise ValueError("transfer ticket has already started")
-        offer = grant.offer
         if self._message_identity(ticket.message) != (
             offer.batch_id,
             offer.step_index,
             offer.epoch,
         ):
-            raise ValueError("transfer grant does not match the reserved send")
+            raise ValueError("pipeline transfer offer does not match the reserved send")
         # Once control enters the backend, failure is ambiguous: metadata or
         # device work may already have started. Keep transport ownership until
         # the execution group is drained or torn down.
         ticket.started = True
-        self.transport.start_granted_transfer(grant, ticket.message)
-
-    def start_send(self, ticket: TransferTicket, offer: PipelineTransferOffer) -> None:
-        """Launch a reserved send from the Worker-local FIFO."""
-        self.start_granted_send(ticket, PipelineTransferGrant(offer=offer))
+        self.transport.start_transfer(offer, ticket.message)
 
     def start_receive(self, offer: PipelineTransferOffer) -> None:
         """Post a receive directly through the PP group coordinator."""
@@ -631,7 +417,7 @@ class PipelineStageConnector:
             or offer.dst_rank != self.transport.dst_rank
         ):
             raise ValueError("pipeline receive offer does not match this connector")
-        self.transport.start_granted_transfer(PipelineTransferGrant(offer=offer))
+        self.transport.start_transfer(offer)
 
     def wait_send_completion(self, ticket: TransferTicket) -> None:
         """Verify backend completion while retaining connector ownership."""

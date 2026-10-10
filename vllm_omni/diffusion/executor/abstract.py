@@ -201,26 +201,13 @@ class DiffusionExecutor(ABC):
         """Cancel queued work while retaining resources until retirement."""
         raise NotImplementedError("queued pipeline cancellation is not wired for this executor")
 
-    def initialize_pipeline_transfers(
+    def initialize_pipeline_transports(
         self,
         activation_edges: set[tuple[int, int]],
         feedback_edges: set[tuple[int, int]],
         max_slots: int = 1,
     ) -> Any:
-        raise NotImplementedError("queued pipeline transfer coordination is not wired for this executor")
-
-    def cancel_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        raise NotImplementedError("queued pipeline transfer cancellation is not wired for this executor")
-
-    def retire_pipeline_transfer_batch(self, batch_id: str, epoch: int) -> None:
-        raise NotImplementedError("queued pipeline transfer retirement is not wired for this executor")
-
-    def pipeline_transfer_batch_retirement_ready(self, batch_id: str, epoch: int) -> bool:
-        raise NotImplementedError("queued pipeline transfer retirement readiness is not wired for this executor")
-
-    def enqueue_pipeline_transfer_start(self, grant: Any) -> None:
-        """Queue a granted transfer start without waiting for a Worker reply."""
-        raise NotImplementedError("queued pipeline transfer start is not wired for this executor")
+        raise NotImplementedError("queued pipeline transport initialization is not wired for this executor")
 
     def progress_pipeline(self) -> Any:
         raise NotImplementedError("queued pipeline progress is not wired for this executor")
