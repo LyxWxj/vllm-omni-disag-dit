@@ -800,6 +800,11 @@ class DiffusionWorker:
                 max_slots=max_slots,
                 transport=transport,
             )
+        # Initialize both direction-specific PP communicators before the first
+        # activation.  Otherwise the first nontrivial send can absorb lazy NCCL
+        # setup and create a one-microbatch bubble on the receiving stage.
+        for device_group in getattr(pp_group, "device_groups", ()):
+            torch.distributed.barrier(group=device_group)
         return {
             "rank": self.rank,
             "activation_edge": (src_rank, dst_rank),
