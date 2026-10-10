@@ -418,17 +418,20 @@ class GroupCoordinator:
 
     def _reap_completed_isends(self) -> None:
         """Release fire-and-forget send buffers in FIFO order."""
-        while self._pending_isends:
-            handles, _ = self._pending_isends[0]
+        pending = getattr(self, "_pending_isends", None)
+        if pending is None:
+            self._pending_isends = pending = deque()
+        while pending:
+            handles, _ = pending[0]
             tensor_handles = handles[1:]
             if not tensor_handles:
-                self._pending_isends.popleft()
+                pending.popleft()
                 continue
             if not all(handle.is_completed() for handle in tensor_handles):
                 break
             if handles:
                 handles[0].wait()
-            self._pending_isends.popleft()
+            pending.popleft()
 
     def broadcast_tensor_dict(
         self,
@@ -537,7 +540,10 @@ class GroupCoordinator:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
         if metadata_handle is not None:
-            self._pending_isends.append((handles, [tensor for tensor in tensor_list if tensor.numel() > 0]))
+            pending = getattr(self, "_pending_isends", None)
+            if pending is None:
+                self._pending_isends = pending = deque()
+            pending.append((handles, [tensor for tensor in tensor_list if tensor.numel() > 0]))
         return handles
 
     def irecv_tensor_dict(
