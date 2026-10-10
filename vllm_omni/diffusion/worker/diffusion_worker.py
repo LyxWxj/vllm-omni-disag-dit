@@ -944,13 +944,6 @@ class DiffusionWorker:
 
     def _reserve_expected_pipeline_receives(self, progress: PipelineTransportProgress) -> None:
         """Reserve identity-specific credit for stage work already admitted locally."""
-        # Metadata receive is currently a blocking coordinator call. Keep the
-        # StageEngine owner available to poll any in-flight tensor send before
-        # posting the opposite edge's metadata receive.
-        for identity, ticket in self.pipeline_send_tickets.items():
-            connector = self._require_pipeline_connector(identity[3])
-            if not ticket.started or not connector.transport.is_send_ready(ticket):
-                return
         candidates: list[tuple[PipelineEdgeKind, PipelineTask]] = []
         last_stage = self.pipeline_stages.get(1)
         if (

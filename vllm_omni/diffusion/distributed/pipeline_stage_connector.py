@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -309,6 +311,7 @@ class _PendingReceive:
     identity: tuple[str, int, int]
     handles: list[Any]
     postprocess: list[Any]
+    metadata_future: Future[Any] | None = None
     handles_verified: bool = False
     postprocess_index: int = 0
     failure: BaseException | None = None
@@ -380,25 +383,35 @@ class DistributedP2PTransport:
         identity = (offer.batch_id, offer.step_index, offer.epoch)
         if identity in self._active_receive_ids or identity in self._completed_receive_ids:
             raise ValueError("duplicate distributed P2P receive grant")
-        # Register before entering the blocking metadata receive. If the
-        # backend raises after partially posting work, keep the identity active
-        # so a replay cannot post an unmatched second receive.
+        # Register before posting the receive. Metadata is blocking inside the
+        # coordinator, so keep it off the StageEngine owner thread.
         self._active_receive_ids.add(identity)
-        # Metadata is carried by the vLLM coordinator's asynchronous object
-        # send. The offer only validates identity and payload shape; it is not
-        # an out-of-band metadata transport.
-        tensor_dict, handles, postprocess = self.group.irecv_tensor_dict(src=self._src_group_rank)
+        metadata_future: Future[Any] = Future()
+
+        def receive_metadata() -> None:
+            try:
+                device = getattr(self.group, "device", None)
+                if device is not None:
+                    from vllm_omni.platforms import current_omni_platform
+
+                    current_omni_platform.set_device(device)
+                metadata_future.set_result(self.group.irecv_tensor_dict(src=self._src_group_rank))
+            except BaseException as exc:
+                metadata_future.set_exception(exc)
+
+        threading.Thread(target=receive_metadata, daemon=True, name="DiffusionP2PReceive").start()
         self._pending_receives.append(
             _PendingReceive(
                 message=PipelineMessage(
                     batch_id=offer.batch_id,
                     step_index=offer.step_index,
                     epoch=offer.epoch,
-                    payload=tensor_dict,
+                    payload=None,
                 ),
                 identity=identity,
-                handles=list(handles),
-                postprocess=list(postprocess),
+                handles=[],
+                postprocess=[],
+                metadata_future=metadata_future,
             )
         )
 
@@ -430,6 +443,23 @@ class DistributedP2PTransport:
             pending = self._pending_receives[0]
             if pending.failure is not None:
                 raise pending.failure
+            if pending.metadata_future is not None:
+                if not pending.metadata_future.done():
+                    break
+                try:
+                    tensor_dict, handles, postprocess = pending.metadata_future.result()
+                    pending.message = PipelineMessage(
+                        batch_id=pending.message.batch_id,
+                        step_index=pending.message.step_index,
+                        epoch=pending.message.epoch,
+                        payload=tensor_dict,
+                    )
+                    pending.handles = list(handles)
+                    pending.postprocess = list(postprocess)
+                    pending.metadata_future = None
+                except BaseException as exc:
+                    pending.failure = exc
+                    raise
             if not all(handle.is_completed() for handle in pending.handles):
                 break
             try:
