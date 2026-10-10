@@ -905,7 +905,11 @@ class DiffusionEngine:
                     future = submit_step(batch.task)
                     if isinstance(future, concurrent.futures.Future):
                         batch.step_future = future
-            self.executor.submit_pipeline_admissions(autonomous_admissions)
+            enqueue_admissions = getattr(self.executor, "enqueue_pipeline_admissions", None)
+            if callable(enqueue_admissions):
+                enqueue_admissions(autonomous_admissions)
+            else:
+                self.executor.submit_pipeline_admissions(autonomous_admissions)
             for batch in ordered[: len(autonomous_admissions)]:
                 batch.stage_enqueued = True
                 batch.phase = _QueuedPipelineBatchPhase.ADMISSION_PENDING

@@ -97,7 +97,7 @@ def test_autonomous_admission_waits_for_both_stage_acknowledgements(mocker) -> N
 
     assert set(grouped) == {batch.task.batch_id}
     assert batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
-    engine.executor.submit_pipeline_admissions.assert_called_once_with([(batch.task, batch.stage_specs)])
+    engine.executor.enqueue_pipeline_admissions.assert_called_once_with([(batch.task, batch.stage_specs)])
 
 
 def test_autonomous_admission_batches_prepared_fifo(mocker) -> None:
@@ -109,7 +109,7 @@ def test_autonomous_admission_batches_prepared_fifo(mocker) -> None:
 
     assert first.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
     assert second.phase is _QueuedPipelineBatchPhase.ADMISSION_PENDING
-    engine.executor.submit_pipeline_admissions.assert_called_once_with(
+    engine.executor.enqueue_pipeline_admissions.assert_called_once_with(
         [(first.task, first.stage_specs), (second.task, second.stage_specs)]
     )
 
@@ -857,7 +857,7 @@ def test_queued_completion_uses_nonzero_physical_topology(mocker) -> None:
     assert engine._progress_queued_pipeline_batch(batch)
     assert batch.stage_specs[0].is_first
     assert batch.stage_physical_ranks == {0: 2, 1: 3}
-    engine.executor.submit_pipeline_admissions.assert_called_once_with([(batch.task, batch.stage_specs)])
+    engine.executor.enqueue_pipeline_admissions.assert_called_once_with([(batch.task, batch.stage_specs)])
     assert batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED
 
 
