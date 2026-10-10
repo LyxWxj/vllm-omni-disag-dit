@@ -91,6 +91,8 @@ class PipelineStageEngine:
         def report_failure(completed: Future[Any]) -> None:
             try:
                 events = completed.result()
+                if method != "admit_pipeline_batches":
+                    return
                 events = events if isinstance(events, tuple) else (events,)
                 if not all(isinstance(event, PipelineEvent) for event in events):
                     raise RuntimeError(f"StageEngine command {method!r} returned invalid pipeline events")
