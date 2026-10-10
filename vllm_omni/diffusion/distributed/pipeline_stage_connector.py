@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 from collections import deque
 from concurrent.futures import Future
@@ -357,7 +358,29 @@ class DistributedP2PTransport:
         self._ready_receives: deque[PipelineMessage] = deque()
         self._active_receive_ids: set[tuple[str, int, int]] = set()
         self._completed_receive_ids: set[tuple[str, int, int]] = set()
+        self._metadata_receives: queue.Queue[Future[Any] | None] = queue.Queue()
+        self._metadata_thread = threading.Thread(
+            target=self._receive_metadata_loop,
+            daemon=True,
+            name="DiffusionP2PMetadataReceive",
+        )
+        self._metadata_thread.start()
         self._closed = False
+
+    def _receive_metadata_loop(self) -> None:
+        while True:
+            future = self._metadata_receives.get()
+            if future is None:
+                return
+            try:
+                device = getattr(self.group, "device", None)
+                if device is not None:
+                    from vllm_omni.platforms import current_omni_platform
+
+                    current_omni_platform.set_device(device)
+                future.set_result(self.group.irecv_tensor_dict(src=self._src_group_rank))
+            except BaseException as exc:
+                future.set_exception(exc)
 
     @property
     def has_outstanding_operations(self) -> bool:
@@ -388,18 +411,7 @@ class DistributedP2PTransport:
         self._active_receive_ids.add(identity)
         metadata_future: Future[Any] = Future()
 
-        def receive_metadata() -> None:
-            try:
-                device = getattr(self.group, "device", None)
-                if device is not None:
-                    from vllm_omni.platforms import current_omni_platform
-
-                    current_omni_platform.set_device(device)
-                metadata_future.set_result(self.group.irecv_tensor_dict(src=self._src_group_rank))
-            except BaseException as exc:
-                metadata_future.set_exception(exc)
-
-        threading.Thread(target=receive_metadata, daemon=True, name="DiffusionP2PReceive").start()
+        self._metadata_receives.put(metadata_future)
         self._pending_receives.append(
             _PendingReceive(
                 message=PipelineMessage(
@@ -518,6 +530,7 @@ class DistributedP2PTransport:
             return
         if self.has_outstanding_operations:
             raise RuntimeError("cannot close distributed P2P transport with outstanding operations")
+        self._metadata_receives.put(None)
         self._closed = True
 
     def _ensure_open(self) -> None:
