@@ -475,7 +475,8 @@ class DistributedP2PTransport:
             if identity in self._send_handles:
                 return False
             raise ValueError("unknown distributed P2P send ticket")
-        return all(handle.is_completed() for handle in handles)
+        tensor_handles = handles[1:] if handles and getattr(handles[0], "_is_metadata_handle", False) else handles
+        return all(handle.is_completed() for handle in tensor_handles)
 
     def abort(self, ticket: TransferTicket) -> bool:
         # NCCL P2P has no safe per-operation cancellation. Discard therefore

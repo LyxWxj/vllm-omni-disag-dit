@@ -34,6 +34,7 @@ class _RetainedHandle:
         self._works = works
         self._retained = retained
         self._waited = False
+        self._is_metadata_handle = True
 
     def is_completed(self) -> bool:
         return all(work.is_completed() for work in self._works)
