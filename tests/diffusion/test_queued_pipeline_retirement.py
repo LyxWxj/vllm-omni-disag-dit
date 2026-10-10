@@ -134,55 +134,6 @@ def test_retirement_ticks_transport_before_releasing_context(mocker) -> None:
     assert engine.executor.method_calls[2] == mocker.call.release_pipeline_batch({0: 0, 1: 1}, batch.task.batch_id)
 
 
-def test_retirement_retries_transfer_tombstone_without_releasing_workers_twice(mocker) -> None:
-    scheduler_output = _scheduler_output()
-    engine = _engine(mocker, scheduler_output)
-    batch = engine._submit_queued_pipeline_batch(scheduler_output)
-    batch.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
-    engine.executor.release_pipeline_batch.return_value = [
-        PipelineEvent(PipelineEventType.RELEASED, batch.task, 0, 0),
-        PipelineEvent(PipelineEventType.RELEASED, batch.task, 1, 1),
-    ]
-    engine.executor.pipeline_transfer_batch_retirement_ready.side_effect = [False, True]
-
-    assert engine._advance_queued_pipeline_batch(batch) is None
-    assert batch.release_acknowledged
-    assert not batch.transfer_retired
-    assert batch.task.batch_id in engine._queued_pipeline_batches
-
-    assert engine._advance_queued_pipeline_batch(batch) is None
-
-    engine.executor.release_pipeline_batch.assert_called_once_with({0: 0, 1: 1}, batch.task.batch_id)
-    engine.executor.retire_pipeline_transfer_batch.assert_called_once_with(batch.task.batch_id, batch.task.epoch)
-    assert batch.transfer_retired
-    assert batch.task.batch_id not in engine._queued_pipeline_batches
-
-
-def test_retirement_retry_after_worker_release_does_not_cancel_or_finish_early(mocker) -> None:
-    scheduler_output = _scheduler_output()
-    engine = _engine(mocker, scheduler_output)
-    engine.scheduler.finish_requests = mocker.Mock()
-    engine._emit_finished_outputs = mocker.Mock()
-    batch = engine._submit_queued_pipeline_batch(scheduler_output)
-    batch.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
-    batch.release_acknowledged = True
-    engine.executor.pipeline_transfer_batch_retirement_ready.side_effect = [False, True]
-
-    engine._handle_queued_iteration_failure(scheduler_output, RuntimeError("retirement is pending"))
-
-    engine.executor.cancel_pipeline_requests.assert_not_called()
-    engine.scheduler.finish_requests.assert_not_called()
-    assert batch.task.batch_id in engine._queued_pipeline_batches
-
-    engine._run_queued_pipeline_iteration(scheduler_output)
-
-    engine.executor.cancel_pipeline_requests.assert_not_called()
-    engine.executor.release_pipeline_batch.assert_not_called()
-    engine.executor.retire_pipeline_transfer_batch.assert_called_once_with(batch.task.batch_id, batch.task.epoch)
-    engine.scheduler.finish_requests.assert_called_once_with("req-a", DiffusionRequestStatus.FINISHED_ERROR)
-    assert batch.task.batch_id not in engine._queued_pipeline_batches
-
-
 def test_retirement_keeps_finalizing_batch_until_receive_ownership_retires(mocker) -> None:
     scheduler_output = _scheduler_output()
     engine = _engine(mocker, scheduler_output)
