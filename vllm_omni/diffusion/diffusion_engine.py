@@ -442,6 +442,7 @@ class DiffusionEngine:
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
         self._queued_pipeline_batches: dict[str, _QueuedPipelineBatch] = {}
+        self._queued_pipeline_retired_ids: set[str] = set()
         self._queued_pipeline_epoch = 0
         set_update_callback = getattr(self.executor, "set_pipeline_update_callback", None)
         if callable(set_update_callback):
@@ -679,6 +680,8 @@ class DiffusionEngine:
                 # Worker can publish them after Engine ownership is retired;
                 # STEP_COMPLETED remains strict because it drives the Future.
                 if event.event_type is not PipelineEventType.STEP_COMPLETED:
+                    continue
+                if event.task.batch_id in getattr(self, "_queued_pipeline_retired_ids", set()):
                     continue
                 raise RuntimeError("Worker returned an event for an unknown queued pipeline task.")
             batch = self._queued_pipeline_batches[event.task.batch_id]
@@ -1069,6 +1072,10 @@ class DiffusionEngine:
             self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
             batch.scheduler_completed = True
         self._queued_pipeline_batches.pop(batch.task.batch_id, None)
+        retired_ids = getattr(self, "_queued_pipeline_retired_ids", None)
+        if retired_ids is None:
+            retired_ids = self._queued_pipeline_retired_ids = set()
+        retired_ids.add(batch.task.batch_id)
         self._authorize_waiting_queued_batches()
 
     def _cancel_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
