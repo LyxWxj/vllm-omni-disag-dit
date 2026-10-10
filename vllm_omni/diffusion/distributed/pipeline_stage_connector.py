@@ -13,10 +13,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-import torch
-
-from vllm_omni.diffusion.distributed.group_coordinator import TensorMetadata
-
 
 @dataclass(frozen=True)
 class PipelineMessage:
@@ -31,34 +27,9 @@ class PipelineEdgeKind(StrEnum):
     FEEDBACK = "feedback"
 
 
-def pipeline_payload_metadata(payload: dict[str, torch.Tensor | Any]) -> tuple[tuple[str, Any], ...]:
-    metadata: list[tuple[str, Any]] = []
-
-    def visit(values: dict[str, torch.Tensor | Any], prefix: str = "") -> None:
-        for key, value in values.items():
-            flattened_key = prefix + key
-            if isinstance(value, torch.Tensor):
-                metadata.append(
-                    (
-                        flattened_key,
-                        TensorMetadata(value.device.type, value.dtype, tuple(value.size())),
-                    )
-                )
-            elif isinstance(value, dict):
-                if not value:
-                    metadata.append((flattened_key, value))
-                else:
-                    visit(value, flattened_key + "%")
-            else:
-                metadata.append((flattened_key, value))
-
-    visit(payload)
-    return tuple(metadata)
-
-
 @dataclass(frozen=True)
 class PipelineTransferOffer:
-    """Metadata-only readiness offer for one directed PP transfer."""
+    """Readiness offer for one directed PP transfer."""
 
     batch_id: str
     step_index: int
@@ -66,7 +37,6 @@ class PipelineTransferOffer:
     edge_kind: PipelineEdgeKind
     src_rank: int
     dst_rank: int
-    payload_metadata: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.batch_id or self.step_index < 0 or self.epoch < 0:
@@ -332,11 +302,6 @@ class DistributedP2PTransport:
             offer.epoch,
         ):
             raise ValueError("pipeline message identity does not match its transfer grant")
-        if offer.payload_metadata and (
-            not isinstance(message.payload, dict)
-            or pipeline_payload_metadata(message.payload) != offer.payload_metadata
-        ):
-            raise ValueError("pipeline message metadata does not match its transfer grant")
 
 
 class PipelineStageConnector:

@@ -76,7 +76,6 @@ from vllm_omni.diffusion.distributed.pipeline_stage_connector import (
     PipelineTransferOffer,
     PipelineTransportProgress,
     TransferTicket,
-    pipeline_payload_metadata,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import (
@@ -1082,7 +1081,6 @@ class DiffusionWorker:
             edge_kind=edge_kind,
             src_rank=transport.src_rank,
             dst_rank=transport.dst_rank,
-            payload_metadata=pipeline_payload_metadata(message.payload),
         )
 
     def _cancelled_pipeline_message_context(
@@ -1284,13 +1282,13 @@ class DiffusionWorker:
                 tensors = getattr(output, "tensors", None)
                 if not isinstance(tensors, dict):
                     raise RuntimeError("first pipeline stage did not produce intermediate tensors")
-                offer = self._make_pipeline_transfer_offer(task, PipelineEdgeKind.ACTIVATION, tensors)
+                offer = self._make_pipeline_transfer_offer(task, PipelineEdgeKind.ACTIVATION)
                 self.reserve_pipeline_send(offer, tensors)
                 output = offer
             elif stage.spec.is_last:
                 if not isinstance(output, torch.Tensor):
                     raise RuntimeError("last pipeline stage did not produce latent feedback")
-                offer = self._make_pipeline_transfer_offer(task, PipelineEdgeKind.FEEDBACK, {"latents": output})
+                offer = self._make_pipeline_transfer_offer(task, PipelineEdgeKind.FEEDBACK)
                 self.reserve_pipeline_send(offer, {"latents": output})
                 output = offer
             if stage.spec.is_last:
@@ -1313,7 +1311,6 @@ class DiffusionWorker:
         self,
         task: PipelineTask,
         edge_kind: PipelineEdgeKind,
-        payload: dict[str, Any] | None = None,
     ) -> PipelineTransferOffer:
         connector = self._require_pipeline_connector(edge_kind)
         transport = connector.transport
@@ -1324,7 +1321,6 @@ class DiffusionWorker:
             edge_kind=edge_kind,
             src_rank=transport.src_rank,
             dst_rank=transport.dst_rank,
-            payload_metadata=() if payload is None else pipeline_payload_metadata(payload),
         )
 
     def complete_pipeline_feedback(
