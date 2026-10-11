@@ -1392,23 +1392,75 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             record_output_peak_memory=True,
         )
 
-    def execute_prepared_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Execute one step from request state prepared by queued admission."""
+    def execute_prepared_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        output_rank: int = 0,
+    ) -> BatchRunnerOutput:
+        """Execute a queued microbatch from request state prepared at admission."""
         request_ids = tuple(scheduler_output.scheduled_request_ids)
-        if len(request_ids) != 1:
-            raise ValueError("Prepared step execution requires exactly one scheduled request.")
-        state = self.state_cache.get(request_ids[0])
-        if state is None:
-            raise RuntimeError(f"Prepared step request {request_ids[0]!r} has no Worker state.")
-        input_batch = InputBatch.make_batch([state], cached_batch=None)
-        if input_batch is None:
-            raise RuntimeError("Prepared step execution produced no input batch.")
+        states = [self.state_cache.get(request_id) for request_id in request_ids]
+        if not request_ids or any(state is None for state in states):
+            missing = [request_id for request_id, state in zip(request_ids, states, strict=True) if state is None]
+            raise RuntimeError(f"Prepared step requests have no Worker state: {missing}")
+        states = cast(list[StepRequestState], states)
+        if int(getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)) <= 1:
+            input_batch = InputBatch.make_batch(states, cached_batch=None)
+            if input_batch is None:
+                raise RuntimeError("Prepared step execution produced no input batch.")
+        else:
+            input_batch = None
         return self._execute_stepwise_core(
             scheduler_output,
             record_output_peak_memory=True,
-            prepared_states=[state],
+            prepared_states=states,
             prepared_input_batch=input_batch,
+            output_rank=output_rank,
         )
+
+    def execute_prepared_decode(self, request_id: str) -> BatchRunnerOutput:
+        """Decode one completed queued request on the RPC-selected PP rank."""
+        pipeline = self.pipeline
+        assert pipeline is not None, "Model not loaded. Call load_model() first."
+        state = self.state_cache.get(request_id)
+        if state is None:
+            raise RuntimeError(f"Queued decode request {request_id!r} has no Worker state.")
+
+        from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_rank
+
+        try:
+            local_pp_rank = int(get_pipeline_parallel_rank())
+        except AssertionError:
+            local_pp_rank = 0
+        previous_decode_owner = getattr(pipeline, "_queued_pipeline_decode_owner", False)
+        if local_pp_rank != 0:
+            pipeline._queued_pipeline_decode_owner = True
+        try:
+            with self._pipeline_inference_context(), set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=self.od_config,
+                attn_metadata={},
+            ):
+                clear_pipeline_stage_durations(pipeline)
+                result = pipeline.post_decode(state, queued_pipeline=True)
+            if result is None:
+                raise RuntimeError(f"Queued decode request {request_id!r} produced no output.")
+            result = self._prepare_output_for_transport(result, state.sampling)
+            self._attach_stepwise_metadata(state, result)
+            self._maybe_send_stage_payload([state], [result])
+            return BatchRunnerOutput.from_list(
+                [
+                    RunnerOutput(
+                        request_id=request_id,
+                        step_index=state.step_index,
+                        finished=True,
+                        result=result,
+                    )
+                ]
+            )
+        finally:
+            if local_pp_rank != 0:
+                pipeline._queued_pipeline_decode_owner = previous_decode_owner
 
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""
@@ -1517,6 +1569,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         in_diffusion_kv_memory_profile: bool = False,
         prepared_states: list[StepRequestState] | None = None,
         prepared_input_batch: InputBatch | None = None,
+        output_rank: int | None = None,
     ) -> BatchRunnerOutput:
         """Run the denoise step after metadata admission and row installation."""
 
@@ -1525,6 +1578,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         with grad_context:
             pipeline = self.pipeline
             assert pipeline is not None, "Model not loaded. Call load_model() first."
+            queued_microbatches = (
+                prepared_states is not None
+                and int(getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)) > 1
+            )
             had_active_states = bool(self.state_cache)
             if prepared_states is None:
                 states, new_request_ids = self._update_states(scheduler_output)
@@ -1539,13 +1596,21 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 and current_omni_platform.is_available()
             ):
                 current_omni_platform.reset_peak_memory_stats()
-            if prepared_input_batch is None:
+            if queued_microbatches:
+                input_batch = None
+                runner_output_list = []
+            elif prepared_input_batch is None:
                 states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
             else:
                 input_batch = prepared_input_batch
                 runner_output_list = []
-            if input_batch is None:
+            if input_batch is None and not queued_microbatches:
                 return BatchRunnerOutput.from_list(runner_output_list)
+            row_counts = (
+                []
+                if queued_microbatches
+                else [state.latents.shape[0] if state.latents is not None else 0 for state in states]
+            )
             attn_metadata: dict[str, Any] = {}
 
             kv_backend = getattr(self, "diffusion_kv_backend", None)
@@ -1557,16 +1622,89 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 paged_kv_runtime=paged_kv_runtime,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
-                clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
-                denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
-                for state in states:
-                    merge_stage_durations(
-                        state,
-                        denoise_stage_durations,
+                def post_decode_request(req: StepRequestState) -> DiffusionOutput | None:
+                    """Decode one request while preserving the queued PP owner."""
+                    vae = getattr(pipeline, "vae", None)
+                    is_distributed_vae = bool(
+                        callable(getattr(vae, "is_distributed_enabled", None))
+                        and vae.is_distributed_enabled()
                     )
+                    from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_rank
+
+                    try:
+                        local_pp_rank = int(get_pipeline_parallel_rank())
+                    except AssertionError:
+                        local_pp_rank = 0
+                    should_decode_here = (
+                        output_rank is None
+                        or is_distributed_vae
+                        or local_pp_rank == output_rank
+                    )
+                    result = None
+                    if should_decode_here:
+                        clear_pipeline_stage_durations(pipeline)
+                        previous_decode_owner = getattr(pipeline, "_queued_pipeline_decode_owner", False)
+                        use_nonfirst_owner = (
+                            output_rank is not None and local_pp_rank == output_rank and output_rank != 0
+                        )
+                        if use_nonfirst_owner:
+                            pipeline._queued_pipeline_decode_owner = True
+                        try:
+                            result = pipeline.post_decode(
+                                req,
+                                queued_pipeline=queued_microbatches,
+                            )
+                        finally:
+                            if use_nonfirst_owner:
+                                pipeline._queued_pipeline_decode_owner = previous_decode_owner
+                    if result is not None:
+                        result = self._prepare_output_for_transport(result, req.sampling)
+                        self._attach_stepwise_metadata(req, result)
+                        if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
+                            pipe = cast(SupportsInteractionApply, pipeline)
+                            pipe.apply_interaction_at_chunk_boundary(req)
+                            pipe.prepare_next_chunk(req)
+                    return result
+
+                scheduler_errors: dict[str, Exception] = {}
+                if queued_microbatches:
+                    noise_pred = None
+                    queued_noise_preds: list[tuple[StepRequestState, torch.Tensor | None]] = []
+                    previous_async_send_mode = getattr(pipeline, "_queued_pipeline_async_sends", False)
+                    pipeline._queued_pipeline_async_sends = True
+                    try:
+                        for state in states:
+                            microbatch = InputBatch.make_batch([state], cached_batch=None)
+                            if microbatch is None or microbatch.latents is None:
+                                raise RuntimeError(f"Queued step request {state.request_id} produced no latent batch.")
+                            row_counts.append(microbatch.latents.shape[0])
+                            clear_pipeline_stage_durations(pipeline)
+                            req_noise_pred = pipeline.denoise_step(microbatch, states=[state])
+                            merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
+                            if getattr(pipeline, "interrupt", False):
+                                break
+                            # Do not resolve the previous request's feedback
+                            # before launching the next request's DiT work.
+                            # On rank 0, scheduler_step consumes the rank 1
+                            # latent feedback and otherwise creates a full
+                            # one-forward bubble between requests.
+                            queued_noise_preds.append((state, req_noise_pred))
+                        for state, req_noise_pred in queued_noise_preds:
+                            try:
+                                pipeline.step_scheduler(state, req_noise_pred)
+                            except Exception as exc:
+                                scheduler_errors[state.request_id] = exc
+                    finally:
+                        pipeline._queued_pipeline_async_sends = previous_async_send_mode
+                else:
+                    clear_pipeline_stage_durations(pipeline)
+                    noise_pred = pipeline.denoise_step(input_batch, states=states)
+                    denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
+                    for state in states:
+                        merge_stage_durations(state, denoise_stage_durations)
 
                 pipeline_interrupted = getattr(pipeline, "interrupt", False)
+
                 if noise_pred is None and pipeline_interrupted:
                     for state in states:
                         runner_output_list.append(
@@ -1580,34 +1718,32 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 else:
                     offset = 0
-                    for req in states:
+                    for req_index, req in enumerate(states):
                         if req.latents is None:
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
-                        row_num = req.latents.shape[0]
+                        row_num = row_counts[req_index]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            if not queued_microbatches:
+                                req_noise_pred = (
+                                    noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                )
+                                pipeline.step_scheduler(req, req_noise_pred)
+                            elif req.request_id in scheduler_errors:
+                                raise scheduler_errors[req.request_id]
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:
                                 should_decode = req.denoise_completed
 
                             if should_decode:
-                                clear_pipeline_stage_durations(pipeline)
-                                result = pipeline.post_decode(req)
-                                if result is not None:
-                                    result = self._prepare_output_for_transport(result, req.sampling)
-                                    self._attach_stepwise_metadata(
-                                        req,
-                                        result,
-                                    )
-                                    # After consuming this chunk's interaction metadata, apply pending interactions and
-                                    # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
-                                    if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
-                                        pipe = cast(SupportsInteractionApply, pipeline)
-                                        pipe.apply_interaction_at_chunk_boundary(req)
-                                        pipe.prepare_next_chunk(req)
+                                # Final queued decode is submitted by Engine as a
+                                # request-local RPC so different output owners can
+                                # decode on different PP ranks concurrently.
+                                result = (
+                                    None
+                                    if queued_microbatches and not self.od_config.streaming_output
+                                    else post_decode_request(req)
+                                )
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index
@@ -1645,7 +1781,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 )
                             )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
+                    if not queued_microbatches and noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."

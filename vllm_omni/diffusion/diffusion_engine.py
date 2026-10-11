@@ -243,6 +243,8 @@ class _QueuedPipelineBatch:
     request_prepared: bool = False
     request_cleanup_completed: bool = False
     step_future: concurrent.futures.Future[BaseRunnerOutput] | None = None
+    decode_future: concurrent.futures.Future[BaseRunnerOutput] | None = None
+    output_rank: int = 0
     native_output: BaseRunnerOutput | None = None
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
@@ -646,10 +648,13 @@ class DiffusionEngine:
         return scheduler_capacity + finalizing_batches
 
     def _queued_denoise_batch_count(self) -> int:
-        """Count active step Futures against the configured admission limit."""
-        return sum(
-            batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
-            for batch in self._queued_pipeline_batches.values()
+        """Count active execution Futures, each of which may carry a microbatch."""
+        return len(
+            {
+                id(batch.step_future)
+                for batch in self._queued_pipeline_batches.values()
+                if batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED and batch.step_future is not None
+            }
         )
 
     def _should_wait_for_queued_pipeline_update(self) -> bool:
@@ -670,6 +675,7 @@ class DiffusionEngine:
             batch.failure is not None
             or batch.abort_requested
             or (batch.step_future is not None and batch.step_future.done())
+            or (batch.decode_future is not None and batch.decode_future.done())
             for batch in self._queued_pipeline_batches.values()
         )
 
@@ -741,25 +747,79 @@ class DiffusionEngine:
             raise
 
     def _authorize_waiting_queued_batches(self) -> None:
-        """Enqueue prepared tasks in admission order as denoise slots open."""
+        """Submit Worker-local queued work as execution slots open.
+
+        A queued PP step is a sequence of request-local microbatches.  The
+        worker must receive the whole compatible sequence in one RPC so its
+        rank-local loop can advance request ``i + 1`` while the other PP rank
+        is finishing request ``i``.  Splitting this sequence at
+        ``max_num_seqs`` creates a Worker busy-loop boundary and removes that
+        overlap.  ``max_num_seqs`` still bounds scheduler admission; this
+        method only coalesces already-admitted, prepared state.
+        """
         available_slots = int(self.od_config.max_inflight_batches) - self._queued_denoise_batch_count()
         if available_slots <= 0:
             return
-        ordered = [
-            batch
-            for batch in self._queued_pipeline_batches.values()
-            if batch.phase is _QueuedPipelineBatchPhase.PREPARED
-        ]
-        for batch in ordered:
+
+        # Preserve FIFO while keeping requests with different step-batch
+        # compatibility keys in separate Worker commands.  The key lives in
+        # the Scheduler-owned state; queued descriptors themselves intentionally
+        # remain one-request records for commit/retirement bookkeeping.
+        groups: list[tuple[Any, list[_QueuedPipelineBatch]]] = []
+        for batch in self._queued_pipeline_batches.values():
+            if batch.phase is not _QueuedPipelineBatchPhase.PREPARED:
+                continue
+            state = self.scheduler.get_request_state(batch.request_id)
+            compatibility_key = getattr(state, "sampling_params_key", None)
+            for group_key, group in groups:
+                if compatibility_key == group_key:
+                    group.append(batch)
+                    break
+            else:
+                groups.append((compatibility_key, [batch]))
+
+        for _compatibility_key, group in groups:
             if available_slots <= 0:
                 break
-            future = self.executor.execute_step(batch.scheduler_output, non_block=True)
+            new_reqs = [request for batch in group for request in batch.scheduler_output.scheduled_new_reqs]
+            cached_ids = [
+                request_id
+                for batch in group
+                for request_id in batch.scheduler_output.scheduled_cached_reqs.request_ids
+            ]
+            # ``finished_req_ids`` belongs to the scheduler cycle that
+            # produced the first descriptor.  It must not retire a state from
+            # another cycle that was coalesced into this Worker-local queue.
+            scheduler_output = dataclasses.replace(
+                group[0].scheduler_output,
+                scheduled_new_reqs=new_reqs,
+                scheduled_cached_reqs=CachedRequestData(request_ids=cached_ids),
+                finished_req_ids=set(),
+            )
+            output_ranks = [self._next_queued_pipeline_output_rank() for _ in group]
+            future = self.executor.execute_step(
+                scheduler_output,
+                non_block=True,
+                output_rank=output_ranks[0],
+            )
             if not isinstance(future, concurrent.futures.Future):
                 raise RuntimeError("Queued execution requires a non-blocking step Future.")
-            batch.step_future = future
             future.add_done_callback(lambda _future: self._notify_queued_pipeline_update())
-            batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
+            for batch, output_rank in zip(group, output_ranks, strict=True):
+                batch.step_future = future
+                batch.output_rank = output_rank
+                batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
             available_slots -= 1
+
+    def _next_queued_pipeline_output_rank(self) -> int:
+        parallel = getattr(self.od_config, "parallel_config", None)
+        pp_size = max(int(getattr(parallel, "pipeline_parallel_size", 1)), 1)
+        if int(getattr(parallel, "vae_patch_parallel_size", 1)) > 1:
+            return 0
+        previous = getattr(self, "_queued_pipeline_last_output_rank", pp_size - 1)
+        rank = (previous + 1) % pp_size
+        self._queued_pipeline_last_output_rank = rank
+        return rank
 
     def _commit_queued_pipeline_step(self, batch: _QueuedPipelineBatch) -> frozenset[str]:
         if self._queued_pipeline_batches.get(batch.batch_id) is not batch:
@@ -791,17 +851,34 @@ class DiffusionEngine:
             batch.phase = _QueuedPipelineBatchPhase.FAILED
             raise
 
-    def _finalize_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput:
+    def _finalize_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput | None:
         if batch.phase is not _QueuedPipelineBatchPhase.FINALIZING:
             raise RuntimeError("Queued pipeline batch is not ready for final decode.")
         if batch.decoded_output is not None:
             return batch.decoded_output
-        output = batch.native_output
-        if output is None:
-            raise RuntimeError("Final queued step has no Worker output.")
+        if batch.native_output is not None:
+            native_request = batch.native_output.get_request_output(batch.request_id)
+            if native_request is not None and native_request.result is not None:
+                batch.decoded_output = batch.native_output
+                return batch.native_output
+        if batch.decode_future is None:
+            batch.decode_future = self.executor.execute_decode(
+                batch.request_id,
+                output_rank=batch.output_rank,
+                non_block=True,
+            )
+            if not isinstance(batch.decode_future, concurrent.futures.Future):
+                raise RuntimeError("Queued decode requires a non-blocking Worker Future.")
+            batch.decode_future.add_done_callback(lambda _future: self._notify_queued_pipeline_update())
+            return None
+        if not batch.decode_future.done():
+            return None
+        output = batch.decode_future.result()
+        if not isinstance(output, BaseRunnerOutput):
+            raise RuntimeError(f"Queued decode returned {type(output)!r}, expected BaseRunnerOutput")
         finished = output.get_request_output(batch.request_id)
         if finished is None or finished.result is None or finished.result.error is not None:
-            raise RuntimeError("Native queued step returned an unsuccessful final output.")
+            raise RuntimeError("Queued decode returned an unsuccessful final output.")
         batch.decoded_output = output
         return output
 
@@ -836,12 +913,13 @@ class DiffusionEngine:
             raise ValueError("Queued pipeline batch is not owned by this Engine.")
         if batch.cancelled:
             return
-        if batch.step_future is not None and not batch.step_future.done():
-            try:
-                batch.step_future.result()
-            except BaseException:
-                if not (batch.abort_requested or batch.failure is not None):
-                    raise
+        for future in (batch.step_future, batch.decode_future):
+            if future is not None and not future.done():
+                try:
+                    future.result()
+                except BaseException:
+                    if not (batch.abort_requested or batch.failure is not None):
+                        raise
         if batch.request_prepared and not batch.request_cleanup_completed:
             cleanup = self.executor.cleanup_finalized_pipeline_request(batch.request_id)
             if not isinstance(cleanup, list) or len(cleanup) != self.od_config.num_gpus or not all(cleanup):
@@ -878,6 +956,8 @@ class DiffusionEngine:
             if batch.phase is _QueuedPipelineBatchPhase.FINALIZING
             else None
         )
+        if batch.phase is _QueuedPipelineBatchPhase.FINALIZING and output is None:
+            return None
         if batch.phase in {
             _QueuedPipelineBatchPhase.STEP_COMMITTED,
             _QueuedPipelineBatchPhase.FINALIZING,
@@ -1168,7 +1248,8 @@ class DiffusionEngine:
                             and self.abort_queue.empty()
                             and not self.scheduler.has_requests()
                             and not any(
-                                batch.step_future is not None and batch.step_future.done()
+                                (batch.step_future is not None and batch.step_future.done())
+                                or (batch.decode_future is not None and batch.decode_future.done())
                                 for batch in self._queued_pipeline_batches.values()
                             )
                         ):

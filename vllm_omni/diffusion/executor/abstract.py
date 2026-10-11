@@ -118,9 +118,19 @@ class DiffusionExecutor(ABC):
         self,
         scheduler_output: DiffusionSchedulerOutput,
         non_block: bool = False,
+        output_rank: int = 0,
     ) -> BaseRunnerOutput | Any:
         """Execute step-mode work from a scheduler output."""
         pass
+
+    def execute_decode(
+        self,
+        request_id: str,
+        output_rank: int = 0,
+        non_block: bool = False,
+    ) -> BaseRunnerOutput | Any:
+        """Decode one queued request on its assigned output rank."""
+        raise NotImplementedError("request-local queued decode is only supported by the multiprocess executor")
 
     @abstractmethod
     def collective_rpc(

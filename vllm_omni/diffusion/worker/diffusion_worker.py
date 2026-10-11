@@ -715,14 +715,29 @@ class DiffusionWorker:
             profiler.step()
         return output
 
-    def execute_prepared_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+    def execute_prepared_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        output_rank: int = 0,
+    ) -> BaseRunnerOutput:
         """Execute one queued step from request state prepared by admission."""
         assert self.model_runner is not None, "Model runner not initialized"
         self._activate_step_lora(scheduler_output)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_prepared_stepwise(scheduler_output)
+            output = self.model_runner.execute_prepared_stepwise(scheduler_output, output_rank=output_rank)
+        if profiler:
+            profiler.step()
+        return output
+
+    def execute_prepared_decode(self, request_id: str) -> BaseRunnerOutput:
+        """Decode one prepared queued request on the RPC-selected rank."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_decode") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_prepared_decode(request_id)
         if profiler:
             profiler.step()
         return output
@@ -1780,8 +1795,15 @@ class WorkerWrapperBase:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
 
-    def execute_prepared_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        return self.worker.execute_prepared_stepwise(scheduler_output)
+    def execute_prepared_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        output_rank: int = 0,
+    ) -> BaseRunnerOutput:
+        return self.worker.execute_prepared_stepwise(scheduler_output, output_rank=output_rank)
+
+    def execute_prepared_decode(self, request_id: str) -> BaseRunnerOutput:
+        return self.worker.execute_prepared_decode(request_id)
 
     def sleep(self, level: int = 1) -> int:
         """

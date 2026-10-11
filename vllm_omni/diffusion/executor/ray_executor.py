@@ -676,7 +676,12 @@ class RayDiffusionExecutor(DiffusionExecutor):
             raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
         return result
 
-    def execute_step(self, scheduler_output: DiffusionSchedulerOutput, non_block: bool = False) -> BaseRunnerOutput:
+    def execute_step(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        non_block: bool = False,
+        output_rank: int = 0,
+    ) -> BaseRunnerOutput:
         if non_block:
             raise NotImplementedError("non-blocking queued PP is only supported by the multiprocess executor")
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -685,7 +690,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         result = self.collective_rpc(
             "execute_stepwise",
             args=(scheduler_output,),
-            unique_reply_rank=0,
+            unique_reply_rank=output_rank,
             exec_all_ranks=True,
         )
         if not isinstance(result, BaseRunnerOutput):

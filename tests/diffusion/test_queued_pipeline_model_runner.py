@@ -20,6 +20,7 @@ class _QueuedPipeline:
         self.prepare_calls = 0
         self.denoise_calls = 0
         self.scheduler_calls = 0
+        self.events = []
         self.forward_context_seen = None
         self.scheduler_forward_context_seen = None
 
@@ -28,16 +29,22 @@ class _QueuedPipeline:
         self.prepare_calls += 1
 
     def denoise_step(self, input_batch, **kwargs):
-        del input_batch, kwargs
+        del input_batch
         self.denoise_calls += 1
+        states = kwargs.get("states")
+        if states:
+            self.events.append(("denoise", states[0].request_id))
         raise AssertionError("queued preparation must not denoise")
 
     def step_scheduler(self, state, noise_pred) -> None:
         del state, noise_pred
 
     def post_decode(self, state, **kwargs):
-        del state, kwargs
-        return None
+        del kwargs
+        self.events.append(("decode", state.request_id))
+        from vllm_omni.diffusion.data import DiffusionOutput
+
+        return DiffusionOutput()
 
 def _state(request_id: str = "req-a") -> StepRequestState:
     state = StepRequestState(
@@ -127,6 +134,66 @@ def test_execute_prepared_stepwise_uses_request_local_batch_and_advances_state(m
     assert runner.state_cache[state.request_id] is state
     update_states_after.assert_not_called()
     runner.pipeline.denoise_step.assert_called_once()
+
+
+def test_execute_prepared_stepwise_sends_one_microbatch_per_pipeline_request(mocker) -> None:
+    runner = _runner()
+    runner.od_config.parallel_config.pipeline_parallel_size = 2
+    states = [_state("req-a"), _state("req-b")]
+    for state in states:
+        state.timesteps = torch.tensor([2.0])
+    runner.state_cache = {state.request_id: state for state in states}
+    runner.od_config.streaming_output = False
+    runner.od_config.diffusion_kv_mode = None
+    runner._sample_peak_memory_mb = mocker.Mock(return_value=0.0)
+    runner.pipeline.denoise_step = mocker.Mock(
+        side_effect=lambda _batch, states: (
+            runner.pipeline.events.append(("denoise", states[0].request_id))
+            or torch.ones_like(states[0].latents)
+        )
+    )
+
+    def step_scheduler(state, noise_pred):
+        runner.pipeline.events.append(("scheduler", state.request_id))
+        state.latents = state.latents + noise_pred
+        state.step_index += 1
+
+    runner.pipeline.step_scheduler = step_scheduler
+    scheduler_output = SimpleNamespace(
+        scheduled_request_ids=["req-a", "req-b"],
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=["req-a", "req-b"]),
+        finished_req_ids=set(),
+    )
+
+    result = runner.execute_prepared_stepwise(scheduler_output)
+
+    assert runner.pipeline.denoise_step.call_count == 2
+    assert all(result.get_request_output(state.request_id) is not None for state in states)
+    assert all(state.step_index == 1 for state in states)
+    for state in states:
+        torch.testing.assert_close(state.latents, torch.ones_like(state.latents))
+    assert runner.pipeline.events == [
+        ("denoise", "req-a"),
+        ("denoise", "req-b"),
+        ("scheduler", "req-a"),
+        ("scheduler", "req-b"),
+    ]
+
+
+def test_execute_prepared_decode_runs_after_queued_denoise(mocker) -> None:
+    runner = _runner()
+    state = _state("req-a")
+    state.step_index = state.total_steps
+    runner.state_cache = {state.request_id: state}
+    runner.od_config.diffusion_kv_mode = None
+    runner._sample_peak_memory_mb = mocker.Mock(return_value=0.0)
+
+    result = runner.execute_prepared_decode(state.request_id)
+
+    output = result.get_request_output(state.request_id)
+    assert output is not None and output.finished and output.result is not None
+    assert runner.pipeline.events == [("decode", "req-a")]
 
 
 def test_prepare_pipeline_requests_rolls_back_local_state_failure(mocker) -> None:

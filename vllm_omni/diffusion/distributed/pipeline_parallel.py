@@ -175,10 +175,29 @@ class PipelineParallelMixin:
         from the last iteration are completed before any subsequent
         collective (e.g. VAE decode broadcast) or tensor reuse.
         """
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        for handle in self._pp_send_work:
+            handle.wait()
+        self._pp_send_work = []
+        self._pp_send_tensors = []
+
+    def _prune_queued_latent_sends(self) -> None:
+        pending_work = self._pp_send_work
+        pending_tensors = getattr(self, "_pp_send_tensors", [])
+        active_work = []
+        active_tensors = []
+        for index, work in enumerate(pending_work):
+            if work.is_completed():
+                continue
+            active_work.append(work)
+            if index < len(pending_tensors):
+                active_tensors.append(pending_tensors[index])
+        self._pp_send_work = active_work
+        self._pp_send_tensors = active_tensors
+
+    def _queued_latent_template(self, latents: torch.Tensor | AsyncLatents) -> torch.Tensor:
+        if isinstance(latents, AsyncLatents):
+            return latents._tensor_dict["latents"]
+        return latents
 
     def predict_noise_maybe_with_cfg(
         self,
@@ -209,7 +228,11 @@ class PipelineParallelMixin:
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
 
-        self._sync_pp_send()
+        queued_async = getattr(self, "_queued_pipeline_async_sends", False)
+        if queued_async:
+            self._prune_queued_latent_sends()
+        else:
+            self._sync_pp_send()
 
         pp_group = get_pp_group()
 
@@ -232,7 +255,9 @@ class PipelineParallelMixin:
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for kwargs, it in zip(all_kwargs, its):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
-                self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
+                activation_work = pp_group.isend_tensor_dict(result.tensors)
+                if not queued_async:
+                    self._pp_send_work.extend(activation_work)
             return None
 
         # Last rank: run full forward
@@ -289,7 +314,26 @@ class PipelineParallelMixin:
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
-            self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
+            if getattr(self, "_queued_pipeline_async_sends", False):
+                handle = torch.distributed.isend(
+                    latents,
+                    dst=pp_group.ranks[0],
+                    group=pp_group.device_group,
+                )
+                self._pp_send_work.append(handle)
+                self._pp_send_tensors = [*getattr(self, "_pp_send_tensors", []), latents]
+            else:
+                self._pp_send_work.extend(pp_group.isend_tensor_dict({"latents": latents}, dst=0))
         elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
+            if getattr(self, "_queued_pipeline_async_sends", False):
+                template = self._queued_latent_template(latents)
+                received = torch.empty_like(template)
+                handle = torch.distributed.irecv(
+                    received,
+                    src=pp_group.ranks[-1],
+                    group=pp_group.device_group,
+                )
+                latents = AsyncLatents({"latents": received}, [handle], [])
+            else:
+                latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
         return latents

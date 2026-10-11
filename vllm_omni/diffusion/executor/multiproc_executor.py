@@ -736,6 +736,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self,
         scheduler_output: DiffusionSchedulerOutput,
         non_block: bool = False,
+        output_rank: int = 0,
     ) -> BaseRunnerOutput | concurrent.futures.Future[BaseRunnerOutput]:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -744,8 +745,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if non_block:
             return self._collective_rpc_future(
                 "execute_prepared_stepwise",
-                args=(scheduler_output,),
-                unique_reply_rank=0,
+                args=(scheduler_output, output_rank),
+                unique_reply_rank=output_rank,
                 exec_all_ranks=True,
             )
         try:
@@ -753,7 +754,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 "execute_stepwise",
                 timeout=_DLO_DP_WAVE_TIMEOUT_S,
                 args=(scheduler_output,),
-                unique_reply_rank=0,
+                unique_reply_rank=output_rank,
                 exec_all_ranks=True,
             )
         except TimeoutError as exc:
@@ -763,6 +764,33 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if isinstance(result, BaseRunnerOutput):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+
+    def execute_decode(
+        self,
+        request_id: str,
+        output_rank: int = 0,
+        non_block: bool = False,
+    ) -> BaseRunnerOutput | concurrent.futures.Future[BaseRunnerOutput]:
+        """Decode one queued request on its assigned PP output rank."""
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+        self._ensure_open()
+        if non_block:
+            return self._collective_rpc_future(
+                "execute_prepared_decode",
+                args=(request_id,),
+                unique_reply_rank=output_rank,
+                exec_all_ranks=False,
+            )
+        result = self.collective_rpc(
+            "execute_prepared_decode",
+            args=(request_id,),
+            unique_reply_rank=output_rank,
+            exec_all_ranks=False,
+        )
+        if isinstance(result, BaseRunnerOutput):
+            return result
+        raise RuntimeError(f"Unexpected response type for execute_decode: {type(result)!r}")
 
     def _collective_rpc_future(
         self,
