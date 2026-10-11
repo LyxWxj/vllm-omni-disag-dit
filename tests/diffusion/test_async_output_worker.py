@@ -178,6 +178,24 @@ class TestReturnResultAsyncPath:
 class TestReturnResultSyncPath:
     """Test _return_result in step-execution mode (sync)."""
 
+    def test_non_block_step_result_uses_async_output_thread(self, mocker):
+        proc = _make_worker_proc(step_execution=True)
+        proc._async_output_queue = queue.Queue()
+        mock_platform = mocker.MagicMock()
+        mock_platform.record_device_event.return_value = MagicMock()
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform",
+            mock_platform,
+        )
+        output = BatchRunnerOutput(runner_outputs=[RunnerOutput(request_id="req", finished=True)])
+
+        proc._return_result(output, rpc_id="rpc-1")
+
+        assert proc._async_output_pending == 1
+        item = proc._async_output_queue.get_nowait()
+        assert item == (output, "rpc-1", mock_platform.record_device_event.return_value, AsyncOutputKind.RPC_RESULT)
+        proc.result_mq.enqueue.assert_not_called()
+
     def test_diffusion_output_uses_sync_path_when_step_execution(self, mocker):
         """In step_execution mode, DiffusionOutput goes through sync SHM pack."""
         proc = _make_worker_proc(step_execution=True)
@@ -312,6 +330,26 @@ class TestAsyncOutputLoopLogic:
             for c in proc.result_mq.enqueue.call_args_list
         )
         assert output_ready_enqueued, "Expected OUTPUT_READY with async_output_id='abc123' in enqueue calls"
+
+    def test_non_block_rpc_result_keeps_rpc_id_and_packed_result(self, mocker):
+        proc = _make_worker_proc(step_execution=True)
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
+        mock_torch = mocker.MagicMock()
+        mock_torch.Stream.return_value = mocker.MagicMock()
+        mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+        mock_torch.device.return_value = mocker.MagicMock()
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
+        output = BatchRunnerOutput(runner_outputs=[RunnerOutput(request_id="req", finished=True)])
+        proc._async_output_queue.put((output, "rpc-2", None, AsyncOutputKind.RPC_RESULT))
+        proc._async_output_queue.put(None)
+
+        proc._async_output_loop()
+
+        message = proc.result_mq.enqueue.call_args.args[0]
+        assert message.kind is AsyncOutputKind.RPC_RESULT
+        assert message.rpc_id == "rpc-2"
+        assert message.result is output
+        assert proc._async_output_pending == 0
 
     def test_late_field_failure_sends_error_without_partial_payload_or_shm_leak(
         self,

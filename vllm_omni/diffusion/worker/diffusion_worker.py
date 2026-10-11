@@ -2112,6 +2112,12 @@ class WorkerProc:
             return
 
         if rpc_id is not None:
+            if self._async_output_queue is not None:
+                gpu_event = current_omni_platform.record_device_event()
+                with self._async_output_done:
+                    self._async_output_pending += 1
+                self._async_output_queue.put((output, rpc_id, gpu_event, AsyncOutputKind.RPC_RESULT))
+                return
             try:
                 pack_diffusion_output_shm(output)
             except (TypeError, ValueError):
@@ -2173,9 +2179,14 @@ class WorkerProc:
                 self._enqueue_result(
                     AsyncDiffusionOutput(
                         kind=output_kind,
+                        rpc_id=async_output_id if output_kind is AsyncOutputKind.RPC_RESULT else None,
                         async_output_id=async_output_id,
                         output=output if output_kind is AsyncOutputKind.OUTPUT_READY else None,
-                        result=output if output_kind is AsyncOutputKind.PIPELINE_FINALIZED else None,
+                        result=(
+                            output
+                            if output_kind in {AsyncOutputKind.RPC_RESULT, AsyncOutputKind.PIPELINE_FINALIZED}
+                            else None
+                        ),
                     )
                 )
             except Exception:
