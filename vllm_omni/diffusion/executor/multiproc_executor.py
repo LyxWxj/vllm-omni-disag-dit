@@ -1009,7 +1009,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         )
 
     def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
-        if self._pipeline_stage_ranks is None:
+        if self._pipeline_stage_ranks is None and not getattr(self, "supports_native_pipeline_async", False):
             raise RuntimeError("pipeline stage ranks are not initialized")
         expected_request_ids = tuple(request.request_id for request in scheduler_output.scheduled_new_reqs)
         expected_request_ids += tuple(
@@ -1021,7 +1021,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             result = self._queued_control_rpc("prepare_pipeline_requests_all_ranks", args=(scheduler_output,))
             return normalize_pipeline_preparation_reports(
                 result,
-                frozenset(self._pipeline_stage_ranks.values()),
+                frozenset(
+                    range(self.od_config.num_gpus)
+                    if getattr(self, "supports_native_pipeline_async", False)
+                    else self._pipeline_stage_ranks.values()
+                ),
                 expected_request_ids,
             )
         except BaseException as exc:
