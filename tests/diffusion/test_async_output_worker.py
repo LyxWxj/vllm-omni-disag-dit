@@ -333,6 +333,7 @@ class TestAsyncOutputLoopLogic:
 
     def test_non_block_rpc_result_keeps_rpc_id_and_packed_result(self, mocker):
         proc = _make_worker_proc(step_execution=True)
+        proc._async_output_queue = queue.Queue()
         mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
         mock_torch = mocker.MagicMock()
         mock_torch.Stream.return_value = mocker.MagicMock()
