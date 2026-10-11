@@ -1669,7 +1669,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 scheduler_errors: dict[str, Exception] = {}
                 if queued_microbatches:
                     noise_pred = None
-                    queued_noise_preds: list[tuple[StepRequestState, torch.Tensor | None]] = []
                     previous_async_send_mode = getattr(pipeline, "_queued_pipeline_async_sends", False)
                     pipeline._queued_pipeline_async_sends = True
                     try:
@@ -1683,14 +1682,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
                             if getattr(pipeline, "interrupt", False):
                                 break
-                            # Do not resolve the previous request's feedback
-                            # before launching the next request's DiT work.
-                            # On rank 0, scheduler_step consumes the rank 1
-                            # latent feedback and otherwise creates a full
-                            # one-forward bubble between requests.
-                            queued_noise_preds.append((state, req_noise_pred))
-                        for state, req_noise_pred in queued_noise_preds:
                             try:
+                                # Both ranks advance this request immediately.
+                                # Rank 1 posts feedback on the reverse PP2
+                                # communicator; rank 0 keeps the receive lazy,
+                                # so this call does not wait for feedback from
+                                # the same denoise step.
                                 pipeline.step_scheduler(state, req_noise_pred)
                             except Exception as exc:
                                 scheduler_errors[state.request_id] = exc

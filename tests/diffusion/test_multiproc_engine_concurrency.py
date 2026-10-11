@@ -235,7 +235,7 @@ class TestStepModeTimeout:
         assert result is future
         executor._collective_rpc_future.assert_called_once_with(
             "execute_prepared_stepwise",
-            args=(scheduler_output,),
+            args=(scheduler_output, 0),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )

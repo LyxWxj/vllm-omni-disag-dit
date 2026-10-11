@@ -737,6 +737,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_output: DiffusionSchedulerOutput,
         non_block: bool = False,
         output_rank: int = 0,
+        reply_rank: int | None = None,
     ) -> BaseRunnerOutput | concurrent.futures.Future[BaseRunnerOutput]:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -746,7 +747,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return self._collective_rpc_future(
                 "execute_prepared_stepwise",
                 args=(scheduler_output, output_rank),
-                unique_reply_rank=output_rank,
+                unique_reply_rank=output_rank if reply_rank is None else reply_rank,
                 exec_all_ranks=True,
             )
         try:
@@ -754,7 +755,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 "execute_stepwise",
                 timeout=_DLO_DP_WAVE_TIMEOUT_S,
                 args=(scheduler_output,),
-                unique_reply_rank=output_rank,
+                unique_reply_rank=output_rank if reply_rank is None else reply_rank,
                 exec_all_ranks=True,
             )
         except TimeoutError as exc:

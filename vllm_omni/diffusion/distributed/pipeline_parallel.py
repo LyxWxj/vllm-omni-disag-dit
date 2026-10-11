@@ -199,6 +199,16 @@ class PipelineParallelMixin:
             return latents._tensor_dict["latents"]
         return latents
 
+    @staticmethod
+    def _queued_feedback_device_group(pp_group: Any) -> Any:
+        """Return the PP2 reverse edge group used by latent feedback."""
+        direction_groups = getattr(pp_group, "device_groups", None)
+        if pp_group.world_size == 2 and direction_groups:
+            # PipelineGroupCoordinator creates device_groups[0] for 0->1
+            # activation traffic and device_groups[1] for 1->0 feedback.
+            return direction_groups[1]
+        return pp_group.device_group
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -315,10 +325,11 @@ class PipelineParallelMixin:
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
             if getattr(self, "_queued_pipeline_async_sends", False):
+                feedback_group = self._queued_feedback_device_group(pp_group)
                 handle = torch.distributed.isend(
                     latents,
                     dst=pp_group.ranks[0],
-                    group=pp_group.device_group,
+                    group=feedback_group,
                 )
                 self._pp_send_work.append(handle)
                 self._pp_send_tensors = [*getattr(self, "_pp_send_tensors", []), latents]
@@ -328,11 +339,35 @@ class PipelineParallelMixin:
             if getattr(self, "_queued_pipeline_async_sends", False):
                 template = self._queued_latent_template(latents)
                 received = torch.empty_like(template)
-                handle = torch.distributed.irecv(
-                    received,
-                    src=pp_group.ranks[-1],
-                    group=pp_group.device_group,
-                )
+                feedback_group = self._queued_feedback_device_group(pp_group)
+                if received.is_cuda and pp_group.world_size == 2:
+                    # NCCL enqueues work on its own stream, ordered after the
+                    # caller stream. Keep feedback receives off the compute
+                    # stream: otherwise the output-ready event or a later
+                    # request's GPU work can inherit all four receives.
+                    stream = getattr(self, "_queued_feedback_recv_stream", None)
+                    if stream is None:
+                        stream = torch.cuda.Stream(device=received.device)
+                        self._queued_feedback_recv_stream = stream
+                    # The new buffer may come from the compute stream's
+                    # allocator cache. Order the side-stream write after its
+                    # previous use, without making compute wait on receive.
+                    stream.wait_stream(torch.cuda.current_stream(received.device))
+                    with torch.cuda.stream(stream):
+                        handle = torch.distributed.irecv(
+                            received,
+                            src=pp_group.ranks[-1],
+                            group=feedback_group,
+                        )
+                        received.record_stream(stream)
+                else:
+                    handle = torch.distributed.irecv(
+                        received,
+                        src=pp_group.ranks[-1],
+                        group=feedback_group,
+                    )
+                # AsyncLatents.wait() installs the dependency on the stream
+                # that actually consumes this request, including VAE decode.
                 latents = AsyncLatents({"latents": received}, [handle], [])
             else:
                 latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))

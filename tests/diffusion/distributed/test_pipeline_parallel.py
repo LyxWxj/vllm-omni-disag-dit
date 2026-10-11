@@ -9,6 +9,7 @@ real multi-GPU NCCL collectives.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -129,6 +130,57 @@ def test_pipeline_tensor_dict_pp2_groups_follow_source_rank() -> None:
 
     assert coordinator._tensor_dict_comm_groups(0) == ("device-0-1", "cpu-0-1")
     assert coordinator._tensor_dict_comm_groups(1) == ("device-1-0", "cpu-1-0")
+
+
+def test_queued_feedback_uses_reverse_pp2_group() -> None:
+    coordinator = object.__new__(PipelineGroupCoordinator)
+    coordinator.world_size = 2
+    coordinator.device_group = "device-0-1"
+    coordinator.device_groups = ["device-0-1", "device-1-0"]
+
+    assert PipelineParallelMixin._queued_feedback_device_group(coordinator) == "device-1-0"
+
+
+@pytest.mark.cpu
+def test_queued_receive_uses_side_stream_and_waits_only_when_consumed(mocker) -> None:
+    class Pipeline(PipelineParallelMixin, CFGParallelMixin):
+        pass
+
+    pipeline = Pipeline()
+    pipeline._queued_pipeline_async_sends = True
+    group = SimpleNamespace(
+        world_size=2,
+        is_first_rank=True,
+        is_last_rank=False,
+        ranks=[2, 3],
+        device_groups=["activation", "feedback"],
+        device_group="activation",
+    )
+    mocker.patch.object(pp_module, "get_pp_group", return_value=group)
+    mocker.patch.object(pp_module, "get_pipeline_parallel_world_size", return_value=2)
+    received = SimpleNamespace(is_cuda=True, device=torch.device("cuda:0"), record_stream=mocker.Mock())
+    mocker.patch.object(torch, "empty_like", return_value=received)
+    stream = mocker.Mock()
+    compute_stream = mocker.Mock()
+    mocker.patch.object(torch.cuda, "current_stream", return_value=compute_stream)
+    create_stream = mocker.patch.object(torch.cuda, "Stream", return_value=stream)
+    stream_context = mocker.MagicMock()
+    select_stream = mocker.patch.object(torch.cuda, "stream", return_value=stream_context)
+    work = mocker.Mock()
+    recv = mocker.patch.object(torch.distributed, "irecv", return_value=work)
+
+    pending = pipeline.scheduler_step_maybe_with_cfg(None, torch.tensor(1), torch.zeros(1), False)
+
+    recv.assert_called_once_with(received, src=3, group="feedback")
+    select_stream.assert_called_once_with(stream)
+    stream.wait_stream.assert_called_once_with(compute_stream)
+    stream_context.__enter__.assert_called_once()
+    received.record_stream.assert_called_once_with(stream)
+    work.wait.assert_not_called()
+    assert pending.resolve() is received
+    work.wait.assert_called_once()
+    pipeline.scheduler_step_maybe_with_cfg(None, torch.tensor(1), torch.zeros(1), False)
+    create_stream.assert_called_once()
 
 
 class SimpleScheduler:

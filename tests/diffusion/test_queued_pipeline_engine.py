@@ -149,6 +149,7 @@ def test_scheduler_cycle_requests_rotate_decode_owners(mocker) -> None:
 def test_prepared_compatible_cycles_share_one_worker_future(mocker) -> None:
     scheduler_outputs = [_scheduler_output(request_id) for request_id in ("req-a", "req-b", "req-c")]
     engine = _engine(mocker, scheduler_outputs[0])
+    engine.scheduler.max_num_running_reqs = 3
     future = Future()
     engine.executor.execute_step.return_value = future
     batches = [
@@ -166,12 +167,68 @@ def test_prepared_compatible_cycles_share_one_worker_future(mocker) -> None:
     assert all(batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED for batch in batches)
 
 
+def test_shared_wave_waits_for_all_commits_before_authorizing_next_wave(mocker) -> None:
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=7,
+        scheduled_new_reqs=[
+            _scheduler_output("req-a").scheduled_new_reqs[0],
+            _scheduler_output("req-b").scheduled_new_reqs[0],
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+    engine = _engine(mocker, scheduler_output)
+    batches = [
+        engine._submit_queued_pipeline_batch(task, authorize=False)
+        for task in engine._split_queued_scheduler_output(scheduler_output)
+    ]
+    future = Future()
+    for batch in batches:
+        batch.step_future = future
+        batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
+    authorize = mocker.patch.object(engine, "_authorize_waiting_queued_batches")
+
+    engine._commit_queued_pipeline_step(batches[0])
+    authorize.assert_not_called()
+    engine._commit_queued_pipeline_step(batches[1])
+    authorize.assert_called_once()
+
+
+def test_future_ready_mid_iteration_commits_whole_wave_before_next_schedule(mocker) -> None:
+    output = _scheduler_output("req-a")
+    output.scheduled_new_reqs.append(_scheduler_output("req-b").scheduled_new_reqs[0])
+    engine = _engine(mocker, output)
+    future = Future()
+    engine.executor.execute_step.return_value = future
+    batches = [
+        engine._submit_queued_pipeline_batch(task, authorize=False)
+        for task in engine._split_queued_scheduler_output(output)
+    ]
+    engine._authorize_waiting_queued_batches()
+
+    # Engine has already visited A when the Future becomes ready at B.
+    assert engine._advance_queued_pipeline_batch(batches[0]) is None
+    future.set_result(BatchRunnerOutput.from_list([
+        RunnerOutput(request_id="req-a", step_index=1),
+        RunnerOutput(request_id="req-b", step_index=1),
+    ]))
+    engine._advance_queued_pipeline_batch(batches[1])
+
+    assert engine.scheduler.commit_pipeline_step.call_count == 2
+    assert batches[0].phase is _QueuedPipelineBatchPhase.STEP_COMMITTED
+    assert engine._queued_pipeline_can_advance_without_schedule()
+    engine._advance_queued_pipeline_batch(batches[0])
+    assert not engine._queued_pipeline_batches
+
+
 def test_prepared_incompatible_cycles_keep_separate_worker_futures(mocker) -> None:
     scheduler_outputs = [_scheduler_output(request_id) for request_id in ("req-a", "req-b")]
     engine = _engine(mocker, scheduler_outputs[0])
     keys = {request_id: object() for request_id in ("req-a", "req-b")}
     engine.scheduler.get_request_state.side_effect = lambda request_id: SimpleNamespace(
-        req=SimpleNamespace(request_id=request_id),
+        req=_scheduler_output(request_id).scheduled_new_reqs[0].req,
         sampling_params_key=keys[request_id],
     )
     futures = [Future(), Future()]

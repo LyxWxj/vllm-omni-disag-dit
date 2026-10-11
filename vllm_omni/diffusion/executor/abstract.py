@@ -119,6 +119,7 @@ class DiffusionExecutor(ABC):
         scheduler_output: DiffusionSchedulerOutput,
         non_block: bool = False,
         output_rank: int = 0,
+        reply_rank: int | None = None,
     ) -> BaseRunnerOutput | Any:
         """Execute step-mode work from a scheduler output."""
         pass

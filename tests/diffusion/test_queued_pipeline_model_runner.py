@@ -175,8 +175,8 @@ def test_execute_prepared_stepwise_sends_one_microbatch_per_pipeline_request(moc
         torch.testing.assert_close(state.latents, torch.ones_like(state.latents))
     assert runner.pipeline.events == [
         ("denoise", "req-a"),
-        ("denoise", "req-b"),
         ("scheduler", "req-a"),
+        ("denoise", "req-b"),
         ("scheduler", "req-b"),
     ]
 

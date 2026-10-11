@@ -630,6 +630,14 @@ class DiffusionEngine:
     def _queued_pipeline_can_advance_without_schedule(self) -> bool:
         if not self._queued_pipeline_batches:
             return False
+        # A shared Future can become ready halfway through an Engine round.
+        # Drain every committed member before the Scheduler sees the first
+        # retired request as a candidate for the next wave.
+        if any(
+            batch.phase is _QueuedPipelineBatchPhase.STEP_COMMITTED
+            for batch in self._queued_pipeline_batches.values()
+        ):
+            return True
         has_candidate = getattr(self.scheduler, "has_queued_admission_candidate", None)
         if not callable(has_candidate):
             return False
@@ -737,7 +745,8 @@ class DiffusionEngine:
         batch = self._reserve_queued_pipeline_batch(scheduler_output)
         try:
             batch.request_prepared = True
-            self.executor.prepare_pipeline_requests(scheduler_output)
+            if scheduler_output.scheduled_new_reqs:
+                self.executor.prepare_pipeline_requests(scheduler_output)
             batch.phase = _QueuedPipelineBatchPhase.PREPARED
             if authorize:
                 self._authorize_waiting_queued_batches()
@@ -797,10 +806,15 @@ class DiffusionEngine:
                 finished_req_ids=set(),
             )
             output_ranks = [self._next_queued_pipeline_output_rank() for _ in group]
+            execute_kwargs: dict[str, Any] = {
+                "non_block": True,
+                "output_rank": output_ranks[0],
+            }
+            if output_ranks[0] != 0:
+                execute_kwargs["reply_rank"] = 0
             future = self.executor.execute_step(
                 scheduler_output,
-                non_block=True,
-                output_rank=output_ranks[0],
+                **execute_kwargs,
             )
             if not isinstance(future, concurrent.futures.Future):
                 raise RuntimeError("Queued execution requires a non-blocking step Future.")
@@ -845,7 +859,23 @@ class DiffusionEngine:
                 batch.phase = _QueuedPipelineBatchPhase.FINALIZING
             else:
                 batch.phase = _QueuedPipelineBatchPhase.STEP_COMMITTED
-            self._authorize_waiting_queued_batches()
+            # A Worker Future may represent a whole request wave. Do not
+            # authorize the next wave after the first request commits: that
+            # lets max_inflight_batches=4 advance request 1..N while request
+            # 0 is still committing, reordering latent feedback and creating
+            # extra PP bubbles. Release the admission gate only after every
+            # descriptor sharing this Future has committed its step.
+            pending_wave_members = any(
+                other is not batch
+                and other.step_future is batch.step_future
+                and other.phase in {
+                    _QueuedPipelineBatchPhase.AUTHORIZED,
+                    _QueuedPipelineBatchPhase.STEP_COMPLETED,
+                }
+                for other in self._queued_pipeline_batches.values()
+            )
+            if not pending_wave_members:
+                self._authorize_waiting_queued_batches()
             return finalizing
         except BaseException:
             batch.phase = _QueuedPipelineBatchPhase.FAILED
@@ -939,13 +969,26 @@ class DiffusionEngine:
                 result = batch.step_future.result()
                 if not isinstance(result, BaseRunnerOutput):
                     raise RuntimeError(f"Native queued step returned {type(result)!r}, expected BaseRunnerOutput")
-                request_output = result.get_request_output(batch.request_id)
-                if request_output is None:
-                    raise RuntimeError("Native queued step returned no request output")
-                if request_output.result is not None and request_output.result.error is not None:
-                    raise RuntimeError(request_output.result.error)
-                batch.native_output = result
-                batch.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
+                wave = [
+                    member
+                    for member in self._queued_pipeline_batches.values()
+                    if member.step_future is batch.step_future
+                    and member.phase is _QueuedPipelineBatchPhase.AUTHORIZED
+                ]
+                # Validate the entire Worker result before publishing any
+                # member as committed. Otherwise Future completion midway
+                # through iteration can rotate the next wave to its tail.
+                for member in wave:
+                    request_output = result.get_request_output(member.request_id)
+                    if request_output is None:
+                        raise RuntimeError("Native queued step returned no request output")
+                    if request_output.result is not None and request_output.result.error is not None:
+                        raise RuntimeError(request_output.result.error)
+                for member in wave:
+                    member.native_output = result
+                    member.phase = _QueuedPipelineBatchPhase.STEP_COMPLETED
+                for member in wave:
+                    self._commit_queued_pipeline_step(member)
             except BaseException:
                 batch.phase = _QueuedPipelineBatchPhase.FAILED
                 raise

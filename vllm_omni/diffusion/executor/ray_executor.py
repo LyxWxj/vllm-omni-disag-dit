@@ -681,6 +681,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         scheduler_output: DiffusionSchedulerOutput,
         non_block: bool = False,
         output_rank: int = 0,
+        reply_rank: int | None = None,
     ) -> BaseRunnerOutput:
         if non_block:
             raise NotImplementedError("non-blocking queued PP is only supported by the multiprocess executor")
@@ -690,7 +691,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         result = self.collective_rpc(
             "execute_stepwise",
             args=(scheduler_output,),
-            unique_reply_rank=output_rank,
+            unique_reply_rank=output_rank if reply_rank is None else reply_rank,
             exec_all_ranks=True,
         )
         if not isinstance(result, BaseRunnerOutput):
