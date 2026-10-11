@@ -352,6 +352,29 @@ class TestAsyncOutputLoopLogic:
         assert message.result is output
         assert proc._async_output_pending == 0
 
+    def test_non_block_rpc_pack_failure_keeps_rpc_id(self, mocker):
+        proc = _make_worker_proc(step_execution=True)
+        proc._async_output_queue = queue.Queue()
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm",
+            side_effect=RuntimeError("SHM pack failed"),
+        )
+        mock_torch = mocker.MagicMock()
+        mock_torch.Stream.return_value = mocker.MagicMock()
+        mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+        mock_torch.device.return_value = mocker.MagicMock()
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
+        output = BatchRunnerOutput(runner_outputs=[RunnerOutput(request_id="req", finished=True)])
+        proc._async_output_queue.put((output, "rpc-3", None, AsyncOutputKind.RPC_RESULT))
+        proc._async_output_queue.put(None)
+
+        proc._async_output_loop()
+
+        message = proc.result_mq.enqueue.call_args.args[0]
+        assert message.kind is AsyncOutputKind.RPC_RESULT
+        assert message.rpc_id == "rpc-3"
+        assert message.error == "Background D2H/SHM packing failed"
+
     def test_late_field_failure_sends_error_without_partial_payload_or_shm_leak(
         self,
         mocker,

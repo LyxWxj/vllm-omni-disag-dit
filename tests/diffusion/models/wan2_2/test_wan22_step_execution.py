@@ -15,15 +15,12 @@ import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
 from vllm_omni.diffusion.ipc import pack_diffusion_output_shm, unpack_diffusion_output_shm
 from vllm_omni.diffusion.models.interface import (
-    SupportsPipelineStageExecution,
     SupportsStepExecution,
-    supports_pipeline_stage_execution,
     supports_step_execution,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.pipeline_state import PipelineStageSpec
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -160,20 +157,11 @@ def _patch_scheduler(monkeypatch) -> None:
     monkeypatch.setattr(wan22_module, "build_wan_scheduler", lambda *_args, **_kwargs: _Scheduler())
 
 
-def _patch_pp_topology(monkeypatch, *, rank: int, world_size: int = 2) -> None:
-    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: world_size)
-    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_rank", lambda: rank)
-    monkeypatch.setattr(wan22_module, "is_pipeline_first_stage", lambda: rank == 0)
-    monkeypatch.setattr(wan22_module, "is_pipeline_last_stage", lambda: rank == world_size - 1)
-
-
 def test_wan22_declares_step_execution_capability() -> None:
     pipeline = _pipeline()
 
     assert isinstance(pipeline, SupportsStepExecution)
     assert supports_step_execution(pipeline)
-    assert isinstance(pipeline, SupportsPipelineStageExecution)
-    assert supports_pipeline_stage_execution(pipeline)
 
     prepare_only = SimpleNamespace(supports_step_execution=True, prepare_encode=lambda *_args, **_kwargs: None)
     assert not isinstance(prepare_only, SupportsStepExecution)
@@ -425,104 +413,6 @@ def test_denoise_and_scheduler_use_request_local_state_once(monkeypatch) -> None
     assert len(state.scheduler.step_calls) == 1
     assert len(pipeline.scheduler.step_calls) == 0
     assert state.step_index == 1
-
-
-@pytest.mark.parametrize("rank", [0, 1], ids=["first-stage", "last-stage"])
-def test_forward_pipeline_stage_runs_local_partition_without_pp_wrapper(monkeypatch, rank) -> None:
-    _patch_scheduler(monkeypatch)
-    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
-    pipeline = _pipeline()
-    state = _state()
-    pipeline.prepare_encode(state)
-    batch = InputBatch.make_batch([state])
-    intermediate = None if rank == 0 else object()
-    captured: dict[str, object] = {}
-    pipeline.predict_noise_maybe_with_cfg = lambda **_kwargs: pytest.fail("queued local stage must bypass PP wrapper")
-
-    def predict_noise(**kwargs):
-        captured.update(kwargs)
-        return torch.ones_like(batch.latents)
-
-    pipeline.predict_noise = predict_noise
-    _patch_pp_topology(monkeypatch, rank=rank)
-
-    output = pipeline.forward_pipeline_stage(
-        batch,
-        pp_stage_spec=PipelineStageSpec(
-            pp_stage_id=rank,
-            world_size=2,
-            is_first=rank == 0,
-            is_last=rank == 1,
-        ),
-        intermediate_tensors=intermediate,
-        states=[state],
-    )
-
-    torch.testing.assert_close(output, torch.ones_like(batch.latents))
-    assert captured["intermediate_tensors"] is intermediate
-    assert captured["current_model"] is pipeline.transformer
-
-
-def test_forward_pipeline_stage_rejects_cfg_and_non_m2_topology(monkeypatch) -> None:
-    _patch_scheduler(monkeypatch)
-    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
-    pipeline = _pipeline()
-    cfg_state = _state()
-    cfg_state.sampling.guidance_scale = 4.0
-    pipeline.prepare_encode(cfg_state)
-    cfg_batch = InputBatch.make_batch([cfg_state])
-    _patch_pp_topology(monkeypatch, rank=0)
-
-    with pytest.raises(ValueError, match="does not support classifier-free guidance"):
-        pipeline.forward_pipeline_stage(
-            cfg_batch,
-            pp_stage_spec=PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=True, is_last=False),
-            intermediate_tensors=None,
-            states=[cfg_state],
-        )
-
-
-def test_step_scheduler_pipeline_stage_bypasses_static_pp_feedback(monkeypatch) -> None:
-    _patch_scheduler(monkeypatch)
-    monkeypatch.setattr(wan22_module, "get_pipeline_parallel_world_size", lambda: 1)
-    pipeline = _pipeline()
-    state = _state()
-    pipeline.prepare_encode(state)
-    pipeline.scheduler_step_maybe_with_cfg = lambda *_args, **_kwargs: pytest.fail(
-        "queued completion must bypass static PP feedback"
-    )
-
-    pipeline.step_scheduler_pipeline_stage(state, torch.ones_like(state.latents))
-
-    assert state.step_index == 1
-    assert len(state.scheduler.step_calls) == 1
-
-
-@pytest.mark.parametrize(
-    ("actual_rank", "actual_world_size", "spec", "message"),
-    [
-        (0, 2, PipelineStageSpec(pp_stage_id=1, world_size=2, is_first=False, is_last=True), "does not match PP rank"),
-        (
-            0,
-            2,
-            PipelineStageSpec(pp_stage_id=0, world_size=2, is_first=False, is_last=True),
-            "endpoint flags",
-        ),
-        (0, 3, PipelineStageSpec(pp_stage_id=0, world_size=3, is_first=True, is_last=False), "exactly two stages"),
-    ],
-)
-def test_pipeline_stage_validation_rejects_topology_mismatch(
-    monkeypatch,
-    actual_rank,
-    actual_world_size,
-    spec,
-    message,
-) -> None:
-    pipeline = _pipeline()
-    _patch_pp_topology(monkeypatch, rank=actual_rank, world_size=actual_world_size)
-
-    with pytest.raises(ValueError, match=message):
-        pipeline.validate_pipeline_stage_execution(spec)
 
 
 def test_pp1_step_cfg_matches_request_denoise_math(monkeypatch) -> None:

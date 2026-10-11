@@ -10,25 +10,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 
-def validate_pipeline_topology_reports(
-    result: Any,
-    activation_edges: set[tuple[int, int]],
-    feedback_edges: set[tuple[int, int]],
-) -> None:
-    while isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
-        result = result[0]
-    if not isinstance(result, list) or not result or not all(isinstance(item, dict) for item in result):
-        raise RuntimeError("Workers did not return valid pipeline topology reports")
-    actual_activation = {tuple(item["activation_edge"]) for item in result}
-    actual_feedback = {tuple(item["feedback_edge"]) for item in result}
-    reporting_ranks = {item["rank"] for item in result}
-    expected_ranks = {rank for edge in activation_edges for rank in edge}
-    if actual_activation != activation_edges or actual_feedback != feedback_edges:
-        raise ValueError("Executor pipeline topology does not match Worker PP groups")
-    if reporting_ranks != expected_ranks:
-        raise ValueError("pipeline topology reports do not cover every configured endpoint")
-
-
 def normalize_pipeline_preparation_reports(
     result: Any,
     expected_ranks: frozenset[int],
@@ -141,10 +122,6 @@ class DiffusionExecutor(ABC):
         """Execute step-mode work from a scheduler output."""
         pass
 
-    def submit_pipeline_step(self, task: Any) -> Any:
-        """Return a Future resolved by autonomous queued PP progress."""
-        raise NotImplementedError("queued pipeline Future submission is not wired for this executor")
-
     @abstractmethod
     def collective_rpc(
         self,
@@ -175,42 +152,8 @@ class DiffusionExecutor(ABC):
         """Prepare rank-local request state at a coordinated drained boundary."""
         raise NotImplementedError("queued pipeline preparation is not wired for this executor")
 
-    def finalize_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str, output_rank: int) -> str:
-        raise NotImplementedError("queued pipeline final decode is not wired for this executor")
-
-    def poll_pipeline_finalization(self, batch_id: str, output_rank: int) -> Any:
-        raise NotImplementedError("queued pipeline finalization polling is not wired for this executor")
-
-    def release_pipeline_batch(self, pp_stage_id: dict[int, int], batch_id: str) -> Any:
-        raise NotImplementedError("queued pipeline retirement is not wired for this executor")
-
-    def pipeline_batch_release_ready(self, pp_stage_id: dict[int, int], batch_id: str) -> bool:
-        raise NotImplementedError("queued pipeline retirement readiness is not wired for this executor")
-
     def cleanup_finalized_pipeline_request(self, request_id: str) -> Any:
         raise NotImplementedError("queued finalized-request cleanup is not wired for this executor")
-
-    def poll_pipeline_events(self) -> list[Any]:
-        """Poll Worker-side queued progress events."""
-        raise NotImplementedError("queued pipeline event polling is not wired for this executor")
-
-    def cancel_pipeline_requests(self, request_generations: Any) -> Any:
-        """Cancel queued work while retaining resources until retirement."""
-        raise NotImplementedError("queued pipeline cancellation is not wired for this executor")
-
-    def initialize_pipeline_transports(
-        self,
-        activation_edges: set[tuple[int, int]],
-        feedback_edges: set[tuple[int, int]],
-        max_slots: int = 1,
-    ) -> Any:
-        raise NotImplementedError("queued pipeline transport initialization is not wired for this executor")
-
-    def progress_pipeline(self) -> Any:
-        raise NotImplementedError("queued pipeline progress is not wired for this executor")
-
-    def pipeline_stage_physical_ranks(self) -> dict[int, int]:
-        raise NotImplementedError("queued pipeline topology is not wired for this executor")
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""

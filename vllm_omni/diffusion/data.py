@@ -1120,7 +1120,6 @@ class OmniDiffusionConfig:
 
     # Queued pipeline-parallel capacity settings.
     max_inflight_batches: int = 1
-    edge_buffer_slots: int = 2
 
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
@@ -1268,10 +1267,8 @@ class OmniDiffusionConfig:
         if self.mode not in {"static", "queued"}:
             raise ValueError(f"mode must be 'static' or 'queued', got {self.mode!r}")
         if self.mode == "queued":
-            for name in ("max_inflight_batches", "edge_buffer_slots"):
-                value = getattr(self, name)
-                if type(value) is not int or value <= 0:
-                    raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            if type(self.max_inflight_batches) is not int or self.max_inflight_batches <= 0:
+                raise ValueError(f"max_inflight_batches must be a positive integer, got {self.max_inflight_batches!r}")
             if not self.step_execution:
                 raise ValueError("mode='queued' requires step_execution=True")
 
@@ -1920,14 +1917,11 @@ class AsyncOutputKind(Enum):
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
-    * ``PIPELINE_FINALIZED`` — queued PP final decode is ready for Engine
-      retirement via ``async_output_id``
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
-    PIPELINE_FINALIZED = "pipeline_finalized"
 
 
 @dataclass

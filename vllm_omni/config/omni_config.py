@@ -862,7 +862,6 @@ class _DiffusionConfigProjection:
     step_execution: bool = False
     mode: str = "static"
     max_inflight_batches: int = 1
-    edge_buffer_slots: int = 2
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False

@@ -23,11 +23,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_pipeline_parallel_rank,
     get_pipeline_parallel_world_size,
     get_pp_group,
-    is_pipeline_first_stage,
-    is_pipeline_last_stage,
 )
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -384,7 +381,6 @@ class Wan22Pipeline(
 ):
     supports_request_batch = True
     supports_step_execution = True
-    supports_pipeline_stage_execution = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -1163,42 +1159,6 @@ class Wan22Pipeline(
         )
         return positive_kwargs, negative_kwargs, do_true_cfg, active_guidance
 
-    def validate_pipeline_stage_execution(self, pp_stage_spec: Any) -> None:
-        actual_world_size = get_pipeline_parallel_world_size()
-        actual_rank = get_pipeline_parallel_rank()
-        actual_is_first = is_pipeline_first_stage()
-        actual_is_last = is_pipeline_last_stage()
-        if actual_world_size != 2 or pp_stage_spec.world_size != actual_world_size:
-            raise ValueError("Wan queued pipeline execution currently requires exactly two stages.")
-        if pp_stage_spec.pp_stage_id != actual_rank:
-            raise ValueError(
-                f"Wan queued pipeline stage id {pp_stage_spec.pp_stage_id} does not match PP rank {actual_rank}."
-            )
-        if pp_stage_spec.is_first != actual_is_first or pp_stage_spec.is_last != actual_is_last:
-            raise ValueError("Wan queued pipeline stage endpoint flags do not match the initialized PP topology.")
-
-    def forward_pipeline_stage(
-        self,
-        input_batch: InputBatch,
-        *,
-        pp_stage_spec: Any,
-        intermediate_tensors: IntermediateTensors | None,
-        states: Sequence[StepRequestState] | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        """Run one Wan PP partition without transport or scheduler feedback."""
-        self.validate_pipeline_stage_execution(pp_stage_spec)
-        positive_kwargs, negative_kwargs, do_true_cfg, _ = self._prepare_step_forward(
-            input_batch,
-            states=states,
-        )
-        if do_true_cfg or negative_kwargs is not None:
-            raise ValueError("Wan queued pipeline execution does not support classifier-free guidance.")
-        return self.predict_noise(
-            **positive_kwargs,
-            intermediate_tensors=intermediate_tensors,
-            return_conditioning=pp_stage_spec.is_first,
-        )
-
     def step_scheduler(
         self,
         state: StepRequestState,
@@ -1215,27 +1175,6 @@ class Wan22Pipeline(
             timestep,
             state.latents,
             state.do_true_cfg,
-            per_request_scheduler=state.scheduler,
-            generator=None,
-        )
-        state.step_index += 1
-
-    def step_scheduler_pipeline_stage(
-        self,
-        state: StepRequestState,
-        noise_pred: torch.Tensor,
-    ) -> None:
-        """Apply one queued last-stage update without static PP feedback."""
-        timestep = state.current_timestep
-        if timestep is None or state.latents is None or state.scheduler is None:
-            raise ValueError(f"Wan request {state.request_id} is not ready for a scheduler step.")
-        if state.do_true_cfg:
-            raise ValueError("Wan queued pipeline execution does not support classifier-free guidance.")
-        state.latents = CFGParallelMixin.scheduler_step(
-            self,
-            noise_pred,
-            timestep,
-            state.latents,
             per_request_scheduler=state.scheduler,
             generator=None,
         )

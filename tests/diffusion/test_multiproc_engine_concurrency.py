@@ -228,7 +228,6 @@ class TestStepModeTimeout:
         executor, _, _ = _make_executor()
         future = Mock()
         executor._collective_rpc_future = Mock(return_value=future)
-        executor._uses_autonomous_pipeline_stages = Mock(return_value=True)
         scheduler_output = _make_sched_output("A")
 
         result = executor.execute_step(scheduler_output, non_block=True)

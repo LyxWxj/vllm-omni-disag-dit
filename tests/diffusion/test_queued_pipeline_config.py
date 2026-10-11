@@ -26,11 +26,10 @@ def _queued_config(**overrides) -> OmniDiffusionConfig:
 
 
 def test_static_mode_keeps_queued_capacity_fields_inert() -> None:
-    config = OmniDiffusionConfig(model="test", max_inflight_batches=0, edge_buffer_slots=-1)
+    config = OmniDiffusionConfig(model="test", max_inflight_batches=0)
 
     assert config.mode == "static"
     assert config.max_inflight_batches == 0
-    assert config.edge_buffer_slots == -1
 
 
 def test_queued_mode_requires_step_execution() -> None:
@@ -38,10 +37,9 @@ def test_queued_mode_requires_step_execution() -> None:
         _queued_config(step_execution=False)
 
 
-@pytest.mark.parametrize("field", ["max_inflight_batches", "edge_buffer_slots"])
-def test_capacity_counts_are_positive(field: str) -> None:
-    with pytest.raises(ValueError, match=field):
-        _queued_config(**{field: 0})
+def test_max_inflight_batches_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="max_inflight_batches"):
+        _queued_config(max_inflight_batches=0)
 
 
 def test_queued_mode_accepts_multiple_scheduler_requests() -> None:
@@ -54,12 +52,6 @@ def test_queued_mode_accepts_multiple_inflight_batches() -> None:
     config = _queued_config(max_inflight_batches=2)
 
     assert config.max_inflight_batches == 2
-
-
-def test_queued_mode_defaults_to_two_edge_buffer_slots() -> None:
-    config = _queued_config()
-
-    assert config.edge_buffer_slots == 2
 
 
 def test_vae_patch_parallel_size_cannot_exceed_pipeline_size() -> None:
