@@ -859,13 +859,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 unique_reply_rank=0,
                 exec_all_ranks=True,
             )
-        result = self.collective_rpc(
-            "execute_stepwise",
-            timeout=_DLO_DP_WAVE_TIMEOUT_S,
-            args=(scheduler_output,),
-            unique_reply_rank=0,
-            exec_all_ranks=True,
-        )
+        try:
+            result = self.collective_rpc(
+                "execute_stepwise",
+                timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                args=(scheduler_output,),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
+            )
+        except TimeoutError as exc:
+            self._fail_closed_on_dp_wave_timeout(exc)
+            raise
 
         if isinstance(result, BaseRunnerOutput):
             return result
