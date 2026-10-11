@@ -3,6 +3,7 @@
 
 import queue
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
 )
 from vllm_omni.diffusion.worker.pipeline_state import PipelineEvent, PipelineEventType, PipelineTask
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -96,6 +98,28 @@ def test_autonomous_admission_waits_for_both_stage_acknowledgements(mocker) -> N
     assert set(grouped) == {batch.task.batch_id}
     assert batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
     engine.executor.enqueue_pipeline_admissions.assert_called_once_with([(batch.task, batch.stage_specs)])
+
+
+def test_native_async_admission_commits_from_execute_step_future(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.executor.supports_native_pipeline_async = True
+    future = Future()
+    engine.executor.execute_step.return_value = future
+    engine.scheduler.commit_pipeline_step = mocker.Mock(return_value=set())
+    batch = engine._submit_queued_pipeline_batch(scheduler_output, authorize=False)
+
+    engine._authorize_waiting_queued_batches()
+
+    engine.executor.execute_step.assert_called_once_with(scheduler_output, non_block=True)
+    engine.executor.enqueue_pipeline_admissions.assert_not_called()
+    assert batch.native_step and batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
+    future.set_result(BatchRunnerOutput.from_list([RunnerOutput(request_id="req-a", step_index=1)]))
+
+    assert engine._advance_queued_pipeline_batch(batch) is None
+
+    engine.scheduler.commit_pipeline_step.assert_called_once_with(scheduler_output, {"req-a": 1})
+    assert batch.task.batch_id not in engine._queued_pipeline_batches
 
 
 def test_autonomous_admission_batches_prepared_fifo(mocker) -> None:

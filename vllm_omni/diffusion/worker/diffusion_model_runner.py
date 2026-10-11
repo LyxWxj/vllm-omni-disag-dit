@@ -1146,6 +1146,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             raise RuntimeError("Model not loaded. Call load_model() first.")
         if not self._supports_step_mode() or not supports_pipeline_stage_execution(self.pipeline):
             raise ValueError("The loaded diffusion pipeline does not support queued local-stage execution.")
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_pipeline_parallel_rank,
+            get_pipeline_parallel_world_size,
+            is_pipeline_first_stage,
+            is_pipeline_last_stage,
+            model_parallel_is_initialized,
+        )
+
+        if model_parallel_is_initialized():
+            self.pipeline.validate_pipeline_stage_execution(
+                PipelineStageSpec(
+                    pp_stage_id=get_pipeline_parallel_rank(),
+                    world_size=get_pipeline_parallel_world_size(),
+                    is_first=is_pipeline_first_stage(),
+                    is_last=is_pipeline_last_stage(),
+                )
+            )
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Queued pipeline preparation does not support cache_backend yet.")
         self._cleanup_finished_step_requests(scheduler_output)
@@ -1651,7 +1668,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         states: list[StepRequestState],
         input_batch: InputBatch,
         interrupted: bool = False,
-        store_input_batch: bool = True,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
@@ -1664,8 +1680,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         else:
             input_batch.latents = gathered_latents.clone()
 
-        if store_input_batch:
-            self.input_batch = input_batch
+        self.input_batch = input_batch
         scatter_latents(states, input_batch)
 
         for state in states:
@@ -1958,12 +1973,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 terminal_request_ids = [
                     runner_output.request_id for runner_output in runner_output_list if runner_output.finished
                 ]
-                self._update_states_after(
-                    states,
-                    input_batch,
-                    pipeline_interrupted,
-                    store_input_batch=prepared_states is None,
-                )
+                if prepared_states is None:
+                    self._update_states_after(states, input_batch, pipeline_interrupted)
                 if (
                     getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                     is DiffusionKVCacheMode.PAGED_SCHEDULER

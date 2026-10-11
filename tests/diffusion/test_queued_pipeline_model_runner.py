@@ -127,6 +127,41 @@ def test_prepare_pipeline_requests_retains_local_state_without_denoising(mocker)
     assert runner.pipeline.scheduler_calls == 0
 
 
+def test_execute_prepared_stepwise_uses_request_local_batch_and_advances_state(mocker) -> None:
+    runner = _runner()
+    state = _state()
+    runner.state_cache = {state.request_id: state}
+    runner.od_config.streaming_output = False
+    runner.od_config.diffusion_kv_mode = None
+    runner._sample_peak_memory_mb = mocker.Mock(return_value=0.0)
+    update_states_after = mocker.patch.object(runner, "_update_states_after")
+    shared_batch = runner.input_batch
+    runner.pipeline.denoise_step = mocker.Mock(return_value=torch.ones_like(state.latents))
+
+    def step_scheduler(request_state, noise_pred):
+        request_state.latents = request_state.latents + noise_pred
+        request_state.step_index += 1
+
+    runner.pipeline.step_scheduler = step_scheduler
+    scheduler_output = SimpleNamespace(
+        scheduled_request_ids=[state.request_id],
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[state.request_id]),
+        finished_req_ids=set(),
+    )
+
+    result = runner.execute_prepared_stepwise(scheduler_output)
+
+    output = result.get_request_output(state.request_id)
+    assert output is not None and output.finished is False and output.result is None
+    assert state.step_index == 1
+    torch.testing.assert_close(state.latents, torch.ones_like(state.latents))
+    assert runner.input_batch is shared_batch
+    assert runner.state_cache[state.request_id] is state
+    update_states_after.assert_not_called()
+    runner.pipeline.denoise_step.assert_called_once()
+
+
 def test_prepare_pipeline_requests_rolls_back_local_state_failure(mocker) -> None:
     runner = _runner()
     runner.od_config.cache_backend = None

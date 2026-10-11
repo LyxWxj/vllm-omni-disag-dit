@@ -1108,7 +1108,16 @@ class DiffusionEngine:
             return
         if batch.native_step:
             if batch.step_future is not None and not batch.step_future.done():
-                batch.step_future.result()
+                try:
+                    batch.step_future.result()
+                except BaseException:
+                    if not (batch.abort_requested or batch.failure is not None):
+                        raise
+            if not batch.request_cleanup_completed:
+                cleanup = self.executor.cleanup_finalized_pipeline_request(batch.task.request_id)
+                if not isinstance(cleanup, list) or len(cleanup) != self.od_config.num_gpus or not all(cleanup):
+                    raise RuntimeError("Native queued request cleanup did not acknowledge every Worker.")
+                batch.request_cleanup_completed = True
             batch.cancelled = True
             batch.phase = _QueuedPipelineBatchPhase.CANCELLING
             return
