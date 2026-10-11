@@ -226,6 +226,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pipeline_progress_thread: threading.Thread | None = None
         self._pipeline_stage_ranks: dict[int, int] | None = None
         self._collective_rpc_lock = threading.RLock()
+        self.supports_native_pipeline_async = self._uses_autonomous_pipeline_stages()
         if not self.od_config.step_execution or self._uses_autonomous_pipeline_stages():
             self._start_result_pump()
         if self._uses_autonomous_pipeline_stages():
@@ -854,7 +855,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if not self._uses_autonomous_pipeline_stages():
                 raise ValueError("non_block execute_step requires queued step execution")
             return self._collective_rpc_future(
-                "execute_stepwise",
+                "execute_prepared_stepwise",
                 args=(scheduler_output,),
                 unique_reply_rank=0,
                 exec_all_ranks=True,
@@ -1305,6 +1306,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 with self._futures_lock:
                     self._rpc_futures.pop(rpc_id, None)
                 raise
+            callback = self._pipeline_update_callback
+            if callback is not None:
+                future.add_done_callback(lambda _completed: callback())
             return future
 
         # ── Path 1: async execute_model / execute_model_batch ──

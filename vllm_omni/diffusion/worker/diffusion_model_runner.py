@@ -1651,6 +1651,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         states: list[StepRequestState],
         input_batch: InputBatch,
         interrupted: bool = False,
+        store_input_batch: bool = True,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
@@ -1663,7 +1664,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         else:
             input_batch.latents = gathered_latents.clone()
 
-        self.input_batch = input_batch
+        if store_input_batch:
+            self.input_batch = input_batch
         scatter_latents(states, input_batch)
 
         for state in states:
@@ -1676,6 +1678,24 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             scheduler_output,
             validate_kv_metadata=True,
             record_output_peak_memory=True,
+        )
+
+    def execute_prepared_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Execute one step from request state prepared by queued admission."""
+        request_ids = tuple(scheduler_output.scheduled_request_ids)
+        if len(request_ids) != 1:
+            raise ValueError("Prepared step execution requires exactly one scheduled request.")
+        state = self.state_cache.get(request_ids[0])
+        if state is None:
+            raise RuntimeError(f"Prepared step request {request_ids[0]!r} has no Worker state.")
+        input_batch = InputBatch.make_batch([state], cached_batch=None)
+        if input_batch is None:
+            raise RuntimeError("Prepared step execution produced no input batch.")
+        return self._execute_stepwise_core(
+            scheduler_output,
+            record_output_peak_memory=True,
+            prepared_states=[state],
+            prepared_input_batch=input_batch,
         )
 
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
@@ -1783,6 +1803,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         *,
         record_output_peak_memory: bool,
         in_diffusion_kv_memory_profile: bool = False,
+        prepared_states: list[StepRequestState] | None = None,
+        prepared_input_batch: InputBatch | None = None,
     ) -> BatchRunnerOutput:
         """Run the denoise step after metadata admission and row installation."""
 
@@ -1792,7 +1814,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             pipeline = self.pipeline
             assert pipeline is not None, "Model not loaded. Call load_model() first."
             had_active_states = bool(self.state_cache)
-            states, new_request_ids = self._update_states(scheduler_output)
+            if prepared_states is None:
+                states, new_request_ids = self._update_states(scheduler_output)
+            else:
+                states, new_request_ids = prepared_states, []
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
@@ -1802,7 +1827,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 and current_omni_platform.is_available()
             ):
                 current_omni_platform.reset_peak_memory_stats()
-            states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
+            if prepared_input_batch is None:
+                states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
+            else:
+                input_batch = prepared_input_batch
+                runner_output_list = []
             if input_batch is None:
                 return BatchRunnerOutput.from_list(runner_output_list)
             attn_metadata: dict[str, Any] = {}
@@ -1929,7 +1958,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 terminal_request_ids = [
                     runner_output.request_id for runner_output in runner_output_list if runner_output.finished
                 ]
-                self._update_states_after(states, input_batch, pipeline_interrupted)
+                self._update_states_after(
+                    states,
+                    input_batch,
+                    pipeline_interrupted,
+                    store_input_batch=prepared_states is None,
+                )
                 if (
                     getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                     is DiffusionKVCacheMode.PAGED_SCHEDULER

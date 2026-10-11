@@ -258,6 +258,8 @@ class _QueuedPipelineBatch:
     stage_enqueued: bool = False
     request_cleanup_completed: bool = False
     step_future: concurrent.futures.Future[BaseRunnerOutput] | None = None
+    native_step: bool = False
+    native_output: BaseRunnerOutput | None = None
     admission_acknowledgements: set[tuple[PipelineEventType, int, int]] = field(default_factory=set)
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
@@ -474,7 +476,8 @@ class DiffusionEngine:
         submit_only: bool = False,
     ) -> None:
         """Drive one queued batch through submission, progress, and retirement."""
-        self._ensure_queued_pipeline_transports()
+        if getattr(self.executor, "supports_native_pipeline_async", False) is not True:
+            self._ensure_queued_pipeline_transports()
         existing = self._queued_pipeline_batch_for_scheduler_output(scheduler_output)
         if existing is None:
             self._submit_queued_pipeline_batch(scheduler_output, authorize=not submit_only)
@@ -893,6 +896,13 @@ class DiffusionEngine:
             autonomous_admissions.append((batch.task, batch.stage_specs))
             available_slots -= 1
         if autonomous_admissions:
+            if getattr(self.executor, "supports_native_pipeline_async", False) is True:
+                for batch in ordered[: len(autonomous_admissions)]:
+                    batch.step_future = self.executor.execute_step(batch.scheduler_output, non_block=True)
+                    batch.native_step = True
+                    batch.stage_enqueued = True
+                    batch.phase = _QueuedPipelineBatchPhase.AUTHORIZED
+                return
             submit_step = getattr(self.executor, "submit_pipeline_step", None)
             if callable(submit_step):
                 for batch in ordered[: len(autonomous_admissions)]:
@@ -972,6 +982,14 @@ class DiffusionEngine:
             raise RuntimeError("Queued pipeline batch is not ready for final decode.")
         if batch.decoded_output is not None:
             return batch.decoded_output
+        if batch.native_step:
+            if batch.native_output is None:
+                return None
+            finished = batch.native_output.get_request_output(batch.task.request_id)
+            if finished is None or finished.result is None or finished.result.error is not None:
+                raise RuntimeError("Native queued step returned an unsuccessful final output.")
+            batch.decoded_output = batch.native_output
+            return batch.native_output
         try:
             output: BatchRunnerOutput | None
             if batch.finalization_handle is None:
@@ -1021,7 +1039,9 @@ class DiffusionEngine:
             _QueuedPipelineBatchPhase.CANCELLING,
         }:
             raise RuntimeError("Queued pipeline batch is not ready for retirement.")
-        if batch.stage_enqueued and not batch.release_acknowledged:
+        if batch.native_step:
+            batch.release_acknowledged = True
+        elif batch.stage_enqueued and not batch.release_acknowledged:
             # Finalization can complete without another scheduler progress
             # round. Give Workers one transport-only tick so completed device
             # consumer events release their receive leases before the context
@@ -1082,6 +1102,12 @@ class DiffusionEngine:
             batch.cancelled = True
             batch.phase = _QueuedPipelineBatchPhase.CANCELLING
             return
+        if batch.native_step:
+            if batch.step_future is not None and not batch.step_future.done():
+                batch.step_future.result()
+            batch.cancelled = True
+            batch.phase = _QueuedPipelineBatchPhase.CANCELLING
+            return
         events = self.executor.cancel_pipeline_requests(
             [(batch.task.request_id, batch.task.epoch)]
         )
@@ -1118,7 +1144,16 @@ class DiffusionEngine:
             if not batch.step_future.done():
                 return None
             try:
-                batch.step_future.result()
+                result = batch.step_future.result()
+                if batch.native_step:
+                    if not isinstance(result, BaseRunnerOutput):
+                        raise RuntimeError(f"Native queued step returned {type(result)!r}, expected BaseRunnerOutput")
+                    request_output = result.get_request_output(batch.task.request_id)
+                    if request_output is None:
+                        raise RuntimeError("Native queued step returned no request output")
+                    if request_output.result is not None and request_output.result.error is not None:
+                        raise RuntimeError(request_output.result.error)
+                    batch.native_output = result
             except BaseException:
                 batch.phase = _QueuedPipelineBatchPhase.FAILED
                 raise

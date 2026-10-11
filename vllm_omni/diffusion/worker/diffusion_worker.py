@@ -760,6 +760,18 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def execute_prepared_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute one queued step from request state prepared by admission."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self._activate_step_lora(scheduler_output)
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_prepared_stepwise(scheduler_output)
+        if profiler:
+            profiler.step()
+        return output
+
     def initialize_pipeline_transports(self, max_slots: int = 1) -> dict[str, Any]:
         """Build this Worker's granted activation and feedback P2P endpoints."""
         if self.pipeline_connectors:
@@ -2340,7 +2352,10 @@ class WorkerProc:
                     **kwargs,
                 )
                 result = True
-            elif stage_engine is not None and non_block and method == "execute_stepwise":
+            elif stage_engine is not None and non_block and method in {
+                "execute_stepwise",
+                "execute_prepared_stepwise",
+            }:
                 result = self.worker.execute_method(method, *args, **kwargs)
             elif stage_engine is not None:
                 result = stage_engine.call(method, *args, **kwargs)
@@ -2742,6 +2757,9 @@ class WorkerWrapperBase:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
+
+    def execute_prepared_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        return self.worker.execute_prepared_stepwise(scheduler_output)
 
     def sleep(self, level: int = 1) -> int:
         """
