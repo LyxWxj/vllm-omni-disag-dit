@@ -817,7 +817,11 @@ class DiffusionEngine:
             step_index = 0
         epoch = self._queued_pipeline_epoch
         self._queued_pipeline_epoch += 1
-        stage_physical_ranks = self.executor.pipeline_stage_physical_ranks()
+        stage_physical_ranks = (
+            {}
+            if getattr(self.executor, "supports_native_pipeline_async", False) is True
+            else self.executor.pipeline_stage_physical_ranks()
+        )
         task = PipelineTask(
             batch_id=f"pp-{epoch}-{scheduler_output.step_id}",
             request_id=request_id,
