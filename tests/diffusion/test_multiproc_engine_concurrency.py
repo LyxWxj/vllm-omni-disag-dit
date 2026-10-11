@@ -224,6 +224,23 @@ def _make_sched_output(*request_ids: str) -> DiffusionSchedulerOutput:
 
 
 class TestStepModeTimeout:
+    def test_non_block_step_returns_executor_future(self):
+        executor, _, _ = _make_executor()
+        future = Mock()
+        executor._collective_rpc_future = Mock(return_value=future)
+        executor._uses_autonomous_pipeline_stages = Mock(return_value=True)
+        scheduler_output = _make_sched_output("A")
+
+        result = executor.execute_step(scheduler_output, non_block=True)
+
+        assert result is future
+        executor._collective_rpc_future.assert_called_once_with(
+            "execute_stepwise",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
     def test_missing_reply_closes_executor_and_prevents_dispatch(self, monkeypatch):
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 

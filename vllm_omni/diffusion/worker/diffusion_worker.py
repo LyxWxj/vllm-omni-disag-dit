@@ -2099,6 +2099,24 @@ class WorkerProc:
             self._enqueue_result(msg)
             return
 
+        if rpc_id is not None:
+            try:
+                pack_diffusion_output_shm(output)
+            except (TypeError, ValueError):
+                raise
+            except Exception as exc:
+                if payload_carries_typed_media(output):
+                    raise
+                logger.warning("SHM pack failed for non-blocking RPC result: %s", exc)
+            self._enqueue_result(
+                AsyncDiffusionOutput(
+                    kind=AsyncOutputKind.RPC_RESULT,
+                    rpc_id=rpc_id,
+                    result=output,
+                )
+            )
+            return
+
         # Sync path (original, or async fallback).
         try:
             pack_diffusion_output_shm(output)
@@ -2246,6 +2264,7 @@ class WorkerProc:
         method = rpc_request["method"]
         args = rpc_request.get("args", ())
         kwargs = rpc_request.get("kwargs", {})
+        non_block = rpc_request.get("non_block", False)
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
         collect_rank_status = rpc_request.get("collect_rank_status", False)
@@ -2321,6 +2340,8 @@ class WorkerProc:
                     **kwargs,
                 )
                 result = True
+            elif stage_engine is not None and non_block and method == "execute_stepwise":
+                result = self.worker.execute_method(method, *args, **kwargs)
             elif stage_engine is not None:
                 result = stage_engine.call(method, *args, **kwargs)
             else:

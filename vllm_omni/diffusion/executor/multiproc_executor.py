@@ -851,7 +851,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         self._ensure_open()
         if non_block:
-            raise ValueError("non_block execute_step requires a queued PipelineTask; call submit_pipeline_step")
+            if not self._uses_autonomous_pipeline_stages():
+                raise ValueError("non_block execute_step requires queued step execution")
+            return self._collective_rpc_future(
+                "execute_stepwise",
+                args=(scheduler_output,),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
+            )
         result = self.collective_rpc(
             "execute_stepwise",
             args=(scheduler_output,),
@@ -862,6 +869,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if isinstance(result, BaseRunnerOutput):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+
+    def _collective_rpc_future(
+        self,
+        method: str,
+        *,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
+    ) -> concurrent.futures.Future[Any]:
+        """Submit a rank-coordinated RPC and return before Worker completion."""
+        with self._collective_rpc_lock:
+            return self._collective_rpc_unlocked(
+                method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                unique_reply_rank=unique_reply_rank,
+                exec_all_ranks=exec_all_ranks,
+                non_block=True,
+            )
 
     def _fail_queued_control(self, operation: str, exc: BaseException) -> None:
         if getattr(self, "_queued_control_failure", None) is None:
@@ -1224,6 +1253,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         unique_reply_rank: int | None = None,
         exec_all_ranks: bool = False,
         reply_all_ranks: bool = False,
+        non_block: bool = False,
     ) -> Any:
         self._ensure_open()
 
@@ -1254,6 +1284,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "collect_rank_status": collect_rank_status,
             "reply_all_ranks": reply_all_ranks,
         }
+
+        if non_block:
+            if unique_reply_rank is None or reply_all_ranks:
+                raise ValueError("non_block RPC requires one unique reply rank")
+            rpc_id = self._next_rpc_id()
+            rpc_request["rpc_id"] = rpc_id
+            rpc_request["non_block"] = True
+            future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+            with self._futures_lock:
+                self._rpc_futures[rpc_id] = future
+            try:
+                self._broadcast_mq.enqueue(rpc_request)  # type: ignore[union-attr]
+            except BaseException:
+                with self._futures_lock:
+                    self._rpc_futures.pop(rpc_id, None)
+                raise
+            return future
 
         # ── Path 1: async execute_model / execute_model_batch ──
         # Request-mode methods use the compute_done/output_ready split
@@ -1456,6 +1503,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if fut is not None and not fut.done():
                     if msg.error:
                         try_set_exception(fut, RuntimeError(msg.error))
+                    elif msg.kind is AsyncOutputKind.RPC_RESULT:
+                        try:
+                            unpack_diffusion_output_shm(msg.result)
+                        except Exception as exc:
+                            try_set_exception(fut, exc)
+                        else:
+                            try_set_result(fut, msg.result)
                     else:
                         try_set_result(fut, msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
