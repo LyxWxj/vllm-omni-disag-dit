@@ -840,6 +840,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         *,
         args: tuple = (),
         timeout: float | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         if self._is_failed:
             raise EngineDeadError()
@@ -861,7 +862,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 )
                 == 1
             )
-            if worker_aggregated:
+            if exec_all_ranks or worker_aggregated:
                 kwargs["exec_all_ranks"] = True
             return self.collective_rpc(method, **kwargs)
         except BaseException as exc:

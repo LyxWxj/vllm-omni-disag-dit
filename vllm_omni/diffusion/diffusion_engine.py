@@ -234,8 +234,10 @@ class _QueuedPipelineBatch:
     request_id: str
     step_index: int
     scheduler_output: Any
+    finalizing: bool = False
     decoded_output: BatchRunnerOutput | None = None
     scheduler_completed: bool = False
+    cancelled: bool = False
     failure: BaseException | None = None
     abort_requested: bool = False
     request_prepared: bool = False
@@ -457,7 +459,7 @@ class DiffusionEngine:
         if submit_only:
             return
         if batch.abort_requested:
-            if batch.phase is not _QueuedPipelineBatchPhase.CANCELLING:
+            if not batch.cancelled:
                 self._cancel_queued_pipeline_batch(batch)
             self._retire_queued_pipeline_batch(batch)
             if batch.batch_id in self._queued_pipeline_batches:
@@ -465,7 +467,7 @@ class DiffusionEngine:
             self._emit_finished_outputs({batch.request_id}, None)
             return
         if batch.failure is not None:
-            if batch.phase is not _QueuedPipelineBatchPhase.CANCELLING:
+            if not batch.cancelled:
                 self._cancel_queued_pipeline_batch(batch)
             self._retire_queued_pipeline_batch(batch)
             if batch.batch_id in self._queued_pipeline_batches:
@@ -541,7 +543,7 @@ class DiffusionEngine:
         if batch.failure is None:
             batch.failure = failure
         try:
-            if batch.phase is not _QueuedPipelineBatchPhase.CANCELLING:
+            if not batch.cancelled:
                 self._cancel_queued_pipeline_batch(batch)
             self._retire_queued_pipeline_batch(batch)
             if batch.batch_id in self._queued_pipeline_batches:
@@ -602,7 +604,7 @@ class DiffusionEngine:
                 continue
             try:
                 if batch.abort_requested:
-                    if batch.phase is not _QueuedPipelineBatchPhase.CANCELLING:
+                    if not batch.cancelled:
                         self._cancel_queued_pipeline_batch(batch)
                     self._retire_queued_pipeline_batch(batch)
                     if batch.batch_id in self._queued_pipeline_batches:
@@ -804,11 +806,15 @@ class DiffusionEngine:
                 finished_req_ids=set(),
             )
             output_ranks = [self._next_queued_pipeline_output_rank() for _ in group]
+            execute_kwargs: dict[str, Any] = {
+                "non_block": True,
+                "output_rank": output_ranks[0],
+            }
+            if output_ranks[0] != 0:
+                execute_kwargs["reply_rank"] = 0
             future = self.executor.execute_step(
                 scheduler_output,
-                non_block=True,
-                output_rank=output_ranks[0],
-                reply_rank=0,
+                **execute_kwargs,
             )
             if not isinstance(future, concurrent.futures.Future):
                 raise RuntimeError("Queued execution requires a non-blocking step Future.")
@@ -848,6 +854,7 @@ class DiffusionEngine:
             )
             if not finalizing.issubset({batch.request_id}):
                 raise RuntimeError("Scheduler finalized a request outside the queued pipeline batch.")
+            batch.finalizing = batch.request_id in finalizing
             if finalizing:
                 batch.phase = _QueuedPipelineBatchPhase.FINALIZING
             else:
@@ -913,21 +920,19 @@ class DiffusionEngine:
         }:
             raise RuntimeError("Queued pipeline batch is not ready for retirement.")
         request_id = batch.request_id
-        finalizing = batch.phase is _QueuedPipelineBatchPhase.FINALIZING
-        cancelling = batch.phase is _QueuedPipelineBatchPhase.CANCELLING
         if (
             batch.request_prepared
             and not batch.request_cleanup_completed
-            and (finalizing or cancelling or batch.abort_requested or batch.failure is not None)
+            and (batch.finalizing or batch.cancelled or batch.abort_requested or batch.failure is not None)
         ):
             cleanup = self.executor.cleanup_finalized_pipeline_request(request_id)
             if not isinstance(cleanup, list) or len(cleanup) != self.od_config.num_gpus or not all(cleanup):
                 raise RuntimeError("Queued request cleanup did not acknowledge every Worker.")
             batch.request_cleanup_completed = True
-        if finalizing and not batch.abort_requested and not batch.scheduler_completed:
+        if batch.finalizing and not batch.abort_requested and not batch.scheduler_completed:
             self.scheduler.complete_pipeline_request(request_id)
             batch.scheduler_completed = True
-        if (batch.abort_requested or (cancelling and batch.failure is None)) and not batch.scheduler_completed:
+        if (batch.abort_requested or (batch.cancelled and batch.failure is None)) and not batch.scheduler_completed:
             self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
             batch.scheduler_completed = True
         self._queued_pipeline_batches.pop(batch.batch_id, None)
@@ -936,7 +941,7 @@ class DiffusionEngine:
     def _cancel_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
         if self._queued_pipeline_batches.get(batch.batch_id) is not batch:
             raise ValueError("Queued pipeline batch is not owned by this Engine.")
-        if batch.phase is _QueuedPipelineBatchPhase.CANCELLING:
+        if batch.cancelled:
             return
         for future in (batch.step_future, batch.decode_future):
             if future is not None and not future.done():
@@ -950,6 +955,7 @@ class DiffusionEngine:
             if not isinstance(cleanup, list) or len(cleanup) != self.od_config.num_gpus or not all(cleanup):
                 raise RuntimeError("Queued request cleanup did not acknowledge every Worker.")
             batch.request_cleanup_completed = True
+        batch.cancelled = True
         batch.phase = _QueuedPipelineBatchPhase.CANCELLING
 
     def _advance_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> BatchRunnerOutput | None:
@@ -1260,6 +1266,7 @@ class DiffusionEngine:
                                 break
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
+                self._authorize_waiting_queued_batches()
                 for task_output in admitted_outputs:
                     batch = self._queued_pipeline_batch_for_scheduler_output(task_output)
                     batch_id = None if batch is None else batch.batch_id
@@ -2094,7 +2101,7 @@ class DiffusionEngine:
                 continue
             batch.abort_requested = True
             try:
-                if batch.phase is not _QueuedPipelineBatchPhase.CANCELLING:
+                if not batch.cancelled:
                     self._cancel_queued_pipeline_batch(batch)
                 self._retire_queued_pipeline_batch(batch)
                 if batch.batch_id in self._queued_pipeline_batches:
