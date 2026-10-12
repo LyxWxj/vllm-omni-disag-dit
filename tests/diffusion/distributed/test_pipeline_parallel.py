@@ -132,15 +132,6 @@ def test_pipeline_tensor_dict_pp2_groups_follow_source_rank() -> None:
     assert coordinator._tensor_dict_comm_groups(1) == ("device-1-0", "cpu-1-0")
 
 
-def test_queued_feedback_uses_reverse_pp2_group() -> None:
-    coordinator = object.__new__(PipelineGroupCoordinator)
-    coordinator.world_size = 2
-    coordinator.device_group = "device-0-1"
-    coordinator.device_groups = ["device-0-1", "device-1-0"]
-
-    assert PipelineParallelMixin._queued_feedback_device_group(coordinator) == "device-1-0"
-
-
 @pytest.mark.cpu
 def test_queued_receive_uses_side_stream_and_waits_only_when_consumed(mocker) -> None:
     class Pipeline(PipelineParallelMixin, CFGParallelMixin):
@@ -277,8 +268,8 @@ class TestAsyncLatents:
 
     pytestmark = _UNIT_MARKS
 
-    def _make(self, tensor: torch.Tensor, handles: list | None = None, postproc: list | None = None) -> AsyncLatents:
-        return AsyncLatents({"latents": tensor}, handles or [], postproc or [])
+    def _make(self, tensor: torch.Tensor, handles: list | None = None) -> AsyncLatents:
+        return AsyncLatents({"latents": tensor}, handles or [])
 
     def test_resolve_returns_wrapped_tensor(self):
         t = torch.randn(2, 4)
@@ -319,13 +310,6 @@ class TestAsyncLatents:
         al = self._make(t, handles=[h1, h2])
         _ = al.shape  # trigger resolution
         assert h1.waited and h2.waited, "Not all handles were waited on"
-
-    def test_postproc_callbacks_invoked_on_resolve(self):
-        t = torch.randn(2, 4)
-        log: list[int] = []
-        al = self._make(t, postproc=[lambda: log.append(1), lambda: log.append(2)])
-        _ = al.shape
-        assert log == [1, 2], f"postproc not called in order: {log}"
 
     def test_idempotent_resolve(self):
         """handle.wait() must not be called twice if _resolve() is called twice."""

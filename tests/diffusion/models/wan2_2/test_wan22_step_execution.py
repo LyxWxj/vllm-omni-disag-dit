@@ -547,7 +547,7 @@ def test_post_decode_materializes_async_latents_before_runner_ipc(monkeypatch) -
     pipeline.prepare_encode(state)
     tensor = torch.arange(300_000, dtype=torch.float32).reshape(1, 4, 1, 300, 250)
     work = _UnpickleableWork()
-    state.latents = AsyncLatents({"latents": tensor}, [work], [])
+    state.latents = AsyncLatents({"latents": tensor}, [work])
     state.extra["wan_output_type"] = "latent"
 
     output = pipeline.post_decode(state)

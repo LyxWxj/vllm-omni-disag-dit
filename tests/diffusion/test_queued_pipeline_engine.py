@@ -77,7 +77,12 @@ def test_queued_step_commits_from_nonblocking_worker_future(mocker) -> None:
     batch = engine._submit_queued_pipeline_batch(scheduler_output, authorize=False)
 
     engine._authorize_waiting_queued_batches()
-    engine.executor.execute_step.assert_called_once_with(scheduler_output, non_block=True, output_rank=0)
+    engine.executor.execute_step.assert_called_once_with(
+        scheduler_output,
+        non_block=True,
+        output_rank=0,
+        reply_rank=0,
+    )
     assert batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
 
     future.set_result(_step_output("req-a"))
@@ -112,7 +117,11 @@ def test_scheduler_cycle_requests_share_one_worker_future(mocker) -> None:
     engine.executor.execute_step.assert_called_once()
     combined_output = engine.executor.execute_step.call_args.args[0]
     assert combined_output.scheduled_request_ids == ["req-a", "req-b"]
-    assert engine.executor.execute_step.call_args.kwargs == {"non_block": True, "output_rank": 0}
+    assert engine.executor.execute_step.call_args.kwargs == {
+        "non_block": True,
+        "output_rank": 0,
+        "reply_rank": 0,
+    }
     assert batches[0].step_future is batches[1].step_future is future
     assert engine._queued_denoise_batch_count() == 1
 
@@ -143,6 +152,7 @@ def test_scheduler_cycle_requests_rotate_decode_owners(mocker) -> None:
         mocker.ANY,
         non_block=True,
         output_rank=0,
+        reply_rank=0,
     )
 
 
