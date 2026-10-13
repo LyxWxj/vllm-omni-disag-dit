@@ -249,6 +249,13 @@ class _QueuedPipelineBatch:
     phase: _QueuedPipelineBatchPhase = _QueuedPipelineBatchPhase.RESERVED
 
 
+@dataclass
+class _QueuedDecodeRound:
+    request_ids: tuple[str, ...]
+    ready_futures: list[concurrent.futures.Future] = dataclasses.field(default_factory=list)
+    dispatched: bool = False
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -428,6 +435,8 @@ class DiffusionEngine:
         self._scheduler_num_waiting_reqs = 0
         self._queued_pipeline_batches: dict[str, _QueuedPipelineBatch] = {}
         self._queued_pipeline_epoch = 0
+        self._queued_decode_round: _QueuedDecodeRound | None = None
+        self.scheduler.grouped_queued_decode = self._uses_grouped_queued_decode()
 
     def _notify_queued_pipeline_update(self) -> None:
         with self._cv:
@@ -630,12 +639,14 @@ class DiffusionEngine:
     def _queued_pipeline_can_advance_without_schedule(self) -> bool:
         if not self._queued_pipeline_batches:
             return False
+        self._maybe_start_queued_decode_round()
+        if getattr(self, "_queued_decode_round", None) is not None:
+            return True
         # A shared Future can become ready halfway through an Engine round.
         # Drain every committed member before the Scheduler sees the first
         # retired request as a candidate for the next wave.
         if any(
-            batch.phase is _QueuedPipelineBatchPhase.STEP_COMMITTED
-            for batch in self._queued_pipeline_batches.values()
+            batch.phase is _QueuedPipelineBatchPhase.STEP_COMMITTED for batch in self._queued_pipeline_batches.values()
         ):
             return True
         has_candidate = getattr(self.scheduler, "has_queued_admission_candidate", None)
@@ -650,6 +661,8 @@ class DiffusionEngine:
         scheduler_capacity = getattr(self.scheduler, "max_num_running_reqs", None)
         if type(scheduler_capacity) is not int or scheduler_capacity <= 0:
             scheduler_capacity = _max_num_seqs(self.od_config) * int(self.od_config.max_inflight_batches)
+        if self._uses_grouped_queued_decode():
+            return scheduler_capacity
         finalizing_batches = sum(
             batch.phase is _QueuedPipelineBatchPhase.FINALIZING for batch in self._queued_pipeline_batches.values()
         )
@@ -679,13 +692,141 @@ class DiffusionEngine:
             has_waiting = getattr(self.scheduler, "has_queued_waiting_request", None)
             if not callable(has_waiting) or self._queued_denoise_batch_count() < max_inflight or not has_waiting():
                 return False
+        decode_round = getattr(self, "_queued_decode_round", None)
+        if decode_round is not None and any(future.done() for future in decode_round.ready_futures):
+            if not decode_round.dispatched and all(future.done() for future in decode_round.ready_futures):
+                return False
         return not any(
-            batch.failure is not None
-            or batch.abort_requested
-            or (batch.step_future is not None and batch.step_future.done())
-            or (batch.decode_future is not None and batch.decode_future.done())
+            ((batch.failure is not None or batch.abort_requested) and not self._queued_decode_round_busy())
+            or batch.phase is _QueuedPipelineBatchPhase.STEP_COMMITTED
+            or (
+                batch.phase in {_QueuedPipelineBatchPhase.AUTHORIZED, _QueuedPipelineBatchPhase.STEP_COMPLETED}
+                and batch.step_future is not None
+                and batch.step_future.done()
+            )
+            or (batch.decode_future is not None and batch.decode_future.done() and not self._queued_decode_round_busy())
             for batch in self._queued_pipeline_batches.values()
         )
+
+    def _uses_grouped_queued_decode(self) -> bool:
+        parallel = getattr(self.od_config, "parallel_config", None)
+        return (
+            getattr(self.od_config, "mode", "static") == "queued"
+            and int(getattr(parallel, "pipeline_parallel_size", 1)) == 2
+            and int(getattr(parallel, "vae_patch_parallel_size", 1)) == 1
+            and int(getattr(parallel, "data_parallel_size", 1)) == 1
+            and int(getattr(self.od_config, "num_gpus", 2)) == 2
+            and not getattr(self.od_config, "streaming_output", False)
+        )
+
+    def _maybe_start_queued_decode_round(self) -> None:
+        """Seal a decode cohort at the request threshold or denoise exhaustion."""
+        if not self._uses_grouped_queued_decode() or getattr(self, "_queued_decode_round", None) is not None:
+            return
+        if any(
+            batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED for batch in self._queued_pipeline_batches.values()
+        ):
+            return
+        pending = [
+            batch
+            for batch in self._queued_pipeline_batches.values()
+            if batch.phase is _QueuedPipelineBatchPhase.FINALIZING
+            and not batch.abort_requested
+            and batch.failure is None
+            and batch.decode_future is None
+            and batch.decoded_output is None
+            and not (
+                batch.native_output is not None
+                and (output := batch.native_output.get_request_output(batch.request_id)) is not None
+                and output.result is not None
+            )
+        ]
+        if not pending:
+            return
+        has_denoise = getattr(self.scheduler, "has_queued_denoise_request", None)
+        if callable(has_denoise):
+            remaining = has_denoise()
+        else:
+            remaining = any(not batch.finalizing for batch in self._queued_pipeline_batches.values())
+        if len(pending) < int(self.od_config.max_inflight_batches) and remaining:
+            return
+        self._queued_decode_round = _QueuedDecodeRound(tuple(batch.request_id for batch in pending))
+
+    def _queued_decode_round_busy(self) -> bool:
+        decode_round = getattr(self, "_queued_decode_round", None)
+        if decode_round is None:
+            return False
+        return any(not future.done() for future in decode_round.ready_futures) or any(
+            batch.decode_future is not None and not batch.decode_future.done()
+            for batch in self._queued_pipeline_batches.values()
+        )
+
+    def _advance_queued_decode_round(self) -> None:
+        self._maybe_start_queued_decode_round()
+        decode_round = getattr(self, "_queued_decode_round", None)
+        if decode_round is None:
+            return
+        members = [
+            batch for batch in self._queued_pipeline_batches.values() if batch.request_id in decode_round.request_ids
+        ]
+        if not members:
+            self._queued_decode_round = None
+            return
+        if decode_round.dispatched:
+            return
+        # Rank0's metadata Future may precede rank1's final DiT. First drain
+        # commits, then enqueue an independent readiness command on each rank.
+        if any(
+            batch.phase
+            in {
+                _QueuedPipelineBatchPhase.AUTHORIZED,
+                _QueuedPipelineBatchPhase.STEP_COMPLETED,
+                _QueuedPipelineBatchPhase.STEP_COMMITTED,
+            }
+            for batch in self._queued_pipeline_batches.values()
+        ):
+            return
+        pp_size = int(self.od_config.parallel_config.pipeline_parallel_size)
+        try:
+            if not decode_round.ready_futures:
+                # Cancellation may have retired a sealed member while the
+                # current denoise wave was draining.
+                decode_round.request_ids = tuple(batch.request_id for batch in members)
+                for rank in range(pp_size):
+                    future = self.executor.prepare_queued_decode(decode_round.request_ids, output_rank=rank)
+                    if not isinstance(future, concurrent.futures.Future):
+                        raise RuntimeError("Queued decode readiness requires a non-blocking Future.")
+                    future.add_done_callback(lambda _future: self._notify_queued_pipeline_update())
+                    decode_round.ready_futures.append(future)
+                return
+            if not all(future.done() for future in decode_round.ready_futures):
+                return
+            for future in decode_round.ready_futures:
+                if tuple(future.result()) != decode_round.request_ids:
+                    raise RuntimeError("Queued decode readiness returned unexpected request IDs.")
+            decode_round.dispatched = True
+            # Submit the entire cohort before consuming any output or running
+            # all-rank cleanup. Per-rank Worker FIFOs serialize local VAE calls.
+            for index, batch in enumerate(members):
+                if batch.abort_requested or batch.failure is not None:
+                    continue
+                batch.output_rank = index % pp_size
+                batch.decode_future = self.executor.execute_decode(
+                    batch.request_id,
+                    output_rank=batch.output_rank,
+                    non_block=True,
+                )
+                if not isinstance(batch.decode_future, concurrent.futures.Future):
+                    raise RuntimeError("Queued decode requires a non-blocking Worker Future.")
+                batch.decode_future.add_done_callback(lambda _future: self._notify_queued_pipeline_update())
+        except BaseException as exc:
+            # A partial dispatch still owns Worker state. A readiness/dispatch
+            # failure cannot resume DiT on a potentially inconsistent group.
+            decode_round.dispatched = True
+            for batch in members:
+                batch.failure = exc
+            self.executor._fail_queued_control("decode cohort dispatch", exc)
+            raise
 
     def _reserve_queued_pipeline_batch(self, scheduler_output: Any) -> _QueuedPipelineBatch:
         if len(self._queued_pipeline_batches) >= self._queued_pipeline_admission_limit():
@@ -766,6 +907,9 @@ class DiffusionEngine:
         overlap.  ``max_num_seqs`` still bounds scheduler admission; this
         method only coalesces already-admitted, prepared state.
         """
+        self._maybe_start_queued_decode_round()
+        if getattr(self, "_queued_decode_round", None) is not None:
+            return
         available_slots = int(self.od_config.max_inflight_batches) - self._queued_denoise_batch_count()
         if available_slots <= 0:
             return
@@ -792,9 +936,7 @@ class DiffusionEngine:
                 break
             new_reqs = [request for batch in group for request in batch.scheduler_output.scheduled_new_reqs]
             cached_ids = [
-                request_id
-                for batch in group
-                for request_id in batch.scheduler_output.scheduled_cached_reqs.request_ids
+                request_id for batch in group for request_id in batch.scheduler_output.scheduled_cached_reqs.request_ids
             ]
             # ``finished_req_ids`` belongs to the scheduler cycle that
             # produced the first descriptor.  It must not retire a state from
@@ -868,7 +1010,8 @@ class DiffusionEngine:
             pending_wave_members = any(
                 other is not batch
                 and other.step_future is batch.step_future
-                and other.phase in {
+                and other.phase
+                in {
                     _QueuedPipelineBatchPhase.AUTHORIZED,
                     _QueuedPipelineBatchPhase.STEP_COMPLETED,
                 }
@@ -892,16 +1035,18 @@ class DiffusionEngine:
                 batch.decoded_output = batch.native_output
                 return batch.native_output
         if batch.decode_future is None:
-            batch.decode_future = self.executor.execute_decode(
-                batch.request_id,
-                output_rank=batch.output_rank,
-                non_block=True,
-            )
-            if not isinstance(batch.decode_future, concurrent.futures.Future):
-                raise RuntimeError("Queued decode requires a non-blocking Worker Future.")
-            batch.decode_future.add_done_callback(lambda _future: self._notify_queued_pipeline_update())
-            return None
-        if not batch.decode_future.done():
+            if self._uses_grouped_queued_decode():
+                self._advance_queued_decode_round()
+            else:
+                batch.decode_future = self.executor.execute_decode(
+                    batch.request_id,
+                    output_rank=batch.output_rank,
+                    non_block=True,
+                )
+                if not isinstance(batch.decode_future, concurrent.futures.Future):
+                    raise RuntimeError("Queued decode requires a non-blocking Worker Future.")
+                batch.decode_future.add_done_callback(lambda _future: self._notify_queued_pipeline_update())
+        if batch.decode_future is None or not batch.decode_future.done() or self._queued_decode_round_busy():
             return None
         output = batch.decode_future.result()
         if not isinstance(output, BaseRunnerOutput):
@@ -913,6 +1058,10 @@ class DiffusionEngine:
         return output
 
     def _retire_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
+        if self._queued_decode_round_busy():
+            return
+        if (batch.abort_requested or batch.failure is not None) and not batch.cancelled:
+            return
         if batch.phase not in {
             _QueuedPipelineBatchPhase.STEP_COMMITTED,
             _QueuedPipelineBatchPhase.FINALIZING,
@@ -936,12 +1085,19 @@ class DiffusionEngine:
             self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
             batch.scheduler_completed = True
         self._queued_pipeline_batches.pop(batch.batch_id, None)
+        decode_round = getattr(self, "_queued_decode_round", None)
+        if decode_round is not None and not any(
+            member.request_id in decode_round.request_ids for member in self._queued_pipeline_batches.values()
+        ):
+            self._queued_decode_round = None
         self._authorize_waiting_queued_batches()
 
     def _cancel_queued_pipeline_batch(self, batch: _QueuedPipelineBatch) -> None:
         if self._queued_pipeline_batches.get(batch.batch_id) is not batch:
             raise ValueError("Queued pipeline batch is not owned by this Engine.")
         if batch.cancelled:
+            return
+        if self._queued_decode_round_busy():
             return
         for future in (batch.step_future, batch.decode_future):
             if future is not None and not future.done():
@@ -972,8 +1128,7 @@ class DiffusionEngine:
                 wave = [
                     member
                     for member in self._queued_pipeline_batches.values()
-                    if member.step_future is batch.step_future
-                    and member.phase is _QueuedPipelineBatchPhase.AUTHORIZED
+                    if member.step_future is batch.step_future and member.phase is _QueuedPipelineBatchPhase.AUTHORIZED
                 ]
                 # Validate the entire Worker result before publishing any
                 # member as committed. Otherwise Future completion midway
@@ -995,9 +1150,7 @@ class DiffusionEngine:
         if batch.phase is _QueuedPipelineBatchPhase.STEP_COMPLETED:
             self._commit_queued_pipeline_step(batch)
         output = (
-            self._finalize_queued_pipeline_batch(batch)
-            if batch.phase is _QueuedPipelineBatchPhase.FINALIZING
-            else None
+            self._finalize_queued_pipeline_batch(batch) if batch.phase is _QueuedPipelineBatchPhase.FINALIZING else None
         )
         if batch.phase is _QueuedPipelineBatchPhase.FINALIZING and output is None:
             return None
@@ -1007,6 +1160,8 @@ class DiffusionEngine:
             _QueuedPipelineBatchPhase.CANCELLING,
         }:
             self._retire_queued_pipeline_batch(batch)
+            if batch.batch_id in self._queued_pipeline_batches:
+                return None
         return output
 
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
@@ -1283,18 +1438,14 @@ class DiffusionEngine:
                         else:
                             self._handle_queued_iteration_failure(task_output, exc)
                 self._advance_unhandled_queued_batches(handled_request_ids)
+                self._advance_queued_decode_round()
                 if self._should_wait_for_queued_pipeline_update():
                     with self._cv:
                         if (
                             not self.stop_event.is_set()
                             and self._rpc_queue.empty()
                             and self.abort_queue.empty()
-                            and not self.scheduler.has_requests()
-                            and not any(
-                                (batch.step_future is not None and batch.step_future.done())
-                                or (batch.decode_future is not None and batch.decode_future.done())
-                                for batch in self._queued_pipeline_batches.values()
-                            )
+                            and self._should_wait_for_queued_pipeline_update()
                         ):
                             self._cv.wait()
                 continue

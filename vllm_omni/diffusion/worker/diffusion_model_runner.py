@@ -1418,6 +1418,28 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output_rank=output_rank,
         )
 
+    def prepare_queued_decode(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """Confirm completion on this rank without issuing new P2P operations."""
+        from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
+
+        for request_id in request_ids:
+            state = self.state_cache.get(request_id)
+            if state is None or not state.denoise_completed:
+                raise RuntimeError(f"Queued decode request {request_id!r} has not completed denoise.")
+        # Also resolve feedback of paused, unfinished requests before draining
+        # shared sends: a threshold can interrupt an otherwise active window.
+        for state in self.state_cache.values():
+            if isinstance(state.latents, AsyncLatents):
+                state.latents = state.latents.resolve()
+        sync_send = getattr(self.pipeline, "_sync_pp_send", None)
+        if callable(sync_send):
+            sync_send()
+        if self.device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+            event.synchronize()
+        return request_ids
+
     def execute_prepared_decode(self, request_id: str) -> BatchRunnerOutput:
         """Decode one completed queued request on the RPC-selected PP rank."""
         pipeline = self.pipeline

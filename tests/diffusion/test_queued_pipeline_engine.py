@@ -77,12 +77,7 @@ def test_queued_step_commits_from_nonblocking_worker_future(mocker) -> None:
     batch = engine._submit_queued_pipeline_batch(scheduler_output, authorize=False)
 
     engine._authorize_waiting_queued_batches()
-    engine.executor.execute_step.assert_called_once_with(
-        scheduler_output,
-        non_block=True,
-        output_rank=0,
-        reply_rank=0,
-    )
+    engine.executor.execute_step.assert_called_once_with(scheduler_output, non_block=True, output_rank=0)
     assert batch.phase is _QueuedPipelineBatchPhase.AUTHORIZED
 
     future.set_result(_step_output("req-a"))
@@ -117,11 +112,7 @@ def test_scheduler_cycle_requests_share_one_worker_future(mocker) -> None:
     engine.executor.execute_step.assert_called_once()
     combined_output = engine.executor.execute_step.call_args.args[0]
     assert combined_output.scheduled_request_ids == ["req-a", "req-b"]
-    assert engine.executor.execute_step.call_args.kwargs == {
-        "non_block": True,
-        "output_rank": 0,
-        "reply_rank": 0,
-    }
+    assert engine.executor.execute_step.call_args.kwargs == {"non_block": True, "output_rank": 0}
     assert batches[0].step_future is batches[1].step_future is future
     assert engine._queued_denoise_batch_count() == 1
 
@@ -152,7 +143,6 @@ def test_scheduler_cycle_requests_rotate_decode_owners(mocker) -> None:
         mocker.ANY,
         non_block=True,
         output_rank=0,
-        reply_rank=0,
     )
 
 
@@ -206,6 +196,64 @@ def test_shared_wave_waits_for_all_commits_before_authorizing_next_wave(mocker) 
     authorize.assert_called_once()
 
 
+def test_grouped_decode_round_starts_at_request_threshold(mocker) -> None:
+    scheduler_outputs = [_scheduler_output(request_id) for request_id in ("req-a", "req-b")]
+    engine = _engine(mocker, scheduler_outputs[0])
+    engine.scheduler.has_queued_denoise_request = mocker.Mock(return_value=True)
+    batches = [
+        engine._submit_queued_pipeline_batch(scheduler_output, authorize=False)
+        for scheduler_output in scheduler_outputs
+    ]
+    for batch in batches:
+        batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+        batch.finalizing = True
+
+    engine._maybe_start_queued_decode_round()
+
+    assert engine._queued_decode_round is not None
+    assert engine._queued_decode_round.request_ids == ("req-a", "req-b")
+
+
+def test_grouped_decode_round_flushes_tail_when_denoise_is_exhausted(mocker) -> None:
+    scheduler_output = _scheduler_output()
+    engine = _engine(mocker, scheduler_output)
+    engine.scheduler.has_queued_denoise_request = mocker.Mock(return_value=False)
+    batch = engine._submit_queued_pipeline_batch(scheduler_output, authorize=False)
+    batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+    batch.finalizing = True
+
+    engine._maybe_start_queued_decode_round()
+
+    assert engine._queued_decode_round is not None
+    assert engine._queued_decode_round.request_ids == ("req-a",)
+
+
+def test_grouped_decode_dispatches_ready_cohort_to_both_ranks(mocker) -> None:
+    scheduler_outputs = [_scheduler_output(request_id) for request_id in ("req-a", "req-b")]
+    engine = _engine(mocker, scheduler_outputs[0])
+    engine.scheduler.has_queued_denoise_request = mocker.Mock(return_value=True)
+    batches = [
+        engine._submit_queued_pipeline_batch(scheduler_output, authorize=False)
+        for scheduler_output in scheduler_outputs
+    ]
+    for batch in batches:
+        batch.phase = _QueuedPipelineBatchPhase.FINALIZING
+        batch.finalizing = True
+
+    ready_futures = [Future(), Future()]
+    decode_futures = [Future(), Future()]
+    engine.executor.prepare_queued_decode.side_effect = ready_futures
+    engine.executor.execute_decode.side_effect = decode_futures
+    engine._maybe_start_queued_decode_round()
+    engine._advance_queued_decode_round()
+    ready_futures[0].set_result(("req-a", "req-b"))
+    ready_futures[1].set_result(("req-a", "req-b"))
+    engine._advance_queued_decode_round()
+
+    assert [call.kwargs["output_rank"] for call in engine.executor.execute_decode.call_args_list] == [0, 1]
+    assert all(batch.decode_future is future for batch, future in zip(batches, decode_futures, strict=True))
+
+
 def test_future_ready_mid_iteration_commits_whole_wave_before_next_schedule(mocker) -> None:
     output = _scheduler_output("req-a")
     output.scheduled_new_reqs.append(_scheduler_output("req-b").scheduled_new_reqs[0])
@@ -220,10 +268,14 @@ def test_future_ready_mid_iteration_commits_whole_wave_before_next_schedule(mock
 
     # Engine has already visited A when the Future becomes ready at B.
     assert engine._advance_queued_pipeline_batch(batches[0]) is None
-    future.set_result(BatchRunnerOutput.from_list([
-        RunnerOutput(request_id="req-a", step_index=1),
-        RunnerOutput(request_id="req-b", step_index=1),
-    ]))
+    future.set_result(
+        BatchRunnerOutput.from_list(
+            [
+                RunnerOutput(request_id="req-a", step_index=1),
+                RunnerOutput(request_id="req-b", step_index=1),
+            ]
+        )
+    )
     engine._advance_queued_pipeline_batch(batches[1])
 
     assert engine.scheduler.commit_pipeline_step.call_count == 2

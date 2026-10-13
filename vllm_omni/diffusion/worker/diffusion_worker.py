@@ -731,6 +731,10 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def prepare_queued_decode(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.prepare_queued_decode(request_ids)
+
     def execute_prepared_decode(self, request_id: str) -> BaseRunnerOutput:
         """Decode one prepared queued request on the RPC-selected rank."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -1801,6 +1805,9 @@ class WorkerWrapperBase:
         output_rank: int = 0,
     ) -> BaseRunnerOutput:
         return self.worker.execute_prepared_stepwise(scheduler_output, output_rank=output_rank)
+
+    def prepare_queued_decode(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        return self.worker.prepare_queued_decode(request_ids)
 
     def execute_prepared_decode(self, request_id: str) -> BaseRunnerOutput:
         return self.worker.execute_prepared_decode(request_id)

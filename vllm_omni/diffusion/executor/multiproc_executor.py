@@ -766,6 +766,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def prepare_queued_decode(self, request_ids: tuple[str, ...], output_rank: int) -> concurrent.futures.Future:
+        """Drain rank-local denoise dependencies before a concentrated decode round."""
+        return self._collective_rpc_future(
+            "prepare_queued_decode",
+            args=(request_ids,),
+            unique_reply_rank=output_rank,
+            exec_all_ranks=False,
+        )
+
     def execute_decode(
         self,
         request_id: str,
@@ -1222,6 +1231,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                                 else:
                                     fut.set_result(output_result)
                                 self._completed_outputs[batch_id] = fut
+
     def _deliver_batch_split(
         self,
         per_req_map: dict[str, str],
