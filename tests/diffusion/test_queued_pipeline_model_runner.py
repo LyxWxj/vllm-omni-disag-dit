@@ -154,12 +154,13 @@ def test_execute_prepared_stepwise_sends_one_microbatch_per_pipeline_request(moc
         )
     )
 
-    def step_scheduler(state, noise_pred):
+    def advance_step(state, noise_pred):
         runner.pipeline.events.append(("scheduler", state.request_id))
         state.latents = state.latents + noise_pred
         state.step_index += 1
 
-    runner.pipeline.step_scheduler = step_scheduler
+    runner.pipeline.advance_step_for_pipeline_rank = advance_step
+    runner.pipeline.step_scheduler = lambda *_args: pytest.fail("rank-aware scheduler path should be used")
     scheduler_output = SimpleNamespace(
         scheduled_request_ids=["req-a", "req-b"],
         scheduled_new_reqs=[],

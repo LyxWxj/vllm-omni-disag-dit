@@ -1482,9 +1482,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            req_noise_pred = noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                            advance_step = getattr(pipeline, "advance_step_for_pipeline_rank", None)
+                            if callable(advance_step):
+                                advance_step(req, req_noise_pred)
+                            else:
+                                pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:

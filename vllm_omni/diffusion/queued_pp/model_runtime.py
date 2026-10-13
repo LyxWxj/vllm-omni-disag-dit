@@ -401,12 +401,11 @@ class QueuedModelRuntime:
                             if getattr(pipeline, "interrupt", False):
                                 break
                             try:
-                                # Both ranks advance this request immediately.
-                                # Rank 1 posts feedback on the reverse PP2
-                                # communicator; rank 0 keeps the receive lazy,
-                                # so this call does not wait for feedback from
-                                # the same denoise step.
-                                pipeline.step_scheduler(state, req_noise_pred)
+                                advance_step = getattr(pipeline, "advance_step_for_pipeline_rank", None)
+                                if callable(advance_step):
+                                    advance_step(state, req_noise_pred)
+                                else:
+                                    pipeline.step_scheduler(state, req_noise_pred)
                             except Exception as exc:
                                 scheduler_errors[state.request_id] = exc
                     finally:

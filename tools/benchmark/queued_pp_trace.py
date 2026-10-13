@@ -106,7 +106,7 @@ def _install_pipeline_hooks(worker: Any) -> None:
         model.forward = traced_forward
         model._queued_pp_trace_forward_installed = True
 
-    for method in ("denoise_step", "step_scheduler", "post_decode"):
+    for method in ("denoise_step", "step_scheduler", "receive_scheduler_feedback", "post_decode"):
         original = getattr(pipeline, method, None)
         if not callable(original):
             continue

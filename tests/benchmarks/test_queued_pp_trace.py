@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _trace_module():
@@ -94,6 +95,19 @@ def test_common_queued_pp_trace_renderer_includes_control_and_rank_lanes(tmp_pat
             )
             + "\n"
         )
+        stream.write(
+            json.dumps(
+                {
+                    "kind": "receive_scheduler_feedback",
+                    "rank": 0,
+                    "request_id": "req-0",
+                    "step_index": 1,
+                    "start_ns": 1_300_000_000,
+                    "end_ns": 1_310_000_000,
+                }
+            )
+            + "\n"
+        )
     (events_dir / "engine_control.jsonl").write_text(
         json.dumps(
             {
@@ -113,6 +127,7 @@ def test_common_queued_pp_trace_renderer_includes_control_and_rank_lanes(tmp_pat
 
     html = output.read_text(encoding="utf-8")
     assert "rank0.post_decode" in html
+    assert "rank0.receive_scheduler_feedback" in html
     assert "rank1.decode_ready" in html
     assert "engine.decode_round" in html
     assert "engine.decode_dispatch" in html
@@ -149,3 +164,21 @@ def test_trace_installer_wraps_private_engine_queue_runtime() -> None:
             setattr(DiffusionWorker, name, method)
         for name, method in original_engine_methods.items():
             setattr(QueuedPipelineEngineQueue, name, method)
+
+
+def test_pipeline_trace_records_feedback_receive_as_its_own_span(tmp_path: Path, monkeypatch) -> None:
+    trace_dir = tmp_path / "worker_events"
+    monkeypatch.setenv("VLLM_OMNI_PP_TRACE_DIR", str(trace_dir))
+    pipeline = SimpleNamespace(receive_scheduler_feedback=lambda _state: None)
+    worker = SimpleNamespace(model_runner=SimpleNamespace(pipeline=pipeline), rank=0, device="cpu")
+    state = SimpleNamespace(request_id="req-a", step_index=3)
+
+    _trace_module()._install_pipeline_hooks(worker)
+    pipeline.receive_scheduler_feedback(state)
+
+    records = [json.loads(line) for line in (trace_dir / "worker_rank0.jsonl").read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["kind"] == "receive_scheduler_feedback"
+    assert records[0]["request_id"] == "req-a"
+    assert records[0]["step_index"] == 3
+    assert records[0]["error"] is None

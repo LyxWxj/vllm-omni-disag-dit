@@ -184,6 +184,49 @@ class PipelineParallelMixin:
                 handle.wait()
             self._pp_send_work = []
 
+    def receive_scheduler_feedback(self, state: Any) -> None:
+        """Post the first-rank receive for the last rank's updated latents.
+
+        The first rank owns the next denoise input but does not run the solver.
+        Keeping this receive separate makes the rank-local scheduler ownership
+        explicit while retaining the lazy latent handoff.
+        """
+        if get_pipeline_parallel_world_size() <= 1:
+            raise RuntimeError("Scheduler feedback receive requires pipeline parallelism.")
+        pp_group = get_pp_group()
+        if not pp_group.is_first_rank:
+            raise RuntimeError("Only the first pipeline rank can receive scheduler feedback.")
+        if state.latents is None:
+            raise ValueError(f"Request {state.request_id} has no latent state for scheduler feedback.")
+        state.latents = self._receive_scheduler_latents(state.latents, pp_group)
+
+    def advance_step_for_pipeline_rank(self, state: Any, noise_pred: torch.Tensor | None) -> None:
+        """Run solver math on the last rank and advance metadata on other ranks."""
+        try:
+            pp_world_size = get_pipeline_parallel_world_size()
+        except AssertionError:
+            pp_world_size = 1
+        if pp_world_size <= 1:
+            self.step_scheduler(state, noise_pred)
+            return
+
+        pp_group = get_pp_group()
+        if pp_group.is_last_rank:
+            self.step_scheduler(state, noise_pred)
+            return
+        if pp_group.is_first_rank:
+            self.receive_scheduler_feedback(state)
+        # Intermediate ranks retain their local latent replica, but their
+        # request timestep must stay aligned with the last rank.
+        state.step_index += 1
+
+    def _receive_scheduler_latents(self, latents: torch.Tensor | AsyncLatents, pp_group: Any) -> AsyncLatents:
+        if getattr(self, "_queued_pipeline_async_sends", False):
+            from vllm_omni.diffusion.queued_pp.feedback import receive_queued_latents
+
+            return receive_queued_latents(self, pp_group, latents)
+        return AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -298,7 +341,7 @@ class PipelineParallelMixin:
 
         pp_group = get_pp_group()
         if getattr(self, "_queued_pipeline_async_sends", False):
-            from vllm_omni.diffusion.queued_pp.feedback import receive_queued_latents, send_queued_latents
+            from vllm_omni.diffusion.queued_pp.feedback import send_queued_latents
 
             if pp_group.is_last_rank:
                 latents = super().scheduler_step_maybe_with_cfg(
@@ -306,7 +349,7 @@ class PipelineParallelMixin:
                 )
                 send_queued_latents(self, pp_group, latents)
             elif pp_group.is_first_rank:
-                latents = receive_queued_latents(self, pp_group, latents)
+                latents = self._receive_scheduler_latents(latents, pp_group)
             return latents
 
         if pp_group.is_last_rank:
@@ -315,5 +358,5 @@ class PipelineParallelMixin:
             )
             self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
         elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
+            latents = self._receive_scheduler_latents(latents, pp_group)
         return latents
