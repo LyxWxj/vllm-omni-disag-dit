@@ -58,6 +58,8 @@ class QueuedExecutorAdapter:
         executor = self._executor
         if executor._pump_running:
             raise RuntimeError("queued executor adapter must own the result queues before starting")
+        if not hasattr(executor, "_collective_rpc_lock"):
+            executor._collective_rpc_lock = threading.RLock()
         result_mqs = executor._result_mqs or ([executor._result_mq] if executor._result_mq is not None else [])
         if not result_mqs:
             raise RuntimeError("queued executor has no Worker result queues")
@@ -309,4 +311,5 @@ class QueuedExecutorAdapter:
         return result
 
     def collective_rpc(self, method: str, **kwargs: Any) -> Any:
-        return self._executor.collective_rpc(method, **kwargs)
+        with self._collective_rpc_lock:
+            return self._executor.collective_rpc(method, **kwargs)

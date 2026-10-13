@@ -41,7 +41,6 @@ def _executor_stub() -> MultiprocDiffusionExecutor:
     executor._is_failed = False
     executor._rpc_id_counter = 0
     executor._rpc_id_lock = threading.Lock()
-    executor._collective_rpc_lock = threading.RLock()
     executor._rpc_futures = {}
     executor._output_futures = {}
     executor._completed_outputs = {}
