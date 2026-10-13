@@ -14,7 +14,7 @@ import copy
 import gc
 import time
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -92,6 +92,19 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _queued_pipeline_async_send_mode(pipeline: Any, enabled: bool):
+    if not enabled:
+        yield
+        return
+    previous = getattr(pipeline, "_queued_pipeline_async_sends", False)
+    pipeline._queued_pipeline_async_sends = True
+    try:
+        yield
+    finally:
+        pipeline._queued_pipeline_async_sends = previous
 
 
 def _dit_any_rank_failed(local_failed: bool) -> bool:
@@ -1447,12 +1460,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
             kv_backend = getattr(self, "diffusion_kv_backend", None)
             paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-                paged_kv_runtime=paged_kv_runtime,
-                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+            queued_feedback_warmup = (
+                getattr(self.od_config, "mode", "static") == "queued"
+                and int(getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)) > 1
+                and getattr(pipeline, "supports_queued_pipeline", False)
+            )
+            with (
+                _queued_pipeline_async_send_mode(pipeline, queued_feedback_warmup),
+                set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata=attn_metadata,
+                    paged_kv_runtime=paged_kv_runtime,
+                    in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+                ),
             ):
                 clear_pipeline_stage_durations(pipeline)
                 noise_pred = pipeline.denoise_step(input_batch, states=states)

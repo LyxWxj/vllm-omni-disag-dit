@@ -183,6 +183,43 @@ def test_execute_prepared_stepwise_sends_one_microbatch_per_pipeline_request(moc
     ]
 
 
+def test_queued_startup_step_uses_feedback_transport_and_restores_mode(mocker) -> None:
+    runner = _runner()
+    state = _state()
+    runner.od_config.mode = "queued"
+    runner.od_config.streaming_output = False
+    runner.od_config.parallel_config.pipeline_parallel_size = 2
+    runner.state_cache = {state.request_id: state}
+    runner._update_states = mocker.Mock(return_value=([state], [state.request_id]))
+    update_states_after = mocker.patch.object(runner, "_update_states_after")
+    runner._prepare_batch_inputs = mocker.Mock(
+        return_value=([state], SimpleNamespace(latents=torch.empty_like(state.latents)), [])
+    )
+    observed_modes = []
+
+    def denoise_step(_input_batch, **_kwargs):
+        observed_modes.append(runner.pipeline._queued_pipeline_async_sends)
+        return torch.ones_like(state.latents)
+
+    def advance_step(request_state, noise_pred):
+        observed_modes.append(runner.pipeline._queued_pipeline_async_sends)
+        request_state.latents = request_state.latents + noise_pred
+        request_state.step_index += 1
+
+    runner.pipeline.denoise_step = denoise_step
+    runner.pipeline.advance_step_for_pipeline_rank = advance_step
+
+    runner._execute_stepwise_core(
+        SimpleNamespace(),
+        record_output_peak_memory=False,
+    )
+
+    assert observed_modes == [True, True]
+    assert runner.pipeline._queued_pipeline_async_sends is False
+    assert state.step_index == 1
+    update_states_after.assert_called_once()
+
+
 def test_execute_prepared_decode_runs_after_queued_denoise(mocker) -> None:
     runner = _runner()
     state = _state("req-a")
