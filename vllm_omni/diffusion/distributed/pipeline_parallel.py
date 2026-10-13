@@ -51,6 +51,10 @@ class AsyncLatents:
         self._tensor = self._tensor_dict["latents"]
         return self._tensor
 
+    def resolve(self) -> torch.Tensor:
+        """Wait for latent feedback and return the received tensor."""
+        return self._resolve()
+
     # Attribute access (e.g. .shape, .to(), .dtype) delegates to the resolved tensor.
     def __getattr__(self, name: str):
         return getattr(self._resolve(), name)
@@ -137,7 +141,7 @@ class PipelineParallelMixin:
             cls.diffuse = wrapped_diffuse
 
     def _wrapped_vae_decode(self) -> None:
-        vae, orig_decode = self.vae, self.vae.decode
+        pipeline, vae, orig_decode = self, self.vae, self.vae.decode
 
         @wraps(orig_decode)
         def wrapped_decode(z: torch.Tensor, *args: Any, **kwargs: Any):
@@ -147,7 +151,7 @@ class PipelineParallelMixin:
                 if get_pipeline_parallel_world_size() > 2:
                     z = get_pp_group().broadcast(z, src=0)
                 return orig_decode(z, *args, **kwargs)
-            elif is_pipeline_first_stage():
+            elif is_pipeline_first_stage() or getattr(pipeline, "_queued_pipeline_decode_owner", False):
                 return orig_decode(z, *args, **kwargs)
             return (None,)  # decoder returns a tuple
 
@@ -171,7 +175,11 @@ class PipelineParallelMixin:
         from the last iteration are completed before any subsequent
         collective (e.g. VAE decode broadcast) or tensor reuse.
         """
-        if self._pp_send_work:
+        if getattr(self, "_queued_pipeline_async_sends", False) or getattr(self, "_pp_send_tensors", None):
+            from vllm_omni.diffusion.queued_pp.feedback import sync_queued_latent_sends
+
+            sync_queued_latent_sends(self)
+        elif self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
@@ -205,7 +213,13 @@ class PipelineParallelMixin:
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
 
-        self._sync_pp_send()
+        queued_async = getattr(self, "_queued_pipeline_async_sends", False)
+        if queued_async:
+            from vllm_omni.diffusion.queued_pp.feedback import prune_queued_latent_sends
+
+            prune_queued_latent_sends(self)
+        else:
+            self._sync_pp_send()
 
         pp_group = get_pp_group()
 
@@ -228,7 +242,9 @@ class PipelineParallelMixin:
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for kwargs, it in zip(all_kwargs, its):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
-                self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
+                activation_work = pp_group.isend_tensor_dict(result.tensors)
+                if not queued_async:
+                    self._pp_send_work.extend(activation_work)
             return None
 
         # Last rank: run full forward
@@ -281,6 +297,18 @@ class PipelineParallelMixin:
             )
 
         pp_group = get_pp_group()
+        if getattr(self, "_queued_pipeline_async_sends", False):
+            from vllm_omni.diffusion.queued_pp.feedback import receive_queued_latents, send_queued_latents
+
+            if pp_group.is_last_rank:
+                latents = super().scheduler_step_maybe_with_cfg(
+                    noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
+                )
+                send_queued_latents(self, pp_group, latents)
+            elif pp_group.is_first_rank:
+                latents = receive_queued_latents(self, pp_group, latents)
+            return latents
+
         if pp_group.is_last_rank:
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator

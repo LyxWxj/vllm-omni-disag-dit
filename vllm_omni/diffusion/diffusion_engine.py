@@ -365,6 +365,10 @@ class DiffusionEngine:
     ) -> None:
         if scheduler is not None:
             self.scheduler = scheduler
+        elif getattr(od_config, "mode", "static") == "queued":
+            from vllm_omni.diffusion.queued_pp.scheduler import QueuedStepScheduler
+
+            self.scheduler = QueuedStepScheduler()
         elif self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
             self.scheduler = StepScheduler()
         else:
@@ -397,6 +401,14 @@ class DiffusionEngine:
             )
         else:
             self.dp_concurrent = False
+        self._queued_pipeline_runtime = None
+        if getattr(self.od_config, "mode", "static") == "queued":
+            from vllm_omni.diffusion.queued_pp.engine_queue import QueuedPipelineEngineQueue
+            from vllm_omni.diffusion.queued_pp.executor_adapter import QueuedExecutorAdapter
+            from vllm_omni.diffusion.queued_pp.queue_config import QueuedPipelineConfig
+
+            queued_config = QueuedPipelineConfig.from_config(self.od_config)
+            self.scheduler.max_num_running_reqs = _max_num_seqs(self.od_config) * queued_config.max_inflight_batches
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -422,6 +434,11 @@ class DiffusionEngine:
         # Copied onto the existing output metrics payload so queue monitoring
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
+        if getattr(self.od_config, "mode", "static") == "queued":
+            self._queued_pipeline_runtime = QueuedPipelineEngineQueue(
+                self,
+                QueuedExecutorAdapter(self.executor),
+            )
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -618,6 +635,7 @@ class DiffusionEngine:
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
+            queued_runtime = getattr(self, "_queued_pipeline_runtime", None)
             # Aborting the last request can leave no runnable wave, even when
             # scheduling is not paused. Deliver its terminal output before idle.
             with self._cv:
@@ -627,6 +645,7 @@ class DiffusionEngine:
             with self._cv:
                 while (
                     (self._scheduling_paused or not self.scheduler.has_requests())
+                    and not (queued_runtime is not None and queued_runtime.has_work())
                     and self._rpc_queue.empty()
                     and self.abort_queue.empty()
                     and not self.stop_event.is_set()
@@ -636,24 +655,41 @@ class DiffusionEngine:
                 if self.stop_event.is_set():
                     break
 
-                if self._scheduling_paused or not self.scheduler.has_requests():
-                    # Only RPC / abort work pending; loop back to drain it.
-                    continue
+                if queued_runtime is not None and queued_runtime.can_advance_without_schedule():
+                    sched_output = None
+                    self._scheduler_num_waiting_reqs = self.scheduler.num_waiting_requests()
+                elif self._scheduling_paused or not self.scheduler.has_requests():
+                    if queued_runtime is None or not queued_runtime.has_work():
+                        # Only RPC / abort work pending; loop back to drain it.
+                        continue
+                    sched_output = None
+                else:
+                    self._wait_for_admission_if_needed_locked()
+                    if self._scheduling_paused:
+                        if queued_runtime is None or not queued_runtime.has_work():
+                            # The gate closed while the batching wait released the lock.
+                            continue
+                        sched_output = None
+                    else:
+                        try:
+                            sched_output = self.scheduler.schedule()
+                        except Exception as exc:
+                            self._fail_engine(exc)
+                            return
+                        self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
-                self._wait_for_admission_if_needed_locked()
-                if self._scheduling_paused:
-                    # The gate closed while the batching wait released the lock.
-                    continue
+            if sched_output is not None:
+                self._emit_request_started_outputs(sched_output)
 
+            if queued_runtime is not None:
                 try:
-                    sched_output = self.scheduler.schedule()
+                    queued_runtime.step(sched_output)
                 except Exception as exc:
                     self._fail_engine(exc)
                     return
-                self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
+                continue
 
-            self._emit_request_started_outputs(sched_output)
-
+            assert sched_output is not None
             if sched_output.is_empty:
                 finished_ids = {
                     rid
@@ -1660,6 +1696,11 @@ class DiffusionEngine:
         request_ids = list(dict.fromkeys(request_ids))
 
         self._poll_native_kv(drain_request_ids=request_ids)
+
+        queued_runtime = getattr(self, "_queued_pipeline_runtime", None)
+        if queued_runtime is not None:
+            queued_runtime.abort_requests(request_ids)
+            return
 
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:

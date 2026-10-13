@@ -28,6 +28,13 @@ class QueuedPipelineConfig:
             raise ValueError(f"max_inflight_batches must be a positive integer, got {max_inflight_batches!r}")
         parallel_config = getattr(config, "parallel_config", None)
         pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1))
-        if pp_size <= 1:
-            raise ValueError("mode='queued' requires pipeline_parallel_size greater than 1")
+        if pp_size != 2:
+            raise ValueError("queued mode currently requires pipeline_parallel_size=2")
+        for name in ("data_parallel_size", "tensor_parallel_size", "sequence_parallel_size", "cfg_parallel_size"):
+            if int(getattr(parallel_config, name, 1)) != 1:
+                raise ValueError(f"queued mode currently requires {name}=1")
+        if int(getattr(parallel_config, "vae_patch_parallel_size", 1)) != 1:
+            raise ValueError("queued mode currently requires vae_patch_parallel_size=1; distributed VAE is unsupported")
+        if getattr(config, "streaming_output", False):
+            raise ValueError("queued mode currently does not support streaming_output")
         return cls(enabled=True, max_inflight_batches=max_inflight_batches)

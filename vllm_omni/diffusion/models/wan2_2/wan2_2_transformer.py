@@ -49,6 +49,13 @@ from vllm_omni.quantization.mxfp4_config import NPUMxfp4LinearMethod
 
 logger = init_logger(__name__)
 
+_WAN_QUEUED_STAGE_SCHEMA = "wan2_2.stage.v1"
+_WAN_QUEUED_STAGE_SCHEMA_KEY = f"{_WAN_QUEUED_STAGE_SCHEMA}.schema"
+_WAN_QUEUED_STAGE_HIDDEN_KEY = f"{_WAN_QUEUED_STAGE_SCHEMA}.hidden_states"
+_WAN_QUEUED_STAGE_TEMB_KEY = f"{_WAN_QUEUED_STAGE_SCHEMA}.temb"
+_WAN_QUEUED_STAGE_TIMESTEP_KEY = f"{_WAN_QUEUED_STAGE_SCHEMA}.timestep_proj"
+_WAN_QUEUED_STAGE_ENCODER_KEY = f"{_WAN_QUEUED_STAGE_SCHEMA}.encoder_hidden_states"
+
 
 class DistributedRMSNorm(nn.Module):
     """
@@ -1070,6 +1077,7 @@ class WanTransformer3DModel(nn.Module):
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_image: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
+        return_conditioning: bool = False,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
@@ -1089,6 +1097,11 @@ class WanTransformer3DModel(nn.Module):
             self._hidden_states_shape = hidden_states.shape
             self._cached_rope_emb = rotary_emb
 
+        tensors = None if intermediate_tensors is None else intermediate_tensors.tensors
+        queued_stage_payload = tensors is not None and _WAN_QUEUED_STAGE_SCHEMA_KEY in tensors
+        if queued_stage_payload and tensors[_WAN_QUEUED_STAGE_SCHEMA_KEY] != _WAN_QUEUED_STAGE_SCHEMA:
+            raise ValueError("Wan queued pipeline stage payload has an unsupported schema version.")
+
         if is_pipeline_first_stage():
             # Patch embedding and flatten to sequence. SP sharding happens at
             # _sp_shard_point so downstream block wrappers see local tensors.
@@ -1098,7 +1111,10 @@ class WanTransformer3DModel(nn.Module):
         else:
             if intermediate_tensors is None:
                 raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
-            hidden_states = intermediate_tensors["hidden_states"]
+            hidden_key = _WAN_QUEUED_STAGE_HIDDEN_KEY if queued_stage_payload else "hidden_states"
+            if hidden_key not in tensors:
+                raise ValueError(f"Wan pipeline stage payload is missing {hidden_key!r}.")
+            hidden_states = tensors[hidden_key]
 
         # Handle timestep shape (2-D for TI2V, 1-D for T2V)
         if timestep.ndim == 2:
@@ -1107,18 +1123,32 @@ class WanTransformer3DModel(nn.Module):
         else:
             ts_seq_len = None
 
-        # Compute conditioning on all PP stages.
-        # Each stage needs temb/timestep_proj for scale-shift modulation in its local blocks.
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
-        )
-        # Prepare timestep_proj via TimestepProjPrepare module
-        # _sp_plan will shard timestep_proj via split_output=True (when ts_seq_len is not None)
-        # This ensures timestep_proj sequence dimension matches sharded hidden_states
-        timestep_proj = self.timestep_proj_prepare(timestep_proj, ts_seq_len)
+        # Stage 0 already computes conditioning for its local blocks. Reusing
+        # those tensors on stage 1 removes a second condition-embedder pass
+        # from every queued micro-task.
+        if queued_stage_payload:
+            required_keys = (
+                _WAN_QUEUED_STAGE_TEMB_KEY,
+                _WAN_QUEUED_STAGE_TIMESTEP_KEY,
+                _WAN_QUEUED_STAGE_ENCODER_KEY,
+            )
+            missing_keys = [key for key in required_keys if key not in tensors]
+            if missing_keys:
+                raise ValueError(f"Wan queued pipeline stage payload is missing {missing_keys!r}.")
+            temb = tensors[_WAN_QUEUED_STAGE_TEMB_KEY]
+            timestep_proj = tensors[_WAN_QUEUED_STAGE_TIMESTEP_KEY]
+            encoder_hidden_states = tensors[_WAN_QUEUED_STAGE_ENCODER_KEY]
+            encoder_hidden_states_image = None
+        else:
+            # Each stage needs temb/timestep_proj for scale-shift modulation.
+            temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+                timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
+            )
+            # Ensure timestep_proj sequence dimension matches sharded hidden_states.
+            timestep_proj = self.timestep_proj_prepare(timestep_proj, ts_seq_len)
 
-        if encoder_hidden_states_image is not None:
-            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+            if encoder_hidden_states_image is not None:
+                encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
         hidden_states_mask = None
         ctx = get_forward_context()
@@ -1170,7 +1200,17 @@ class WanTransformer3DModel(nn.Module):
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
             # predict_noise will broadcast it to the next stage before calling that stage's forward.
-            return IntermediateTensors({"hidden_states": hidden_states})
+            if return_conditioning:
+                output_tensors = {
+                    _WAN_QUEUED_STAGE_SCHEMA_KEY: _WAN_QUEUED_STAGE_SCHEMA,
+                    _WAN_QUEUED_STAGE_HIDDEN_KEY: hidden_states,
+                    _WAN_QUEUED_STAGE_TEMB_KEY: temb,
+                    _WAN_QUEUED_STAGE_TIMESTEP_KEY: timestep_proj,
+                    _WAN_QUEUED_STAGE_ENCODER_KEY: encoder_hidden_states,
+                }
+            else:
+                output_tensors = {"hidden_states": hidden_states}
+            return IntermediateTensors(output_tensors)
 
         # Output norm, projection & unpatchify
         shift, scale = self.output_scale_shift_prepare(temb)

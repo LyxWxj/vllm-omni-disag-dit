@@ -39,8 +39,18 @@ def test_queued_mode_requires_step_execution() -> None:
 
 
 def test_queued_mode_requires_pipeline_parallelism() -> None:
-    with pytest.raises(ValueError, match="pipeline_parallel_size greater than 1"):
+    with pytest.raises(ValueError, match="pipeline_parallel_size=2"):
         _queued_config(parallel_config=DiffusionParallelConfig())
+
+
+def test_queued_mode_rejects_distributed_vae() -> None:
+    with pytest.raises(ValueError, match="distributed VAE is unsupported"):
+        _queued_config(parallel_config=DiffusionParallelConfig(pipeline_parallel_size=2, vae_patch_parallel_size=2))
+
+
+def test_queued_mode_rejects_streaming_output() -> None:
+    with pytest.raises(ValueError, match="does not support streaming_output"):
+        _queued_config(streaming_output=True)
 
 
 @pytest.mark.parametrize("capacity", [0, -1, True, 1.5])

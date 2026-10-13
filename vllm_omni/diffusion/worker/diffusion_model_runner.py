@@ -1091,6 +1091,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _queued_model_runtime(self) -> Any:
+        runtime = getattr(self, "_queued_model_runtime_instance", None)
+        if runtime is None:
+            from vllm_omni.diffusion.queued_pp.model_runtime import QueuedModelRuntime
+
+            runtime = QueuedModelRuntime(self)
+            self._queued_model_runtime_instance = runtime
+        return runtime
+
     def release_step_requests(self, request_ids: Sequence[str]) -> None:
         """Drop request-owned state after execution/output preparation has returned.
 
@@ -1289,6 +1298,22 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             validate_kv_metadata=True,
             record_output_peak_memory=True,
         )
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[str, ...]:
+        return self._queued_model_runtime().prepare_pipeline_requests(scheduler_output)
+
+    def execute_prepared_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        output_rank: int = 0,
+    ) -> BatchRunnerOutput:
+        return self._queued_model_runtime().execute_prepared_stepwise(scheduler_output, output_rank=output_rank)
+
+    def prepare_queued_decode(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        return self._queued_model_runtime().prepare_queued_decode(request_ids)
+
+    def execute_prepared_decode(self, request_id: str) -> BatchRunnerOutput:
+        return self._queued_model_runtime().execute_prepared_decode(request_id)
 
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""

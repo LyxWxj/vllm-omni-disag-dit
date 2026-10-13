@@ -759,6 +759,40 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def _queued_worker_runtime(self) -> Any:
+        runtime = getattr(self, "_queued_worker_runtime_instance", None)
+        if runtime is None:
+            from vllm_omni.diffusion.queued_pp.worker_runtime import QueuedWorkerRuntime
+
+            runtime = QueuedWorkerRuntime(self)
+            self._queued_worker_runtime_instance = runtime
+        return runtime
+
+    def execute_prepared_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        output_rank: int = 0,
+    ) -> BaseRunnerOutput:
+        return self._queued_worker_runtime().execute_prepared_stepwise(scheduler_output, output_rank=output_rank)
+
+    def prepare_queued_decode(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        return self._queued_worker_runtime().prepare_queued_decode(request_ids)
+
+    def execute_prepared_decode(self, request_id: str) -> BaseRunnerOutput:
+        return self._queued_worker_runtime().execute_prepared_decode(request_id)
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> dict[str, Any]:
+        return self._queued_worker_runtime().prepare_pipeline_requests(scheduler_output)
+
+    def prepare_pipeline_requests_all_ranks(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
+        return self._queued_worker_runtime().prepare_pipeline_requests_all_ranks(scheduler_output)
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> bool:
+        return self._queued_worker_runtime().cleanup_finalized_pipeline_request(request_id)
+
+    def cleanup_finalized_pipeline_request_all_ranks(self, request_id: str) -> list[bool]:
+        return self._queued_worker_runtime().cleanup_finalized_pipeline_request_all_ranks(request_id)
+
     def release_step_requests(self, request_ids: list[str]) -> None:
         """Retire cancelled step state at the serialized worker-call boundary."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -1209,7 +1243,7 @@ class WorkerProc:
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
-        if not self.od_config.step_execution:
+        if not self.od_config.step_execution or getattr(self.od_config, "mode", "static") == "queued":
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1254,8 +1288,18 @@ class WorkerProc:
             self._enqueue_result(output)
             return
 
+        if rpc_id is not None and getattr(self.od_config, "mode", "static") == "queued":
+            from vllm_omni.diffusion.queued_pp.worker_runtime import return_queued_rpc_result
+
+            if not isinstance(output, (DiffusionOutput, BatchRunnerOutput)) and return_queued_rpc_result(
+                self, output, rpc_id
+            ):
+                return
+
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
-        if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
+        if (not self.od_config.step_execution or rpc_id is not None) and isinstance(
+            output, (DiffusionOutput, BatchRunnerOutput)
+        ):
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
             with self._async_output_done:
@@ -1837,6 +1881,31 @@ class WorkerWrapperBase:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
+
+    def execute_prepared_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        output_rank: int = 0,
+    ) -> BaseRunnerOutput:
+        return self.worker.execute_prepared_stepwise(scheduler_output, output_rank=output_rank)
+
+    def prepare_queued_decode(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        return self.worker.prepare_queued_decode(request_ids)
+
+    def execute_prepared_decode(self, request_id: str) -> BaseRunnerOutput:
+        return self.worker.execute_prepared_decode(request_id)
+
+    def prepare_pipeline_requests(self, scheduler_output: DiffusionSchedulerOutput) -> dict[str, Any]:
+        return self.worker.prepare_pipeline_requests(scheduler_output)
+
+    def prepare_pipeline_requests_all_ranks(self, scheduler_output: DiffusionSchedulerOutput) -> list[dict[str, Any]]:
+        return self.worker.prepare_pipeline_requests_all_ranks(scheduler_output)
+
+    def cleanup_finalized_pipeline_request(self, request_id: str) -> bool:
+        return self.worker.cleanup_finalized_pipeline_request(request_id)
+
+    def cleanup_finalized_pipeline_request_all_ranks(self, request_id: str) -> list[bool]:
+        return self.worker.cleanup_finalized_pipeline_request_all_ranks(request_id)
 
     def sleep(self, level: int = 1) -> int:
         """

@@ -1361,13 +1361,20 @@ class OmniDiffusionConfig:
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
         if self.mode == "queued":
             pp_size = self.parallel_config.pipeline_parallel_size
-            if pp_size <= 1:
-                raise ValueError("mode='queued' requires pipeline_parallel_size greater than 1")
-            if self.parallel_config.vae_patch_parallel_size > pp_size:
+            if pp_size != 2:
+                raise ValueError("queued mode currently requires pipeline_parallel_size=2")
+            if self.parallel_config.vae_patch_parallel_size != 1:
                 raise ValueError(
-                    "queued mode requires vae_patch_parallel_size <= pipeline_parallel_size; "
-                    f"got {self.parallel_config.vae_patch_parallel_size} and {pp_size}"
+                    "queued mode currently requires vae_patch_parallel_size=1; distributed VAE is unsupported"
                 )
+            if self.parallel_config.data_parallel_size != 1:
+                raise ValueError("queued mode currently requires data_parallel_size=1")
+            if self.parallel_config.tensor_parallel_size != 1 or self.parallel_config.sequence_parallel_size != 1:
+                raise ValueError("queued mode currently requires tensor and sequence parallel sizes to be 1")
+            if self.parallel_config.cfg_parallel_size != 1:
+                raise ValueError("queued mode currently requires cfg_parallel_size=1")
+            if self.streaming_output:
+                raise ValueError("queued mode currently does not support streaming_output")
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
