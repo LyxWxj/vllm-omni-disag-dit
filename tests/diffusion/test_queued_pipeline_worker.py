@@ -12,7 +12,7 @@ from vllm_omni.diffusion.queued_pp.worker_runtime import (
     QueuedWorkerRuntime,
     return_queued_rpc_result,
 )
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerProc
+from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -42,7 +42,7 @@ def test_static_worker_does_not_route_rpc_through_queued_runtime() -> None:
 
 def test_step_worker_sends_tensor_output_through_async_d2h_queue(monkeypatch) -> None:
     messages = []
-    worker = object.__new__(DiffusionWorker)
+    worker = object.__new__(WorkerProc)
     worker.result_mq = object()
     worker.od_config = SimpleNamespace(step_execution=True, mode="queued")
     worker._async_output_queue = queue.Queue()
@@ -63,7 +63,7 @@ def test_step_worker_sends_tensor_output_through_async_d2h_queue(monkeypatch) ->
 
 def test_step_worker_sends_metadata_rpc_result_inline() -> None:
     messages = []
-    worker = object.__new__(DiffusionWorker)
+    worker = object.__new__(WorkerProc)
     worker.result_mq = object()
     worker.od_config = SimpleNamespace(step_execution=True, mode="queued")
     worker._enqueue_result = messages.append

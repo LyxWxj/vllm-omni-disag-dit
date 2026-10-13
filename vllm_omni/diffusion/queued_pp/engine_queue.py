@@ -49,7 +49,7 @@ class QueuedPipelineEngineQueue:
         return getattr(self._engine, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in {"_engine", "_executor_adapter"} or name.startswith("_queued_"):
+        if name in {"_engine", "_executor_adapter"} or name.startswith("_queued_") or hasattr(type(self), name):
             object.__setattr__(self, name, value)
         else:
             setattr(self._engine, name, value)

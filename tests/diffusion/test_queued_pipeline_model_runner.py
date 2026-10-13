@@ -218,7 +218,7 @@ def test_prepare_pipeline_requests_rolls_back_local_state_failure(mocker) -> Non
 
     mocker.patch.object(runner, "_update_states", side_effect=fail_update)
     failure_agreement = mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        "vllm_omni.diffusion.queued_pp.model_runtime._dit_any_rank_failed",
         side_effect=lambda failed: failed,
     )
 
@@ -256,7 +256,7 @@ def test_prepare_pipeline_requests_agrees_and_rolls_back_metadata_install_failur
     remove = mocker.patch.object(runner, "remove_diffusion_kv_requests", return_value=0)
     update_states = mocker.patch.object(runner, "_update_states")
     failure_agreement = mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        "vllm_omni.diffusion.queued_pp.model_runtime._dit_any_rank_failed",
         side_effect=lambda failed: failed,
     )
 
@@ -301,7 +301,7 @@ def test_prepare_pipeline_requests_agrees_before_encode_on_generator_failure(moc
         side_effect=RuntimeError("generator setup failed"),
     )
     failure_agreement = mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        "vllm_omni.diffusion.queued_pp.model_runtime._dit_any_rank_failed",
         side_effect=lambda failed: failed,
     )
 
@@ -342,7 +342,7 @@ def test_prepare_pipeline_requests_rolls_back_successful_peer_on_late_remote_fai
     install = mocker.patch.object(runner, "install_diffusion_kv_metadata", return_value=True)
     remove = mocker.patch.object(runner, "remove_diffusion_kv_requests", return_value=1)
     failure_agreement = mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_model_runner._dit_any_rank_failed",
+        "vllm_omni.diffusion.queued_pp.model_runtime._dit_any_rank_failed",
         side_effect=[False, False, False, True],
     )
 

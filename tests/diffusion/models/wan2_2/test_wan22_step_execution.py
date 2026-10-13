@@ -559,6 +559,7 @@ def test_post_decode_materializes_async_latents_before_runner_ipc(monkeypatch) -
 
     input_batch = InputBatch.make_batch([state])
     runner = object.__new__(DiffusionModelRunner)
+    runner.state_cache = {}
     DiffusionModelRunner._update_states_after(runner, [state], input_batch)
     payload = BatchRunnerOutput.from_list([RunnerOutput(request_id=state.request_id, finished=True, result=output)])
 
