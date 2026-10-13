@@ -102,6 +102,9 @@ class GroupCoordinator:
     ):
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        # PipelineGroupCoordinator does not call GroupCoordinator.__init__;
+        # preserve the base class's optional broadcaster contract explicitly.
+        self.shm_broadcaster = None
         self.device_group = None
         self.cpu_group = None
         self.shm_broadcaster = None

@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.distributed import group_coordinator as group_coordinator_module
+from vllm_omni.diffusion.distributed.group_coordinator import PipelineGroupCoordinator
 from vllm_omni.diffusion.queued_pp.feedback import (
     prune_queued_latent_sends,
     queued_feedback_device_group,
@@ -41,6 +43,20 @@ def _pp_group():
 def test_queued_feedback_uses_reverse_pp2_group() -> None:
     pp_group = _pp_group()
     assert queued_feedback_device_group(pp_group) is pp_group.device_groups[1]
+
+
+def test_pipeline_coordinator_keeps_base_broadcast_contract(monkeypatch) -> None:
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "new_group", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        group_coordinator_module,
+        "current_omni_platform",
+        SimpleNamespace(get_torch_device=lambda _rank: torch.device("cpu")),
+    )
+
+    coordinator = PipelineGroupCoordinator([[0, 1]], local_rank=0, torch_distributed_backend="gloo")
+
+    assert coordinator.shm_broadcaster is None
 
 
 def test_queued_send_retains_latent_until_reverse_send_completes(monkeypatch) -> None:
