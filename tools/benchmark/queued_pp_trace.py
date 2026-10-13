@@ -150,7 +150,7 @@ def _install_pipeline_hooks(worker: Any) -> None:
 
 def install() -> None:
     """Install process-local hooks before workers and Engine are created."""
-    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+    from vllm_omni.diffusion.queued_pp.engine_queue import QueuedPipelineEngineQueue
     from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
     if getattr(DiffusionWorker.execute_prepared_stepwise, "_queued_pp_trace_wrapper", False):
@@ -226,7 +226,7 @@ def install() -> None:
     DiffusionWorker.execute_prepared_decode = trace_decode
 
     def wrap_engine(name: str, kind: str) -> None:
-        original = getattr(DiffusionEngine, name, None)
+        original = getattr(QueuedPipelineEngineQueue, name, None)
         if not callable(original) or getattr(original, "_queued_pp_trace_wrapper", False):
             return
 
@@ -269,12 +269,12 @@ def install() -> None:
             return result
 
         wrapped._queued_pp_trace_wrapper = True
-        setattr(DiffusionEngine, name, wrapped)
+        setattr(QueuedPipelineEngineQueue, name, wrapped)
 
     wrap_engine("_maybe_start_queued_decode_round", "decode_round")
     wrap_engine("_advance_queued_decode_round", "decode_dispatch")
 
-    original_authorize = DiffusionEngine._authorize_waiting_queued_batches
+    original_authorize = QueuedPipelineEngineQueue._authorize_waiting_queued_batches
 
     @functools.wraps(original_authorize)
     def trace_authorize(engine: Any, *args: Any, **kwargs: Any) -> Any:
@@ -301,9 +301,10 @@ def install() -> None:
             )
         return result
 
-    DiffusionEngine._authorize_waiting_queued_batches = trace_authorize
+    trace_authorize._queued_pp_trace_wrapper = True
+    QueuedPipelineEngineQueue._authorize_waiting_queued_batches = trace_authorize
 
-    original_commit = DiffusionEngine._commit_queued_pipeline_step
+    original_commit = QueuedPipelineEngineQueue._commit_queued_pipeline_step
 
     @functools.wraps(original_commit)
     def trace_commit(engine: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
@@ -322,7 +323,8 @@ def install() -> None:
         )
         return result
 
-    DiffusionEngine._commit_queued_pipeline_step = trace_commit
+    trace_commit._queued_pp_trace_wrapper = True
+    QueuedPipelineEngineQueue._commit_queued_pipeline_step = trace_commit
 
 
 def _load_trace(trace_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:

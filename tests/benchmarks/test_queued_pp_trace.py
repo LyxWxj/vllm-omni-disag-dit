@@ -121,3 +121,31 @@ def test_common_queued_pp_trace_renderer_includes_control_and_rank_lanes(tmp_pat
     assert "64×64" in html
     assert "steps=2, 4" in html
     assert "abc" in html and "def" in html
+
+
+def test_trace_installer_wraps_private_engine_queue_runtime() -> None:
+    from vllm_omni.diffusion.queued_pp.engine_queue import QueuedPipelineEngineQueue
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    trace = _trace_module()
+    engine_methods = (
+        "_maybe_start_queued_decode_round",
+        "_advance_queued_decode_round",
+        "_authorize_waiting_queued_batches",
+        "_commit_queued_pipeline_step",
+    )
+    original_engine_methods = {name: getattr(QueuedPipelineEngineQueue, name) for name in engine_methods}
+    worker_methods = ("execute_prepared_stepwise", "prepare_queued_decode", "execute_prepared_decode")
+    original_worker_methods = {name: getattr(DiffusionWorker, name) for name in worker_methods}
+    try:
+        trace.install()
+        assert getattr(DiffusionWorker.execute_prepared_stepwise, "_queued_pp_trace_wrapper", False)
+        assert all(
+            getattr(getattr(QueuedPipelineEngineQueue, name), "_queued_pp_trace_wrapper", False)
+            for name in engine_methods
+        )
+    finally:
+        for name, method in original_worker_methods.items():
+            setattr(DiffusionWorker, name, method)
+        for name, method in original_engine_methods.items():
+            setattr(QueuedPipelineEngineQueue, name, method)
