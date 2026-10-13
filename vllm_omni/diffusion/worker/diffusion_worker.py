@@ -1296,10 +1296,10 @@ class WorkerProc:
             ):
                 return
 
-        # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
-        if (not self.od_config.step_execution or rpc_id is not None) and isinstance(
-            output, (DiffusionOutput, BatchRunnerOutput)
-        ):
+        # Request-mode output keeps the compute_done/output_ready split. A
+        # queued step RPC instead resolves its Future only after the packed
+        # runner output is ready.
+        if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
             with self._async_output_done:
@@ -1311,6 +1311,30 @@ class WorkerProc:
                 async_output_id=async_output_id,
             )
             self._enqueue_result(msg)
+            return
+
+        if rpc_id is not None:
+            if self._async_output_queue is not None:
+                gpu_event = current_omni_platform.record_device_event()
+                with self._async_output_done:
+                    self._async_output_pending += 1
+                self._async_output_queue.put((output, rpc_id, gpu_event, AsyncOutputKind.RPC_RESULT))
+                return
+            try:
+                pack_diffusion_output_shm(output)
+            except (TypeError, ValueError):
+                raise
+            except Exception as exc:
+                if payload_carries_typed_media(output):
+                    raise
+                logger.warning("SHM pack failed for non-blocking RPC result: %s", exc)
+            self._enqueue_result(
+                AsyncDiffusionOutput(
+                    kind=AsyncOutputKind.RPC_RESULT,
+                    rpc_id=rpc_id,
+                    result=output,
+                )
+            )
             return
 
         # Sync path (original, or async fallback).
@@ -1344,7 +1368,11 @@ class WorkerProc:
             item = self._async_output_queue.get()
             if item is None:
                 break
-            output, async_output_id, gpu_event = item
+            if len(item) == 3:
+                output, async_output_id, gpu_event = item
+                output_kind = AsyncOutputKind.OUTPUT_READY
+            else:
+                output, async_output_id, gpu_event, output_kind = item
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
@@ -1355,9 +1383,11 @@ class WorkerProc:
 
                 self._enqueue_result(
                     AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
+                        kind=output_kind,
+                        rpc_id=async_output_id if output_kind is AsyncOutputKind.RPC_RESULT else None,
                         async_output_id=async_output_id,
-                        output=output,
+                        output=output if output_kind is AsyncOutputKind.OUTPUT_READY else None,
+                        result=output if output_kind is AsyncOutputKind.RPC_RESULT else None,
                     )
                 )
             except Exception:
@@ -1367,7 +1397,8 @@ class WorkerProc:
                 )
                 self._enqueue_result(
                     AsyncDiffusionOutput(
-                        kind=AsyncOutputKind.OUTPUT_READY,
+                        kind=output_kind,
+                        rpc_id=async_output_id if output_kind is AsyncOutputKind.RPC_RESULT else None,
                         async_output_id=async_output_id,
                         error="Background D2H/SHM packing failed",
                     )

@@ -55,10 +55,9 @@ def test_step_worker_sends_tensor_output_through_async_d2h_queue(monkeypatch) ->
     worker._return_result(BatchRunnerOutput.from_list([]), rpc_id="rpc-1")
 
     item = worker._async_output_queue.get_nowait()
-    assert item[1:] == ("output-1", "device-event")
+    assert item[1:] == ("rpc-1", "device-event", AsyncOutputKind.RPC_RESULT)
     assert worker._async_output_pending == 1
-    assert messages[0].kind is AsyncOutputKind.COMPUTE_DONE
-    assert messages[0].rpc_id == "rpc-1"
+    assert messages == []
 
 
 def test_step_worker_sends_metadata_rpc_result_inline() -> None:

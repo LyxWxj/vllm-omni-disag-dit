@@ -7,6 +7,7 @@ import concurrent.futures
 import threading
 from typing import Any
 
+import zmq
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -83,7 +84,7 @@ class QueuedExecutorAdapter:
         while not self._pump_stop.is_set():
             try:
                 message = result_mq.dequeue(timeout=1.0)
-            except TimeoutError:
+            except (TimeoutError, zmq.error.Again):
                 if self._is_failed:
                     break
                 continue
