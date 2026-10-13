@@ -263,7 +263,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if remaining <= 0:
                     raise TimeoutError(f"RPC call to {method} timed out.")
                 chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
-            if not self.od_config.step_execution:
+            # A queued executor adapter may install the async result pump even
+            # for step execution so non-blocking queued RPCs share one reader.
+            # Once a pump owns the result queues, synchronous RPC responses
+            # arrive in _sync_result_buffer regardless of execution mode.
+            if not self.od_config.step_execution or getattr(self, "_pump_running", False):
                 try:
                     return self._sync_result_buffer.get(timeout=chunk_timeout)
                 except queue.Empty:

@@ -3,6 +3,7 @@
 
 import queue
 import threading
+import time
 
 import pytest
 
@@ -107,6 +108,24 @@ def test_queued_rpc_future_waits_for_background_output_ready() -> None:
             )
         )
         assert future.result(timeout=2.0).output == "decoded"
+    finally:
+        raw_executor._pump_stop.set()
+        for thread in raw_executor._result_pump_threads:
+            thread.join(timeout=2.0)
+
+
+def test_step_rpc_reads_sync_result_buffer_when_queued_pump_owns_queue() -> None:
+    raw_executor = _executor_stub()
+    _adapter = QueuedExecutorAdapter(raw_executor)
+    raw_executor.od_config = type("Config", (), {"step_execution": True})()
+    try:
+        expected = DiffusionOutput(output="dummy-warmup")
+        raw_executor._sync_result_buffer.put(expected)
+        result = raw_executor._dequeue_one_with_failure_polling(
+            time.monotonic() + 1.0,
+            "execute_step",
+        )
+        assert result is expected
     finally:
         raw_executor._pump_stop.set()
         for thread in raw_executor._result_pump_threads:
