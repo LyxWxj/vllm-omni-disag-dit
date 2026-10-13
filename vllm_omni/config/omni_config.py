@@ -389,7 +389,8 @@ def _stage_cli_overrides(
     # step_execution is a diffusion execution protocol, not an LLM engine
     # argument. Keep global and stage-scoped CLI values off AR/generation stages.
     if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
-        result.pop("step_execution", None)
+        for diffusion_only_field in ("step_execution", "mode", "max_inflight_batches"):
+            result.pop(diffusion_only_field, None)
     if execution_type == StageExecutionType.DIFFUSION:
         prefix = f"stage_{stage_id}_"
         for key, value in cli_overrides.items():
@@ -875,6 +876,8 @@ class _DiffusionConfigProjection:
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
+    mode: str = "static"
+    max_inflight_batches: int = 1
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False

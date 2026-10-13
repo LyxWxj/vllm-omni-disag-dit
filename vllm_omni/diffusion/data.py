@@ -1133,6 +1133,12 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Opt-in queued pipeline runtime. Capacity is interpreted only when
+    # ``mode`` is ``queued``; static request and step execution keep their
+    # existing behavior regardless of this value.
+    mode: str = "static"
+    max_inflight_batches: int = 1
+
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 
@@ -1279,6 +1285,13 @@ class OmniDiffusionConfig:
             raise ValueError("max_num_batched_tokens must be positive")
         if self.max_model_len is not None and self.max_model_len != -1 and self.max_model_len <= 0:
             raise ValueError("max_model_len must be positive or -1")
+        if self.mode not in {"static", "queued"}:
+            raise ValueError(f"mode must be 'static' or 'queued', got {self.mode!r}")
+        if self.mode == "queued":
+            if type(self.max_inflight_batches) is not int or self.max_inflight_batches <= 0:
+                raise ValueError(f"max_inflight_batches must be a positive integer, got {self.max_inflight_batches!r}")
+            if not self.step_execution:
+                raise ValueError("mode='queued' requires step_execution=True")
 
         if self.omni_kv_config is None:
             self.omni_kv_config = {}
@@ -1346,6 +1359,15 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if self.mode == "queued":
+            pp_size = self.parallel_config.pipeline_parallel_size
+            if pp_size <= 1:
+                raise ValueError("mode='queued' requires pipeline_parallel_size greater than 1")
+            if self.parallel_config.vae_patch_parallel_size > pp_size:
+                raise ValueError(
+                    "queued mode requires vae_patch_parallel_size <= pipeline_parallel_size; "
+                    f"got {self.parallel_config.vae_patch_parallel_size} and {pp_size}"
+                )
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
