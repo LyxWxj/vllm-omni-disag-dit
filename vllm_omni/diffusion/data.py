@@ -1147,6 +1147,11 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Closed request-batch pipeline parallelism.  Unlike step execution this
+    # keeps the Engine request-mode contract: one RPC owns the whole batch.
+    request_pipeline_parallel: bool = False
+    request_pipeline_parallel_window: int = 1
+
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 
@@ -1371,6 +1376,31 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+
+        if type(self.request_pipeline_parallel) is not bool:
+            raise TypeError("request_pipeline_parallel must be a bool")
+        if type(self.request_pipeline_parallel_window) is not int or not (
+            1 <= self.request_pipeline_parallel_window <= 4
+        ):
+            raise ValueError("request_pipeline_parallel_window must be an integer in [1, 4]")
+        if self.request_pipeline_parallel:
+            if self.step_execution:
+                raise ValueError("request_pipeline_parallel requires step_execution=False")
+            if self.streaming_output:
+                raise ValueError("request_pipeline_parallel does not support streaming_output")
+            parallel = self.parallel_config
+            if (
+                parallel.pipeline_parallel_size != 2
+                or parallel.data_parallel_size != 1
+                or parallel.tensor_parallel_size != 1
+                or parallel.sequence_parallel_size != 1
+                or parallel.cfg_parallel_size != 1
+                or parallel.vae_patch_parallel_size != 1
+            ):
+                raise ValueError(
+                    "request_pipeline_parallel currently requires PP=2 with DP/TP/SP/CFG/VAE parallelism set to 1"
+                )
+
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)

@@ -644,6 +644,8 @@ class StageDeployConfig:
     video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None
+    request_pipeline_parallel: bool | None = None
+    request_pipeline_parallel_window: int | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
     vae_fast_path: str | None = None

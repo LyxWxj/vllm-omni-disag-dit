@@ -69,6 +69,39 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     assert captured_requests[0].sampling_params.num_inference_steps == 2
 
 
+def test_request_pipeline_dummy_run_warms_each_decode_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(
+        model_class_name="mock_model",
+        diffusion_load_format="default",
+        request_pipeline_parallel=True,
+        max_num_seqs=2,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
+        lambda od_config: (False, False),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
+        lambda model_class_name, supports_audio_input: 1,
+    )
+    captured_requests: list[OmniDiffusionRequest] = []
+
+    def run_request_batch(requests: list[OmniDiffusionRequest]):
+        captured_requests.extend(requests)
+        return [type("Output", (), {"error": None})() for _ in requests]
+
+    engine._add_request_batch_and_wait_for_responses = run_request_batch
+
+    engine._dummy_run()
+
+    assert [request.request_id for request in captured_requests] == [
+        "dummy_req_id/owner-0",
+        "dummy_req_id/owner-1",
+    ]
+
+
 def test_allgather_startup_runs_broadcast_dummy_request() -> None:
     engine = object.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(

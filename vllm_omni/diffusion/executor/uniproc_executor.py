@@ -161,7 +161,9 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 
         self._ensure_open()
-        if len(scheduler_output.scheduled_new_reqs) <= 1:
+        if len(scheduler_output.scheduled_new_reqs) <= 1 and not getattr(
+            self.od_config, "request_pipeline_parallel", False
+        ):
             return self.execute_request(scheduler_output)
 
         result = self.collective_rpc(

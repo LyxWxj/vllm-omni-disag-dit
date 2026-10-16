@@ -474,9 +474,11 @@ class DiffusionEngine:
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
             logger.info(
-                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
+                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s request_pipeline_parallel=%s window=%s",
                 getattr(od_config, "max_num_seqs", None),
                 getattr(od_config, "request_batch_max_wait_ms", None),
+                getattr(od_config, "request_pipeline_parallel", False),
+                getattr(od_config, "request_pipeline_parallel_window", 1),
             )
 
     async def _check_and_start_background_loop(self):
@@ -1656,6 +1658,94 @@ class DiffusionEngine:
                         output = fut.result(timeout=_async_output_timeout())
                     return output
 
+    def _add_request_batch_and_wait_for_responses(
+        self,
+        requests: list[OmniDiffusionRequest],
+    ) -> list[DiffusionOutput]:
+        """Synchronously execute a startup request batch.
+
+        Startup warmup may run while an InlineStage is already inside an
+        asyncio loop. Submitting an asynchronous batch from a helper loop
+        would bind the Engine's background loop to a loop that is closed as
+        soon as warmup returns. Keep this path on the same synchronous control
+        flow as ``add_req_and_wait_for_response`` instead.
+        """
+        if not requests:
+            return []
+        prepared_requests = [self._prepare_request_for_admission(request) for request in requests]
+        target_request_ids = [request.request_id for request in prepared_requests]
+        pending_request_ids = set(target_request_ids)
+        outputs: dict[str, DiffusionOutput] = {}
+        with self._rpc_lock:
+            if self._closed:
+                raise RuntimeError("DiffusionEngine is closed.")
+            for request in prepared_requests:
+                self.scheduler.add_request(request)
+
+            while pending_request_ids:
+                self._process_aborts_queue()
+                try:
+                    sched_output = self.scheduler.schedule()
+                except Exception as exc:
+                    self._fail_engine(exc)
+                    raise
+                if sched_output.is_empty:
+                    finished_ids = pending_request_ids.intersection(sched_output.finished_req_ids)
+                    for request_id in finished_ids:
+                        self._remove_diffusion_kv_requests([request_id])
+                        outputs[request_id] = self._finalize_finished_request(request_id)
+                    pending_request_ids.difference_update(finished_ids)
+                    if pending_request_ids and not self.scheduler.has_requests():
+                        raise RuntimeError("Diffusion scheduler has no runnable startup warmup requests.")
+                    continue
+
+                scheduled_request_ids = sched_output.scheduled_request_ids
+                try:
+                    self._prepare_kv_for_forward(sched_output)
+                    runner_output: BaseRunnerOutput = (
+                        self.execute_fn(sched_output) if scheduled_request_ids else BatchRunnerOutput.from_list([])
+                    )
+                    self._poll_native_kv()
+                except EngineDeadError:
+                    raise
+                except Exception as exc:
+                    if self._closed:
+                        raise
+                    logger.error(
+                        "Execution failed for startup warmup requests %s",
+                        scheduled_request_ids,
+                        exc_info=True,
+                    )
+                    runner_output = BatchRunnerOutput.from_list(
+                        [
+                            RunnerOutput(
+                                request_id=request_id,
+                                step_index=None,
+                                finished=True,
+                                result=DiffusionOutput.from_exception(exc),
+                            )
+                            for request_id in scheduled_request_ids
+                        ]
+                    )
+
+                self._process_aborts_queue()
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                for request_id in pending_request_ids.intersection(finished_req_ids):
+                    self._remove_diffusion_kv_requests([request_id])
+                    req_output = runner_output.get_request_output(request_id)
+                    output = self._finalize_finished_request(
+                        request_id,
+                        runner_output=req_output,
+                        missing_result_error="Startup warmup finished without a final output.",
+                    )
+                    if output.async_output_id:
+                        fut = self.executor.wait_output_ready(output.async_output_id)
+                        output = fut.result(timeout=_async_output_timeout())
+                    outputs[request_id] = output
+                pending_request_ids.difference_update(finished_req_ids)
+
+        return [outputs[request_id] for request_id in target_request_ids]
+
     def profile(
         self,
         is_start: bool = True,
@@ -1712,6 +1802,7 @@ class DiffusionEngine:
         num_image_inputs: int = 1,
         num_inference_steps: int = 1,
         num_frames: int | None = None,
+        request_id: str = DUMMY_DIFFUSION_REQUEST_ID,
     ) -> OmniDiffusionRequest | None:
         """Build a startup request; explicit frame counts bypass the warmup policy."""
         prompt = OmniTextPrompt(prompt="dummy run")
@@ -1734,7 +1825,7 @@ class DiffusionEngine:
             return None
         return OmniDiffusionRequest(
             prompt=prompt,
-            request_id=DUMMY_DIFFUSION_REQUEST_ID,
+            request_id=request_id,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
@@ -1815,23 +1906,47 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
-        req = self._make_dummy_request(
-            height=512,
-            width=512,
-            guidance_scale=0.0,
-            # Dummy warmup must exercise at least one denoising iteration in
-            # every execution mode. Some pipelines (for example BAGEL) perform
-            # ``num_inference_steps - 1`` scheduler updates and reject an empty
-            # one-step schedule.
-            num_inference_steps=2,
-        )
-        if req is None:
+        warmup_count = 1
+        if getattr(self.od_config, "request_pipeline_parallel", False):
+            pp_size = self.od_config.parallel_config.pipeline_parallel_size
+            # Request-owner decode assigns owners by position in a scheduled
+            # request batch. Only a batch with at least one request per PP
+            # rank can warm every VAE owner; serial request configurations do
+            # not dispatch decode to the other ranks in normal operation.
+            if pp_size > 1 and _max_num_seqs(self.od_config) >= pp_size:
+                warmup_count = pp_size
+
+        requests = [
+            self._make_dummy_request(
+                height=512,
+                width=512,
+                guidance_scale=0.0,
+                # Dummy warmup must exercise at least one denoising iteration
+                # in every execution mode. Some pipelines (for example
+                # BAGEL) perform ``num_inference_steps - 1`` scheduler
+                # updates and reject an empty one-step schedule.
+                num_inference_steps=2,
+                request_id=(
+                    DUMMY_DIFFUSION_REQUEST_ID if warmup_count == 1 else f"{DUMMY_DIFFUSION_REQUEST_ID}/owner-{index}"
+                ),
+            )
+            for index in range(warmup_count)
+        ]
+        requests = [request for request in requests if request is not None]
+        if not requests:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
-        logger.info("dummy run to warm up the model")
-        output = self.add_req_and_wait_for_response(req)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
+        logger.info("dummy run to warm up the model (requests=%d)", len(requests))
+        if len(requests) == 1:
+            output = self.add_req_and_wait_for_response(requests[0])
+            if output.error:
+                raise RuntimeError(f"Dummy run failed: {output.error}")
+            return
+
+        outputs = self._add_request_batch_and_wait_for_responses(requests)
+        for request, output in zip(requests, outputs, strict=True):
+            if output.error:
+                raise RuntimeError(f"Dummy run {request.request_id} failed: {output.error}")
 
     def _submit_rpc(
         self,

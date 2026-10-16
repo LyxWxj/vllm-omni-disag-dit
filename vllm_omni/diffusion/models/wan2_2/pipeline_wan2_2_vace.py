@@ -196,6 +196,8 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
 
+    supports_request_pipeline = False
+
     # VACE's forward() defaults to 50 steps, not the base pipeline's 40.
     default_num_inference_steps: int = 50
 
