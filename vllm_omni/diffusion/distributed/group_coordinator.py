@@ -472,6 +472,43 @@ class GroupCoordinator:
             handles.append(handle)
         return handles
 
+    def isend_tensor(
+        self,
+        tensor: torch.Tensor,
+        dst: int | None = None,
+    ) -> list[torch.distributed.Work]:
+        """Start a non-blocking send when the receiver already knows the shape.
+
+        Request-mode feedback uses a fixed latent shape on both PP ranks.  It
+        can therefore skip the blocking CPU metadata exchange performed by
+        :meth:`isend_tensor_dict`, which otherwise prevents the next request's
+        stage-0 forward from overlapping the current stage-1 forward.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1 or tensor.numel() == 0:
+            return []
+        if dst is None:
+            dst = self.group_next_rank
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+        group = self.cpu_group if tensor.is_cpu else self.device_group
+        handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)
+        if tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        return [handle]
+
+    def irecv_tensor(
+        self,
+        tensor: torch.Tensor,
+        src: int | None = None,
+    ) -> list[torch.distributed.Work]:
+        """Post a non-blocking receive when the tensor shape is known locally."""
+        if not torch.distributed.is_initialized() or self.world_size == 1 or tensor.numel() == 0:
+            return []
+        if src is None:
+            src = self.group_prev_rank
+        assert src < self.world_size, f"Invalid src rank ({src})"
+        group = self.cpu_group if tensor.is_cpu else self.device_group
+        return [torch.distributed.irecv(tensor, src=self.ranks[src], group=group)]
+
     def irecv_tensor_dict(
         self,
         src: int | None = None,
@@ -646,6 +683,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        # PipelineGroupCoordinator has its own initializer instead of calling
+        # GroupCoordinator.__init__, but broadcast_object still uses this
+        # optional shared-memory broadcaster hook.
+        self.shm_broadcaster = None
         self.cpu_groups = []
         self.device_groups = []
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:

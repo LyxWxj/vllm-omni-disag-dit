@@ -194,6 +194,8 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
 
+    supports_request_pipeline = False
+
     def __init__(
         self,
         *,

@@ -153,6 +153,12 @@ def supports_step_execution(pipeline: object) -> bool:
     return isinstance(pipeline, SupportsStepExecution)
 
 
+def supports_request_pipeline(pipeline: object) -> bool:
+    """Return whether ``pipeline`` opts into request-mode PP microtasks."""
+
+    return bool(getattr(pipeline, "supports_request_pipeline", False)) and supports_step_execution(pipeline)
+
+
 # --- Generic role-based component loading for diffusion disaggregation ---------
 
 # Which component groups (as declared by ``SupportsComponentDiscovery``) each

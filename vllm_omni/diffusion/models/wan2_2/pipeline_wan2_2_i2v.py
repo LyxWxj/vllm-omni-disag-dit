@@ -201,6 +201,7 @@ class Wan22I2VPipeline(
     """
 
     supports_request_batch = True
+    supports_request_pipeline = False
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]

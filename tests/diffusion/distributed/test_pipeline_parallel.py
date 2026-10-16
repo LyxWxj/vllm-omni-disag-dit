@@ -539,6 +539,53 @@ def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) ->
     )
 
 
+def direct_isend_irecv_worker(
+    local_rank: int,
+    world_size: int,
+    init_method: str,
+    device_kind: DeviceKind,
+    result_queue,
+):
+    """Exercise the shape-known P2P path used by request-mode feedback."""
+    device = init_dist(local_rank, world_size, init_method, device_kind)
+    initialize_model_parallel(pipeline_parallel_size=world_size, backend=_mp_backend(device_kind))
+    pp_group = get_pp_group()
+
+    if pp_group.is_first_rank:
+        _seed_device(79, device)
+        tensor = torch.randn(3, 5, dtype=torch.float32, device=device)
+        handles = pp_group.isend_tensor(tensor)
+        for handle in handles:
+            handle.wait()
+        result_queue.put(("sent", tensor.cpu()))
+    else:
+        received = torch.empty((3, 5), dtype=torch.float32, device=device)
+        handles = pp_group.irecv_tensor(received)
+        for handle in handles:
+            handle.wait()
+        result_queue.put(("received", received.cpu()))
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    _cleanup_distributed()
+
+
+def _run_direct_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) -> None:
+    mp_context = collective_context(device_kind)
+    manager = mp_context.Manager()
+    q = manager.Queue()
+    start_collective_workers(
+        direct_isend_irecv_worker,
+        args=(pp_size, init_method, device_kind, q),
+        nprocs=pp_size,
+        device_kind=device_kind,
+    )
+    results = {label: tensor for label, tensor in [q.get(), q.get()]}
+    torch.testing.assert_close(
+        results["received"], results["sent"], rtol=0, atol=0, msg="direct isend/irecv transferred tensor incorrectly"
+    )
+
+
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
@@ -546,6 +593,15 @@ def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) ->
 def test_isend_irecv_tensor_dict(pp_size: int):
     """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
     _run_isend_irecv(pp_size, device_kind="cpu", init_method=get_file_store_init_method())
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("pp_size", [2])
+def test_isend_irecv_tensor(pp_size: int):
+    """Known-shape feedback bypasses the blocking metadata handshake."""
+    _run_direct_isend_irecv(pp_size, device_kind="cpu", init_method=get_file_store_init_method())
 
 
 @pytest.mark.full_model

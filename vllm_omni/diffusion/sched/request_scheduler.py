@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -60,8 +60,35 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
 class RequestScheduler(BaseScheduler):
     """Scheduler for static request waves, including admission coalescing."""
 
+    @staticmethod
+    def _request_pipeline_compatibility_key(key: RequestBatchSamplingParamsKey) -> RequestBatchSamplingParamsKey:
+        """Remove fields that are request-local in the closed PP task plan."""
+        return replace(
+            key,
+            height=None,
+            width=None,
+            num_frames=1,
+            num_inference_steps=None,
+            sample_solver=None,
+            flow_shift=None,
+        )
+
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
-        if not super()._can_schedule_waiting(state):
+        if self.od_config is not None and getattr(self.od_config, "request_pipeline_parallel", False):
+            if self._running:
+                current_key = self._current_sampling_params_key()
+                if current_key is None or state.sampling_params_key is None:
+                    return False
+                if not isinstance(current_key, RequestBatchSamplingParamsKey):
+                    return False
+                candidate_key = state.sampling_params_key
+                if not isinstance(candidate_key, RequestBatchSamplingParamsKey):
+                    return False
+                if self._request_pipeline_compatibility_key(current_key) != self._request_pipeline_compatibility_key(
+                    candidate_key
+                ):
+                    return False
+        elif not super()._can_schedule_waiting(state):
             return False
         manager = self._diffusion_kv_manager
         if not self._running or manager is None or not manager.has_request(state.request_id):

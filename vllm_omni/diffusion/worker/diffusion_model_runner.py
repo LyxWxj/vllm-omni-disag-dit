@@ -41,7 +41,12 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+    get_pipeline_parallel_rank,
+    get_pipeline_parallel_world_size,
+    get_pp_group,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
@@ -51,6 +56,7 @@ from vllm_omni.diffusion.models.interface import (
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
+    supports_request_pipeline,
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
@@ -64,6 +70,12 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request_pipeline import (
+    RequestPipelineBatchState,
+    RequestPipelineTransport,
+    build_request_pipeline_tasks,
+    trace_request_pipeline_event,
+)
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
@@ -383,6 +395,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             raise ValueError(
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
+            )
+        if getattr(self.od_config, "request_pipeline_parallel", False) and not supports_request_pipeline(self.pipeline):
+            raise ValueError(
+                "request_pipeline_parallel=True requires a pipeline implementing the request-pipeline contract; "
+                f"{self.od_config.model_class_name} does not support it."
             )
 
         # The offloader owns loader-plan handoff and startup recovery. The
@@ -1056,6 +1073,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
         must declare ``supports_request_batch = True``.
         """
+        if getattr(od_config, "request_pipeline_parallel", False):
+            return self.execute_request_pipeline_batch(scheduler_output, od_config)
+
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
             self._validate_diffusion_kv_metadata(
@@ -1085,6 +1105,355 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         except OmniClientError as exc:
             return self._runner_output_from_outputs(reqs, [DiffusionOutput.from_exception(exc) for _ in reqs])
         finally:
+            if installed_request_ids:
+                self.remove_diffusion_kv_requests(installed_request_ids)
+
+    def _validate_request_pipeline_batch(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        od_config: OmniDiffusionConfig,
+    ) -> list[OmniDiffusionRequest]:
+        """Validate the closed request-pipeline contract.
+
+        Requests are prepared and executed one at a time, so spatial/temporal
+        shape, denoise step count, and Wan scheduler settings are request-local.
+        The remaining fields below still describe batch-wide execution policy.
+        """
+
+        if scheduler_output.scheduled_cached_reqs.request_ids:
+            raise ValueError("request_pipeline_parallel does not accept cached step requests")
+        requests = [new_req.req for new_req in scheduler_output.scheduled_new_reqs]
+        if not requests:
+            return []
+        if self.pipeline is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        if od_config.cache_backend not in (None, "none"):
+            raise ValueError("request_pipeline_parallel does not support cache_backend")
+        if (
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        ):
+            raise ValueError("request_pipeline_parallel does not support paged diffusion KV metadata yet")
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            validate_new_request_data_identity(new_req)
+            self._validate_diffusion_kv_metadata(
+                request_id=new_req.request_id,
+                metadata=new_req.diffusion_kv_metadata,
+            )
+            if new_req.req.prompt is None:
+                raise ValueError(f"request_pipeline_parallel request {new_req.request_id!r} has no prompt")
+
+        first = requests[0].sampling_params
+        comparable_fields = (
+            "output_type",
+            "num_outputs_per_prompt",
+            "guidance_scale",
+            "guidance_scale_2",
+            "true_cfg_scale",
+            "cfg_normalize",
+        )
+        for request in requests[1:]:
+            sampling = request.sampling_params
+            for field_name in comparable_fields:
+                if getattr(sampling, field_name, None) != getattr(first, field_name, None):
+                    raise ValueError(
+                        "request_pipeline_parallel requires homogeneous sampling fields; "
+                        f"{field_name!r} differs between requests"
+                    )
+        allowed_request_local_extra_args = {"sample_solver", "flow_shift"}
+        allowed_legacy_wan_extra_args = {"cfg_img_scale", "cfg_text_scale"}
+        for request in requests:
+            extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+            unsupported_extra_args = set(extra_args) - allowed_request_local_extra_args - allowed_legacy_wan_extra_args
+            if unsupported_extra_args:
+                raise ValueError(
+                    "request_pipeline_parallel only supports Wan scheduler and legacy CFG extra_args; "
+                    f"unsupported keys for {request.request_id!r}: {sorted(unsupported_extra_args)}"
+                )
+        return requests
+
+    def _prepare_request_pipeline_states(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+    ) -> tuple[list[StepRequestState], list[RunnerOutput]]:
+        """Build and prepare all request-local states before any task starts."""
+
+        states, new_request_ids = self._update_states(scheduler_output)
+        # Request-pipeline tasks are request-local.  In particular, do not
+        # collate different latent/prompt shapes into one InputBatch during
+        # preparation; each task builds its one-request view later.
+        prepared_states, _, preparation_errors = self._prepare_batch_inputs(
+            states,
+            new_request_ids,
+            build_input_batch=False,
+        )
+        self.input_batch = None
+        return prepared_states, preparation_errors
+
+    def _build_request_pipeline_batch(
+        self,
+        states: list[StepRequestState],
+        *,
+        window: int,
+    ) -> RequestPipelineBatchState:
+        steps = tuple(state.total_steps for state in states)
+        if any(state.do_true_cfg for state in states):
+            raise ValueError("request_pipeline_parallel currently does not support true CFG")
+        tasks = build_request_pipeline_tasks(
+            [state.request_id for state in states],
+            steps,
+            window=window,
+        )
+        transport_factory = getattr(self.pipeline, "request_pipeline_transport", None)
+        transport = (
+            transport_factory(window=window)
+            if callable(transport_factory)
+            else RequestPipelineTransport(self.pipeline, window=window)
+        )
+        return RequestPipelineBatchState(tuple(states), tasks, transport)
+
+    def execute_request_pipeline_batch(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        od_config: OmniDiffusionConfig,
+    ) -> BatchRunnerOutput:
+        """Execute a closed request batch as an interleaved PP microtask plan."""
+
+        requests = self._validate_request_pipeline_batch(scheduler_output, od_config)
+        if not requests:
+            return BatchRunnerOutput.from_list([])
+
+        installed_request_ids: list[str] = []
+        request_ids = [request.request_id for request in requests]
+        batch: RequestPipelineBatchState | None = None
+        outputs: list[DiffusionOutput] = []
+        try:
+            use_hsdp = od_config.parallel_config.use_hsdp
+            for new_req in scheduler_output.scheduled_new_reqs:
+                if new_req.diffusion_kv_metadata is not None:
+                    self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
+                    installed_request_ids.append(new_req.request_id)
+
+            # Text encoding is part of request preparation.  Keep it under the
+            # same inference context as denoising so encoder activations are not
+            # retained as autograd graphs for every request in the closed batch.
+            with torch.no_grad() if use_hsdp else torch.inference_mode():
+                states, preparation_errors = self._prepare_request_pipeline_states(scheduler_output)
+            if preparation_errors:
+                first_error = preparation_errors[0].result
+                if first_error is None or first_error.error is None:
+                    raise RuntimeError("request-pipeline preparation failed")
+                raise RuntimeError(first_error.error)
+            if len(states) != len(requests):
+                raise RuntimeError("request-pipeline request/state count mismatch")
+            batch = self._build_request_pipeline_batch(
+                states,
+                window=getattr(od_config, "request_pipeline_parallel_window", 1),
+            )
+
+            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if is_primary and current_omni_platform.is_available():
+                current_omni_platform.reset_peak_memory_stats()
+            grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+            kv_backend = getattr(self, "diffusion_kv_backend", None)
+            paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
+            attn_metadata: dict[str, Any] = {}
+            state_by_id = {state.request_id: state for state in states}
+            with (
+                grad_context,
+                request_cancellation_scope(
+                    [getattr(request, "cancellation_signal", None) for request in requests],
+                    enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
+                ),
+                batch.transport,
+            ):
+                for task in batch.tasks:
+                    state = state_by_id[task.request_id]
+                    task_error: BaseException | None = None
+                    try:
+                        check_request_cancellation()
+                        batch.transport.begin_task(task)
+                        if task.is_tombstone:
+                            if state.step_index != state.total_steps:
+                                raise RuntimeError(
+                                    f"request-pipeline tombstone arrived before {task.request_id} completed: "
+                                    f"state step {state.step_index}, total steps {state.total_steps}"
+                                )
+                        elif state.step_index != task.step_index:
+                            raise RuntimeError(
+                                f"request-pipeline task order mismatch for {task.request_id}: "
+                                f"expected state step {state.step_index}, task step {task.step_index}"
+                            )
+                    except BaseException as exc:
+                        task_error = exc
+                    if _dit_any_rank_failed(task_error is not None):
+                        if task_error is None:
+                            task_error = RuntimeError(
+                                f"request-pipeline task {task.task_index} failed on another DiT rank"
+                            )
+                        batch.failed = task_error
+                        raise task_error
+                    if task.is_tombstone:
+                        # Both PP ranks admit the same no-op task.  No
+                        # activation, feedback, transformer, or scheduler work
+                        # is issued for a completed request.
+                        continue
+                    trace_request_pipeline_event(
+                        "request_pipeline_execute",
+                        phase="enter",
+                        request_id=task.request_id,
+                        step_index=task.step_index,
+                        task_index=task.task_index,
+                    )
+                    local_error: BaseException | None = None
+                    try:
+                        if state.latents is not None:
+                            state.latents = batch.transport.consume_feedback(state.latents)
+                        input_batch = InputBatch.make_batch((state,))
+                        clear_pipeline_stage_durations(self.pipeline)
+                        with set_forward_context(
+                            vllm_config=self.vllm_config,
+                            omni_diffusion_config=od_config,
+                            attn_metadata=attn_metadata,
+                            paged_kv_runtime=paged_kv_runtime,
+                        ):
+                            noise_pred = self.pipeline.denoise_step(input_batch)
+                        merge_stage_durations(state, consume_pipeline_stage_durations(self.pipeline))
+                        # Every rank invokes the scheduler hook.  Rank 0 posts
+                        # the feedback receive while the last rank owns the
+                        # actual solver update and send.
+                        self.pipeline.step_scheduler(state, noise_pred)
+                        if state.step_index != task.step_index + 1:
+                            raise RuntimeError(
+                                f"request-pipeline scheduler did not advance {task.request_id} "
+                                f"from step {task.step_index}"
+                            )
+                    except BaseException as exc:
+                        local_error = exc
+                    if _dit_any_rank_failed(local_error is not None):
+                        if local_error is None:
+                            local_error = RuntimeError(
+                                f"request-pipeline task {task.task_index} failed on another DiT rank"
+                            )
+                        batch.failed = local_error
+                        raise local_error
+                    trace_request_pipeline_event(
+                        "request_pipeline_execute",
+                        phase="return",
+                        request_id=task.request_id,
+                        step_index=task.step_index,
+                        task_index=task.task_index,
+                    )
+
+                # The context exits through RequestPipelineTransport.__exit__,
+                # which drains both activation sends and lazy feedback receives.
+
+            pp_rank = get_pipeline_parallel_rank() if torch.distributed.is_initialized() else 0
+            pp_world_size = get_pipeline_parallel_world_size() if torch.distributed.is_initialized() else 1
+            pp_group = get_pp_group() if pp_world_size > 1 else None
+            decode_errors: list[BaseException] = []
+            for request_index, state in enumerate(batch.states):
+                decode_owner = request_index % pp_world_size
+                local_error: BaseException | None = None
+                output: DiffusionOutput | None = None
+                if pp_rank == decode_owner:
+                    previous_decode_owner = getattr(self.pipeline, "_request_pipeline_decode_owner", None)
+                    self.pipeline._request_pipeline_decode_owner = True
+                    try:
+                        with torch.no_grad() if use_hsdp else torch.inference_mode():
+                            clear_pipeline_stage_durations(self.pipeline)
+                            output = self.pipeline.post_decode(state)
+                            if output is None:
+                                output = DiffusionOutput()
+                            output = self._prepare_output_for_transport(output, state.sampling)
+                    except BaseException as exc:
+                        local_error = exc
+                    finally:
+                        if previous_decode_owner is None:
+                            delattr(self.pipeline, "_request_pipeline_decode_owner")
+                        else:
+                            self.pipeline._request_pipeline_decode_owner = previous_decode_owner
+
+                if (
+                    local_error is None
+                    and decode_owner != 0
+                    and pp_rank == decode_owner
+                    and (output is None or not isinstance(output.output, torch.Tensor))
+                ):
+                    local_error = RuntimeError(
+                        "request-pipeline request-owner decode currently requires a tensor output; "
+                        f"request {state.request_id} returned "
+                        f"{type(None if output is None else output.output).__name__}"
+                    )
+
+                if local_error is not None:
+                    decode_errors.append(local_error)
+
+                if decode_owner != 0 and pp_rank == decode_owner:
+                    assert pp_group is not None
+                    payload = (
+                        {"output": output.output}
+                        if local_error is None and output is not None
+                        else {"error": str(local_error or "request-owner decode failed")}
+                    )
+                    for work in pp_group.isend_tensor_dict(payload, dst=0):
+                        work.wait()
+                    output = None
+                elif decode_owner != 0 and pp_rank == 0:
+                    assert pp_group is not None
+                    received, handles, postprocess = pp_group.irecv_tensor_dict(src=decode_owner)
+                    for handle in handles:
+                        handle.wait()
+                    for callback in postprocess:
+                        callback()
+                    remote_error = received.get("error")
+                    if remote_error is not None:
+                        decode_errors.append(
+                            RuntimeError(
+                                f"request-pipeline decode owner {decode_owner} failed for "
+                                f"{state.request_id}: {remote_error}"
+                            )
+                        )
+                        output = None
+                    else:
+                        received_output = received.get("output")
+                        if not isinstance(received_output, torch.Tensor):
+                            decode_errors.append(
+                                RuntimeError(
+                                    f"request-pipeline decode owner {decode_owner} returned no tensor for "
+                                    f"{state.request_id}"
+                                )
+                            )
+                            output = None
+                        else:
+                            output = DiffusionOutput(output=received_output)
+
+                if output is None:
+                    output = DiffusionOutput()
+                attach_stage_durations(state, output)
+                outputs.append(output)
+                if is_primary:
+                    output.peak_memory_mb = max(output.peak_memory_mb, self._sample_peak_memory_mb())
+
+            if _dit_any_rank_failed(bool(decode_errors)):
+                decode_error = (
+                    decode_errors[0]
+                    if decode_errors
+                    else RuntimeError("request-pipeline decode failed on another rank")
+                )
+                batch.failed = decode_error
+                raise decode_error
+
+            self._maybe_send_stage_payload(requests, outputs)
+            return self._runner_output_from_outputs(requests, outputs)
+        except OmniClientError as exc:
+            error_outputs = [DiffusionOutput.from_exception(exc) for _ in requests]
+            return self._runner_output_from_outputs(requests, error_outputs)
+        finally:
+            if batch is not None and batch.failed is not None:
+                logger.error("Request-pipeline batch failed: %s", batch.failed, exc_info=True)
+            self.release_step_requests(request_ids)
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
 
@@ -1177,6 +1546,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
+        *,
+        build_input_batch: bool = True,
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
         pipeline = self.pipeline
@@ -1249,7 +1620,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     continue
             prepared_states.append(state)
 
-        if not prepared_states:
+        if not prepared_states or not build_input_batch:
             return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
