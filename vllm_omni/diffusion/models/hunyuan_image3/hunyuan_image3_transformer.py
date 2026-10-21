@@ -54,6 +54,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -66,6 +67,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_pipeline_parallel_world_size,
     get_pp_group,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -2485,7 +2487,8 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
-    ) -> tuple | BaseModelOutputWithPast:
+        pipeline_parallel: bool = False,
+    ) -> IntermediateTensors | tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -2496,11 +2499,20 @@ class HunyuanImage3Model(nn.Module):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if inputs_embeds is None:
+        pp_world_size = get_pipeline_parallel_world_size() if pipeline_parallel else 1
+        pp_group = get_pp_group() if pipeline_parallel else None
+        if inputs_embeds is None and pp_world_size == 1:
             inputs_embeds = self.embed_tokens(input_ids)
 
         # embed positions
-        hidden_states = inputs_embeds
+        if pp_world_size > 1 and not pp_group.is_first_rank:
+            hidden_shape = (attention_mask.shape[0], query_lens[0], self.config.hidden_size)
+            hidden_dtype = next(self.layers[self.start_layer : self.end_layer].parameters()).dtype
+            hidden_states = torch.empty(hidden_shape, device=attention_mask.device, dtype=hidden_dtype)
+            for handle in pp_group.irecv_tensor(hidden_states, src=pp_group.group_prev_rank):
+                handle.wait()
+        else:
+            hidden_states = inputs_embeds
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -2572,7 +2584,9 @@ class HunyuanImage3Model(nn.Module):
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        layer_start = self.start_layer if pipeline_parallel else 0
+        layer_end = self.end_layer if pipeline_parallel else len(self.layers)
+        for layer_idx, decoder_layer in enumerate(self.layers[layer_start:layer_end], start=layer_start):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2604,6 +2618,9 @@ class HunyuanImage3Model(nn.Module):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+        if pp_world_size > 1 and not pp_group.is_last_rank:
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
