@@ -456,6 +456,7 @@ class Wan22Pipeline(
     supports_request_batch = True
     supports_step_execution = True
     supports_request_pipeline = True
+    supports_step_batch_pp = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -790,7 +791,8 @@ class Wan22Pipeline(
             raise ValueError(
                 f"Wan request latents have shape {tuple(request_latents.shape)}, expected {expected_shape}."
             )
-        if pp_group is None or pp_group.is_first_rank:
+        queued_step_pp = bool(getattr(self.od_config, "step_execution", False) and pp_group is not None)
+        if pp_group is None or pp_group.is_first_rank or queued_step_pp:
             return self.prepare_latents(
                 batch_size=batch_size,
                 num_channels_latents=self.transformer_config.in_channels,
@@ -830,7 +832,8 @@ class Wan22Pipeline(
         else:
             raise ValueError("Wan prompt_embeds must be a 2D or 3D tensor")
         dtype = self._step_model_dtype()
-        owner = pp_group is None or pp_group.is_first_rank
+        queued_step_pp = bool(getattr(self.od_config, "step_execution", False) and pp_group is not None)
+        owner = pp_group is None or pp_group.is_first_rank or queued_step_pp
         if owner:
             if prompt_embeds is None:
                 if not prompt:
@@ -926,6 +929,10 @@ class Wan22Pipeline(
             if local_error is not None:
                 raise local_error
             return state
+        if getattr(self.od_config, "step_execution", False):
+            if local_error is not None:
+                raise local_error
+            return state
         status = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
         statuses: list[str | None] = [None] * pp_group.world_size
         torch.distributed.all_gather_object(statuses, status, group=pp_group.cpu_group)
@@ -952,8 +959,8 @@ class Wan22Pipeline(
     ) -> torch.Tensor | None:
         del kwargs
         states = tuple(states or input_batch.states)
-        if len(states) != 1:
-            raise ValueError("Wan request pipeline denoise_step expects one request state")
+        if not states:
+            raise ValueError("Wan request pipeline denoise_step expects at least one request state")
         if input_batch.prompt_embeds is None:
             raise ValueError("Wan request pipeline requires prompt embeddings")
         timestep = input_batch.timesteps
@@ -971,7 +978,8 @@ class Wan22Pipeline(
             "current_model": current_model,
         }
         negative_kwargs = None
-        if states[0].do_true_cfg:
+        do_true_cfg = states[0].do_true_cfg
+        if do_true_cfg:
             if input_batch.negative_prompt_embeds is None:
                 raise ValueError("Wan CFG step execution requires negative prompt embeddings")
             negative_kwargs = {
@@ -979,7 +987,7 @@ class Wan22Pipeline(
                 "encoder_hidden_states": input_batch.negative_prompt_embeds,
             }
         return self.predict_noise_maybe_with_cfg(
-            do_true_cfg=states[0].do_true_cfg,
+            do_true_cfg=do_true_cfg,
             true_cfg_scale=states[0].extra["wan_guidance_low"],
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,

@@ -48,6 +48,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     get_pp_group,
 )
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
@@ -394,6 +395,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
                 f"{self.od_config.model_class_name} does not support that contract."
+            )
+        if (
+            getattr(self.od_config, "step_execution", False)
+            and getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) > 1
+            and not getattr(self.pipeline, "supports_step_batch_pp", False)
+        ):
+            raise ValueError(
+                "step-execution pipeline parallelism currently requires a pipeline implementing "
+                "the request-local step PP contract; "
+                f"{self.od_config.model_class_name} does not support it."
             )
         if self.od_config.streaming_output and not self._supports_step_mode():
             raise ValueError(
@@ -1687,12 +1698,173 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Execute one step for one scheduled request and return runner output."""
+        """Execute one step for the scheduled request batch and return runner output."""
+        if (
+            getattr(self.od_config, "step_execution", False)
+            and getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) > 1
+        ):
+            try:
+                return self._execute_stepwise_pipeline(scheduler_output)
+            except Exception:
+                self.release_step_requests(scheduler_output.scheduled_request_ids)
+                raise
         return self._execute_stepwise(
             scheduler_output,
             validate_kv_metadata=True,
             record_output_peak_memory=True,
         )
+
+    def _execute_stepwise_pipeline(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Run one batched local DiT stage and leave per-request solvers to the last rank."""
+        pipeline = self.pipeline
+        if pipeline is None or not getattr(pipeline, "supports_step_batch_pp", False):
+            raise ValueError("The loaded pipeline does not support step-batching PP")
+        if self.od_config.cache_backend not in (None, "none") or self.od_config.streaming_output:
+            raise ValueError("step-batching PP does not support cache backends or streaming output")
+        omni_kv = getattr(self.od_config, "omni_kv_config", None) or {}
+        if getattr(self.od_config, "kv_transfer_config", None) is not None or any(
+            omni_kv.get(key, False) for key in ("need_send_cache", "need_recv_cache")
+        ):
+            raise ValueError("step-batching PP does not support diffusion KV transfer")
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        ):
+            raise ValueError("step-batching PP does not support paged diffusion KV")
+
+        self._cleanup_finished_step_requests(scheduler_output)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            validate_new_request_data_identity(new_req)
+            if not new_req.req.use_step_execution:
+                raise ValueError("step-batching PP does not support full-forward fallback requests")
+            self._validate_diffusion_kv_metadata(
+                request_id=new_req.request_id,
+                metadata=new_req.diffusion_kv_metadata,
+            )
+
+        states, new_request_ids = self._update_states(scheduler_output)
+        new_request_id_set = set(new_request_ids)
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        outputs: list[RunnerOutput] = []
+        kv_backend = getattr(self, "diffusion_kv_backend", None)
+        paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
+
+        with grad_context:
+            for state in states:
+                if state.request_id in new_request_id_set:
+                    if state.sampling.generator is not None:
+                        raise ValueError("step-batching PP requires a seed-based generator, not a custom Generator")
+                    self._initialize_generator(state.sampling)
+                    clear_pipeline_stage_durations(pipeline)
+                    pipeline.prepare_encode(state)
+                    merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
+
+            for state in states:
+                if isinstance(state.latents, AsyncLatents):
+                    state.latents = state.latents.resolve()
+
+            input_batch = InputBatch.make_batch(states, cached_batch=self.input_batch)
+            self.input_batch = input_batch
+            clear_pipeline_stage_durations(pipeline)
+            with set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=self.od_config,
+                attn_metadata={},
+                paged_kv_runtime=paged_kv_runtime,
+            ):
+                noise_pred = pipeline.denoise_step(input_batch, states=states)
+            denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
+
+            offset = 0
+            for state in states:
+                merge_stage_durations(state, denoise_stage_durations)
+                row_count = state.latents.shape[0]
+                state_noise = noise_pred[offset : offset + row_count] if noise_pred is not None else None
+                pipeline.step_scheduler(state, state_noise)
+                offset += row_count
+                outputs.append(RunnerOutput(request_id=state.request_id, step_index=state.step_index, finished=False))
+
+        return BatchRunnerOutput.from_list(outputs)
+
+    def decode_pipeline_requests(self, request_ids: list[str]) -> BatchRunnerOutput:
+        """Drain the PP edge, then distribute a decode cohort across PP ranks."""
+        pipeline = self.pipeline
+        if pipeline is None or not getattr(pipeline, "supports_step_batch_pp", False):
+            raise ValueError("The loaded pipeline does not support step-batching PP")
+        pp_group = get_pp_group()
+        pp_rank = get_pipeline_parallel_rank()
+        states = [self.state_cache[request_id] for request_id in request_ids]
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
+
+        with grad_context:
+            pipeline._sync_pp_send()
+            if pp_rank == 0:
+                for state in states:
+                    if isinstance(state.latents, AsyncLatents):
+                        state.latents = state.latents.resolve()
+            pp_group.barrier()
+
+            outputs: list[RunnerOutput] = []
+            for index, state in enumerate(states):
+                owner = index % pp_group.world_size
+                output: DiffusionOutput | None = None
+                if pp_rank == owner:
+                    previous_owner = getattr(pipeline, "_request_pipeline_decode_owner", None)
+                    pipeline._request_pipeline_decode_owner = True
+                    try:
+                        clear_pipeline_stage_durations(pipeline)
+                        output = pipeline.post_decode(state)
+                        output = output or DiffusionOutput()
+                        output = self._prepare_output_for_transport(output, state.sampling)
+                    except Exception as exc:
+                        output = DiffusionOutput.from_exception(exc)
+                    finally:
+                        if previous_owner is None:
+                            delattr(pipeline, "_request_pipeline_decode_owner")
+                        else:
+                            pipeline._request_pipeline_decode_owner = previous_owner
+
+                    if output is not None and output.error is None and not isinstance(output.output, torch.Tensor):
+                        output = DiffusionOutput(error="step-batching PP decode requires tensor outputs")
+
+                if owner != 0 and pp_rank == owner:
+                    assert pp_group is not None
+                    payload = (
+                        {"error": output.error}
+                        if output is not None and output.error
+                        else {"output": output.output}
+                    )
+                    for work in pp_group.isend_tensor_dict(payload, dst=0):
+                        work.wait()
+                elif owner != 0 and pp_rank == 0:
+                    received, handles, callbacks = pp_group.irecv_tensor_dict(src=owner)
+                    for handle in handles:
+                        handle.wait()
+                    for callback in callbacks:
+                        callback()
+                    if received is not None and received.get("error"):
+                        output = DiffusionOutput(error=received["error"])
+                    else:
+                        assert received is not None
+                        output = DiffusionOutput(output=received["output"])
+
+                if pp_rank == 0:
+                    output = output or DiffusionOutput()
+                    attach_stage_durations(state, output)
+                    outputs.append(
+                        RunnerOutput(
+                            request_id=state.request_id,
+                            step_index=state.step_index,
+                            finished=True,
+                            result=output,
+                        )
+                    )
+
+        self.release_step_requests(request_ids)
+        return BatchRunnerOutput.from_list(outputs) if pp_rank == 0 else BatchRunnerOutput.from_list([])
 
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -29,6 +31,22 @@ def test_safe_linalg_solve_uses_torch_native_path(monkeypatch: pytest.MonkeyPatc
     result = flow_matching.safe_linalg_solve(matrix, rhs)
 
     assert result is expected
+
+
+def test_safe_linalg_solve_uses_async_cuda_path(monkeypatch: pytest.MonkeyPatch):
+    matrix = SimpleNamespace(is_cuda=True, device=torch.device("cuda"))
+    rhs = object()
+    expected = object()
+
+    def fake_solve_ex(solve_matrix, solve_rhs, *, check_errors):
+        assert solve_matrix is matrix
+        assert solve_rhs is rhs
+        assert check_errors is False
+        return SimpleNamespace(result=expected)
+
+    monkeypatch.setattr(flow_matching.torch.linalg, "solve_ex", fake_solve_ex)
+
+    assert flow_matching.safe_linalg_solve(matrix, rhs) is expected
 
 
 def test_safe_linalg_solve_falls_back_on_missing_cpu_lapack(monkeypatch: pytest.MonkeyPatch):

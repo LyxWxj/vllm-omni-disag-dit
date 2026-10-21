@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     SchedulerRequestState,
@@ -40,9 +41,83 @@ class StepScheduler(BaseScheduler):
     def __init__(self) -> None:
         super().__init__()
         self._request_progress: dict[str, _StepProgress] = {}
+        self._pipeline_inflight: set[str] = set()
+        self._pipeline_decode_pending: set[str] = set()
+        self._pipeline_parallel = False
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
+        self._pipeline_inflight.clear()
+        self._pipeline_decode_pending.clear()
+        parallel = getattr(self.od_config, "parallel_config", None)
+        self._pipeline_parallel = bool(
+            getattr(self.od_config, "step_execution", False)
+            and getattr(parallel, "pipeline_parallel_size", 1) > 1
+        )
+        if self._pipeline_parallel:
+            # Keep three batches per rank resident so stage 0 can stay ahead of
+            # solver completion on the last rank.
+            self.max_num_running_reqs *= 3 * parallel.pipeline_parallel_size
+
+    def schedule(self) -> DiffusionSchedulerOutput:
+        pipeline_capacity = self.max_num_running_reqs
+        batch_limit = max(1, int(getattr(self.od_config, "max_num_seqs", 1)))
+        if self._pipeline_parallel:
+            eligible = sum(
+                request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
+                for request_id in self._running
+            )
+            self.max_num_running_reqs = min(pipeline_capacity, len(self._running) + max(batch_limit - eligible, 0))
+        try:
+            output = super().schedule()
+        finally:
+            self.max_num_running_reqs = pipeline_capacity
+
+        if self._pipeline_parallel:
+            output.scheduled_cached_reqs.request_ids = [
+                request_id
+                for request_id in output.scheduled_cached_reqs.request_ids
+                if request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
+            ]
+            output.scheduled_cached_reqs.request_ids = output.scheduled_cached_reqs.request_ids[
+                : max(batch_limit - len(output.scheduled_new_reqs), 0)
+            ]
+        return output
+
+    def mark_pipeline_inflight(self, request_ids: list[str]) -> None:
+        self._pipeline_inflight.update(request_ids)
+
+    def pipeline_step_completed(self, request_ids: list[str]) -> None:
+        self._pipeline_inflight.difference_update(request_ids)
+
+    @property
+    def has_pipeline_inflight(self) -> bool:
+        return bool(self._pipeline_inflight)
+
+    @property
+    def has_pipeline_ready(self) -> bool:
+        return any(
+            request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
+            for request_id in self._running
+        )
+
+    def pipeline_decode_pending(self) -> list[str]:
+        return [request_id for request_id in self._running if request_id in self._pipeline_decode_pending]
+
+    def finish_pipeline_decode(self, output: BaseRunnerOutput) -> set[str]:
+        request_ids = self.pipeline_decode_pending()
+        if not request_ids:
+            return set()
+        sched_output = DiffusionSchedulerOutput(
+            step_id=self._step_id,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(request_ids),
+            finished_req_ids=set(),
+            num_running_reqs=len(self._running),
+            num_waiting_reqs=len(self._waiting),
+        )
+        self._pipeline_decode_pending.difference_update(request_ids)
+        return self.update_from_output(sched_output, output)
 
     def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
         return self._request_progress[state.request_id].wait_deadline is None
@@ -114,6 +189,9 @@ class StepScheduler(BaseScheduler):
         if not super()._can_schedule_waiting(state):
             return False
 
+        if self._pipeline_parallel:
+            return True
+
         is_first_step = self._request_progress[state.request_id].current_step == 0
         for request_id in self._running:
             running = self._request_states[request_id]
@@ -131,6 +209,7 @@ class StepScheduler(BaseScheduler):
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
         for request_id in scheduled_request_ids:
+            self._pipeline_inflight.discard(request_id)
             state = self._request_states.get(request_id)
             progress = self._request_progress.get(request_id)
             if state is None or progress is None or state.is_finished():
@@ -173,6 +252,8 @@ class StepScheduler(BaseScheduler):
                 terminal_errors[request_id] = None
             else:
                 state.error = None
+                if self._pipeline_parallel and progress.current_step >= progress.total_steps:
+                    self._pipeline_decode_pending.add(request_id)
                 wait = req_output.wait_for_interaction
                 if wait is not None:
                     # RPCs are drained before this update. Latch successful
@@ -188,6 +269,7 @@ class StepScheduler(BaseScheduler):
 
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
+        self._pipeline_decode_pending.discard(request_id)
 
     def _finish_requests(
         self,

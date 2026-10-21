@@ -1401,6 +1401,29 @@ class OmniDiffusionConfig:
                     "request_pipeline_parallel currently requires PP=2 with DP/TP/SP/CFG/VAE parallelism set to 1"
                 )
 
+        parallel = self.parallel_config
+        if self.step_execution and parallel.pipeline_parallel_size > 1:
+            if self.streaming_output:
+                raise ValueError("step-execution pipeline parallelism does not support streaming_output")
+            if (
+                parallel.pipeline_parallel_size != 2
+                or parallel.data_parallel_size != 1
+                or parallel.tensor_parallel_size != 1
+                or parallel.sequence_parallel_size != 1
+                or parallel.cfg_parallel_size != 1
+                or parallel.vae_patch_parallel_size != 1
+            ):
+                raise ValueError(
+                    "step-execution pipeline parallelism currently requires PP=2 and all other parallel sizes set to 1"
+                )
+            omni_kv = self.omni_kv_config or {}
+            if (
+                self.kv_transfer_config is not None
+                or self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+                or any(omni_kv.get(key, False) for key in ("need_send_cache", "need_recv_cache"))
+            ):
+                raise ValueError("step-execution pipeline parallelism does not support diffusion KV transfer")
+
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
@@ -2031,11 +2054,13 @@ class AsyncOutputKind(Enum):
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
+    * ``PIPELINE_STEP_DONE`` — last PP rank completed the step solver
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
+    PIPELINE_STEP_DONE = "pipeline_step_done"
 
 
 @dataclass

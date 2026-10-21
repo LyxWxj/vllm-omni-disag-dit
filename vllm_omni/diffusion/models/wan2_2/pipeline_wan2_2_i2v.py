@@ -202,6 +202,7 @@ class Wan22I2VPipeline(
     Wan2.2-style I2V (with expand_timesteps for TI2V-5B).
     """
 
+    supports_step_batch_pp = False
     supports_request_batch = True
     supports_request_pipeline = False
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]

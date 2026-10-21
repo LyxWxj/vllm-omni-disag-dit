@@ -45,6 +45,27 @@ def test_wan_unipc_shifts_unmodified_training_endpoints(shift: float, steps: int
     torch.testing.assert_close(scheduler.sigmas, torch.from_numpy(expected_sigmas), rtol=0, atol=0)
 
 
+def test_wan_unipc_steps_do_not_materialize_scalar_tensor_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    scheduler = build_wan_scheduler("unipc", 5.0)
+    scheduler.set_timesteps(6, device="cpu")
+    scheduler.set_begin_index(0)
+
+    original_tensor = torch.tensor
+
+    def reject_scalar_tensor_lists(data, *args, **kwargs):
+        if isinstance(data, (list, tuple)) and any(isinstance(value, torch.Tensor) and value.ndim == 0 for value in data):
+            raise AssertionError("solver scalar tensors must stay on device and use torch.stack")
+        return original_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", reject_scalar_tensor_lists)
+    sample = torch.randn(1, 16, 3, 4, 4)
+    for timestep in scheduler.timesteps:
+        output = scheduler.step(torch.randn_like(sample), timestep, sample)
+        sample = output.prev_sample
+
+    assert torch.isfinite(sample).all()
+
+
 def test_wan_euler_keeps_dmd_shift_semantics() -> None:
     scheduler = build_wan_scheduler("euler", FASTWAN_DMD_SCHEDULER_SHIFT)
     scheduler.set_timesteps(3, device="cpu")

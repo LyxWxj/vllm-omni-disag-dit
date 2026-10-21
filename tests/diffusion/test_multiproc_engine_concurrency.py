@@ -18,7 +18,7 @@ import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
@@ -77,6 +77,7 @@ def _make_executor(num_gpus: int = 1):
     executor._closed = False
     executor._processes = []
     executor._is_failed = False
+    executor._pump_running = False
     executor._failure_callbacks = []
     executor._completed_outputs = {}
     executor._dropped_output_ids = OrderedDict()
@@ -266,6 +267,51 @@ class TestStepModeTimeout:
             with pytest.raises(RuntimeError, match="DiffusionExecutor is closed"):
                 dispatch(_make_sched_output("B", "C"))
         assert req_q.empty()
+
+
+class TestAsyncPipelineDispatch:
+    def _executor(self):
+        executor, req_q, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=True,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        )
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._rpc_id_counter = 0
+        executor._rpc_id_lock = threading.Lock()
+        executor._pipeline_step_results = queue.Queue()
+        executor._pipeline_step_callback = Mock()
+        return executor, req_q
+
+    def test_dispatch_returns_before_rank0_reply(self):
+        executor, req_q = self._executor()
+
+        executor.execute_step_pipeline(_make_sched_output("A"))
+
+        request = req_q.get_nowait()
+        assert request["pipeline_step_id"] == "0"
+        assert request["pipeline_completion_rank"] == 1
+        assert not executor.has_pipeline_step_results()
+
+        future = next(iter(executor._rpc_futures.values()))
+        future.set_result(AsyncDiffusionOutput(kind=AsyncOutputKind.RPC_RESULT))
+        assert not executor.has_pipeline_step_results()
+        executor._pipeline_step_callback.assert_not_called()
+
+    def test_rank0_rpc_failure_becomes_pipeline_result(self):
+        executor, req_q = self._executor()
+
+        executor.execute_step_pipeline(_make_sched_output("A"))
+        req_q.get_nowait()
+        future = next(iter(executor._rpc_futures.values()))
+        future.set_exception(RuntimeError("rank0 failed"))
+
+        event = executor.wait_pipeline_step_result(timeout=1)
+        assert event.kind == AsyncOutputKind.RPC_RESULT
+        assert event.async_output_id == "0"
+        assert event.error == "rank0 failed"
+        executor._pipeline_step_callback.assert_called_once_with()
 
 
 class TestRequestModeDispatch:
@@ -569,6 +615,7 @@ class TestRequestModeDispatch:
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
         )
+        executor._pump_running = True
         executor._sync_result_buffer = res_q
         executor._fail_closed_on_dp_wave_timeout = Mock()
         monkeypatch.setattr(executor_module, "_DLO_DP_WAVE_TIMEOUT_S", 0.05)
@@ -1127,6 +1174,7 @@ class TestMultiprocExecutorRaisesEngineDeadError:
         executor._result_mq = MagicMock()
         executor._result_mq.dequeue = MagicMock(side_effect=TimeoutError)
         executor._is_failed = True
+        executor._pump_running = False
 
         with pytest.raises(EngineDeadError):
             executor.collective_rpc(

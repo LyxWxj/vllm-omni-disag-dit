@@ -532,10 +532,11 @@ class Wan22S2VPipeline(
       - Audio conditioning via wav2vec2 features injected into transformer.
       - Motion frame autoregressive chaining across multiple clips.
       - Optional pose video conditioning.
-      - Reference image encoded as separate ``ref_latents`` tokens (not
-        channel-concatenated like I2V).
+    - Reference image encoded as separate ``ref_latents`` tokens (not
+      channel-concatenated like I2V).
     """
 
+    supports_step_batch_pp = False
     # Default config values from Wan2.2/wan/configs/wan_s2v_14B.py
     supports_request_batch = True
     supports_request_pipeline = False

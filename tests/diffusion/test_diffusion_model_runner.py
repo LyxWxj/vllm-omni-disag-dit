@@ -13,6 +13,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -849,6 +850,122 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
     assert output.output == "a prompt"
     assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
     assert runner.pipeline.last_req.num_reqs == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_decode_pipeline_requests_disables_gradients(monkeypatch):
+    class FakeGroup:
+        world_size = 1
+
+        def barrier(self):
+            pass
+
+    class FakePipeline:
+        supports_step_batch_pp = True
+        _request_pipeline_decode_owner = False
+
+        def _sync_pp_send(self):
+            pass
+
+        def post_decode(self, state):
+            assert not torch.is_grad_enabled()
+            parameter = torch.nn.Parameter(torch.ones(1))
+            return DiffusionOutput(output=parameter * 2)
+
+    state = SimpleNamespace(
+        request_id="req",
+        sampling=SimpleNamespace(),
+        latents=torch.ones(1),
+        step_index=1,
+        stage_durations={},
+    )
+    runner = SimpleNamespace(
+        pipeline=FakePipeline(),
+        od_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(use_hsdp=False),
+            diffusion_offload_config=None,
+        ),
+        state_cache={"req": state},
+        _prepare_output_for_transport=lambda output, sampling: output,
+        release_step_requests=lambda request_ids: None,
+    )
+    monkeypatch.setattr(model_runner_module, "get_pp_group", lambda: FakeGroup())
+    monkeypatch.setattr(model_runner_module, "get_pipeline_parallel_rank", lambda: 0)
+
+    output = DiffusionModelRunner.decode_pipeline_requests(runner, ["req"])
+
+    result = output.get_request_output("req").result.output
+    assert not result.requires_grad
+    assert result.grad_fn is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
+    class FakePipeline:
+        supports_step_batch_pp = True
+
+        def denoise_step(self, input_batch, states):
+            assert isinstance(states[0].latents, torch.Tensor)
+            return torch.zeros_like(input_batch.latents)
+
+        def step_scheduler(self, state, noise_pred):
+            del noise_pred
+            state.latents = pending_feedback
+
+    class FakeWork:
+        def __init__(self):
+            self.wait_count = 0
+
+        def wait(self):
+            self.wait_count += 1
+            return True
+
+    class FakeSchedulerOutput:
+        scheduled_new_reqs = []
+        scheduled_cached_reqs = SimpleNamespace(request_ids=["req"])
+        finished_req_ids = set()
+        scheduled_request_ids = ["req"]
+
+    latent = torch.ones(1, 1)
+    previous_feedback_work = FakeWork()
+    next_feedback_work = FakeWork()
+    pending_feedback = AsyncLatents({"latents": latent}, [next_feedback_work], [])
+    state = StepRequestState(
+        request_id="req",
+        sampling=OmniDiffusionSamplingParams(num_inference_steps=1),
+        prompt_embeds=torch.ones(1, 1, 1),
+        latents=AsyncLatents({"latents": latent}, [previous_feedback_work], []),
+        timesteps=torch.ones(1),
+        step_index=0,
+    )
+    runner = SimpleNamespace(
+        pipeline=FakePipeline(),
+        od_config=SimpleNamespace(
+            cache_backend=None,
+            streaming_output=False,
+            omni_kv_config=None,
+            kv_transfer_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(use_hsdp=False),
+        ),
+        input_batch=None,
+        vllm_config=None,
+        diffusion_kv_backend=None,
+        _cleanup_finished_step_requests=lambda scheduler_output: None,
+        _update_states=lambda scheduler_output: ([state], []),
+    )
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "clear_pipeline_stage_durations", lambda pipeline: None)
+    monkeypatch.setattr(model_runner_module, "consume_pipeline_stage_durations", lambda pipeline: {})
+    monkeypatch.setattr(model_runner_module, "merge_stage_durations", lambda state, durations: None)
+
+    DiffusionModelRunner._execute_stepwise_pipeline(runner, FakeSchedulerOutput())
+
+    assert state.latents is pending_feedback
+    assert previous_feedback_work.wait_count == 1
+    assert next_feedback_work.wait_count == 0
 
 
 @pytest.mark.core_model

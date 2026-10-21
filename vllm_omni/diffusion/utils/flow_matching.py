@@ -10,6 +10,10 @@ from torch import nn
 
 def safe_linalg_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     try:
+        if matrix.is_cuda:
+            # The solver matrices are tiny and well-conditioned; skip solve's
+            # CUDA-side info check, which synchronizes the device every step.
+            return torch.linalg.solve_ex(matrix, rhs, check_errors=False).result
         return torch.linalg.solve(matrix, rhs)
     except RuntimeError as exc:
         if matrix.device.type != "cpu" or "requires compiling PyTorch with LAPACK" not in str(exc):
