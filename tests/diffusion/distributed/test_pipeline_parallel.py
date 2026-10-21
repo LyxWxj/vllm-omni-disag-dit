@@ -882,6 +882,59 @@ def test_predict_noise_parity(pp_size, cfg_size, do_true_cfg, dtype, num_layers,
 # ---------------------------------------------------------------------------
 
 
+def test_step_pipeline_feedback_resolves_prior_async_latents_before_direct_receive(monkeypatch):
+    from types import SimpleNamespace
+
+    class FakeHandle:
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self):
+            self.waits += 1
+
+    class FakeGroup:
+        is_first_rank = True
+        is_last_rank = False
+        world_size = 2
+
+        def __init__(self):
+            self.received = None
+            self.tensor_dict_calls = 0
+
+        def irecv_tensor(self, tensor, src):
+            assert src == 1
+            self.received = tensor
+            return [FakeHandle()]
+
+        def irecv_tensor_dict(self, src):
+            self.tensor_dict_calls += 1
+            raise AssertionError("step PP feedback must use the shape-known tensor receive")
+
+    group = FakeGroup()
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(pp_module, "get_pp_group", lambda: group)
+
+    pipeline = object.__new__(MockPipelineParallel)
+    pipeline.od_config = SimpleNamespace(step_execution=True)
+    pipeline.supports_step_batch_pp = True
+    pipeline._request_pipeline_transport = None
+    previous_handle = FakeHandle()
+    previous = AsyncLatents({"latents": torch.randn(1, 4, 2, 2)}, [previous_handle], [])
+
+    next_latents = pipeline.scheduler_step_maybe_with_cfg(
+        noise_pred=None,
+        t=torch.tensor(1),
+        latents=previous,
+        do_true_cfg=False,
+    )
+
+    assert isinstance(next_latents, AsyncLatents)
+    assert group.received is not None
+    assert group.received.shape == previous._tensor_dict["latents"].shape
+    assert group.tensor_dict_calls == 0
+    assert previous_handle.waits == 1
+
+
 def compute_scheduler_step_baseline(
     test_config: dict,
     do_true_cfg: bool,

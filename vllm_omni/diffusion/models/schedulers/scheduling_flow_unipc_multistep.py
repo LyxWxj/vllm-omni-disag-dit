@@ -398,8 +398,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             assert mi is not None
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones_like(rks[-1]) if rks else torch.ones((), device=device))
+        rks = torch.stack(rks)
 
         R = []
         b = []
@@ -424,7 +424,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)
 
         if D1s is not None and len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
@@ -530,8 +530,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             assert mi is not None
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones_like(rks[-1]) if rks else torch.ones((), device=device))
+        rks = torch.stack(rks)
 
         R = []
         b = []
@@ -556,7 +556,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)
 
         if D1s is not None and len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)

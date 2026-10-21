@@ -219,7 +219,11 @@ class PipelineParallelMixin:
         # Request-mode microtasks own a bounded send window.  The transport
         # waits the oldest slot before admitting a new task; synchronizing here
         # would serialize every request-step pair and remove the overlap.
-        if getattr(self, "_request_pipeline_transport", None) is None:
+        queued_step_pp = bool(
+            getattr(getattr(self, "od_config", None), "step_execution", False)
+            and getattr(self, "supports_step_batch_pp", False)
+        )
+        if getattr(self, "_request_pipeline_transport", None) is None and not queued_step_pp:
             self._sync_pp_send()
 
         pp_group = get_pp_group()
@@ -281,7 +285,7 @@ class PipelineParallelMixin:
         self,
         noise_pred: torch.Tensor | tuple[torch.Tensor, ...] | None,
         t: torch.Tensor | tuple[torch.Tensor, ...],
-        latents: torch.Tensor | tuple[torch.Tensor, ...],
+        latents: torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents,
         do_true_cfg: bool,
         per_request_scheduler: Any | None = None,
         generator: torch.Generator | None = None,
@@ -305,11 +309,15 @@ class PipelineParallelMixin:
         pp_group = get_pp_group()
         trace_request_pipeline_event("pp_feedback", phase="enter")
         transport = getattr(self, "_request_pipeline_transport", None)
+        queued_step_pp = bool(
+            getattr(getattr(self, "od_config", None), "step_execution", False)
+            and getattr(self, "supports_step_batch_pp", False)
+        )
         if pp_group.is_last_rank:
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
-            if transport is not None and isinstance(latents, torch.Tensor):
+            if (transport is not None or queued_step_pp) and isinstance(latents, torch.Tensor):
                 # Request-mode Wan tasks already agree on the latent shape.
                 # Avoid the blocking CPU metadata exchange in
                 # isend_tensor_dict so the next stage-0 task can overlap this
@@ -317,12 +325,16 @@ class PipelineParallelMixin:
                 feedback_work = pp_group.isend_tensor(latents, dst=0)
             else:
                 feedback_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
-            if transport is None:
+            if transport is None and queued_step_pp:
+                self._pp_send_work.extend(feedback_work)
+            elif transport is None:
                 self._pp_send_work = feedback_work
             else:
                 self._pp_send_work.extend(feedback_work)
         elif pp_group.is_first_rank:
-            if transport is not None and isinstance(latents, torch.Tensor):
+            if queued_step_pp and isinstance(latents, AsyncLatents):
+                latents = latents.resolve()
+            if (transport is not None or queued_step_pp) and isinstance(latents, torch.Tensor):
                 received_latents = torch.empty_like(latents)
                 feedback_handles = pp_group.irecv_tensor(
                     received_latents,

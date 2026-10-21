@@ -2043,6 +2043,61 @@ class TestStepScheduler:
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
 
+    def test_pipeline_step_admits_new_request_while_cached_request_is_inflight(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=3,
+            )
+        )
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=3))
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=3))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_a, req_b]
+        scheduler.mark_pipeline_inflight(first.scheduled_request_ids)
+
+        req_c = scheduler.add_request(_make_step_request("c", num_inference_steps=3))
+        next_step = scheduler.schedule()
+
+        assert _new_ids(next_step) == [req_c]
+        assert _cached_ids(next_step) == []
+        assert next_step.num_running_reqs == 3
+
+    def test_pipeline_final_step_waits_for_decode_cohort(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=2,
+            )
+        )
+        request_id = scheduler.add_request(_make_step_request("final", num_inference_steps=1))
+        step = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(step.scheduled_request_ids)
+
+        scheduler.pipeline_step_completed(step.scheduled_request_ids)
+        step_output = BatchRunnerOutput.from_list([_make_step_output(request_id, 1)])
+        assert scheduler.update_from_output(step, step_output) == set()
+        assert scheduler.pipeline_decode_pending() == [request_id]
+        assert scheduler.schedule().is_empty
+        assert scheduler.get_request_state(request_id).status == DiffusionRequestStatus.RUNNING
+
+        decoded = BatchRunnerOutput.from_list(
+            [
+                RunnerOutput(
+                    request_id=request_id,
+                    step_index=1,
+                    finished=True,
+                    result=DiffusionOutput(output=torch.tensor([1.0])),
+                )
+            ]
+        )
+        assert scheduler.finish_pipeline_decode(decoded) == {request_id}
+        assert scheduler.has_requests() is False
+
     def test_mixed_batch_error_finishes_only_failed_request(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))

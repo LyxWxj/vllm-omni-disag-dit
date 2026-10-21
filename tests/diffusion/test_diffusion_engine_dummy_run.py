@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,6 +16,23 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_pipeline_step_result_callback_does_not_block_before_loop_start() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._loop_started = False
+    callback = threading.Thread(target=engine._notify_pipeline_step_result, daemon=True)
+
+    with engine._rpc_lock:
+        callback.start()
+        callback.join(timeout=1)
+        callback_blocked = callback.is_alive()
+
+    callback.join(timeout=1)
+    assert callback_blocked is False
+    assert callback.is_alive() is False
 
 
 @pytest.mark.parametrize("model_class_name", ["DreamZeroPipeline", "LingBotWorldCausalDMDPipeline"])
