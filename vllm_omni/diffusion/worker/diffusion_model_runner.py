@@ -1233,6 +1233,71 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         return RequestPipelineBatchState(tuple(states), tasks, transport)
 
+    def _decode_pipeline_request(
+        self, state: StepRequestState, request_index: int
+    ) -> tuple[DiffusionOutput, BaseException | None]:
+        """Decode on the request owner and gather its output to PP rank 0."""
+        pipeline = self.pipeline
+        assert pipeline is not None
+        distributed = torch.distributed.is_initialized()
+        pp_rank = get_pipeline_parallel_rank() if distributed else 0
+        pp_size = get_pipeline_parallel_world_size() if distributed else 1
+        owner = request_index % pp_size
+        output: DiffusionOutput | None = None
+        error: BaseException | None = None
+        if pp_rank == owner:
+            previous_owner = getattr(pipeline, "_request_pipeline_decode_owner", None)
+            pipeline._request_pipeline_decode_owner = True
+            try:
+                use_hsdp = self.od_config.parallel_config.use_hsdp
+                distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+                with torch.no_grad() if (use_hsdp or distributed_offload) else torch.inference_mode():
+                    clear_pipeline_stage_durations(pipeline)
+                    output = pipeline.post_decode(state) or DiffusionOutput()
+                    output = self._prepare_output_for_transport(output, state.sampling)
+                if output.error is not None:
+                    error = RuntimeError(output.error)
+                elif owner != 0 and not isinstance(output.output, torch.Tensor):
+                    raise TypeError(f"Pipeline decode for {state.request_id} on rank {owner} requires tensor outputs")
+            except BaseException as exc:
+                error = exc
+                output = DiffusionOutput.from_exception(exc)
+            finally:
+                if previous_owner is None:
+                    delattr(pipeline, "_request_pipeline_decode_owner")
+                else:
+                    pipeline._request_pipeline_decode_owner = previous_owner
+
+        if owner != 0:
+            pp_group = get_pp_group()
+            if pp_rank == owner:
+                assert output is not None
+                payload = {"error": output.error} if error is not None else {"output": output.output}
+                for work in pp_group.isend_tensor_dict(payload, dst=0):
+                    work.wait()
+                output = None
+            elif pp_rank == 0:
+                received, handles, callbacks = pp_group.irecv_tensor_dict(src=owner)
+                for handle in handles:
+                    handle.wait()
+                for callback in callbacks:
+                    callback()
+                assert received is not None
+                if received.get("error") is not None:
+                    error = RuntimeError(received["error"])
+                    output = DiffusionOutput.from_exception(error)
+                elif not isinstance(received.get("output"), torch.Tensor):
+                    error = TypeError(f"Pipeline decode owner {owner} returned no tensor for {state.request_id}")
+                    output = DiffusionOutput.from_exception(error)
+                else:
+                    output = DiffusionOutput(output=received["output"])
+
+        output = output or DiffusionOutput()
+        if pp_rank == 0:
+            self._mark_pp_video_output(output, state.sampling)
+            attach_stage_durations(state, output)
+        return output, error
+
     def execute_request_pipeline_batch(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -1367,90 +1432,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # The context exits through RequestPipelineTransport.__exit__,
                 # which drains both activation sends and lazy feedback receives.
 
-            pp_rank = get_pipeline_parallel_rank() if torch.distributed.is_initialized() else 0
-            pp_world_size = get_pipeline_parallel_world_size() if torch.distributed.is_initialized() else 1
-            pp_group = get_pp_group() if pp_world_size > 1 else None
             decode_errors: list[BaseException] = []
             for request_index, state in enumerate(batch.states):
-                decode_owner = request_index % pp_world_size
-                local_error: BaseException | None = None
-                output: DiffusionOutput | None = None
-                if pp_rank == decode_owner:
-                    previous_decode_owner = getattr(self.pipeline, "_request_pipeline_decode_owner", None)
-                    self.pipeline._request_pipeline_decode_owner = True
-                    try:
-                        with torch.no_grad() if use_hsdp else torch.inference_mode():
-                            clear_pipeline_stage_durations(self.pipeline)
-                            output = self.pipeline.post_decode(state)
-                            if output is None:
-                                output = DiffusionOutput()
-                            output = self._prepare_output_for_transport(output, state.sampling)
-                    except BaseException as exc:
-                        local_error = exc
-                    finally:
-                        if previous_decode_owner is None:
-                            delattr(self.pipeline, "_request_pipeline_decode_owner")
-                        else:
-                            self.pipeline._request_pipeline_decode_owner = previous_decode_owner
-
-                if (
-                    local_error is None
-                    and decode_owner != 0
-                    and pp_rank == decode_owner
-                    and (output is None or not isinstance(output.output, torch.Tensor))
-                ):
-                    local_error = RuntimeError(
-                        "request-pipeline request-owner decode currently requires a tensor output; "
-                        f"request {state.request_id} returned "
-                        f"{type(None if output is None else output.output).__name__}"
-                    )
-
-                if local_error is not None:
-                    decode_errors.append(local_error)
-
-                if decode_owner != 0 and pp_rank == decode_owner:
-                    assert pp_group is not None
-                    payload = (
-                        {"output": output.output}
-                        if local_error is None and output is not None
-                        else {"error": str(local_error or "request-owner decode failed")}
-                    )
-                    for work in pp_group.isend_tensor_dict(payload, dst=0):
-                        work.wait()
-                    output = None
-                elif decode_owner != 0 and pp_rank == 0:
-                    assert pp_group is not None
-                    received, handles, postprocess = pp_group.irecv_tensor_dict(src=decode_owner)
-                    for handle in handles:
-                        handle.wait()
-                    for callback in postprocess:
-                        callback()
-                    remote_error = received.get("error")
-                    if remote_error is not None:
-                        decode_errors.append(
-                            RuntimeError(
-                                f"request-pipeline decode owner {decode_owner} failed for "
-                                f"{state.request_id}: {remote_error}"
-                            )
-                        )
-                        output = None
-                    else:
-                        received_output = received.get("output")
-                        if not isinstance(received_output, torch.Tensor):
-                            decode_errors.append(
-                                RuntimeError(
-                                    f"request-pipeline decode owner {decode_owner} returned no tensor for "
-                                    f"{state.request_id}"
-                                )
-                            )
-                            output = None
-                        else:
-                            output = DiffusionOutput(output=received_output)
-
-                if output is None:
-                    output = DiffusionOutput()
-                self._mark_pp_video_output(output, state.sampling)
-                attach_stage_durations(state, output)
+                output, error = self._decode_pipeline_request(state, request_index)
+                if error is not None:
+                    decode_errors.append(error)
                 outputs.append(output)
                 if is_primary:
                     output.peak_memory_mb = max(output.peak_memory_mb, self._sample_peak_memory_mb())
@@ -1789,50 +1775,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
             outputs: list[RunnerOutput] = []
             for index, state in enumerate(states):
-                owner = index % pp_group.world_size
-                output: DiffusionOutput | None = None
-                if pp_rank == owner:
-                    previous_owner = getattr(pipeline, "_request_pipeline_decode_owner", None)
-                    pipeline._request_pipeline_decode_owner = True
-                    try:
-                        clear_pipeline_stage_durations(pipeline)
-                        output = pipeline.post_decode(state)
-                        output = output or DiffusionOutput()
-                        output = self._prepare_output_for_transport(output, state.sampling)
-                    except Exception as exc:
-                        output = DiffusionOutput.from_exception(exc)
-                    finally:
-                        if previous_owner is None:
-                            delattr(pipeline, "_request_pipeline_decode_owner")
-                        else:
-                            pipeline._request_pipeline_decode_owner = previous_owner
-
-                    if output is not None and output.error is None and not isinstance(output.output, torch.Tensor):
-                        output = DiffusionOutput(error="step-batching PP decode requires tensor outputs")
-
-                if owner != 0 and pp_rank == owner:
-                    assert pp_group is not None
-                    payload = (
-                        {"error": output.error} if output is not None and output.error else {"output": output.output}
-                    )
-                    for work in pp_group.isend_tensor_dict(payload, dst=0):
-                        work.wait()
-                elif owner != 0 and pp_rank == 0:
-                    received, handles, callbacks = pp_group.irecv_tensor_dict(src=owner)
-                    for handle in handles:
-                        handle.wait()
-                    for callback in callbacks:
-                        callback()
-                    if received is not None and received.get("error"):
-                        output = DiffusionOutput(error=received["error"])
-                    else:
-                        assert received is not None
-                        output = DiffusionOutput(output=received["output"])
-
+                output, error = self._decode_pipeline_request(state, index)
+                if error is not None and not isinstance(error, Exception):
+                    raise error
                 if pp_rank == 0:
-                    output = output or DiffusionOutput()
-                    self._mark_pp_video_output(output, state.sampling)
-                    attach_stage_durations(state, output)
+                    if output.error is None and not isinstance(output.output, torch.Tensor):
+                        output = DiffusionOutput(error="step-batching PP decode requires tensor outputs")
                     outputs.append(
                         RunnerOutput(
                             request_id=state.request_id,
