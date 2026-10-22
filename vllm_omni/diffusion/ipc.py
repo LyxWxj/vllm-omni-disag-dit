@@ -451,16 +451,21 @@ def _pack_diffusion_fields(
     if enable_registered_shm and output.video_output_index is not None:
         index = output.video_output_index
         values = output.output
-        if not isinstance(values, tuple) or type(index) is not int or not 0 <= index < len(values):
-            raise ValueError("video_output_index must identify a video tensor in the legacy output tuple")
-        if not isinstance(values[index], torch.Tensor):
-            raise TypeError("The legacy video output must be a tensor")
-        packed_output = tuple(
-            _pack_tensor_if_large(value, d2h_stream=d2h_stream, created=created, enable_registered_shm=True)
-            if position == index
-            else _pack_value_if_large(value, d2h_stream=d2h_stream, created=created)
-            for position, value in enumerate(values)
-        )
+        if isinstance(values, torch.Tensor) and type(index) is int and index == 0:
+            packed_output = _pack_tensor_if_large(
+                values, d2h_stream=d2h_stream, created=created, enable_registered_shm=True
+            )
+        elif not isinstance(values, tuple) or type(index) is not int or not 0 <= index < len(values):
+            raise ValueError("video_output_index must identify a bare video tensor (0) or a legacy output tuple entry")
+        else:
+            if not isinstance(values[index], torch.Tensor):
+                raise TypeError("The legacy video output must be a tensor")
+            packed_output = tuple(
+                _pack_tensor_if_large(value, d2h_stream=d2h_stream, created=created, enable_registered_shm=True)
+                if position == index
+                else _pack_value_if_large(value, d2h_stream=d2h_stream, created=created)
+                for position, value in enumerate(values)
+            )
     elif output.output is not None:
         packed_output = _pack_value_if_large(output.output, d2h_stream=d2h_stream, created=created)
     packed_media = _UNSET

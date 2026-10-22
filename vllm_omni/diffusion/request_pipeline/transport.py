@@ -24,13 +24,13 @@ class RequestPipelineTransport:
             raise ValueError(f"window must be a positive integer, got {window!r}")
         self.pipeline = pipeline
         self.window = window
-        self._active: deque[RequestPipelineTask] = deque()
+        self._active: deque[tuple[RequestPipelineTask, list[Any]]] = deque()
         self._pending_latents: list[Any] = []
         self._closed = False
 
     @property
     def active_tasks(self) -> tuple[RequestPipelineTask, ...]:
-        return tuple(self._active)
+        return tuple(task for task, _ in self._active)
 
     def __enter__(self) -> RequestPipelineTransport:
         if getattr(self.pipeline, "_request_pipeline_transport", None) is not None:
@@ -53,10 +53,10 @@ class RequestPipelineTransport:
             raise RuntimeError("Request pipeline transport is closed")
         if not 0 <= task.transport_slot < self.window:
             raise ValueError(f"task transport slot {task.transport_slot} is outside window {self.window}")
-        if self._active and task.task_index <= self._active[-1].task_index:
+        if self._active and task.task_index <= self._active[-1][0].task_index:
             raise ValueError("request pipeline tasks must be admitted in task-index order")
         self.wait_oldest_slot_if_full()
-        self._active.append(task)
+        self._active.append((task, []))
         trace_request_pipeline_event(
             "request_pipeline_task",
             phase="begin",
@@ -67,6 +67,11 @@ class RequestPipelineTransport:
             is_tombstone=task.is_tombstone,
             window=self.window,
         )
+
+    def register_send_work(self, work: list[Any]) -> None:
+        if not self._active:
+            raise RuntimeError("request pipeline send work has no active task")
+        self._active[-1][1].extend(work)
 
     def register_feedback(self, latents: Any) -> None:
         self._pending_latents.append(latents)
@@ -84,17 +89,25 @@ class RequestPipelineTransport:
     def wait_oldest_slot_if_full(self) -> None:
         if len(self._active) < self.window:
             return
-        self.pipeline._sync_pp_send()
+        _, work = self._active[0]
+        if work:
+            for handle in work:
+                handle.wait()
+        else:
+            self.pipeline._sync_pp_send()
         self._active.popleft()
 
     def drain(self) -> None:
         if self._closed:
             return
+        for _, work in self._active:
+            for handle in work:
+                handle.wait()
+        self._active.clear()
         self.pipeline._sync_pp_send()
         for latent in self._pending_latents:
             resolve = getattr(latent, "resolve", None)
             if callable(resolve):
                 resolve()
         self._pending_latents.clear()
-        self._active.clear()
         self._closed = True

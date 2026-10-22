@@ -467,9 +467,7 @@ class DiffusionEngine:
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
         parallel = getattr(self.od_config, "parallel_config", None)
-        self.step_pipeline_parallel = bool(
-            self.step_execution and getattr(parallel, "pipeline_parallel_size", 1) > 1
-        )
+        self.step_pipeline_parallel = bool(self.step_execution and getattr(parallel, "pipeline_parallel_size", 1) > 1)
         self._pipeline_scheduler_outputs: dict[str, DiffusionSchedulerOutput] = {}
         if self.step_pipeline_parallel and not isinstance(self.scheduler, StepScheduler):
             raise ValueError("step-execution pipeline parallelism requires StepScheduler")
@@ -693,10 +691,7 @@ class DiffusionEngine:
             if self.step_pipeline_parallel:
                 assert isinstance(self.scheduler, StepScheduler)
                 pp_size = self.od_config.parallel_config.pipeline_parallel_size
-                if (
-                    len(self.scheduler.pipeline_decode_pending()) >= pp_size
-                    and not self.scheduler.has_pipeline_ready
-                ):
+                if len(self.scheduler.pipeline_decode_pending()) >= pp_size and not self.scheduler.has_pipeline_ready:
                     if self.scheduler.has_pipeline_inflight:
                         self._wait_for_pipeline_step_result()
                     else:
@@ -960,8 +955,9 @@ class DiffusionEngine:
 
         self._process_aborts_queue()
         finished_ids = self.scheduler.update_from_output(scheduler_output, output)
-        if self.scheduler.pipeline_decode_pending():
-            decode_output = self.executor.decode_pipeline_requests(self.scheduler.pipeline_decode_pending())
+        decode_request_ids = self.scheduler.pipeline_decode_pending()
+        if decode_request_ids:
+            decode_output = self.executor.decode_pipeline_requests(decode_request_ids)
             finished_ids |= self.scheduler.finish_pipeline_decode(decode_output)
             output = decode_output
         return output, finished_ids
