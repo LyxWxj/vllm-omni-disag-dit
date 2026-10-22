@@ -164,11 +164,15 @@ class BaseScheduler(ABC):
         return request_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
+        return self._schedule(self._running)
+
+    def _schedule(self, running_request_ids: list[str], *, batch_limit: int | None = None) -> DiffusionSchedulerOutput:
+        """Schedule selected continuations, then admit requests within both limits."""
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_request_ids: list[str] = []
 
         # First, schedule the RUNNING request(s)
-        for request_id in self._running:
+        for request_id in running_request_ids:
             state = self._request_states.get(request_id)
             if state is not None and self._can_schedule_running(state):
                 scheduled_cached_request_ids.append(request_id)
@@ -177,6 +181,8 @@ class BaseScheduler(ABC):
         deferred: list[str] = []
         waiting_budget = len(self._waiting)
         while self._waiting and waiting_budget and len(self._running) < self.max_num_running_reqs:
+            if batch_limit is not None and len(scheduled_new_reqs) + len(scheduled_cached_request_ids) >= batch_limit:
+                break
             waiting_budget -= 1
             request_id = self._waiting[0]
             state = self._request_states.get(request_id)

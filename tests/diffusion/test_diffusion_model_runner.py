@@ -873,23 +873,19 @@ def test_decode_pipeline_requests_disables_gradients(monkeypatch):
             parameter = torch.nn.Parameter(torch.ones(1))
             return DiffusionOutput(output=parameter * 2)
 
-    state = SimpleNamespace(
+    state = StepRequestState(
         request_id="req",
-        sampling=SimpleNamespace(),
+        sampling=OmniDiffusionSamplingParams(),
         latents=torch.ones(1),
         step_index=1,
-        stage_durations={},
     )
-    runner = SimpleNamespace(
-        pipeline=FakePipeline(),
-        od_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(use_hsdp=False),
-            diffusion_offload_config=None,
-        ),
-        state_cache={"req": state},
-        _prepare_output_for_transport=lambda output, sampling: output,
-        release_step_requests=lambda request_ids: None,
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = FakePipeline()
+    runner.od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        diffusion_offload_config=None,
     )
+    runner.state_cache = {"req": state}
     monkeypatch.setattr(model_runner_module, "get_pp_group", lambda: FakeGroup())
     monkeypatch.setattr(model_runner_module, "get_pipeline_parallel_rank", lambda: 0)
 

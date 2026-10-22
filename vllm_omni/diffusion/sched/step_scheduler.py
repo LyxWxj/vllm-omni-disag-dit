@@ -44,6 +44,7 @@ class StepScheduler(BaseScheduler):
         self._pipeline_inflight: set[str] = set()
         self._pipeline_decode_pending: set[str] = set()
         self._pipeline_parallel = False
+        self._pipeline_batch_size = 1
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
@@ -51,38 +52,23 @@ class StepScheduler(BaseScheduler):
         self._pipeline_decode_pending.clear()
         parallel = getattr(self.od_config, "parallel_config", None)
         self._pipeline_parallel = bool(
-            getattr(self.od_config, "step_execution", False)
-            and getattr(parallel, "pipeline_parallel_size", 1) > 1
+            getattr(self.od_config, "step_execution", False) and getattr(parallel, "pipeline_parallel_size", 1) > 1
         )
+        self._pipeline_batch_size = self.max_num_running_reqs
         if self._pipeline_parallel:
             # Keep three batches per rank resident so stage 0 can stay ahead of
             # solver completion on the last rank.
             self.max_num_running_reqs *= 3 * parallel.pipeline_parallel_size
 
     def schedule(self) -> DiffusionSchedulerOutput:
-        pipeline_capacity = self.max_num_running_reqs
-        batch_limit = max(1, int(getattr(self.od_config, "max_num_seqs", 1)))
-        if self._pipeline_parallel:
-            eligible = sum(
-                request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
-                for request_id in self._running
-            )
-            self.max_num_running_reqs = min(pipeline_capacity, len(self._running) + max(batch_limit - eligible, 0))
-        try:
-            output = super().schedule()
-        finally:
-            self.max_num_running_reqs = pipeline_capacity
-
-        if self._pipeline_parallel:
-            output.scheduled_cached_reqs.request_ids = [
-                request_id
-                for request_id in output.scheduled_cached_reqs.request_ids
-                if request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
-            ]
-            output.scheduled_cached_reqs.request_ids = output.scheduled_cached_reqs.request_ids[
-                : max(batch_limit - len(output.scheduled_new_reqs), 0)
-            ]
-        return output
+        if not self._pipeline_parallel:
+            return super().schedule()
+        ready_ids = [
+            request_id
+            for request_id in self._running
+            if request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
+        ][: self._pipeline_batch_size]
+        return self._schedule(ready_ids, batch_limit=self._pipeline_batch_size)
 
     def mark_pipeline_inflight(self, request_ids: list[str]) -> None:
         self._pipeline_inflight.update(request_ids)
@@ -103,6 +89,17 @@ class StepScheduler(BaseScheduler):
 
     def pipeline_decode_pending(self) -> list[str]:
         return [request_id for request_id in self._running if request_id in self._pipeline_decode_pending]
+
+    def should_decode_pipeline(self, *, scheduling_exhausted: bool = False) -> bool:
+        """Request a decode barrier for a full cohort or an underfilled tail."""
+        assert self.od_config is not None
+        return bool(self._pipeline_decode_pending) and (
+            scheduling_exhausted
+            or (
+                len(self._pipeline_decode_pending) >= self.od_config.parallel_config.pipeline_parallel_size
+                and not self.has_pipeline_ready
+            )
+        )
 
     def finish_pipeline_decode(self, output: BaseRunnerOutput) -> set[str]:
         request_ids = self.pipeline_decode_pending()

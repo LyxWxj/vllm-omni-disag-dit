@@ -60,35 +60,8 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
 class RequestScheduler(BaseScheduler):
     """Scheduler for static request waves, including admission coalescing."""
 
-    @staticmethod
-    def _request_pipeline_compatibility_key(key: RequestBatchSamplingParamsKey) -> RequestBatchSamplingParamsKey:
-        """Remove fields that are request-local in the closed PP task plan."""
-        return replace(
-            key,
-            height=None,
-            width=None,
-            num_frames=1,
-            num_inference_steps=None,
-            sample_solver=None,
-            flow_shift=None,
-        )
-
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
-        if self.od_config is not None and getattr(self.od_config, "request_pipeline_parallel", False):
-            if self._running:
-                current_key = self._current_sampling_params_key()
-                if current_key is None or state.sampling_params_key is None:
-                    return False
-                if not isinstance(current_key, RequestBatchSamplingParamsKey):
-                    return False
-                candidate_key = state.sampling_params_key
-                if not isinstance(candidate_key, RequestBatchSamplingParamsKey):
-                    return False
-                if self._request_pipeline_compatibility_key(current_key) != self._request_pipeline_compatibility_key(
-                    candidate_key
-                ):
-                    return False
-        elif not super()._can_schedule_waiting(state):
+        if not super()._can_schedule_waiting(state):
             return False
         manager = self._diffusion_kv_manager
         if not self._running or manager is None or not manager.has_request(state.request_id):
@@ -136,7 +109,19 @@ class RequestScheduler(BaseScheduler):
         )
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        return build_request_batch_sampling_params_key(request)
+        key = build_request_batch_sampling_params_key(request)
+        if getattr(self.od_config, "request_pipeline_parallel", False):
+            # These fields are request-local in the closed PP task plan.
+            key = replace(
+                key,
+                height=None,
+                width=None,
+                num_frames=1,
+                num_inference_steps=None,
+                sample_solver=None,
+                flow_shift=None,
+            )
+        return key
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
