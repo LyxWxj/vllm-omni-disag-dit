@@ -1282,16 +1282,27 @@ class WorkerProc:
             return
 
         # Sync path (original, or async fallback).
+        registered_pp_decode = (
+            self.od_config.step_execution
+            and self.od_config.parallel_config.pipeline_parallel_size > 1
+            and self.od_config.video_output_transport.enable_registered_shm
+            and current_omni_platform.is_cuda()
+            and isinstance(output, BatchRunnerOutput)
+            and any(item.result is not None and item.result.video_output_index == 0 for item in output.runner_outputs)
+        )
         try:
-            pack_diffusion_output_shm(output)
+            if registered_pp_decode:
+                stream = torch.Stream(device=torch.device("cuda", self.gpu_id))
+                stream.wait_stream(torch.accelerator.current_stream())
+                pack_diffusion_output_shm(output, d2h_stream=stream, enable_registered_shm=True)
+            else:
+                pack_diffusion_output_shm(output)
         except (TypeError, ValueError):
             raise
         except Exception as e:
-            # Typed media that fails to pack is left unprepared/on device (the
-            # pack is failure-atomic and does not mutate it), so enqueueing it
-            # would ship a broken payload. Re-raise memory/packing failures here
-            # instead of swallowing them for typed media.
-            if payload_carries_typed_media(output):
+            # Packing is failure-atomic. Typed media and opted-in PP outputs
+            # must fail rather than enqueue a device payload after a copy error.
+            if registered_pp_decode or payload_carries_typed_media(output):
                 raise
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)

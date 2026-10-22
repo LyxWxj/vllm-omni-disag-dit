@@ -126,9 +126,8 @@ def _dit_any_rank_failed(local_failed: bool) -> bool:
         group = None
     if group is None:
         return local_failed
-    signal = torch.tensor(1 if local_failed else 0, dtype=torch.int32)
-    if current_omni_platform.is_available():
-        signal = signal.to(device=current_omni_platform.device_type)
+    device = current_omni_platform.device_type if current_omni_platform.is_available() else "cpu"
+    signal = torch.tensor(1 if local_failed else 0, dtype=torch.int32, device=device)
     torch.distributed.all_reduce(signal, op=torch.distributed.ReduceOp.MAX, group=group)
     return bool(signal.item())
 
@@ -777,6 +776,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             )
         return output
 
+    @staticmethod
+    def _mark_pp_video_output(output: DiffusionOutput, sampling: OmniDiffusionSamplingParams) -> None:
+        if (
+            isinstance(output.output, torch.Tensor)
+            and output.output.ndim == 5
+            and sampling.output_type != "latent"
+            and sampling.num_frames > 1
+        ):
+            output.video_output_index = 0
+
     def _runner_output_from_outputs(
         self,
         reqs: list[OmniDiffusionRequest],
@@ -1306,9 +1315,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         batch.failed = task_error
                         raise task_error
                     if task.is_tombstone:
-                        # Both PP ranks admit the same no-op task.  No
-                        # activation, feedback, transformer, or scheduler work
-                        # is issued for a completed request.
+                        # Keep every rank on the same task/control sequence.
                         continue
                     trace_request_pipeline_event(
                         "request_pipeline_execute",
@@ -1442,6 +1449,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 if output is None:
                     output = DiffusionOutput()
+                self._mark_pp_video_output(output, state.sampling)
                 attach_stage_durations(state, output)
                 outputs.append(output)
                 if is_primary:
@@ -1805,9 +1813,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if owner != 0 and pp_rank == owner:
                     assert pp_group is not None
                     payload = (
-                        {"error": output.error}
-                        if output is not None and output.error
-                        else {"output": output.output}
+                        {"error": output.error} if output is not None and output.error else {"output": output.output}
                     )
                     for work in pp_group.isend_tensor_dict(payload, dst=0):
                         work.wait()
@@ -1825,6 +1831,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 if pp_rank == 0:
                     output = output or DiffusionOutput()
+                    self._mark_pp_video_output(output, state.sampling)
                     attach_stage_durations(state, output)
                     outputs.append(
                         RunnerOutput(

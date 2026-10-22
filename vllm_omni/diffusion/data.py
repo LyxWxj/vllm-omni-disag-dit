@@ -1954,9 +1954,9 @@ class DiffusionOutput:
     # pipelines rely on is preserved. Mutually exclusive with ``output``.
     media: DiffusionMediaOutput | None = None
 
-    # Compatibility adapter for joint (video, audio) outputs that have not
-    # migrated to typed media. Only this tuple entry is eligible for video
-    # transport optimizations; unmarked legacy outputs retain their old path.
+    # Identify a video tensor in legacy output: 0 for a bare tensor, or the
+    # video entry's index in a joint (video, audio) tuple. Only marked video
+    # tensors are eligible for video transport optimizations.
     video_output_index: int | None = None
 
     def __post_init__(self) -> None:
