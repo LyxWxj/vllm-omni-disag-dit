@@ -86,7 +86,6 @@ class StepScheduler(BaseScheduler):
 
     def should_decode_pipeline(self, *, scheduling_exhausted: bool = False) -> bool:
         """Request a decode barrier for a full cohort or an underfilled tail."""
-        assert self.od_config is not None
         return bool(self._pipeline_decode_pending) and (
             scheduling_exhausted
             or (

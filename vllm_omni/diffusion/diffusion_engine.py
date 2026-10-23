@@ -693,14 +693,8 @@ class DiffusionEngine:
                 pending_finished = self.scheduler.pending_finished_request_ids()
             self._emit_finished_outputs(pending_finished, None)
 
-            if self.step_pipeline_parallel:
-                assert isinstance(self.scheduler, StepScheduler)
-                if self.scheduler.should_decode_pipeline():
-                    if self.scheduler.has_pipeline_inflight:
-                        self._wait_for_pipeline_step_result()
-                    else:
-                        self._run_pipeline_decode()
-                    continue
+            if self.step_pipeline_parallel and self._wait_or_decode_pipeline_if_needed():
+                continue
 
             with self._cv:
                 while (
@@ -740,11 +734,7 @@ class DiffusionEngine:
                 }
                 self._emit_finished_outputs(finished_ids, None)
                 if self.step_pipeline_parallel:
-                    assert isinstance(self.scheduler, StepScheduler)
-                    if self.scheduler.has_pipeline_inflight:
-                        self._wait_for_pipeline_step_result()
-                    elif self.scheduler.should_decode_pipeline(scheduling_exhausted=True):
-                        self._run_pipeline_decode()
+                    self._wait_or_decode_pipeline_if_needed(scheduling_exhausted=True)
                 continue
 
             if self.step_pipeline_parallel:
@@ -836,6 +826,19 @@ class DiffusionEngine:
         with self._cv:
             if not self.executor.has_pipeline_step_results():
                 self._cv.wait(timeout=1.0)
+
+    def _wait_or_decode_pipeline_if_needed(self, *, scheduling_exhausted: bool = False) -> bool:
+        """Wait for in-flight steps or decode a ready cohort; return if handled."""
+        assert isinstance(self.scheduler, StepScheduler)
+        if self.scheduler.has_pipeline_inflight:
+            if scheduling_exhausted or self.scheduler.should_decode_pipeline():
+                self._wait_for_pipeline_step_result()
+                return True
+            return False
+        if self.scheduler.should_decode_pipeline(scheduling_exhausted=scheduling_exhausted):
+            self._run_pipeline_decode()
+            return True
+        return False
 
     @staticmethod
     def _pipeline_error_output(request_ids: list[str], error: BaseException | str) -> BatchRunnerOutput:
