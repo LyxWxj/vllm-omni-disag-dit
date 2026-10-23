@@ -1325,9 +1325,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
                     installed_request_ids.append(new_req.request_id)
 
-            # Text encoding is part of request preparation.  Keep it under the
-            # same inference context as denoising so encoder activations are not
-            # retained as autograd graphs for every request in the closed batch.
             with torch.no_grad() if use_hsdp else torch.inference_mode():
                 states, preparation_errors = self._prepare_request_pipeline_states(scheduler_output)
             if preparation_errors:
