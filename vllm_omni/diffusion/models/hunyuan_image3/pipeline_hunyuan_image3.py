@@ -348,7 +348,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
-    supports_step_batch_pp = True
+    supports_step_pipeline_parallel = True
     supports_request_batch = False
     support_image_input = True
     # The warmup request's blank image routes this AR+diffusion model down its

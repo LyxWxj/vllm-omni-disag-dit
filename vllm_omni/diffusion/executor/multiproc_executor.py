@@ -685,7 +685,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         propagated through RunnerOutput so the engine waits in
         step_streaming() instead of blocking the busy loop here.
         """
-        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 
         self._ensure_open()
         if len(scheduler_output.scheduled_new_reqs) <= 1 and not getattr(
@@ -718,42 +718,72 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
             # Propagate async_output_id to per-request RunnerOutputs so the
             # engine waits in step_streaming() instead of blocking here.
-            batch_id = result.async_output_id
-            per_req_map: dict[str, str] = {}
-            runner_outputs: list[RunnerOutput] = []
-            for new_req in scheduler_output.scheduled_new_reqs:
-                per_req_id = f"{batch_id}/{new_req.request_id}"
-                per_req_map[per_req_id] = new_req.request_id
-                runner_outputs.append(
-                    RunnerOutput(
-                        request_id=new_req.request_id,
-                        step_index=None,
-                        finished=True,
-                        result=None,
-                        async_output_id=per_req_id,
-                    )
-                )
-            # The worker's background D2H/SHM thread can publish OUTPUT_READY
-            # before this call returns. In that case the pump found no split
-            # map and cached the whole batch output under batch_id, so adopt it
-            # here instead of registering a map nothing will ever consume.
-            with self._futures_lock:
-                early = self._completed_outputs.pop(batch_id, None)
-                if early is None:
-                    self._batch_split_map[batch_id] = per_req_map
-            if early is not None:
-                logger.debug("Batch %s output arrived before split map; splitting now", batch_id)
-                try:
-                    batch_output = early.result()
-                    error = None
-                except Exception as exc:
-                    batch_output = None
-                    error = str(exc)
-                self._deliver_batch_split(per_req_map, batch_output, error)
-            return BatchRunnerOutput.from_list(runner_outputs)
+            return self._async_batch_runner_output(
+                result,
+                [new_req.request_id for new_req in scheduler_output.scheduled_new_reqs],
+            )
         if not isinstance(result, BatchRunnerOutput):
             raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
         return result
+
+    def _async_batch_runner_output(
+        self,
+        result: AsyncDiffusionOutput,
+        request_ids: list[str],
+        *,
+        require_step_metadata: bool = False,
+    ) -> BaseRunnerOutput:
+        """Split one background-packed batch into per-request output futures."""
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+        batch_id = result.async_output_id
+        if batch_id is None:
+            raise RuntimeError("Async batch completion did not include an output id")
+
+        metadata: dict[str, tuple[int | None, bool]] = {}
+        if require_step_metadata:
+            try:
+                metadata = {request_id: (step_index, finished) for request_id, step_index, finished in result.result}
+            except (TypeError, ValueError) as exc:
+                self.drop_output(batch_id)
+                raise RuntimeError("Async step-pipeline decode omitted per-request completion metadata") from exc
+            if set(metadata) != set(request_ids) or any(
+                step_index is None or not finished for step_index, finished in metadata.values()
+            ):
+                self.drop_output(batch_id)
+                raise RuntimeError("Async step-pipeline decode returned invalid per-request completion metadata")
+
+        per_req_map: dict[str, str] = {}
+        runner_outputs: list[RunnerOutput] = []
+        for request_id in request_ids:
+            per_req_id = f"{batch_id}/{request_id}"
+            per_req_map[per_req_id] = request_id
+            step_index, finished = metadata.get(request_id, (None, True))
+            runner_outputs.append(
+                RunnerOutput(
+                    request_id=request_id,
+                    step_index=step_index,
+                    finished=finished,
+                    result=None,
+                    async_output_id=per_req_id,
+                )
+            )
+
+        # OUTPUT_READY can reach the pump before this split map is installed.
+        with self._futures_lock:
+            early = self._completed_outputs.pop(batch_id, None)
+            if early is None:
+                self._batch_split_map[batch_id] = per_req_map
+        if early is not None:
+            logger.debug("Batch %s output arrived before split map; splitting now", batch_id)
+            try:
+                batch_output = early.result()
+                error = None
+            except Exception as exc:
+                batch_output = None
+                error = str(exc)
+            self._deliver_batch_split(per_req_map, batch_output, error)
+        return BatchRunnerOutput.from_list(runner_outputs)
 
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
@@ -870,13 +900,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         """Run the decode cohort on every PP rank and return rank-0 outputs."""
         from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
-        result = self.collective_rpc(
-            "decode_pipeline_requests",
-            args=(request_ids,),
-            unique_reply_rank=0,
-            exec_all_ranks=True,
-            timeout=_DLO_DP_WAVE_TIMEOUT_S,
-        )
+        async_output = self._step_pipeline_parallel_enabled()
+        try:
+            result = self.collective_rpc(
+                "decode_pipeline_requests",
+                args=(request_ids,),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
+                timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                async_output=async_output,
+            )
+        except TimeoutError as exc:
+            self._fail_closed_on_dp_wave_timeout(exc)
+            raise
+        if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
+            return self._async_batch_runner_output(result, request_ids, require_step_metadata=True)
         if isinstance(result, BaseRunnerOutput):
             return result
         raise RuntimeError(f"Unexpected response type for pipeline decode: {type(result)!r}")
@@ -889,6 +927,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
         exec_all_ranks: bool = False,
+        async_output: bool = False,
     ) -> Any:
         self._ensure_open()
 
@@ -911,18 +950,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "collect_rank_status": collect_rank_status,
         }
 
-        # ── Path 1: async execute_model / execute_model_batch ──
-        # Request-mode methods use the compute_done/output_ready split
-        # so the D2H copy runs on a side stream in the worker background
-        # thread while the default stream is free for the next forward.
-        # pump routes the result back to a Future via rpc_id.
+        # Request-mode execution and opted-in Step-PP decode use the same
+        # compute_done/output_ready split. The pump returns compute_done here;
+        # background D2H/SHM work remains independent of the Engine busy loop.
         if (
-            not self.od_config.step_execution
-            and method in ("execute_model", "execute_model_batch")
-            and not multi_rank_reply
-        ):
+            async_output or (not self.od_config.step_execution and method in ("execute_model", "execute_model_batch"))
+        ) and not multi_rank_reply:
             rpc_id = self._next_rpc_id()
             rpc_request["rpc_id"] = rpc_id
+            if async_output:
+                rpc_request["async_output"] = True
             fut: concurrent.futures.Future = concurrent.futures.Future()
             with self._futures_lock:
                 self._rpc_futures[rpc_id] = fut

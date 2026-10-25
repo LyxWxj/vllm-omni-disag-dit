@@ -706,6 +706,33 @@ class TestDiffusionCompileConfig:
             )
 
 
+class TestPipelineParallelConfig:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @pytest.mark.parametrize(
+        "step_execution, request_pipeline_parallel",
+        [(True, False), (False, True)],
+    )
+    def test_pp8_is_accepted_by_wan_parallel_modes(self, step_execution, request_pipeline_parallel) -> None:
+        config = OmniDiffusionConfig(
+            model="test",
+            num_gpus=8,
+            parallel_config={"pipeline_parallel_size": 8},
+            step_execution=step_execution,
+            request_pipeline_parallel=request_pipeline_parallel,
+        )
+
+        assert config.parallel_config.pipeline_parallel_size == 8
+
+    def test_request_pipeline_parallel_requires_at_least_two_ranks(self) -> None:
+        with pytest.raises(ValueError, match="requires PP>1"):
+            OmniDiffusionConfig(
+                model="test",
+                request_pipeline_parallel=True,
+                parallel_config={"pipeline_parallel_size": 1},
+            )
+
+
 class TestRequestBatchAdmission:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

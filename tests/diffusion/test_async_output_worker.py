@@ -36,6 +36,8 @@ def _make_worker_proc(step_execution=False):
     proc = object.__new__(WorkerProc)
     proc.od_config = MagicMock()
     proc.od_config.step_execution = step_execution
+    proc.od_config.parallel_config.pipeline_parallel_size = 1
+    proc.od_config.video_output_transport.enable_registered_shm = False
     proc.gpu_id = 0
     proc.result_mq = MagicMock()
     proc._running = True
@@ -165,6 +167,29 @@ class TestReturnResultAsyncPath:
         enqueued_msg = proc.result_mq.enqueue.call_args[0][0]
         assert isinstance(enqueued_msg, AsyncDiffusionOutput)
         assert enqueued_msg.kind == AsyncOutputKind.COMPUTE_DONE
+
+    def test_step_pipeline_decode_uses_async_output_path(self, mocker):
+        proc = _make_worker_proc(step_execution=True)
+        proc._async_output_queue = queue.Queue()
+        mock_platform = mocker.MagicMock()
+        mock_platform.record_device_event.return_value = MagicMock()
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform",
+            mock_platform,
+        )
+        pack = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
+        output = BatchRunnerOutput.from_list(
+            [RunnerOutput(request_id="r1", step_index=8, finished=True, result=DiffusionOutput(output="video"))]
+        )
+
+        proc._return_result(output, rpc_id="decode-rpc", async_output=True)
+
+        msg = proc.result_mq.enqueue.call_args[0][0]
+        assert msg.kind == AsyncOutputKind.COMPUTE_DONE
+        assert msg.rpc_id == "decode-rpc"
+        assert msg.result == (("r1", 8, True),)
+        assert proc._async_output_queue.get_nowait()[0] is output
+        pack.assert_not_called()
 
     def test_none_result_mq_skips_all_paths(self):
         """If result_mq is None, _return_result should do nothing."""

@@ -456,7 +456,7 @@ class Wan22Pipeline(
     supports_request_batch = True
     supports_step_execution = True
     supports_request_pipeline = True
-    supports_step_batch_pp = True
+    supports_step_pipeline_parallel = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]

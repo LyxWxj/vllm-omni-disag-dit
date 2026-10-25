@@ -2103,6 +2103,27 @@ class TestStepScheduler:
         assert scheduler.finish_pipeline_decode(decoded) == {request_id}
         assert scheduler.has_requests() is False
 
+    def test_pipeline_decode_can_finish_before_async_output_is_ready(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=1,
+            )
+        )
+        request_id = scheduler.add_request(_make_step_request("async-final", num_inference_steps=1))
+        step = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(step.scheduled_request_ids)
+        scheduler.pipeline_step_completed(step.scheduled_request_ids)
+        scheduler.update_from_output(step, BatchRunnerOutput.from_list([_make_step_output(request_id, 1)]))
+
+        async_decode = BatchRunnerOutput.from_list(
+            [RunnerOutput(request_id=request_id, step_index=1, finished=True, async_output_id="decode-1/async-final")]
+        )
+        assert scheduler.finish_pipeline_decode(async_decode) == {request_id}
+        assert scheduler.has_requests() is False
+
     def test_mixed_batch_error_finishes_only_failed_request(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))

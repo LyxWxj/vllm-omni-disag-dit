@@ -536,7 +536,7 @@ class Wan22S2VPipeline(
       channel-concatenated like I2V).
     """
 
-    supports_step_batch_pp = False
+    supports_step_pipeline_parallel = False
     # Default config values from Wan2.2/wan/configs/wan_s2v_14B.py
     supports_request_batch = True
     supports_request_pipeline = False

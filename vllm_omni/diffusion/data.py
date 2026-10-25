@@ -1390,7 +1390,7 @@ class OmniDiffusionConfig:
                 raise ValueError("request_pipeline_parallel does not support streaming_output")
             parallel = self.parallel_config
             if (
-                parallel.pipeline_parallel_size != 2
+                parallel.pipeline_parallel_size < 2
                 or parallel.data_parallel_size != 1
                 or parallel.tensor_parallel_size != 1
                 or parallel.sequence_parallel_size != 1
@@ -1398,7 +1398,7 @@ class OmniDiffusionConfig:
                 or parallel.vae_patch_parallel_size != 1
             ):
                 raise ValueError(
-                    "request_pipeline_parallel currently requires PP=2 with DP/TP/SP/CFG/VAE parallelism set to 1"
+                    "request_pipeline_parallel currently requires PP>1 with DP/TP/SP/CFG/VAE parallelism set to 1"
                 )
 
         parallel = self.parallel_config
@@ -1406,15 +1406,14 @@ class OmniDiffusionConfig:
             if self.streaming_output:
                 raise ValueError("step-execution pipeline parallelism does not support streaming_output")
             if (
-                parallel.pipeline_parallel_size != 2
-                or parallel.data_parallel_size != 1
+                parallel.data_parallel_size != 1
                 or parallel.tensor_parallel_size != 1
                 or parallel.sequence_parallel_size != 1
                 or parallel.cfg_parallel_size != 1
                 or parallel.vae_patch_parallel_size != 1
             ):
                 raise ValueError(
-                    "step-execution pipeline parallelism currently requires PP=2 and all other parallel sizes set to 1"
+                    "step-execution pipeline parallelism requires all parallel sizes other than PP to be 1"
                 )
             omni_kv = self.omni_kv_config or {}
             if (
@@ -2051,7 +2050,8 @@ class AsyncOutputKind(Enum):
     """Message kind for ``AsyncDiffusionOutput`` — routes async results.
 
     * ``RPC_RESULT`` — ordinary RPC return (sleep, wake, profile, etc.)
-    * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
+    * ``COMPUTE_DONE`` — worker computation finished; output transfer may
+      continue in the background
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
     * ``PIPELINE_STEP_DONE`` — last PP rank completed the step solver
@@ -2067,9 +2067,9 @@ class AsyncOutputKind(Enum):
 class AsyncDiffusionOutput:
     """Async protocol envelope for ``result_mq`` messages.
 
-    In request-mode (``step_execution=False``), all ``result_mq``
-    messages use this envelope.  The ``kind`` field routes the message
-    to the correct consumer.
+    Request-mode output delivery and Step-PP decode use this envelope for
+    their asynchronous ``COMPUTE_DONE`` / ``OUTPUT_READY`` messages. The
+    ``kind`` field routes the message to the correct consumer.
     """
 
     kind: AsyncOutputKind

@@ -976,7 +976,7 @@ def test_step_pipeline_feedback_resolves_prior_async_latents_before_direct_recei
 
     pipeline = object.__new__(MockPipelineParallel)
     pipeline.od_config = SimpleNamespace(step_execution=True)
-    pipeline.supports_step_batch_pp = True
+    pipeline.supports_step_pipeline_parallel = True
     pipeline._request_pipeline_transport = None
     previous_handle = FakeHandle()
     previous = AsyncLatents({"latents": torch.randn(1, 4, 2, 2)}, [previous_handle], [])

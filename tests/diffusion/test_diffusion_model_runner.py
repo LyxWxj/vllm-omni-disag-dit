@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -862,7 +862,7 @@ def test_decode_pipeline_requests_disables_gradients(monkeypatch):
             pass
 
     class FakePipeline:
-        supports_step_batch_pp = True
+        supports_step_pipeline_parallel = True
         _request_pipeline_decode_owner = False
 
         def _sync_pp_send(self):
@@ -900,10 +900,10 @@ def test_decode_pipeline_requests_disables_gradients(monkeypatch):
 @pytest.mark.cpu
 def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
     class FakePipeline:
-        supports_step_batch_pp = True
+        supports_step_pipeline_parallel = True
 
-        def denoise_step(self, input_batch, states):
-            assert isinstance(states[0].latents, torch.Tensor)
+        def denoise_step(self, input_batch):
+            assert isinstance(input_batch.states[0].latents, torch.Tensor)
             return torch.zeros_like(input_batch.latents)
 
         def step_scheduler(self, state, noise_pred):
@@ -952,6 +952,7 @@ def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
         _cleanup_finished_step_requests=lambda scheduler_output: None,
         _update_states=lambda scheduler_output: ([state], []),
     )
+    runner._execute_request_step = MethodType(DiffusionModelRunner._execute_request_step, runner)
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "clear_pipeline_stage_durations", lambda pipeline: None)
     monkeypatch.setattr(model_runner_module, "consume_pipeline_stage_durations", lambda pipeline: {})
@@ -962,6 +963,76 @@ def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
     assert state.latents is pending_feedback
     assert previous_feedback_work.wait_count == 1
     assert next_feedback_work.wait_count == 0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_step_pipeline_runs_one_forward_per_request_with_different_shapes(monkeypatch):
+    class FakePipeline:
+        supports_step_pipeline_parallel = True
+
+        def __init__(self):
+            self.forward_calls = []
+
+        def denoise_step(self, input_batch):
+            assert len(input_batch.states) == 1
+            state = input_batch.states[0]
+            self.forward_calls.append((state.request_id, tuple(input_batch.latents.shape)))
+            return torch.zeros_like(input_batch.latents)
+
+        def step_scheduler(self, state, noise_pred):
+            assert noise_pred.shape == state.latents.shape
+            state.step_index += 1
+
+    class FakeSchedulerOutput:
+        scheduled_new_reqs = []
+        scheduled_cached_reqs = SimpleNamespace(request_ids=["small", "large"])
+        finished_req_ids = set()
+        scheduled_request_ids = ["small", "large"]
+
+    states = [
+        StepRequestState(
+            request_id=request_id,
+            sampling=OmniDiffusionSamplingParams(num_inference_steps=2),
+            prompt_embeds=torch.ones(1, 2, 4),
+            latents=torch.ones(1, 2, 2, side, side),
+            timesteps=torch.ones(1),
+            step_index=0,
+        )
+        for request_id, side in (("small", 2), ("large", 3))
+    ]
+    pipeline = FakePipeline()
+    runner = SimpleNamespace(
+        pipeline=pipeline,
+        od_config=SimpleNamespace(
+            cache_backend=None,
+            streaming_output=False,
+            omni_kv_config=None,
+            kv_transfer_config=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(use_hsdp=False),
+        ),
+        input_batch=None,
+        vllm_config=None,
+        diffusion_kv_backend=None,
+        _cleanup_finished_step_requests=lambda scheduler_output: None,
+        _update_states=lambda scheduler_output: (states, []),
+    )
+    runner._execute_request_step = MethodType(DiffusionModelRunner._execute_request_step, runner)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "clear_pipeline_stage_durations", lambda pipeline: None)
+    monkeypatch.setattr(model_runner_module, "consume_pipeline_stage_durations", lambda pipeline: {})
+    monkeypatch.setattr(model_runner_module, "merge_stage_durations", lambda state, durations: None)
+
+    output = DiffusionModelRunner._execute_stepwise_pipeline(runner, FakeSchedulerOutput())
+
+    assert pipeline.forward_calls == [
+        ("small", (1, 2, 2, 2, 2)),
+        ("large", (1, 2, 2, 3, 3)),
+    ]
+    assert [state.step_index for state in states] == [1, 1]
+    assert output.get_request_output("small") is not None
+    assert output.get_request_output("large") is not None
 
 
 @pytest.mark.core_model

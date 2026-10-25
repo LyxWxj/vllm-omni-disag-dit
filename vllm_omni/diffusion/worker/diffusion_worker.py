@@ -1393,7 +1393,9 @@ class WorkerProc:
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
-        if not self.od_config.step_execution:
+        pipeline_parallel_size = getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)
+        async_pipeline_decode = self.od_config.step_execution and pipeline_parallel_size > 1 and self.gpu_id == 0
+        if not self.od_config.step_execution or async_pipeline_decode:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1431,7 +1433,36 @@ class WorkerProc:
             assert self.result_mq is not None, "Result queue not initialized"
             self.result_mq.enqueue(msg)
 
-    def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
+    def _enqueue_async_output(
+        self,
+        output: DiffusionOutput | BatchRunnerOutput,
+        rpc_id: str | None,
+        *,
+        result: Any | None = None,
+    ) -> None:
+        if self._async_output_queue is None:
+            raise RuntimeError("Async diffusion output was requested without a worker output queue")
+        async_output_id = WorkerProc._generate_async_output_id()
+        gpu_event = current_omni_platform.record_device_event()
+        with self._async_output_done:
+            self._async_output_pending += 1
+        self._async_output_queue.put((output, async_output_id, gpu_event))
+        self._enqueue_result(
+            AsyncDiffusionOutput(
+                kind=AsyncOutputKind.COMPUTE_DONE,
+                rpc_id=rpc_id,
+                async_output_id=async_output_id,
+                result=result,
+            )
+        )
+
+    def _return_result(
+        self,
+        output: Any,
+        rpc_id: str | None = None,
+        *,
+        async_output: bool = False,
+    ) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is None:
             return
@@ -1440,23 +1471,18 @@ class WorkerProc:
             return
 
         if self.od_config.step_execution and rpc_id is not None:
+            if async_output:
+                if not isinstance(output, BatchRunnerOutput):
+                    raise TypeError("Asynchronous step-pipeline output must be a BatchRunnerOutput")
+                metadata = tuple((item.request_id, item.step_index, item.finished) for item in output.runner_outputs)
+                self._enqueue_async_output(output, rpc_id, result=metadata)
+                return
             self._enqueue_result(AsyncDiffusionOutput(kind=AsyncOutputKind.RPC_RESULT, rpc_id=rpc_id, result=output))
             return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
-            async_output_id = WorkerProc._generate_async_output_id()
-            gpu_event = current_omni_platform.record_device_event()
-            with self._async_output_done:
-                self._async_output_pending += 1
-            assert self._async_output_queue is not None, "Async output queue not initialized"
-            self._async_output_queue.put((output, async_output_id, gpu_event))
-            msg = AsyncDiffusionOutput(
-                kind=AsyncOutputKind.COMPUTE_DONE,
-                rpc_id=rpc_id,
-                async_output_id=async_output_id,
-            )
-            self._enqueue_result(msg)
+            self._enqueue_async_output(output, rpc_id)
             return
 
         # Sync path (original, or async fallback).
@@ -1761,7 +1787,7 @@ class WorkerProc:
                             )
                         )
                     if should_reply:
-                        self._return_result(result, rpc_id=rpc_id)
+                        self._return_result(result, rpc_id=rpc_id, async_output=msg.get("async_output", False))
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)
