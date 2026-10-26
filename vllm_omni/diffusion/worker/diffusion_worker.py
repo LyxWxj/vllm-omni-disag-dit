@@ -1393,8 +1393,9 @@ class WorkerProc:
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
-        request_pipeline = getattr(self.od_config, "request_pipeline_parallel", False) is True
-        if not self.od_config.step_execution and not request_pipeline:
+        pipeline_parallel_size = getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)
+        async_pipeline_decode = self.od_config.step_execution and pipeline_parallel_size > 1 and self.gpu_id == 0
+        if not self.od_config.step_execution or async_pipeline_decode:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1455,7 +1456,13 @@ class WorkerProc:
             )
         )
 
-    def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
+    def _return_result(
+        self,
+        output: Any,
+        rpc_id: str | None = None,
+        *,
+        async_output: bool = False,
+    ) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is None:
             return
@@ -1463,11 +1470,20 @@ class WorkerProc:
             self._enqueue_result(output)
             return
 
-        # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
-        if (
-            not self.od_config.step_execution
-            and getattr(self.od_config, "request_pipeline_parallel", False) is not True
-            and isinstance(output, (DiffusionOutput, BatchRunnerOutput))
+        if self.od_config.step_execution and rpc_id is not None:
+            if async_output:
+                if not isinstance(output, BatchRunnerOutput):
+                    raise TypeError("Asynchronous step-pipeline output must be a BatchRunnerOutput")
+                metadata = tuple((item.request_id, item.step_index, item.finished) for item in output.runner_outputs)
+                self._enqueue_async_output(output, rpc_id, result=metadata)
+                return
+            self._enqueue_result(AsyncDiffusionOutput(kind=AsyncOutputKind.RPC_RESULT, rpc_id=rpc_id, result=output))
+            return
+
+        # Async path: enqueue compute_done immediately, bg thread does D2H/SHM.
+        pipeline_parallel_size = getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)
+        if (not self.od_config.step_execution or pipeline_parallel_size > 1) and isinstance(
+            output, (DiffusionOutput, BatchRunnerOutput)
         ):
             self._enqueue_async_output(output, rpc_id)
             return
@@ -1761,7 +1777,7 @@ class WorkerProc:
                             )
                         )
                     if should_reply:
-                        self._return_result(result, rpc_id=rpc_id)
+                        self._return_result(result, rpc_id=rpc_id, async_output=msg.get("async_output", False))
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)

@@ -840,6 +840,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         except TimeoutError as exc:
             self._fail_closed_on_dp_wave_timeout(exc)
             raise
+        if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
+            return self._async_batch_runner_output(result, request_ids, require_step_metadata=True)
         if isinstance(result, BaseRunnerOutput):
             return result
         raise RuntimeError(f"Unexpected response type for pipeline decode: {type(result)!r}")
@@ -874,14 +876,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "collect_rank_status": collect_rank_status,
         }
 
+        pipeline_parallel_size = getattr(
+            getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1
+        )
+        async_pipeline_decode = (
+            self.od_config.step_execution
+            and pipeline_parallel_size > 1
+            and method == "decode_pipeline_requests"
+        )
         async_request_batch = (
-            not self.od_config.step_execution
-            and getattr(self.od_config, "request_pipeline_parallel", False) is not True
+            (not self.od_config.step_execution or pipeline_parallel_size > 1)
             and method in ("execute_model", "execute_model_batch")
         )
-        if async_request_batch and not multi_rank_reply:
+        if (async_pipeline_decode or async_request_batch) and not multi_rank_reply:
             rpc_id = self._next_rpc_id()
             rpc_request["rpc_id"] = rpc_id
+            if async_pipeline_decode:
+                rpc_request["async_output"] = True
             fut: concurrent.futures.Future = concurrent.futures.Future()
             with self._futures_lock:
                 self._rpc_futures[rpc_id] = fut
