@@ -386,6 +386,74 @@ class TestBatchSplitDelivery:
             assert futures[rid].result(timeout=1.0) is outputs[rid]
 
 
+class TestStepPipelineAsyncDecode:
+    def test_decode_pipeline_returns_async_per_request_outputs(self):
+        executor = _make_executor(step_execution=True)
+        executor.od_config.parallel_config.pipeline_parallel_size = 2
+        executor._ensure_open = lambda: None
+        request_ids = ["r0", "r1"]
+        completion = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.COMPUTE_DONE,
+            rpc_id="rpc-1",
+            async_output_id="decode-1",
+            result=(("r0", 4, True), ("r1", 6, True)),
+        )
+        call = {}
+
+        def fake_collective_rpc(*args, **kwargs):
+            call.update(kwargs)
+            return completion
+
+        executor.collective_rpc = fake_collective_rpc
+        output = executor.decode_pipeline_requests(request_ids)
+
+        assert call["async_output"] is True
+        assert [output.get_request_output(rid).step_index for rid in request_ids] == [4, 6]
+        assert [output.get_request_output(rid).finished for rid in request_ids] == [True, True]
+        assert [output.get_request_output(rid).async_output_id for rid in request_ids] == [
+            "decode-1/r0",
+            "decode-1/r1",
+        ]
+
+        decoded = {rid: DiffusionOutput(output=f"video-{rid}") for rid in request_ids}
+        ready = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="decode-1",
+            output=_FakeBatchOutput(decoded),
+        )
+        _feed_one_msg_to_pump(executor, ready)
+        for rid in request_ids:
+            future = executor.wait_output_ready(f"decode-1/{rid}")
+            assert future.done()
+            assert future.result(timeout=1.0) is decoded[rid]
+
+    def test_step_pipeline_collective_rpc_returns_on_compute_done(self):
+        executor = _make_executor(step_execution=True)
+        executor._ensure_open = lambda: None
+        completion = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.COMPUTE_DONE,
+            rpc_id="1",
+            async_output_id="decode-1",
+        )
+        requests = []
+
+        def enqueue(request):
+            requests.append(request)
+            _feed_one_msg_to_pump(executor, completion)
+
+        executor._broadcast_mq = SimpleNamespace(enqueue=enqueue)
+        result = executor.collective_rpc(
+            "decode_pipeline_requests",
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+            async_output=True,
+        )
+
+        assert result is completion
+        assert requests[0]["async_output"] is True
+        assert requests[0]["rpc_id"] == "1"
+
+
 class TestShutdownCleansUpFutures:
     """Test that shutdown cancels pending futures."""
 

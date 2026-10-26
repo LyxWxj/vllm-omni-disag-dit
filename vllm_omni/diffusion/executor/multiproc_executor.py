@@ -825,6 +825,25 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def set_pipeline_step_callback(self, callback: Callable[[AsyncDiffusionOutput], None]) -> None:
         self._pipeline_step_callback = callback
 
+    def decode_pipeline_requests(self, request_ids: list[str]) -> BaseRunnerOutput:
+        """Run the decode cohort on every PP rank and return rank-0 outputs."""
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+        try:
+            result = self.collective_rpc(
+                "decode_pipeline_requests",
+                args=(request_ids,),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
+                timeout=_DLO_DP_WAVE_TIMEOUT_S,
+            )
+        except TimeoutError as exc:
+            self._fail_closed_on_dp_wave_timeout(exc)
+            raise
+        if isinstance(result, BaseRunnerOutput):
+            return result
+        raise RuntimeError(f"Unexpected response type for pipeline decode: {type(result)!r}")
+
     def collective_rpc(
         self,
         method: str,
@@ -855,7 +874,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "collect_rank_status": collect_rank_status,
         }
 
-        async_request_batch = not self.od_config.step_execution and method in ("execute_model", "execute_model_batch")
+        async_request_batch = (
+            not self.od_config.step_execution
+            and getattr(self.od_config, "request_pipeline_parallel", False) is not True
+            and method in ("execute_model", "execute_model_batch")
+        )
         if async_request_batch and not multi_rank_reply:
             rpc_id = self._next_rpc_id()
             rpc_request["rpc_id"] = rpc_id

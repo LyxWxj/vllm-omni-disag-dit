@@ -897,6 +897,14 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def decode_pipeline_requests(self, request_ids: list[str]) -> BaseRunnerOutput:
+        """Decode a completed step-PP cohort after the Engine barrier."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        output = self.model_runner.decode_pipeline_requests(request_ids)
+        for request_id in request_ids:
+            self._step_lora_state.pop(request_id, None)
+        return output
+
     def release_step_requests(self, request_ids: list[str]) -> None:
         """Retire cancelled step state at the serialized worker-call boundary."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -1385,9 +1393,8 @@ class WorkerProc:
         # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
-        pipeline_parallel_size = getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)
-        async_pipeline_decode = self.od_config.step_execution and pipeline_parallel_size > 1 and self.gpu_id == 0
-        if not self.od_config.step_execution or async_pipeline_decode:
+        request_pipeline = getattr(self.od_config, "request_pipeline_parallel", False) is True
+        if not self.od_config.step_execution and not request_pipeline:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1448,13 +1455,7 @@ class WorkerProc:
             )
         )
 
-    def _return_result(
-        self,
-        output: Any,
-        rpc_id: str | None = None,
-        *,
-        async_output: bool = False,
-    ) -> None:
+    def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is None:
             return
@@ -1462,43 +1463,24 @@ class WorkerProc:
             self._enqueue_result(output)
             return
 
-        if self.od_config.step_execution and rpc_id is not None:
-            if async_output:
-                if not isinstance(output, BatchRunnerOutput):
-                    raise TypeError("Asynchronous step-pipeline output must be a BatchRunnerOutput")
-                metadata = tuple((item.request_id, item.step_index, item.finished) for item in output.runner_outputs)
-                self._enqueue_async_output(output, rpc_id, result=metadata)
-                return
-            self._enqueue_result(AsyncDiffusionOutput(kind=AsyncOutputKind.RPC_RESULT, rpc_id=rpc_id, result=output))
-            return
-
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
-        if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
+        if (
+            not self.od_config.step_execution
+            and getattr(self.od_config, "request_pipeline_parallel", False) is not True
+            and isinstance(output, (DiffusionOutput, BatchRunnerOutput))
+        ):
             self._enqueue_async_output(output, rpc_id)
             return
 
         # Sync path (original, or async fallback).
-        registered_pp_decode = (
-            self.od_config.step_execution
-            and self.od_config.parallel_config.pipeline_parallel_size > 1
-            and self.od_config.video_output_transport.enable_registered_shm
-            and current_omni_platform.is_cuda()
-            and isinstance(output, BatchRunnerOutput)
-            and any(item.result is not None and item.result.video_output_index == 0 for item in output.runner_outputs)
-        )
         try:
-            if registered_pp_decode:
-                stream = torch.Stream(device=torch.device("cuda", self.gpu_id))
-                stream.wait_stream(torch.accelerator.current_stream())
-                pack_diffusion_output_shm(output, d2h_stream=stream, enable_registered_shm=True)
-            else:
-                pack_diffusion_output_shm(output)
+            pack_diffusion_output_shm(output)
         except (TypeError, ValueError):
             raise
         except Exception as e:
             # Packing is failure-atomic. Typed media and opted-in PP outputs
             # must fail rather than enqueue a device payload after a copy error.
-            if registered_pp_decode or payload_carries_typed_media(output):
+            if payload_carries_typed_media(output):
                 raise
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
@@ -1779,7 +1761,7 @@ class WorkerProc:
                             )
                         )
                     if should_reply:
-                        self._return_result(result, rpc_id=rpc_id, async_output=msg.get("async_output", False))
+                        self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)

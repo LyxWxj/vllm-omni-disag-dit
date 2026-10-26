@@ -1211,29 +1211,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 )
         return requests
 
-    def _prepare_pipeline_states(self, states: list[StepRequestState], new_request_ids: list[str]) -> None:
-        """Prepare new PP requests together without batching their forwards."""
-        new_ids = set(new_request_ids)
-        new_states = [state for state in states if state.request_id in new_ids]
-        if not new_states:
-            return
-        pipeline = self.pipeline
-        assert pipeline is not None
-        for state in new_states:
-            self._initialize_generator(state.sampling)
-        prepare_batch = getattr(pipeline, "prepare_encode_batch", None)
-        if callable(prepare_batch):
-            clear_pipeline_stage_durations(pipeline)
-            prepare_batch(new_states)
-            durations = consume_pipeline_stage_durations(pipeline)
-            for state in new_states:
-                merge_stage_durations(state, durations)
-        else:
-            for state in new_states:
-                clear_pipeline_stage_durations(pipeline)
-                pipeline.prepare_encode(state)
-                merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
+    def _prepare_request_pipeline_states(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+    ) -> tuple[list[StepRequestState], list[RunnerOutput]]:
+        """Build and prepare all request-local states before any task starts."""
+
+        states, new_request_ids = self._update_states(scheduler_output)
+        # Request-pipeline tasks are request-local.  In particular, do not
+        # collate different latent/prompt shapes into one InputBatch during
+        # preparation; each task builds its one-request view later.
+        prepared_states, _, preparation_errors = self._prepare_batch_inputs(
+            states,
+            new_request_ids,
+            build_input_batch=False,
+        )
         self.input_batch = None
+        return prepared_states, preparation_errors
 
     def _execute_request_step(
         self,
@@ -1280,8 +1274,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         return RequestPipelineBatchState(tuple(states), tasks, transport)
 
-    def _decode_pipeline_request(self, state: StepRequestState) -> tuple[DiffusionOutput, BaseException | None]:
-        """Decode on the final PP rank and gather its output to PP rank 0."""
+    def _decode_pipeline_request(
+        self, state: StepRequestState, request_index: int
+    ) -> tuple[DiffusionOutput, BaseException | None]:
+        """Decode on the request owner and gather its output to PP rank 0."""
         pipeline = self.pipeline
         assert pipeline is not None
         distributed = torch.distributed.is_initialized()
@@ -1366,8 +1362,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     installed_request_ids.append(new_req.request_id)
 
             with torch.no_grad() if use_hsdp else torch.inference_mode():
-                states, new_request_ids = self._update_states(scheduler_output)
-                self._prepare_pipeline_states(states, new_request_ids)
+                states, preparation_errors = self._prepare_request_pipeline_states(scheduler_output)
+            if preparation_errors:
+                first_error = preparation_errors[0].result
+                if first_error is None or first_error.error is None:
+                    raise RuntimeError("request-pipeline preparation failed")
+                raise RuntimeError(first_error.error)
             if len(states) != len(requests):
                 raise RuntimeError("request-pipeline request/state count mismatch")
             batch = self._build_request_pipeline_batch(
@@ -1449,17 +1449,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # The context exits through RequestPipelineTransport.__exit__,
                 # which drains both activation sends and lazy feedback receives.
 
-            outputs: list[DiffusionOutput] = []
             decode_errors: list[BaseException] = []
-            for state in batch.states:
-                output, error = self._decode_pipeline_request(state)
+            for request_index, state in enumerate(batch.states):
+                output, error = self._decode_pipeline_request(state, request_index)
                 if error is not None:
                     decode_errors.append(error)
                 outputs.append(output)
-            if is_primary:
-                peak_memory_mb = self._sample_peak_memory_mb()
-                for output in outputs:
-                    output.peak_memory_mb = max(output.peak_memory_mb, peak_memory_mb)
+                if is_primary:
+                    output.peak_memory_mb = max(output.peak_memory_mb, self._sample_peak_memory_mb())
 
             if _dit_any_rank_failed(bool(decode_errors)):
                 decode_error = (
@@ -1578,6 +1575,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
+        *,
+        build_input_batch: bool = True,
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
         pipeline = self.pipeline
@@ -1666,7 +1665,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     continue
             prepared_states.append(state)
 
-        if not prepared_states:
+        if not prepared_states or not build_input_batch:
             return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
@@ -1725,17 +1724,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Run one request-step forward per scheduled state on every PP rank."""
         pipeline = self.pipeline
         assert pipeline is not None
-        try:
-            pp_rank = int(get_pipeline_parallel_rank())
-            last_pp_rank = int(get_pipeline_parallel_world_size()) - 1
-        except AssertionError:
-            pp_rank = last_pp_rank = 0
 
         self._cleanup_finished_step_requests(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
 
         states, new_request_ids = self._update_states(scheduler_output)
+        new_request_id_set = set(new_request_ids)
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         outputs: list[RunnerOutput] = []
@@ -1743,7 +1738,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
 
         with grad_context:
-            self._prepare_pipeline_states(states, new_request_ids)
+            for state in states:
+                if state.request_id in new_request_id_set:
+                    self._initialize_generator(state.sampling)
+                    clear_pipeline_stage_durations(pipeline)
+                    pipeline.prepare_encode(state)
+                    merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
             self.input_batch = None
             for state in states:
                 if isinstance(state.latents, AsyncLatents):
@@ -1754,36 +1754,48 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     attn_metadata={},
                     paged_kv_runtime=paged_kv_runtime,
                 )
-                finished = state.denoise_completed
-                result = None
-                if finished and pp_rank == last_pp_rank and callable(getattr(pipeline, "post_decode", None)):
-                    previous_owner = getattr(pipeline, "_request_pipeline_decode_owner", None)
-                    pipeline._request_pipeline_decode_owner = True
-                    try:
-                        clear_pipeline_stage_durations(pipeline)
-                        result = pipeline.post_decode(state) or DiffusionOutput()
-                        self._mark_pp_video_output(result, state.sampling)
-                        result = self._prepare_output_for_transport(result, state.sampling)
-                        attach_stage_durations(state, result)
-                    except Exception as exc:
-                        result = DiffusionOutput.from_exception(exc)
-                    finally:
-                        if previous_owner is None:
-                            delattr(pipeline, "_request_pipeline_decode_owner")
-                        else:
-                            pipeline._request_pipeline_decode_owner = previous_owner
-                outputs.append(
-                    RunnerOutput(
-                        request_id=state.request_id,
-                        step_index=state.step_index,
-                        finished=finished,
-                        result=result,
-                    )
-                )
-
-            self.release_step_requests([state.request_id for state in states if state.denoise_completed])
+                outputs.append(RunnerOutput(request_id=state.request_id, step_index=state.step_index, finished=False))
 
         return BatchRunnerOutput.from_list(outputs)
+
+    def decode_pipeline_requests(self, request_ids: list[str]) -> BatchRunnerOutput:
+        """Drain the PP edge, then distribute a decode cohort across PP ranks."""
+        pipeline = self.pipeline
+        assert pipeline is not None
+        pp_group = get_pp_group()
+        pp_rank = get_pipeline_parallel_rank()
+        states = [self.state_cache[request_id] for request_id in request_ids]
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
+
+        with grad_context:
+            pipeline._sync_pp_send()
+            if pp_rank == 0:
+                for state in states:
+                    if isinstance(state.latents, AsyncLatents):
+                        state.latents = state.latents.resolve()
+            pp_group.barrier()
+
+            outputs: list[RunnerOutput] = []
+            for index, state in enumerate(states):
+                output, error = self._decode_pipeline_request(state, index)
+                if error is not None and not isinstance(error, Exception):
+                    raise error
+                if pp_rank == 0:
+                    if output.error is None and not isinstance(output.output, torch.Tensor):
+                        output = DiffusionOutput(error="Step-PP decode requires tensor outputs")
+                    outputs.append(
+                        RunnerOutput(
+                            request_id=state.request_id,
+                            step_index=state.step_index,
+                            finished=True,
+                            result=output,
+                        )
+                    )
+
+        self.release_step_requests(request_ids)
+        return BatchRunnerOutput.from_list(outputs) if pp_rank == 0 else BatchRunnerOutput.from_list([])
 
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""

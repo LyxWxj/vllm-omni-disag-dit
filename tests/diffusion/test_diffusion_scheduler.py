@@ -2138,6 +2138,85 @@ class TestStepScheduler:
         with pytest.raises(ValueError, match=error):
             scheduler.add_request(request)
 
+    def test_pipeline_final_step_waits_for_decode_cohort(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=2,
+            )
+        )
+        request_id = scheduler.add_request(_make_step_request("final", num_inference_steps=1))
+        step = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(step.scheduled_request_ids)
+
+        scheduler.pipeline_step_completed(step.scheduled_request_ids)
+        step_output = BatchRunnerOutput.from_list([_make_step_output(request_id, 1)])
+        assert scheduler.update_from_output(step, step_output) == set()
+        assert scheduler.pipeline_decode_pending() == [request_id]
+        assert scheduler.schedule().is_empty
+        assert scheduler.get_request_state(request_id).status == DiffusionRequestStatus.RUNNING
+
+        decoded = BatchRunnerOutput.from_list(
+            [
+                RunnerOutput(
+                    request_id=request_id,
+                    step_index=1,
+                    finished=True,
+                    result=DiffusionOutput(output=torch.tensor([1.0])),
+                )
+            ]
+        )
+        assert scheduler.finish_pipeline_decode(decoded) == {request_id}
+        assert scheduler.has_requests() is False
+
+    def test_pipeline_decodes_full_cohort_while_other_requests_are_ready(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=2,
+            )
+        )
+        req_a = scheduler.add_request(_make_step_request("cohort-a", num_inference_steps=1))
+        req_b = scheduler.add_request(_make_step_request("cohort-b", num_inference_steps=1))
+        step = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(step.scheduled_request_ids)
+        scheduler.add_request(_make_step_request("ready", num_inference_steps=1))
+        assert _new_ids(scheduler.schedule()) == ["ready"]
+        scheduler.pipeline_step_completed(step.scheduled_request_ids)
+        scheduler.update_from_output(
+            step,
+            BatchRunnerOutput.from_list([_make_step_output(req_a, 1), _make_step_output(req_b, 1)]),
+        )
+
+        assert scheduler.pipeline_decode_pending() == [req_a, req_b]
+        assert scheduler.has_pipeline_ready
+        assert scheduler.should_decode_pipeline()
+
+    def test_pipeline_decode_can_finish_before_async_output_is_ready(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=1,
+            )
+        )
+        request_id = scheduler.add_request(_make_step_request("async-final", num_inference_steps=1))
+        step = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(step.scheduled_request_ids)
+        scheduler.pipeline_step_completed(step.scheduled_request_ids)
+        scheduler.update_from_output(step, BatchRunnerOutput.from_list([_make_step_output(request_id, 1)]))
+
+        async_decode = BatchRunnerOutput.from_list(
+            [RunnerOutput(request_id=request_id, step_index=1, finished=True, async_output_id="decode-1/async-final")]
+        )
+        assert scheduler.finish_pipeline_decode(async_decode) == {request_id}
+        assert scheduler.has_requests() is False
+
     def test_mixed_batch_error_finishes_only_failed_request(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
