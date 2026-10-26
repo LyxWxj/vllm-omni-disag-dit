@@ -469,16 +469,14 @@ class DiffusionEngine:
         self._scheduler_num_waiting_reqs = 0
         parallel = getattr(self.od_config, "parallel_config", None)
         self.step_pipeline_parallel = bool(self.step_execution and getattr(parallel, "pipeline_parallel_size", 1) > 1)
-        self._pipeline_scheduler_outputs: dict[str, DiffusionSchedulerOutput] = {}
+        self._pipeline_scheduler_outputs: dict[str, tuple[DiffusionSchedulerOutput, float]] = {}
+        self._pipeline_step_results: queue.Queue[AsyncDiffusionOutput] = queue.Queue()
         if self.step_pipeline_parallel and not isinstance(self.scheduler, StepScheduler):
             raise ValueError("step-execution pipeline parallelism requires StepScheduler")
         pipeline_executor_methods = (
             "execute_step_pipeline",
             "decode_pipeline_requests",
-            "drain_pipeline_step_results",
-            "has_pipeline_step_results",
             "set_pipeline_step_callback",
-            "wait_pipeline_step_result",
         )
         if self.step_pipeline_parallel and any(not hasattr(self.executor, name) for name in pipeline_executor_methods):
             raise ValueError("step-execution pipeline parallelism requires the multiprocessing diffusion executor")
@@ -841,26 +839,44 @@ class DiffusionEngine:
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
 
     def _process_pipeline_step_results(self) -> None:
-        """Commit completed solver steps delivered by the last PP rank."""
-        for event in self.executor.drain_pipeline_step_results():
+        """Commit PP events delivered by the result pump."""
+        while True:
+            try:
+                event = self._pipeline_step_results.get_nowait()
+            except queue.Empty:
+                break
             self._handle_pipeline_step_result(event)
+        now = time.monotonic()
+        timeout = _async_output_timeout()
+        for step_id, (_, submitted_at) in list(self._pipeline_scheduler_outputs.items()):
+            if now - submitted_at >= timeout:
+                self._handle_pipeline_step_result(
+                    AsyncDiffusionOutput(
+                        kind=AsyncOutputKind.RPC_RESULT,
+                        async_output_id=step_id,
+                        error="Timed out waiting for the last pipeline rank",
+                    )
+                )
 
-    def _notify_pipeline_step_result(self) -> None:
-        if not self._loop_started:
-            return
-        with self._cv:
-            self._cv.notify_all()
+    def _notify_pipeline_step_result(self, event: AsyncDiffusionOutput) -> None:
+        self._pipeline_step_results.put(event)
+        if self._loop_started:
+            with self._cv:
+                self._cv.notify_all()
 
     def _wait_for_pipeline_step_result(self) -> None:
         with self._cv:
-            if not self.executor.has_pipeline_step_results():
+            if self._pipeline_step_results.empty():
                 self._cv.wait(timeout=1.0)
 
     def _wait_or_decode_pipeline_if_needed(self, *, scheduling_exhausted: bool = False) -> bool:
         """Wait for in-flight steps or decode a ready cohort; return if handled."""
         assert isinstance(self.scheduler, StepScheduler)
         if self.scheduler.has_pipeline_inflight:
-            if scheduling_exhausted or self.scheduler.should_decode_pipeline():
+            if self.scheduler.should_decode_pipeline(scheduling_exhausted=scheduling_exhausted):
+                self._wait_for_pipeline_step_result()
+                return True
+            if len(self._pipeline_scheduler_outputs) >= self.scheduler.od_config.parallel_config.pipeline_parallel_size:
                 self._wait_for_pipeline_step_result()
                 return True
             return False
@@ -889,7 +905,7 @@ class DiffusionEngine:
     def _submit_pipeline_step(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         assert isinstance(self.scheduler, StepScheduler)
         pipeline_step_id = str(scheduler_output.step_id)
-        self._pipeline_scheduler_outputs[pipeline_step_id] = scheduler_output
+        self._pipeline_scheduler_outputs[pipeline_step_id] = (scheduler_output, time.monotonic())
         try:
             self._prepare_kv_for_forward(scheduler_output)
             self.executor.execute_step_pipeline(scheduler_output)
@@ -918,12 +934,16 @@ class DiffusionEngine:
     ) -> tuple[DiffusionSchedulerOutput, BaseRunnerOutput, set[str]] | None:
         """Commit one last-rank result for both startup and the busy loop."""
         if event.kind == AsyncOutputKind.RPC_RESULT:
-            self._fail_engine(RuntimeError(event.error or "Rank 0 pipeline stage failed"))
+            if event.error:
+                if event.async_output_id is not None:
+                    self._pipeline_scheduler_outputs.pop(event.async_output_id, None)
+                self._fail_engine(RuntimeError(event.error))
             return None
         assert event.async_output_id is not None
-        scheduler_output = self._pipeline_scheduler_outputs.pop(event.async_output_id, None)
-        if scheduler_output is None:
+        pending = self._pipeline_scheduler_outputs.pop(event.async_output_id, None)
+        if pending is None:
             return None
+        scheduler_output, _ = pending
 
         assert isinstance(self.scheduler, StepScheduler)
         self._process_aborts_queue()
@@ -959,7 +979,7 @@ class DiffusionEngine:
         pipeline_step_id = str(scheduler_output.step_id)
         while True:
             try:
-                event = self.executor.wait_pipeline_step_result(timeout=_async_output_timeout())
+                event = self._pipeline_step_results.get(timeout=_async_output_timeout())
             except queue.Empty as exc:
                 error = TimeoutError("Timed out waiting for the last pipeline rank")
                 self._fail_engine(error)
@@ -1367,6 +1387,7 @@ class DiffusionEngine:
                 self._request_cancellations.cancel_all()
             if self.stop_event is not None:
                 self.stop_event.set()
+            getattr(self, "_pipeline_scheduler_outputs", {}).clear()
             streams = list(self._out_streams.values())
             self._cv.notify_all()
 
@@ -2342,6 +2363,7 @@ class DiffusionEngine:
                     self._request_cancellations.cancel_all()
                 if self.stop_event is not None:
                     self.stop_event.set()
+                getattr(self, "_pipeline_scheduler_outputs", {}).clear()
                 pending_streams = list(self._out_streams.values())
                 self._out_streams.clear()
                 if self._streaming_playback is not None:

@@ -324,6 +324,31 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             custom_pipeline_name: Optional custom pipeline class name to use.
         """
 
+        parallel = getattr(self.od_config, "parallel_config", None)
+        pp_size = getattr(parallel, "pipeline_parallel_size", 1)
+        request_pipeline_parallel = bool(getattr(self.od_config, "request_pipeline_parallel", False))
+        step_pipeline_parallel = bool(
+            (getattr(self.od_config, "step_execution", False) or self.od_config.streaming_output) and pp_size > 1
+        )
+        if request_pipeline_parallel or step_pipeline_parallel:
+            if self.od_config.cache_backend not in (None, "none"):
+                mode = "Step-PP" if step_pipeline_parallel else "request_pipeline_parallel"
+                raise ValueError(f"{mode} does not support cache backends")
+            if (
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                is DiffusionKVCacheMode.PAGED_SCHEDULER
+            ):
+                mode = "Step-PP" if step_pipeline_parallel else "request_pipeline_parallel"
+                raise ValueError(f"{mode} does not support paged diffusion KV")
+        if step_pipeline_parallel:
+            if self.od_config.streaming_output:
+                raise ValueError("Step-PP does not support streaming output")
+            omni_kv = getattr(self.od_config, "omni_kv_config", None) or {}
+            if getattr(self.od_config, "kv_transfer_config", None) is not None or any(
+                omni_kv.get(key, False) for key in ("need_send_cache", "need_recv_cache")
+            ):
+                raise ValueError("Step-PP does not support diffusion KV transfer")
+
         if load_format == "dummy":
             return
 
@@ -395,11 +420,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
-        if (
-            getattr(self.od_config, "step_execution", False)
-            and getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1) > 1
-            and not getattr(self.pipeline, "supports_step_pipeline_parallel", False)
-        ):
+        if step_pipeline_parallel and not getattr(self.pipeline, "supports_step_pipeline_parallel", False):
             raise ValueError(
                 "step-execution pipeline parallelism currently requires a pipeline implementing "
                 "the request-local step PP contract; "
@@ -1137,7 +1158,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def _validate_request_pipeline_batch(
         self,
         scheduler_output: DiffusionSchedulerOutput,
-        od_config: OmniDiffusionConfig,
     ) -> list[OmniDiffusionRequest]:
         """Validate the closed request-pipeline contract.
 
@@ -1153,14 +1173,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return []
         if self.pipeline is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
-        if od_config.cache_backend not in (None, "none"):
-            raise ValueError("request_pipeline_parallel does not support cache_backend")
-        if (
-            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-        ):
-            raise ValueError("request_pipeline_parallel does not support paged diffusion KV metadata yet")
-
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
             self._validate_diffusion_kv_metadata(
@@ -1334,7 +1346,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     ) -> BatchRunnerOutput:
         """Execute a closed request batch as an interleaved PP microtask plan."""
 
-        requests = self._validate_request_pipeline_batch(scheduler_output, od_config)
+        requests = self._validate_request_pipeline_batch(scheduler_output)
         if not requests:
             return BatchRunnerOutput.from_list([])
 
@@ -1385,18 +1397,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     try:
                         check_request_cancellation()
                         batch.transport.begin_task(task)
-                        if task.is_tombstone:
-                            if state.step_index != state.total_steps:
-                                raise RuntimeError(
-                                    f"request-pipeline tombstone arrived before {task.request_id} completed: "
-                                    f"state step {state.step_index}, total steps {state.total_steps}"
-                                )
-                        elif state.step_index != task.step_index:
-                            raise RuntimeError(
-                                f"request-pipeline task order mismatch for {task.request_id}: "
-                                f"expected state step {state.step_index}, task step {task.step_index}"
-                            )
-                    except BaseException as exc:
+                    except Exception as exc:
                         task_error = exc
                     if _dit_any_rank_failed(task_error is not None):
                         if task_error is None:
@@ -1428,12 +1429,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             attn_metadata=attn_metadata,
                             paged_kv_runtime=paged_kv_runtime,
                         )
-                        if state.step_index != task.step_index + 1:
-                            raise RuntimeError(
-                                f"request-pipeline scheduler did not advance {task.request_id} "
-                                f"from step {task.step_index}"
-                            )
-                    except BaseException as exc:
+                    except Exception as exc:
                         local_error = exc
                     if _dit_any_rank_failed(local_error is not None):
                         if local_error is None:
@@ -1727,30 +1723,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def _execute_stepwise_pipeline(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run one request-step forward per scheduled state on every PP rank."""
         pipeline = self.pipeline
-        if pipeline is None or not getattr(pipeline, "supports_step_pipeline_parallel", False):
-            raise ValueError("The loaded pipeline does not support Step-PP")
-        if self.od_config.cache_backend not in (None, "none") or self.od_config.streaming_output:
-            raise ValueError("Step-PP does not support cache backends or streaming output")
-        omni_kv = getattr(self.od_config, "omni_kv_config", None) or {}
-        if getattr(self.od_config, "kv_transfer_config", None) is not None or any(
-            omni_kv.get(key, False) for key in ("need_send_cache", "need_recv_cache")
-        ):
-            raise ValueError("Step-PP does not support diffusion KV transfer")
-        if (
-            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-        ):
-            raise ValueError("Step-PP does not support paged diffusion KV")
+        assert pipeline is not None
 
         self._cleanup_finished_step_requests(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
-            if not new_req.req.use_step_execution:
-                raise ValueError("Step-PP does not support full-forward fallback requests")
-            self._validate_diffusion_kv_metadata(
-                request_id=new_req.request_id,
-                metadata=new_req.diffusion_kv_metadata,
-            )
 
         states, new_request_ids = self._update_states(scheduler_output)
         new_request_id_set = set(new_request_ids)
@@ -1763,8 +1740,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         with grad_context:
             for state in states:
                 if state.request_id in new_request_id_set:
-                    if state.sampling.generator is not None:
-                        raise ValueError("Step-PP requires a seed-based generator, not a custom Generator")
                     self._initialize_generator(state.sampling)
                     clear_pipeline_stage_durations(pipeline)
                     pipeline.prepare_encode(state)
@@ -1786,8 +1761,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def decode_pipeline_requests(self, request_ids: list[str]) -> BatchRunnerOutput:
         """Drain the PP edge, then distribute a decode cohort across PP ranks."""
         pipeline = self.pipeline
-        if pipeline is None or not getattr(pipeline, "supports_step_pipeline_parallel", False):
-            raise ValueError("The loaded pipeline does not support Step-PP")
+        assert pipeline is not None
         pp_group = get_pp_group()
         pp_rank = get_pipeline_parallel_rank()
         states = [self.state_cache[request_id] for request_id in request_ids]

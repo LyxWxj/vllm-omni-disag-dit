@@ -1811,6 +1811,14 @@ class WorkerProc:
                                     error=error,
                                 )
                             )
+                        elif msg.get("pipeline_step_id") is not None and output_rank == self.gpu_id:
+                            self._enqueue_result(
+                                AsyncDiffusionOutput(
+                                    kind=AsyncOutputKind.RPC_RESULT,
+                                    async_output_id=msg["pipeline_step_id"],
+                                    error=error,
+                                )
+                            )
                         elif rpc_id is not None and msg.get("output_rank") == self.gpu_id:
                             # Async RPC: must complete the executor's pending
                             # future so collective_rpc() doesn't hang.

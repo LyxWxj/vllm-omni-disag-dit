@@ -74,7 +74,12 @@ class StepScheduler(BaseScheduler):
         self._pipeline_inflight.update(request_ids)
 
     def pipeline_step_completed(self, request_ids: list[str]) -> None:
+        completed = [request_id for request_id in request_ids if request_id in self._pipeline_inflight]
         self._pipeline_inflight.difference_update(request_ids)
+        completed = [request_id for request_id in completed if request_id in self._running]
+        if completed:
+            completed_set = set(completed)
+            self._running = completed + [request_id for request_id in self._running if request_id not in completed_set]
 
     @property
     def has_pipeline_inflight(self) -> bool:
@@ -94,10 +99,8 @@ class StepScheduler(BaseScheduler):
         """Request a decode barrier for a full cohort or an underfilled tail."""
         return bool(self._pipeline_decode_pending) and (
             scheduling_exhausted
-            or (
-                len(self._pipeline_decode_pending) >= self.od_config.parallel_config.pipeline_parallel_size
-                and not self.has_pipeline_ready
-            )
+            or len(self._pipeline_decode_pending) >= self.od_config.parallel_config.pipeline_parallel_size
+            or not self.has_pipeline_ready
         )
 
     def finish_pipeline_decode(self, output: BaseRunnerOutput) -> set[str]:
@@ -158,6 +161,11 @@ class StepScheduler(BaseScheduler):
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         request_id = request.request_id
+        if self._pipeline_parallel:
+            if not request.use_step_execution:
+                raise ValueError("Step-PP does not support full-forward fallback requests")
+            if request.sampling_params.generator is not None:
+                raise ValueError("Step-PP requires a seed-based generator, not a custom Generator")
         total_steps = self._get_total_steps(request)
         if total_steps <= 0:
             raise ValueError(f"Diffusion request {request_id} must have positive total_steps, got {total_steps}")

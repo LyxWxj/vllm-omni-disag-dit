@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import queue
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -8,11 +9,12 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion import io_support
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -23,7 +25,9 @@ def test_pipeline_step_result_callback_does_not_block_before_loop_start() -> Non
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._loop_started = False
-    callback = threading.Thread(target=engine._notify_pipeline_step_result, daemon=True)
+    engine._pipeline_step_results = queue.Queue()
+    event = AsyncDiffusionOutput(kind=AsyncOutputKind.PIPELINE_STEP_DONE)
+    callback = threading.Thread(target=engine._notify_pipeline_step_result, args=(event,), daemon=True)
 
     with engine._rpc_lock:
         callback.start()
@@ -33,6 +37,55 @@ def test_pipeline_step_result_callback_does_not_block_before_loop_start() -> Non
     callback.join(timeout=1)
     assert callback_blocked is False
     assert callback.is_alive() is False
+    assert engine._pipeline_step_results.get_nowait() is event
+
+
+def test_step_pipeline_bounds_inflight_scheduler_outputs() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = StepScheduler()
+    engine.scheduler.initialize(
+        SimpleNamespace(
+            step_execution=True,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+            max_num_seqs=2,
+        )
+    )
+    engine.scheduler.mark_pipeline_inflight(["request-a", "request-b"])
+    engine._pipeline_scheduler_outputs = {"step-0": (None, 0.0)}
+    engine._wait_for_pipeline_step_result = Mock()
+    engine._run_pipeline_decode = Mock()
+
+    assert engine._wait_or_decode_pipeline_if_needed() is False
+    engine._wait_for_pipeline_step_result.assert_not_called()
+
+    engine.scheduler.mark_pipeline_inflight(["request-c", "request-d"])
+    engine._pipeline_scheduler_outputs["step-1"] = (None, 0.0)
+
+    assert engine._wait_or_decode_pipeline_if_needed() is True
+    engine._wait_for_pipeline_step_result.assert_called_once_with()
+    engine._run_pipeline_decode.assert_not_called()
+
+
+def test_step_pipeline_drains_inflight_output_when_decode_is_ready() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = StepScheduler()
+    engine.scheduler.initialize(
+        SimpleNamespace(
+            step_execution=True,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+            max_num_seqs=2,
+        )
+    )
+    engine.scheduler._pipeline_decode_pending.update(["finished-a", "finished-b"])
+    engine.scheduler.mark_pipeline_inflight(["request-c", "request-d"])
+    engine._pipeline_scheduler_outputs = {"step-0": (None, 0.0)}
+    engine._wait_for_pipeline_step_result = Mock()
+    engine._run_pipeline_decode = Mock()
+
+    assert engine._wait_or_decode_pipeline_if_needed() is True
+
+    engine._wait_for_pipeline_step_result.assert_called_once_with()
+    engine._run_pipeline_decode.assert_not_called()
 
 
 @pytest.mark.parametrize("model_class_name", ["DreamZeroPipeline", "LingBotWorldCausalDMDPipeline"])

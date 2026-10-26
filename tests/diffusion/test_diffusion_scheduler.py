@@ -2070,6 +2070,74 @@ class TestStepScheduler:
         assert _cached_ids(next_step) == []
         assert next_step.num_running_reqs == 3
 
+    def test_pipeline_completion_is_scheduled_before_other_ready_requests(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=2,
+            )
+        )
+        scheduler.add_request(_make_step_request("a", num_inference_steps=3))
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=3))
+        first = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(first.scheduled_request_ids)
+
+        req_c = scheduler.add_request(_make_step_request("c", num_inference_steps=3))
+        admitted = scheduler.schedule()
+        assert _new_ids(admitted) == [req_c]
+        scheduler.mark_pipeline_inflight(admitted.scheduled_request_ids)
+
+        scheduler.pipeline_step_completed([req_b])
+        ready = scheduler.schedule()
+
+        assert _cached_ids(ready) == [req_b]
+        assert _new_ids(ready) == []
+
+    def test_pipeline_completion_does_not_reschedule_aborted_request(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=2,
+            )
+        )
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=3))
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=3))
+        first = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(first.scheduled_request_ids)
+        scheduler.finish_requests(req_b, DiffusionRequestStatus.FINISHED_ABORTED)
+
+        scheduler.pipeline_step_completed([req_b])
+        ready = scheduler.schedule()
+
+        assert req_b not in scheduler._running
+        assert req_b not in _cached_ids(ready)
+        assert req_a not in _cached_ids(ready)
+
+    @pytest.mark.parametrize("fallback", [False, True])
+    def test_pipeline_rejects_unsupported_request_modes_at_admission(self, fallback: bool) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=1,
+            )
+        )
+        request = _make_step_request("unsupported")
+        if fallback:
+            request.use_step_execution = False
+            error = "full-forward fallback"
+        else:
+            request.sampling_params.generator = torch.Generator()
+            error = "custom Generator"
+
+        with pytest.raises(ValueError, match=error):
+            scheduler.add_request(request)
+
     def test_pipeline_final_step_waits_for_decode_cohort(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
@@ -2102,6 +2170,31 @@ class TestStepScheduler:
         )
         assert scheduler.finish_pipeline_decode(decoded) == {request_id}
         assert scheduler.has_requests() is False
+
+    def test_pipeline_decodes_full_cohort_while_other_requests_are_ready(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=2,
+            )
+        )
+        req_a = scheduler.add_request(_make_step_request("cohort-a", num_inference_steps=1))
+        req_b = scheduler.add_request(_make_step_request("cohort-b", num_inference_steps=1))
+        step = scheduler.schedule()
+        scheduler.mark_pipeline_inflight(step.scheduled_request_ids)
+        scheduler.add_request(_make_step_request("ready", num_inference_steps=1))
+        assert _new_ids(scheduler.schedule()) == ["ready"]
+        scheduler.pipeline_step_completed(step.scheduled_request_ids)
+        scheduler.update_from_output(
+            step,
+            BatchRunnerOutput.from_list([_make_step_output(req_a, 1), _make_step_output(req_b, 1)]),
+        )
+
+        assert scheduler.pipeline_decode_pending() == [req_a, req_b]
+        assert scheduler.has_pipeline_ready
+        assert scheduler.should_decode_pipeline()
 
     def test_pipeline_decode_can_finish_before_async_output_is_ready(self) -> None:
         scheduler = StepScheduler()
