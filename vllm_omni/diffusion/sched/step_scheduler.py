@@ -13,16 +13,15 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
-    CachedRequestData,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     SchedulerRequestState,
 )
 
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
-
-logger = init_logger(__name__)
 
 
 @dataclass
@@ -42,14 +41,12 @@ class StepScheduler(BaseScheduler):
         super().__init__()
         self._request_progress: dict[str, _StepProgress] = {}
         self._pipeline_inflight: set[str] = set()
-        self._pipeline_decode_pending: set[str] = set()
         self._pipeline_parallel = False
         self._pipeline_batch_size = 1
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
         self._pipeline_inflight.clear()
-        self._pipeline_decode_pending.clear()
         parallel = getattr(self.od_config, "parallel_config", None)
         self._pipeline_parallel = bool(
             getattr(self.od_config, "step_execution", False) and getattr(parallel, "pipeline_parallel_size", 1) > 1
@@ -66,7 +63,7 @@ class StepScheduler(BaseScheduler):
         ready_ids = [
             request_id
             for request_id in self._running
-            if request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
+            if request_id not in self._pipeline_inflight
         ][: self._pipeline_batch_size]
         return self._schedule(ready_ids, batch_limit=self._pipeline_batch_size)
 
@@ -85,38 +82,6 @@ class StepScheduler(BaseScheduler):
     def has_pipeline_inflight(self) -> bool:
         return bool(self._pipeline_inflight)
 
-    @property
-    def has_pipeline_ready(self) -> bool:
-        return any(
-            request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
-            for request_id in self._running
-        )
-
-    def pipeline_decode_pending(self) -> list[str]:
-        return [request_id for request_id in self._running if request_id in self._pipeline_decode_pending]
-
-    def should_decode_pipeline(self, *, scheduling_exhausted: bool = False) -> bool:
-        """Request a decode barrier for a full cohort or an underfilled tail."""
-        return bool(self._pipeline_decode_pending) and (
-            scheduling_exhausted
-            or len(self._pipeline_decode_pending) >= self.od_config.parallel_config.pipeline_parallel_size
-            or not self.has_pipeline_ready
-        )
-
-    def finish_pipeline_decode(self, output: BaseRunnerOutput) -> set[str]:
-        request_ids = self.pipeline_decode_pending()
-        if not request_ids:
-            return set()
-        sched_output = DiffusionSchedulerOutput(
-            step_id=self._step_id,
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData(request_ids),
-            finished_req_ids=set(),
-            num_running_reqs=len(self._running),
-            num_waiting_reqs=len(self._waiting),
-        )
-        self._pipeline_decode_pending.difference_update(request_ids)
-        return self.update_from_output(sched_output, output)
 
     def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
         return self._request_progress[state.request_id].wait_deadline is None
@@ -256,8 +221,6 @@ class StepScheduler(BaseScheduler):
                 terminal_errors[request_id] = None
             else:
                 state.error = None
-                if self._pipeline_parallel and progress.current_step >= progress.total_steps:
-                    self._pipeline_decode_pending.add(request_id)
                 wait = req_output.wait_for_interaction
                 if wait is not None:
                     # RPCs are drained before this update. Latch successful
@@ -273,7 +236,6 @@ class StepScheduler(BaseScheduler):
 
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
-        self._pipeline_decode_pending.discard(request_id)
 
     def _finish_requests(
         self,

@@ -14,7 +14,6 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecu
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -38,54 +37,6 @@ def test_pipeline_step_result_callback_does_not_block_before_loop_start() -> Non
     assert callback_blocked is False
     assert callback.is_alive() is False
     assert engine._pipeline_step_results.get_nowait() is event
-
-
-def test_step_pipeline_bounds_inflight_scheduler_outputs() -> None:
-    engine = object.__new__(DiffusionEngine)
-    engine.scheduler = StepScheduler()
-    engine.scheduler.initialize(
-        SimpleNamespace(
-            step_execution=True,
-            parallel_config=SimpleNamespace(pipeline_parallel_size=2),
-            max_num_seqs=2,
-        )
-    )
-    engine.scheduler.mark_pipeline_inflight(["request-a", "request-b"])
-    engine._pipeline_scheduler_outputs = {"step-0": (None, 0.0)}
-    engine._wait_for_pipeline_step_result = Mock()
-    engine._run_pipeline_decode = Mock()
-
-    assert engine._wait_or_decode_pipeline_if_needed() is False
-    engine._wait_for_pipeline_step_result.assert_not_called()
-
-    engine.scheduler.mark_pipeline_inflight(["request-c", "request-d"])
-    engine._pipeline_scheduler_outputs["step-1"] = (None, 0.0)
-
-    assert engine._wait_or_decode_pipeline_if_needed() is True
-    engine._wait_for_pipeline_step_result.assert_called_once_with()
-    engine._run_pipeline_decode.assert_not_called()
-
-
-def test_step_pipeline_drains_inflight_output_when_decode_is_ready() -> None:
-    engine = object.__new__(DiffusionEngine)
-    engine.scheduler = StepScheduler()
-    engine.scheduler.initialize(
-        SimpleNamespace(
-            step_execution=True,
-            parallel_config=SimpleNamespace(pipeline_parallel_size=2),
-            max_num_seqs=2,
-        )
-    )
-    engine.scheduler._pipeline_decode_pending.update(["finished-a", "finished-b"])
-    engine.scheduler.mark_pipeline_inflight(["request-c", "request-d"])
-    engine._pipeline_scheduler_outputs = {"step-0": (None, 0.0)}
-    engine._wait_for_pipeline_step_result = Mock()
-    engine._run_pipeline_decode = Mock()
-
-    assert engine._wait_or_decode_pipeline_if_needed() is True
-
-    engine._wait_for_pipeline_step_result.assert_called_once_with()
-    engine._run_pipeline_decode.assert_not_called()
 
 
 @pytest.mark.parametrize("model_class_name", ["DreamZeroPipeline", "LingBotWorldCausalDMDPipeline"])
@@ -138,39 +89,6 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
 
     assert len(captured_requests) == 1
     assert captured_requests[0].sampling_params.num_inference_steps == 2
-
-
-def test_request_pipeline_dummy_run_warms_each_decode_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    engine = DiffusionEngine.__new__(DiffusionEngine)
-    engine.od_config = SimpleNamespace(
-        model_class_name="mock_model",
-        diffusion_load_format="default",
-        request_pipeline_parallel=True,
-        max_num_seqs=2,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
-        lambda od_config: (False, False),
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
-        lambda model_class_name, supports_audio_input: 1,
-    )
-    captured_requests: list[OmniDiffusionRequest] = []
-
-    def run_request_batch(requests: list[OmniDiffusionRequest]):
-        captured_requests.extend(requests)
-        return [type("Output", (), {"error": None})() for _ in requests]
-
-    engine._add_request_batch_and_wait_for_responses = run_request_batch
-
-    engine._dummy_run()
-
-    assert [request.request_id for request in captured_requests] == [
-        "dummy_req_id/owner-0",
-        "dummy_req_id/owner-1",
-    ]
 
 
 def test_allgather_startup_runs_broadcast_dummy_request() -> None:

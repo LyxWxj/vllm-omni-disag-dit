@@ -897,14 +897,6 @@ class DiffusionWorker:
             profiler.step()
         return output
 
-    def decode_pipeline_requests(self, request_ids: list[str]) -> BaseRunnerOutput:
-        """Decode a completed step-PP cohort after the Engine barrier."""
-        assert self.model_runner is not None, "Model runner not initialized"
-        output = self.model_runner.decode_pipeline_requests(request_ids)
-        for request_id in request_ids:
-            self._step_lora_state.pop(request_id, None)
-        return output
-
     def release_step_requests(self, request_ids: list[str]) -> None:
         """Retire cancelled step state at the serialized worker-call boundary."""
         assert self.model_runner is not None, "Model runner not initialized"

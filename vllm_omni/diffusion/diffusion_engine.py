@@ -475,7 +475,6 @@ class DiffusionEngine:
             raise ValueError("step-execution pipeline parallelism requires StepScheduler")
         pipeline_executor_methods = (
             "execute_step_pipeline",
-            "decode_pipeline_requests",
             "set_pipeline_step_callback",
         )
         if self.step_pipeline_parallel and any(not hasattr(self.executor, name) for name in pipeline_executor_methods):
@@ -687,7 +686,7 @@ class DiffusionEngine:
                     pending_finished = self.scheduler.pending_finished_request_ids()
                 self._emit_finished_outputs(pending_finished, None)
 
-            if self.step_pipeline_parallel and self._wait_or_decode_pipeline_if_needed():
+            if self.step_pipeline_parallel and self._wait_for_pipeline_capacity():
                 continue
 
             with self._cv:
@@ -760,8 +759,6 @@ class DiffusionEngine:
                     if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
                 }
                 self._emit_finished_outputs(finished_ids, None)
-                if self.step_pipeline_parallel:
-                    self._wait_or_decode_pipeline_if_needed(scheduling_exhausted=True)
                 continue
 
             if self.step_pipeline_parallel:
@@ -869,19 +866,13 @@ class DiffusionEngine:
             if self._pipeline_step_results.empty():
                 self._cv.wait(timeout=1.0)
 
-    def _wait_or_decode_pipeline_if_needed(self, *, scheduling_exhausted: bool = False) -> bool:
-        """Wait for in-flight steps or decode a ready cohort; return if handled."""
+    def _wait_for_pipeline_capacity(self) -> bool:
+        """Wait until one pipeline step slot is available."""
         assert isinstance(self.scheduler, StepScheduler)
-        if self.scheduler.has_pipeline_inflight:
-            if self.scheduler.should_decode_pipeline(scheduling_exhausted=scheduling_exhausted):
-                self._wait_for_pipeline_step_result()
-                return True
-            if len(self._pipeline_scheduler_outputs) >= self.scheduler.od_config.parallel_config.pipeline_parallel_size:
-                self._wait_for_pipeline_step_result()
-                return True
-            return False
-        if self.scheduler.should_decode_pipeline(scheduling_exhausted=scheduling_exhausted):
-            self._run_pipeline_decode()
+        if self.scheduler.has_pipeline_inflight and len(self._pipeline_scheduler_outputs) >= (
+            self.scheduler.od_config.parallel_config.pipeline_parallel_size
+        ):
+            self._wait_for_pipeline_step_result()
             return True
         return False
 
@@ -995,9 +986,6 @@ class DiffusionEngine:
             _, output, finished_ids = committed
             break
 
-        if self.scheduler.should_decode_pipeline(scheduling_exhausted=True):
-            output, decoded_ids = self._decode_pipeline_requests(self.scheduler.pipeline_decode_pending())
-            finished_ids |= decoded_ids
         return output, finished_ids
 
     def _handle_pipeline_step_result(self, event: AsyncDiffusionOutput) -> None:
@@ -1011,25 +999,6 @@ class DiffusionEngine:
             output,
             worker_execution_completed=True,
         )
-
-    def _decode_pipeline_requests(self, request_ids: list[str]) -> tuple[BaseRunnerOutput, set[str]]:
-        assert isinstance(self.scheduler, StepScheduler)
-        try:
-            output = self.executor.decode_pipeline_requests(request_ids)
-        except Exception as exc:
-            if self._closed:
-                raise
-            logger.error("Pipeline decode failed for requests %s", request_ids, exc_info=True)
-            self._release_pipeline_requests(request_ids)
-            output = self._pipeline_error_output(request_ids, exc)
-        return output, self.scheduler.finish_pipeline_decode(output)
-
-    def _run_pipeline_decode(self) -> None:
-        assert isinstance(self.scheduler, StepScheduler)
-        request_ids = self.scheduler.pipeline_decode_pending()
-        if request_ids:
-            output, finished_ids = self._decode_pipeline_requests(request_ids)
-            self._emit_outputs(finished_ids, request_ids, output, worker_execution_completed=True)
 
     def _emit_request_started_outputs(self, sched_output: DiffusionSchedulerOutput) -> None:
         """Notify opted-in callers when requests leave the scheduler queue."""
@@ -2158,16 +2127,6 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
-        warmup_count = 1
-        if getattr(self.od_config, "request_pipeline_parallel", False):
-            pp_size = self.od_config.parallel_config.pipeline_parallel_size
-            # Request-owner decode assigns owners by position in a scheduled
-            # request batch. Only a batch with at least one request per PP
-            # rank can warm every VAE owner; serial request configurations do
-            # not dispatch decode to the other ranks in normal operation.
-            if pp_size > 1 and _max_num_seqs(self.od_config) >= pp_size:
-                warmup_count = pp_size
-
         requests = [
             self._make_dummy_request(
                 height=512,
@@ -2178,11 +2137,9 @@ class DiffusionEngine:
                 # BAGEL) perform ``num_inference_steps - 1`` scheduler
                 # updates and reject an empty one-step schedule.
                 num_inference_steps=2,
-                request_id=(
-                    DUMMY_DIFFUSION_REQUEST_ID if warmup_count == 1 else f"{DUMMY_DIFFUSION_REQUEST_ID}/owner-{index}"
-                ),
+                request_id=DUMMY_DIFFUSION_REQUEST_ID,
             )
-            for index in range(warmup_count)
+            for _ in range(1)
         ]
         requests = [request for request in requests if request is not None]
         if not requests:

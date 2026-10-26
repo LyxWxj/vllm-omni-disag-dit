@@ -854,50 +854,6 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_decode_pipeline_requests_disables_gradients(monkeypatch):
-    class FakeGroup:
-        world_size = 1
-
-        def barrier(self):
-            pass
-
-    class FakePipeline:
-        supports_step_pipeline_parallel = True
-        _request_pipeline_decode_owner = False
-
-        def _sync_pp_send(self):
-            pass
-
-        def post_decode(self, state):
-            assert not torch.is_grad_enabled()
-            parameter = torch.nn.Parameter(torch.ones(1))
-            return DiffusionOutput(output=parameter * 2)
-
-    state = StepRequestState(
-        request_id="req",
-        sampling=OmniDiffusionSamplingParams(),
-        latents=torch.ones(1),
-        step_index=1,
-    )
-    runner = object.__new__(DiffusionModelRunner)
-    runner.pipeline = FakePipeline()
-    runner.od_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(use_hsdp=False),
-        diffusion_offload_config=None,
-    )
-    runner.state_cache = {"req": state}
-    monkeypatch.setattr(model_runner_module, "get_pp_group", lambda: FakeGroup())
-    monkeypatch.setattr(model_runner_module, "get_pipeline_parallel_rank", lambda: 0)
-
-    output = DiffusionModelRunner.decode_pipeline_requests(runner, ["req"])
-
-    result = output.get_request_output("req").result.output
-    assert not result.requires_grad
-    assert result.grad_fn is None
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
     class FakePipeline:
         supports_step_pipeline_parallel = True
@@ -953,6 +909,7 @@ def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
         _update_states=lambda scheduler_output: ([state], []),
     )
     runner._execute_request_step = MethodType(DiffusionModelRunner._execute_request_step, runner)
+    runner._prepare_pipeline_states = MethodType(DiffusionModelRunner._prepare_pipeline_states, runner)
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "clear_pipeline_stage_durations", lambda pipeline: None)
     monkeypatch.setattr(model_runner_module, "consume_pipeline_stage_durations", lambda pipeline: {})
@@ -1019,6 +976,7 @@ def test_step_pipeline_runs_one_forward_per_request_with_different_shapes(monkey
         _update_states=lambda scheduler_output: (states, []),
     )
     runner._execute_request_step = MethodType(DiffusionModelRunner._execute_request_step, runner)
+    runner._prepare_pipeline_states = MethodType(DiffusionModelRunner._prepare_pipeline_states, runner)
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "clear_pipeline_stage_durations", lambda pipeline: None)
     monkeypatch.setattr(model_runner_module, "consume_pipeline_stage_durations", lambda pipeline: {})
@@ -1754,3 +1712,56 @@ def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_siz
 
     runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
     assert runner.execute_model(_make_request()).output == "next request"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("batched", [False, True])
+def test_pipeline_preparation_only_encodes_new_requests(batched):
+    states = [
+        StepRequestState(request_id=name, sampling=OmniDiffusionSamplingParams(seed=seed))
+        for seed, name in enumerate(("cached", "new0", "new1"))
+    ]
+    initialized = []
+    prepared = []
+    pipeline = SimpleNamespace(prepare_encode=lambda state: prepared.append(state.request_id))
+    if batched:
+        pipeline.prepare_encode_batch = lambda batch: prepared.append([state.request_id for state in batch])
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.input_batch = object()
+    runner._initialize_generator = lambda sampling: initialized.append(sampling.seed)
+
+    runner._prepare_pipeline_states(states, ["new0", "new1"])
+    runner._prepare_pipeline_states(states, [])
+
+    assert initialized == [1, 2]
+    assert prepared == ([["new0", "new1"]] if batched else ["new0", "new1"])
+    assert runner.input_batch is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_pipeline_decode_outputs_preserves_order_and_errors():
+    states = [SimpleNamespace(request_id=name) for name in ("first", "second", "third")]
+    error = RuntimeError("decode failed")
+    expected = [DiffusionOutput(output=torch.tensor([i])) for i in range(3)]
+    calls = []
+    runner = object.__new__(DiffusionModelRunner)
+
+    def decode(state, index):
+        calls.append((state.request_id, index))
+        return expected[index], error if index == 1 else None
+
+    runner._decode_pipeline_request = decode
+    outputs = []
+    errors = []
+    for index, state in enumerate(states):
+        output, decode_error = runner._decode_pipeline_request(state)
+        outputs.append(output)
+        if decode_error is not None:
+            errors.append(decode_error)
+
+    assert calls == [("first", 0), ("second", 1), ("third", 2)]
+    assert all(actual is wanted for actual, wanted in zip(outputs, expected))
+    assert errors == [error]

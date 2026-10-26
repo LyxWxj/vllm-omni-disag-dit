@@ -817,6 +817,9 @@ class Wan22Pipeline(
         )
         if has_image:
             raise ValueError("Wan request pipeline supports text-only T2V requests")
+        # Batch preparation may already have encoded this request's text.
+        if prompt_embeds is None:
+            prompt_embeds = state.prompt_embeds
         guidance_low, guidance_high = resolve_wan_guidance_scales(sampling, default_guidance_scale=4.0)
         do_true_cfg = guidance_low > 1.0 or guidance_high > 1.0
         if pp_group is not None and do_true_cfg:
@@ -917,38 +920,63 @@ class Wan22Pipeline(
         )
 
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
-        """Prepare one Wan T2V request and synchronize rank-local state."""
         del kwargs
+        self.prepare_encode_batch([state])
+        return state
+
+    def prepare_encode_batch(self, states: Sequence[StepRequestState]) -> None:
+        """Batch PP text encoding; keep RNG, latents and solver request-local."""
         pp_group = get_pp_group() if get_pipeline_parallel_world_size() > 1 else None
         local_error: Exception | None = None
         try:
-            self._prepare_encode_local(state, pp_group)
+            step_pp = bool(getattr(self.od_config, "step_execution", False))
+            if pp_group is not None and (pp_group.is_first_rank or step_pp) and len(states) > 1:
+                prompt_groups: dict[int, list[tuple[StepRequestState, str]]] = {}
+                for state in states:
+                    prompt, embeds, _, _, has_image = self._step_prompt_fields(state.prompt)
+                    if has_image:
+                        raise ValueError("Wan request pipeline supports text-only T2V requests")
+                    if embeds is None:
+                        if not prompt:
+                            raise ValueError("Prompt is required for Wan request pipeline")
+                        max_length = state.sampling.max_sequence_length or 512
+                        prompt_groups.setdefault(max_length, []).append((state, prompt))
+                for max_length, group in prompt_groups.items():
+                    embeds, _ = self.encode_prompt(
+                        prompt=[prompt for _, prompt in group],
+                        do_classifier_free_guidance=False,
+                        num_videos_per_prompt=1,
+                        max_sequence_length=max_length,
+                        device=self.device,
+                        dtype=self._step_model_dtype(),
+                    )
+                    for (state, _), embedding in zip(group, embeds.split(1)):
+                        state.prompt_embeds = embedding
+            for state in states:
+                self._prepare_encode_local(state, pp_group)
         except Exception as exc:
             local_error = exc
-        if pp_group is None:
+        if pp_group is None or getattr(self.od_config, "step_execution", False):
             if local_error is not None:
                 raise local_error
-            return state
-        if getattr(self.od_config, "step_execution", False):
-            if local_error is not None:
-                raise local_error
-            return state
+            return
+        # Agree on preparation failure before any rank enters tensor broadcast.
         status = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
         statuses: list[str | None] = [None] * pp_group.world_size
         torch.distributed.all_gather_object(statuses, status, group=pp_group.cpu_group)
         failures = [f"rank {rank}: {value}" for rank, value in enumerate(statuses) if value is not None]
         if failures:
             raise RuntimeError("Wan request-pipeline preparation failed: " + "; ".join(failures)) from local_error
-        broadcast = pp_group.broadcast_tensor_dict(
-            {"prompt_embeds": state.prompt_embeds, "latents": state.latents} if pp_group.is_first_rank else None,
-            src=0,
-        )
-        if broadcast is None:
-            raise RuntimeError("Wan request-pipeline conditioning broadcast returned no state")
-        state.prompt_embeds = broadcast["prompt_embeds"]
-        state.latents = broadcast["latents"]
-        state.txt_seq_lens = [int(state.prompt_embeds.shape[1])] * int(state.prompt_embeds.shape[0])
-        return state
+        for state in states:
+            broadcast = pp_group.broadcast_tensor_dict(
+                {"prompt_embeds": state.prompt_embeds, "latents": state.latents} if pp_group.is_first_rank else None,
+                src=0,
+            )
+            if broadcast is None:
+                raise RuntimeError("Wan request-pipeline conditioning broadcast returned no state")
+            state.prompt_embeds = broadcast["prompt_embeds"]
+            state.latents = broadcast["latents"]
+            state.txt_seq_lens = [int(state.prompt_embeds.shape[1])] * int(state.prompt_embeds.shape[0])
 
     def denoise_step(
         self,
