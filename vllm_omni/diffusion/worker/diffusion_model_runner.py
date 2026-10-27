@@ -1139,8 +1139,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         state: StepRequestState,
         *,
-        od_config: OmniDiffusionConfig,
-        attn_metadata: dict[str, Any],
         paged_kv_runtime: Any | None,
     ) -> None:
         """Run one request-step forward and its rank-local scheduler hook."""
@@ -1150,8 +1148,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         clear_pipeline_stage_durations(pipeline)
         with set_forward_context(
             vllm_config=self.vllm_config,
-            omni_diffusion_config=od_config,
-            attn_metadata=attn_metadata,
+            omni_diffusion_config=self.od_config,
+            attn_metadata={},
             paged_kv_runtime=paged_kv_runtime,
         ):
             noise_pred = pipeline.denoise_step(input_batch)
@@ -1267,8 +1265,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
-        *,
-        build_input_batch: bool = True,
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
         pipeline = self.pipeline
@@ -1357,7 +1353,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     continue
             prepared_states.append(state)
 
-        if not prepared_states or not build_input_batch:
+        if not prepared_states:
             return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
@@ -1442,8 +1438,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     state.latents = state.latents.resolve()
                 self._execute_request_step(
                     state,
-                    od_config=self.od_config,
-                    attn_metadata={},
                     paged_kv_runtime=paged_kv_runtime,
                 )
                 outputs.append(RunnerOutput(request_id=state.request_id, step_index=state.step_index, finished=False))

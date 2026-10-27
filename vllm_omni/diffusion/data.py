@@ -2027,13 +2027,11 @@ class AsyncOutputKind(Enum):
       continue in the background
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
-    * ``PIPELINE_STEP_DONE`` — last PP rank completed the step solver
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
-    PIPELINE_STEP_DONE = "pipeline_step_done"
 
 
 @dataclass

@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion import io_support
-from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, OmniDiffusionConfig
+from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
     DiffusionExecutionMode,
@@ -21,29 +21,10 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
-
-
-def test_pipeline_step_result_callback_does_not_block_before_loop_start() -> None:
-    engine = object.__new__(DiffusionEngine)
-    engine._rpc_lock = threading.RLock()
-    engine._cv = threading.Condition(engine._rpc_lock)
-    engine._loop_started = False
-    engine._pipeline_step_results = queue.Queue()
-    event = AsyncDiffusionOutput(kind=AsyncOutputKind.PIPELINE_STEP_DONE)
-    callback = threading.Thread(target=engine._notify_pipeline_step_result, args=(event,), daemon=True)
-
-    with engine._rpc_lock:
-        callback.start()
-        callback.join(timeout=1)
-        callback_blocked = callback.is_alive()
-
-    callback.join(timeout=1)
-    assert callback_blocked is False
-    assert callback.is_alive() is False
-    assert engine._pipeline_step_results.get_nowait() is event
 
 
 def test_rank_pipeline_completion_keeps_task_on_its_own_rank_queue() -> None:
@@ -73,17 +54,76 @@ def test_rank_pipeline_decode_releases_other_ranks_without_waiting() -> None:
     engine.executor.release_rank_step_requests.return_value = release_future
     engine.scheduler = StepScheduler()
     engine.scheduler.finish_pipeline_decode = Mock(return_value={"request-a"})
-    engine.scheduler.finish_pipeline_decode.return_value = {"request-a"}
-    engine._emit_outputs = Mock()
     engine._dispatch_pipeline_rank_tasks = Mock()
     output = Mock()
 
-    engine._handle_rank_pipeline_result(_RankPipelineResult(task.task_id, rank=1, output=output))
+    completion = engine._handle_rank_pipeline_result(_RankPipelineResult(task.task_id, rank=1, output=output))
 
     engine.executor.release_rank_step_requests.assert_called_once_with(["request-a"], 0)
     engine.executor.collective_rpc.assert_not_called()
     engine.scheduler.finish_pipeline_decode.assert_called_once_with(output, ["request-a"])
-    engine._emit_outputs.assert_called_once()
+    assert completion == (["request-a"], output, {"request-a"}, True)
+
+
+def test_pipeline_startup_uses_rank_queues_and_decodes_final_output() -> None:
+    scheduler = StepScheduler()
+    scheduler.initialize(
+        SimpleNamespace(
+            max_num_seqs=1,
+            step_execution=True,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        )
+    )
+    request = OmniDiffusionRequest(
+        prompt="warmup",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="warmup",
+    )
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+
+    def completed_future(value):
+        future = Future()
+        future.set_result(value)
+        return future
+
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = scheduler
+    engine._pipeline_scheduler_outputs = {}
+    engine._pipeline_step_results = queue.Queue()
+    engine._rank_pipeline_queues = [queue.Queue(), queue.Queue()]
+    engine._rank_pipeline_active = [None, None]
+    engine._cv = threading.Condition(threading.RLock())
+    engine._closed = False
+    engine._prepare_kv_for_forward = Mock()
+    engine._process_aborts_queue = Mock()
+    engine._release_pipeline_requests = Mock()
+    engine._emit_outputs = Mock()
+    engine._fail_engine = Mock()
+
+    def execute_rank_step(_scheduler_output, _rank):
+        return completed_future(
+            BatchRunnerOutput.from_list([RunnerOutput(request_id="warmup", step_index=1, finished=False)])
+        )
+
+    decode_output = BatchRunnerOutput.from_list(
+        [RunnerOutput(request_id="warmup", step_index=1, finished=True, result=DiffusionOutput(output="video"))]
+    )
+    engine.executor = Mock(
+        execute_rank_step=Mock(side_effect=execute_rank_step),
+        execute_rank_decode=Mock(return_value=completed_future(decode_output)),
+        release_rank_step_requests=Mock(return_value=completed_future(None)),
+    )
+
+    output, finished_ids = engine._execute_pipeline_step_synchronously(scheduler_output)
+
+    assert output.get_request_output("warmup").result.output == "video"
+    assert finished_ids == {"warmup"}
+    assert scheduler.get_request_state("warmup").is_finished()
+    assert engine.executor.execute_rank_step.call_count == 2
+    engine.executor.execute_rank_decode.assert_called_once_with("warmup")
+    engine._emit_outputs.assert_not_called()
+    engine._fail_engine.assert_not_called()
 
 
 @pytest.mark.parametrize("model_class_name", ["DreamZeroPipeline", "LingBotWorldCausalDMDPipeline"])

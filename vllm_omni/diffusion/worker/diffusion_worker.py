@@ -1722,8 +1722,6 @@ class WorkerProc:
             # entire decoded video -- would occupy accelerator memory for the
             # whole idle period on every rank that did not produce the reply.
             # The `collect_rank_status` branch above already returns None here.
-            if rpc_request.get("pipeline_completion_rank") == self.gpu_id:
-                return result, False
             return None, False
         return result, should_reply
 
@@ -1767,15 +1765,6 @@ class WorkerProc:
                 try:
                     rpc_id = msg.get("rpc_id")
                     result, should_reply = self._execute_rpc(msg)
-                    pipeline_step_id = msg.get("pipeline_step_id")
-                    if pipeline_step_id is not None and msg.get("pipeline_completion_rank") == self.gpu_id:
-                        self._enqueue_result(
-                            AsyncDiffusionOutput(
-                                kind=AsyncOutputKind.PIPELINE_STEP_DONE,
-                                async_output_id=pipeline_step_id,
-                                result=result,
-                            )
-                        )
                     if should_reply:
                         self._return_result(result, rpc_id=rpc_id, async_output=msg.get("async_output", False))
                 except Exception as e:
@@ -1789,27 +1778,7 @@ class WorkerProc:
                     exec_all_ranks = msg.get("exec_all_ranks", False)
                     wave_id = msg.get("wave_id")
                     if self.result_mq is not None:
-                        is_pipeline_completion = (
-                            msg.get("pipeline_step_id") is not None
-                            and msg.get("pipeline_completion_rank") == self.gpu_id
-                        )
-                        if is_pipeline_completion:
-                            self._enqueue_result(
-                                AsyncDiffusionOutput(
-                                    kind=AsyncOutputKind.PIPELINE_STEP_DONE,
-                                    async_output_id=msg["pipeline_step_id"],
-                                    error=error,
-                                )
-                            )
-                        elif msg.get("pipeline_step_id") is not None and output_rank == self.gpu_id:
-                            self._enqueue_result(
-                                AsyncDiffusionOutput(
-                                    kind=AsyncOutputKind.RPC_RESULT,
-                                    async_output_id=msg["pipeline_step_id"],
-                                    error=error,
-                                )
-                            )
-                        elif rpc_id is not None and msg.get("output_rank") == self.gpu_id:
+                        if rpc_id is not None and msg.get("output_rank") == self.gpu_id:
                             # Async RPC: must complete the executor's pending
                             # future so collective_rpc() doesn't hang.
                             self._enqueue_result(

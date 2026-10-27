@@ -218,7 +218,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # When pumps are active they are the sole readers of the worker result
         # queues; non-async messages are placed here for collective_rpc().
         self._sync_result_buffer: queue.Queue = queue.Queue()
-        self._pipeline_step_callback: Callable[[AsyncDiffusionOutput], None] | None = None
         if not self.od_config.step_execution or self._step_pipeline_parallel_enabled():
             self._start_result_pump()
 
@@ -803,23 +802,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
-    def execute_step_pipeline(self, scheduler_output: DiffusionSchedulerOutput) -> None:
-        """Broadcast one pipeline step; the Engine owns its completion state."""
-        self._ensure_open()
-        pipeline_step_id = str(scheduler_output.step_id)
-        request = {
-            "type": "rpc",
-            "method": "execute_stepwise",
-            "args": (scheduler_output,),
-            "kwargs": {},
-            "output_rank": 0,
-            "exec_all_ranks": True,
-            "collect_rank_status": False,
-            "pipeline_step_id": pipeline_step_id,
-            "pipeline_completion_rank": self.od_config.parallel_config.pipeline_parallel_size - 1,
-        }
-        self._broadcast_mq.enqueue(request)  # pyright: ignore[reportOptionalMemberAccess]
-
     def execute_rank_step(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -899,31 +881,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         rpc_future.add_done_callback(complete_decode)
         self._broadcast_mq.enqueue(request)  # pyright: ignore[reportOptionalMemberAccess]
         return output_future
-
-    def set_pipeline_step_callback(self, callback: Callable[[AsyncDiffusionOutput], None]) -> None:
-        self._pipeline_step_callback = callback
-
-    def decode_pipeline_requests(self, request_ids: list[str]) -> BaseRunnerOutput:
-        """Run the decode cohort on the final PP rank and return its output."""
-        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
-
-        try:
-            last_rank = self.od_config.parallel_config.pipeline_parallel_size - 1
-            result = self.collective_rpc(
-                "decode_pipeline_requests",
-                args=(request_ids,),
-                unique_reply_rank=last_rank,
-                exec_all_ranks=False,
-                timeout=_DLO_DP_WAVE_TIMEOUT_S,
-            )
-        except TimeoutError as exc:
-            self._fail_closed_on_dp_wave_timeout(exc)
-            raise
-        if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
-            return self._async_batch_runner_output(result, request_ids, require_step_metadata=True)
-        if isinstance(result, BaseRunnerOutput):
-            return result
-        raise RuntimeError(f"Unexpected response type for pipeline decode: {type(result)!r}")
 
     def collective_rpc(
         self,
@@ -1088,7 +1045,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         Dispatches AsyncDiffusionOutput messages to the appropriate future:
         * RPC_RESULT / COMPUTE_DONE → _rpc_futures[rpc_id]
         * OUTPUT_READY → _output_futures[async_output_id]
-        * Step-PP events → the Engine callback
+        * rank-targeted RPCs → their registered Future
         """
         result_mq = result_mq or self._result_mq
         if result_mq is None:
@@ -1131,12 +1088,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         try_set_exception(fut, RuntimeError(msg.error))
                     else:
                         try_set_result(fut, msg)
-                elif msg.kind == AsyncOutputKind.RPC_RESULT and msg.async_output_id:
-                    if self._pipeline_step_callback is not None:
-                        self._pipeline_step_callback(msg)
-            elif msg.kind == AsyncOutputKind.PIPELINE_STEP_DONE:
-                if self._pipeline_step_callback is not None:
-                    self._pipeline_step_callback(msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
                 batch_id = msg.async_output_id
                 with self._futures_lock:

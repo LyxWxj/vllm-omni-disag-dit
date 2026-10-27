@@ -387,45 +387,44 @@ class TestBatchSplitDelivery:
 
 
 class TestStepPipelineAsyncDecode:
-    def test_decode_pipeline_returns_async_per_request_outputs(self):
+    def test_rank_decode_returns_async_per_request_output(self):
         executor = _make_executor(step_execution=True)
         executor.od_config.parallel_config.pipeline_parallel_size = 2
         executor._ensure_open = lambda: None
-        request_ids = ["r0", "r1"]
+        requests = []
+        executor._broadcast_mq = SimpleNamespace(enqueue=requests.append)
+        future = executor.execute_rank_decode("r0")
+        request = requests[0]
+
+        assert request["method"] == "decode_pipeline_requests"
+        assert request["args"] == (["r0"],)
+        assert request["output_rank"] == 1
+        assert request["async_output"] is True
+
         completion = AsyncDiffusionOutput(
             kind=AsyncOutputKind.COMPUTE_DONE,
-            rpc_id="rpc-1",
+            rpc_id=request["rpc_id"],
             async_output_id="decode-1",
-            result=(("r0", 4, True), ("r1", 6, True)),
+            result=(("r0", 4, True),),
         )
-        call = {}
+        _feed_one_msg_to_pump(executor, completion)
+        output = future.result(timeout=1.0)
+        item = output.get_request_output("r0")
+        assert item.step_index == 4
+        assert item.finished is True
+        assert item.async_output_id == "decode-1/r0"
 
-        def fake_collective_rpc(*args, **kwargs):
-            call.update(kwargs)
-            return completion
-
-        executor.collective_rpc = fake_collective_rpc
-        output = executor.decode_pipeline_requests(request_ids)
-
-        assert call["async_output"] is True
-        assert [output.get_request_output(rid).step_index for rid in request_ids] == [4, 6]
-        assert [output.get_request_output(rid).finished for rid in request_ids] == [True, True]
-        assert [output.get_request_output(rid).async_output_id for rid in request_ids] == [
-            "decode-1/r0",
-            "decode-1/r1",
-        ]
-
-        decoded = {rid: DiffusionOutput(output=f"video-{rid}") for rid in request_ids}
+        decoded = {"r0": DiffusionOutput(output="video-r0")}
         ready = AsyncDiffusionOutput(
             kind=AsyncOutputKind.OUTPUT_READY,
             async_output_id="decode-1",
             output=_FakeBatchOutput(decoded),
         )
+        executor._pump_stop.clear()
         _feed_one_msg_to_pump(executor, ready)
-        for rid in request_ids:
-            future = executor.wait_output_ready(f"decode-1/{rid}")
-            assert future.done()
-            assert future.result(timeout=1.0) is decoded[rid]
+        output_future = executor.wait_output_ready("decode-1/r0")
+        assert output_future.done()
+        assert output_future.result(timeout=1.0) is decoded["r0"]
 
     def test_step_pipeline_collective_rpc_returns_on_compute_done(self):
         executor = _make_executor(step_execution=True)

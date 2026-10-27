@@ -18,7 +18,7 @@ import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
@@ -285,42 +285,20 @@ class TestAsyncPipelineDispatch:
         executor._rpc_futures = {}
         executor._rpc_id_counter = 0
         executor._rpc_id_lock = threading.Lock()
-        executor._pipeline_step_callback = Mock()
         return executor, req_q
 
-    def test_dispatch_returns_before_rank0_reply(self):
+    def test_rank_step_dispatch_targets_rank_and_tracks_rpc_future(self):
         executor, req_q = self._executor()
+        executor._ensure_open = lambda: None
 
-        executor.execute_step_pipeline(_make_sched_output("A"))
+        future = executor.execute_rank_step(_make_sched_output("A"), rank=1)
 
         request = req_q.get_nowait()
-        assert request["pipeline_step_id"] == "0"
-        assert request["pipeline_completion_rank"] == 1
-        assert "rpc_id" not in request
-        assert executor._rpc_futures == {}
-        executor._pipeline_step_callback.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "kind",
-        [AsyncOutputKind.PIPELINE_STEP_DONE, AsyncOutputKind.RPC_RESULT],
-    )
-    def test_pipeline_events_are_forwarded_to_engine(self, kind):
-        executor, _, result_q = _make_executor(num_gpus=2)
-        executor._closed = False
-        executor._pump_stop = threading.Event()
-        executor._futures_lock = threading.RLock()
-        executor._rpc_futures = {}
-        executor._pipeline_step_callback = Mock(side_effect=lambda _: executor._pump_stop.set())
-        event = AsyncDiffusionOutput(
-            kind=kind,
-            async_output_id="0",
-            error="stage failed" if kind == AsyncOutputKind.RPC_RESULT else None,
-        )
-        result_q.put(event)
-
-        executor._result_pump()
-
-        executor._pipeline_step_callback.assert_called_once_with(event)
+        assert request["method"] == "execute_stepwise"
+        assert request["output_rank"] == 1
+        assert request["exec_all_ranks"] is False
+        assert request["rpc_id"] in executor._rpc_futures
+        assert executor._rpc_futures[request["rpc_id"]] is future
 
 
 class TestRequestModeDispatch:
