@@ -9,6 +9,7 @@ real multi-GPU NCCL collectives.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -446,6 +447,26 @@ class TestVaeDecodeGuard:
 
         assert pipeline.vae.decode.__name__ == "decode"
         assert pipeline.vae.decode.__doc__ == "Original decode docstring."
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_step_pipeline_decodes_only_on_last_rank(monkeypatch, rank):
+    pipeline = TestVaeDecodeGuard._make_pipeline()
+    pipeline.od_config = SimpleNamespace(step_execution=True)
+    monkeypatch.setattr(pp_module, "is_pipeline_last_stage", lambda: rank == 2)
+    monkeypatch.setattr(pp_module, "is_pipeline_first_stage", lambda: rank == 0)
+    z = torch.ones(2, 3)
+
+    result = pipeline.vae.decode(z)
+
+    assert pipeline.vae.calls == int(rank == 2)
+    if rank == 2:
+        torch.testing.assert_close(result[0], z + 1)
+    else:
+        assert result == (None,)
 
 
 @pytest.mark.core_model

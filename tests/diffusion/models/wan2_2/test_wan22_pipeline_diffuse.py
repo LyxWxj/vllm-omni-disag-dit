@@ -18,6 +18,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, bui
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -215,6 +216,37 @@ def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: 
         else:
             reference.set_timesteps(5, device="cpu")
         torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize("supplied_embeds", [False, True])
+def test_step_prepare_is_rank_local_and_preserves_seed(monkeypatch, mocker, rank, supplied_embeds) -> None:
+    pipeline = _make_pipeline()
+    pipeline.has_transformer_2 = False
+    pipeline.od_config.step_execution = True
+    pipeline.encode_prompt = mocker.Mock(side_effect=_stub_encode_prompt)
+    del pipeline.prepare_latents  # Exercise the real seeded latent initialization.
+    group = SimpleNamespace(world_size=3, rank_in_group=rank)
+    monkeypatch.setattr("vllm_omni.diffusion.distributed.parallel_state._PP", group)
+    prompt = {"prompt_embeds": torch.ones(4, 8)} if supplied_embeds else "a prompt"
+    sampling = OmniDiffusionSamplingParams(
+        height=32,
+        width=32,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        guidance_scale_provided=True,
+        generator=torch.Generator().manual_seed(42),
+    )
+    state = StepRequestState(request_id="step", prompt=prompt, sampling=sampling)
+
+    assert pipeline.prepare_encode(state) is state
+
+    expected_latents = torch.randn(1, 4, 2, 4, 4, generator=torch.Generator().manual_seed(42))
+    torch.testing.assert_close(state.latents, expected_latents, rtol=0, atol=0)
+    assert len(state.timesteps) == 2
+    assert pipeline.encode_prompt.call_count == (0 if supplied_embeds else 1)
+    assert state.prompt_embeds.shape[-1] == 8
 
 
 def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:

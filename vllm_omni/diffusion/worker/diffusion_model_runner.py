@@ -44,8 +44,6 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
-    get_pipeline_parallel_rank,
-    get_pp_group,
 )
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents
 from vllm_omni.diffusion.forward_context import set_forward_context
@@ -324,19 +322,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if step_pipeline_parallel:
             if self.od_config.cache_backend not in (None, "none"):
                 raise ValueError("Step-PP does not support cache backends")
-            if (
-                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-                is DiffusionKVCacheMode.PAGED_SCHEDULER
-            ):
-                raise ValueError("Step-PP does not support paged diffusion KV")
-        if step_pipeline_parallel:
-            if self.od_config.streaming_output:
-                raise ValueError("Step-PP does not support streaming output")
-            omni_kv = getattr(self.od_config, "omni_kv_config", None) or {}
-            if getattr(self.od_config, "kv_transfer_config", None) is not None or any(
-                omni_kv.get(key, False) for key in ("need_send_cache", "need_recv_cache")
-            ):
-                raise ValueError("Step-PP does not support diffusion KV transfer")
 
         if load_format == "dummy":
             return
@@ -784,16 +769,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             )
         return output
 
-    @staticmethod
-    def _mark_pp_video_output(output: DiffusionOutput, sampling: OmniDiffusionSamplingParams) -> None:
-        if (
-            isinstance(output.output, torch.Tensor)
-            and output.output.ndim == 5
-            and sampling.output_type != "latent"
-            and sampling.num_frames > 1
-        ):
-            output.video_output_index = 0
-
     def _runner_output_from_outputs(
         self,
         reqs: list[OmniDiffusionRequest],
@@ -1135,27 +1110,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
 
-    def _execute_request_step(
-        self,
-        state: StepRequestState,
-        *,
-        paged_kv_runtime: Any | None,
-    ) -> None:
-        """Run one request-step forward and its rank-local scheduler hook."""
-        pipeline = self.pipeline
-        assert pipeline is not None
-        input_batch = InputBatch.make_batch((state,))
-        clear_pipeline_stage_durations(pipeline)
-        with set_forward_context(
-            vllm_config=self.vllm_config,
-            omni_diffusion_config=self.od_config,
-            attn_metadata={},
-            paged_kv_runtime=paged_kv_runtime,
-        ):
-            noise_pred = pipeline.denoise_step(input_batch)
-        merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
-        pipeline.step_scheduler(state, noise_pred)
-
     # ------------------------------------------------------------------
     # Step-wise execution
     # ------------------------------------------------------------------
@@ -1422,9 +1376,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         outputs: list[RunnerOutput] = []
-        kv_backend = getattr(self, "diffusion_kv_backend", None)
-        paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
-
         with grad_context:
             for state in states:
                 if state.request_id in new_request_id_set:
@@ -1436,57 +1387,43 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             for state in states:
                 if isinstance(state.latents, AsyncLatents):
                     state.latents = state.latents.resolve()
-                self._execute_request_step(
-                    state,
-                    paged_kv_runtime=paged_kv_runtime,
-                )
+                input_batch = InputBatch.make_batch((state,))
+                clear_pipeline_stage_durations(pipeline)
+                with set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata={},
+                ):
+                    noise_pred = pipeline.denoise_step(input_batch)
+                merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
+                pipeline.step_scheduler(state, noise_pred)
                 outputs.append(RunnerOutput(request_id=state.request_id, step_index=state.step_index, finished=False))
 
         return BatchRunnerOutput.from_list(outputs)
 
-    def decode_pipeline_requests(self, request_ids: list[str]) -> BatchRunnerOutput:
-        """Decode the cohort locally on the final PP rank."""
+    def decode_pipeline_request(self, request_id: str) -> BatchRunnerOutput:
+        """Decode one completed request on the final PP rank."""
         pipeline = self.pipeline
         assert pipeline is not None
-        pp_rank = get_pipeline_parallel_rank()
-        last_rank = get_pp_group().world_size - 1
-        if pp_rank != last_rank:
-            raise RuntimeError(f"Pipeline decode must run on last rank {last_rank}, got rank {pp_rank}")
-        states = [self.state_cache[request_id] for request_id in request_ids]
+        state = self.state_cache[request_id]
         use_hsdp = self.od_config.parallel_config.use_hsdp
         use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
 
         with grad_context:
             pipeline._sync_pp_send()
-            outputs: list[RunnerOutput] = []
-            for state in states:
-                previous_owner = getattr(pipeline, "_pipeline_decode_owner", None)
-                pipeline._pipeline_decode_owner = True
-                try:
-                    clear_pipeline_stage_durations(pipeline)
-                    output = pipeline.post_decode(state) or DiffusionOutput()
-                    self._mark_pp_video_output(output, state.sampling)
-                    output = self._prepare_output_for_transport(output, state.sampling)
-                    attach_stage_durations(state, output)
-                except Exception as exc:
-                    output = DiffusionOutput.from_exception(exc)
-                finally:
-                    if previous_owner is None:
-                        delattr(pipeline, "_pipeline_decode_owner")
-                    else:
-                        pipeline._pipeline_decode_owner = previous_owner
-                outputs.append(
-                    RunnerOutput(
-                        request_id=state.request_id,
-                        step_index=state.step_index,
-                        finished=True,
-                        result=output,
-                    )
-                )
+            try:
+                clear_pipeline_stage_durations(pipeline)
+                output = pipeline.post_decode(state) or DiffusionOutput()
+                output = self._prepare_output_for_transport(output, state.sampling)
+                attach_stage_durations(state, output)
+            except Exception as exc:
+                output = DiffusionOutput.from_exception(exc)
 
-        self.release_step_requests(request_ids)
-        return BatchRunnerOutput.from_list(outputs)
+        self.release_step_requests([request_id])
+        return BatchRunnerOutput.from_list(
+            [RunnerOutput(request_id=request_id, step_index=state.step_index, finished=True, result=output)]
+        )
 
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""

@@ -214,7 +214,6 @@ class _RankPipelineTask:
     task_id: str
     request_id: str
     scheduler_output: DiffusionSchedulerOutput | None
-    is_decode: bool = False
     started_at: float = 0.0
 
 
@@ -880,7 +879,7 @@ class DiffusionEngine:
                 self._fail_engine(TimeoutError("Timed out waiting for the last pipeline rank"))
                 break
         if any(
-            task is not None and task.is_decode and now - task.started_at >= timeout
+            task is not None and task.scheduler_output is None and now - task.started_at >= timeout
             for task in self._rank_pipeline_active
         ):
             self._fail_engine(TimeoutError("Timed out waiting for Step-PP decode"))
@@ -929,10 +928,9 @@ class DiffusionEngine:
             task.started_at = time.monotonic()
             self._rank_pipeline_active[rank] = task
             try:
-                if task.is_decode:
+                if task.scheduler_output is None:
                     future = self.executor.execute_rank_decode(task.request_id)
                 else:
-                    assert task.scheduler_output is not None
                     future = self.executor.execute_rank_step(task.scheduler_output, rank)
             except Exception as exc:
                 self._pipeline_step_results.put(_RankPipelineResult(task.task_id, rank, error=str(exc)))
@@ -967,8 +965,10 @@ class DiffusionEngine:
                 )
             else:
                 self._pipeline_step_results.put(_RankPipelineResult(task.task_id, rank, output=output))
-        with self._cv:
-            self._cv.notify_all()
+        # Startup consumes the queue directly while holding the Engine lock.
+        if self._loop_started:
+            with self._cv:
+                self._cv.notify_all()
 
     def _wait_for_pipeline_step_result(self) -> None:
         with self._cv:
@@ -984,7 +984,7 @@ class DiffusionEngine:
             return None
         self._rank_pipeline_active[rank] = None
         if event.error is not None:
-            if task.is_decode:
+            if task.scheduler_output is None:
                 assert isinstance(self.scheduler, StepScheduler)
                 request_ids = [task.request_id]
                 self._release_pipeline_requests_async(request_ids)
@@ -999,7 +999,7 @@ class DiffusionEngine:
                     completion = scheduler_output.scheduled_request_ids, output, finished_ids, True
             self._dispatch_pipeline_rank_tasks()
             return completion
-        if task.is_decode:
+        if task.scheduler_output is None:
             assert isinstance(self.scheduler, StepScheduler)
             request_ids = [task.request_id]
             self._release_pipeline_requests_async(request_ids, include_last_rank=False)
@@ -1018,7 +1018,7 @@ class DiffusionEngine:
         scheduler_output, output, finished_ids = committed
         assert isinstance(self.scheduler, StepScheduler)
         if task.request_id in self.scheduler.pipeline_decode_pending():
-            decode_task = _RankPipelineTask(f"decode:{task.task_id}", task.request_id, None, True)
+            decode_task = _RankPipelineTask(f"decode:{task.task_id}", task.request_id, None)
             self._rank_pipeline_queues[rank].put_nowait(decode_task)
         self._dispatch_pipeline_rank_tasks()
         return scheduler_output.scheduled_request_ids, output, finished_ids, True
@@ -1108,12 +1108,6 @@ class DiffusionEngine:
     ) -> tuple[BaseRunnerOutput, set[str]]:
         """Run startup work through the same rank queues as the Engine loop."""
         assert isinstance(self.scheduler, StepScheduler)
-        rank_count = len(self._rank_pipeline_queues)
-        pending_ranks = {
-            f"{scheduler_output.step_id}:{request_id}": set(range(rank_count))
-            for request_id in scheduler_output.scheduled_request_ids
-        }
-        pending_decodes: set[str] = set()
         runner_outputs: dict[str, RunnerOutput] = {}
         finished_ids: set[str] = set()
         try:
@@ -1125,26 +1119,13 @@ class DiffusionEngine:
             output = self._pipeline_error_output(scheduler_output.scheduled_request_ids, exc)
             return output, self.scheduler.update_from_output(scheduler_output, output)
 
-        while pending_ranks or pending_decodes:
+        while any(self._rank_pipeline_active) or any(not tasks.empty() for tasks in self._rank_pipeline_queues):
             try:
                 event = self._pipeline_step_results.get(timeout=_async_output_timeout())
             except queue.Empty as exc:
                 error = TimeoutError("Timed out waiting for Step-PP startup tasks")
                 self._fail_engine(error)
                 raise error from exc
-
-            task = self._rank_pipeline_active[event.rank]
-            if task is None or task.task_id != event.task_id:
-                continue
-
-            if task.is_decode:
-                pending_decodes.discard(task.task_id)
-            else:
-                ranks = pending_ranks.get(task.task_id)
-                if ranks is not None:
-                    ranks.discard(event.rank)
-                    if not ranks:
-                        pending_ranks.pop(task.task_id)
 
             completion = self._handle_rank_pipeline_result(event)
             if completion is None:
@@ -1155,14 +1136,6 @@ class DiffusionEngine:
                 request_output = output.get_request_output(request_id)
                 if request_output is not None:
                     runner_outputs[request_id] = request_output
-            if (
-                not task.is_decode
-                and event.error is None
-                and event.rank == rank_count - 1
-                and task.request_id in self.scheduler.pipeline_decode_pending()
-            ):
-                pending_decodes.add(f"decode:{task.task_id}")
-
         ordered_outputs = [runner_outputs[request_id] for request_id in scheduler_output.scheduled_request_ids]
         return BatchRunnerOutput.from_list(ordered_outputs), finished_ids
 

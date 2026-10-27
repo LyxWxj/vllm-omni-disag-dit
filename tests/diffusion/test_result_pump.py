@@ -387,27 +387,35 @@ class TestBatchSplitDelivery:
 
 
 class TestStepPipelineAsyncDecode:
-    def test_rank_decode_returns_async_per_request_output(self):
+    @pytest.mark.parametrize("deliver_early", [False, True])
+    def test_rank_decode_returns_async_per_request_output(self, deliver_early):
         executor = _make_executor(step_execution=True)
         executor.od_config.parallel_config.pipeline_parallel_size = 2
         executor._ensure_open = lambda: None
         requests = []
-        executor._broadcast_mq = SimpleNamespace(enqueue=requests.append)
-        future = executor.execute_rank_decode("r0")
-        request = requests[0]
-
-        assert request["method"] == "decode_pipeline_requests"
-        assert request["args"] == (["r0"],)
-        assert request["output_rank"] == 1
-        assert request["async_output"] is True
-
         completion = AsyncDiffusionOutput(
             kind=AsyncOutputKind.COMPUTE_DONE,
-            rpc_id=request["rpc_id"],
+            rpc_id="1",
             async_output_id="decode-1",
             result=(("r0", 4, True),),
         )
-        _feed_one_msg_to_pump(executor, completion)
+
+        def enqueue(request):
+            requests.append(request)
+            if deliver_early:
+                _feed_one_msg_to_pump(executor, completion)
+
+        executor._broadcast_mq = SimpleNamespace(enqueue=enqueue)
+        future = executor.execute_rank_decode("r0")
+        request = requests[0]
+
+        assert request["method"] == "decode_pipeline_request"
+        assert request["args"] == ("r0",)
+        assert request["output_rank"] == 1
+        assert request["async_output"] is True
+
+        if not deliver_early:
+            _feed_one_msg_to_pump(executor, completion)
         output = future.result(timeout=1.0)
         item = output.get_request_output("r0")
         assert item.step_index == 4
@@ -425,32 +433,6 @@ class TestStepPipelineAsyncDecode:
         output_future = executor.wait_output_ready("decode-1/r0")
         assert output_future.done()
         assert output_future.result(timeout=1.0) is decoded["r0"]
-
-    def test_step_pipeline_collective_rpc_returns_on_compute_done(self):
-        executor = _make_executor(step_execution=True)
-        executor._ensure_open = lambda: None
-        completion = AsyncDiffusionOutput(
-            kind=AsyncOutputKind.COMPUTE_DONE,
-            rpc_id="1",
-            async_output_id="decode-1",
-        )
-        requests = []
-
-        def enqueue(request):
-            requests.append(request)
-            _feed_one_msg_to_pump(executor, completion)
-
-        executor._broadcast_mq = SimpleNamespace(enqueue=enqueue)
-        result = executor.collective_rpc(
-            "decode_pipeline_requests",
-            unique_reply_rank=0,
-            exec_all_ranks=True,
-            async_output=True,
-        )
-
-        assert result is completion
-        assert requests[0]["async_output"] is True
-        assert requests[0]["rpc_id"] == "1"
 
 
 class TestShutdownCleansUpFutures:

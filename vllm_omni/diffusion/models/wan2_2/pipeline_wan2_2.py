@@ -23,7 +23,7 @@ from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_world_size, get_pp_group
+from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_world_size
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
@@ -775,7 +775,6 @@ class Wan22Pipeline(
         num_frames: int,
         generator: torch.Generator | list[torch.Generator] | None,
         request_latents: torch.Tensor | None,
-        pp_group: Any | None,
     ) -> torch.Tensor:
         expected_shape = (
             batch_size,
@@ -790,22 +789,20 @@ class Wan22Pipeline(
             raise ValueError(
                 f"Wan request latents have shape {tuple(request_latents.shape)}, expected {expected_shape}."
             )
-        queued_step_pp = bool(getattr(self.od_config, "step_execution", False) and pp_group is not None)
-        if pp_group is None or pp_group.is_first_rank or queued_step_pp:
-            return self.prepare_latents(
-                batch_size=batch_size,
-                num_channels_latents=self.transformer_config.in_channels,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                dtype=torch.float32,
-                device=self.device,
-                generator=generator,
-                latents=request_latents,
-            )
-        return torch.empty(expected_shape, dtype=torch.float32, device=self.device)
+        return self.prepare_latents(
+            batch_size=batch_size,
+            num_channels_latents=self.transformer_config.in_channels,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            dtype=torch.float32,
+            device=self.device,
+            generator=generator,
+            latents=request_latents,
+        )
 
-    def _prepare_encode_local(self, state: StepRequestState, pp_group: Any | None) -> None:
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        """Prepare one Wan T2V request independently on each rank."""
         if self.is_dmd:
             raise ValueError("Wan request pipeline does not support DMD checkpoints")
         if self.has_transformer_2 or self.transformer_2 is not None:
@@ -818,74 +815,53 @@ class Wan22Pipeline(
             raise ValueError("Wan request pipeline supports text-only T2V requests")
         guidance_low, guidance_high = resolve_wan_guidance_scales(sampling, default_guidance_scale=4.0)
         do_true_cfg = guidance_low > 1.0 or guidance_high > 1.0
-        if pp_group is not None and do_true_cfg:
+        if get_pipeline_parallel_world_size() > 1 and do_true_cfg:
             raise ValueError("Wan PP step execution does not support true CFG")
         height, width, num_frames = self._prepare_generation_geometry(sampling)
         num_outputs = sampling.num_outputs_per_prompt or 1
-        if prompt_embeds is None:
-            batch_size = num_outputs
-        elif prompt_embeds.ndim == 2:
-            batch_size = num_outputs
-        elif prompt_embeds.ndim == 3:
-            batch_size = int(prompt_embeds.shape[0]) * num_outputs
-        else:
+        if prompt_embeds is not None and prompt_embeds.ndim not in (2, 3):
             raise ValueError("Wan prompt_embeds must be a 2D or 3D tensor")
         dtype = self._step_model_dtype()
-        queued_step_pp = bool(getattr(self.od_config, "step_execution", False) and pp_group is not None)
-        owner = pp_group is None or pp_group.is_first_rank or queued_step_pp
-        if owner:
-            if prompt_embeds is None:
-                if not prompt:
-                    raise ValueError("Prompt is required for Wan request pipeline")
-                prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                    prompt=[prompt],
-                    negative_prompt=[negative_prompt or ""] if do_true_cfg else None,
-                    do_classifier_free_guidance=do_true_cfg,
+        if prompt_embeds is None:
+            if not prompt:
+                raise ValueError("Prompt is required for Wan request pipeline")
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt=[prompt],
+                negative_prompt=[negative_prompt or ""] if do_true_cfg else None,
+                do_classifier_free_guidance=do_true_cfg,
+                num_videos_per_prompt=num_outputs,
+                max_sequence_length=sampling.max_sequence_length or 512,
+                device=self.device,
+                dtype=dtype,
+            )
+        else:
+            prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
+            if prompt_embeds.ndim == 2:
+                prompt_embeds = prompt_embeds.unsqueeze(0)
+            prompt_embeds = prompt_embeds.repeat_interleave(num_outputs, dim=0)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=dtype)
+                if negative_prompt_embeds.ndim == 2:
+                    negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs, dim=0)
+            elif do_true_cfg:
+                _, negative_prompt_embeds = self.encode_prompt(
+                    prompt=[""] * max(1, int(prompt_embeds.shape[0]) // num_outputs),
+                    negative_prompt=[negative_prompt or ""] * max(1, int(prompt_embeds.shape[0]) // num_outputs),
+                    do_classifier_free_guidance=True,
                     num_videos_per_prompt=num_outputs,
                     max_sequence_length=sampling.max_sequence_length or 512,
                     device=self.device,
                     dtype=dtype,
                 )
-            else:
-                prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
-                if prompt_embeds.ndim == 2:
-                    prompt_embeds = prompt_embeds.unsqueeze(0)
-                prompt_embeds = prompt_embeds.repeat_interleave(num_outputs, dim=0)
-                if negative_prompt_embeds is not None:
-                    negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=dtype)
-                    if negative_prompt_embeds.ndim == 2:
-                        negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
-                    negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs, dim=0)
-                elif do_true_cfg:
-                    _, negative_prompt_embeds = self.encode_prompt(
-                        prompt=[""] * max(1, int(prompt_embeds.shape[0]) // num_outputs),
-                        negative_prompt=[negative_prompt or ""] * max(1, int(prompt_embeds.shape[0]) // num_outputs),
-                        do_classifier_free_guidance=True,
-                        num_videos_per_prompt=num_outputs,
-                        max_sequence_length=sampling.max_sequence_length or 512,
-                        device=self.device,
-                        dtype=dtype,
-                    )
-            latents = self._prepare_step_latents(
-                batch_size=int(prompt_embeds.shape[0]),
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                generator=sampling.generator,
-                request_latents=sampling.latents,
-                pp_group=pp_group,
-            )
-        else:
-            prompt_embeds = None
-            latents = self._prepare_step_latents(
-                batch_size=batch_size,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                generator=None,
-                request_latents=None,
-                pp_group=pp_group,
-            )
+        latents = self._prepare_step_latents(
+            batch_size=int(prompt_embeds.shape[0]),
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            generator=sampling.generator,
+            request_latents=sampling.latents,
+        )
 
         scheduler, timesteps = self._prepare_request_scheduler(
             sampling,
@@ -898,55 +874,13 @@ class Wan22Pipeline(
         state.step_index = 0
         state.scheduler = scheduler
         state.do_true_cfg = do_true_cfg
-        state.txt_seq_lens = (
-            [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0]) if prompt_embeds is not None else None
-        )
+        state.txt_seq_lens = [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
         state.negative_txt_seq_lens = (
             [int(negative_prompt_embeds.shape[1])] * int(negative_prompt_embeds.shape[0])
             if do_true_cfg and negative_prompt_embeds is not None
             else None
         )
-        state.extra.update(
-            {
-                "wan_boundary_timestep": None,
-                "wan_dtype": dtype,
-                "wan_guidance_low": guidance_low,
-                "wan_guidance_high": guidance_high,
-            }
-        )
-
-    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
-        """Prepare one Wan T2V request and synchronize rank-local state."""
-        del kwargs
-        pp_group = get_pp_group() if get_pipeline_parallel_world_size() > 1 else None
-        local_error: Exception | None = None
-        try:
-            self._prepare_encode_local(state, pp_group)
-        except Exception as exc:
-            local_error = exc
-        if pp_group is None:
-            if local_error is not None:
-                raise local_error
-            return state
-        if getattr(self.od_config, "step_execution", False):
-            if local_error is not None:
-                raise local_error
-            return state
-        status = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
-        statuses: list[str | None] = [None] * pp_group.world_size
-        torch.distributed.all_gather_object(statuses, status, group=pp_group.cpu_group)
-        failures = [f"rank {rank}: {value}" for rank, value in enumerate(statuses) if value is not None]
-        if failures:
-            raise RuntimeError("Wan request-pipeline preparation failed: " + "; ".join(failures)) from local_error
-        broadcast = pp_group.broadcast_tensor_dict(
-            {"prompt_embeds": state.prompt_embeds, "latents": state.latents} if pp_group.is_first_rank else None,
-            src=0,
-        )
-        if broadcast is None:
-            raise RuntimeError("Wan request-pipeline conditioning broadcast returned no state")
-        state.prompt_embeds = broadcast["prompt_embeds"]
-        state.latents = broadcast["latents"]
-        state.txt_seq_lens = [int(state.prompt_embeds.shape[1])] * int(state.prompt_embeds.shape[0])
+        state.extra["wan_guidance_low"] = guidance_low
         return state
 
     def denoise_step(

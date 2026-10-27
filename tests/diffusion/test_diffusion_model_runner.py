@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -508,6 +508,7 @@ def test_step_pipeline_state_update_skips_empty_kv_collective() -> None:
         finished_req_ids=set(),
         scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        interaction_boundaries={},
     )
 
     DiffusionModelRunner._update_states(runner, scheduler_output)
@@ -891,16 +892,9 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_decode_pipeline_requests_disables_gradients(monkeypatch):
-    class FakeGroup:
-        world_size = 1
-
-        def barrier(self):
-            pass
-
+def test_decode_pipeline_request_disables_gradients():
     class FakePipeline:
         supports_step_pipeline_parallel = True
-        _pipeline_decode_owner = False
 
         def _sync_pp_send(self):
             pass
@@ -923,10 +917,7 @@ def test_decode_pipeline_requests_disables_gradients(monkeypatch):
         diffusion_offload_config=None,
     )
     runner.state_cache = {"req": state}
-    monkeypatch.setattr(model_runner_module, "get_pp_group", lambda: FakeGroup())
-    monkeypatch.setattr(model_runner_module, "get_pipeline_parallel_rank", lambda: 0)
-
-    output = DiffusionModelRunner.decode_pipeline_requests(runner, ["req"])
+    output = DiffusionModelRunner.decode_pipeline_request(runner, "req")
 
     result = output.get_request_output("req").result.output
     assert not result.requires_grad
@@ -989,7 +980,6 @@ def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
         _cleanup_finished_step_requests=lambda scheduler_output: None,
         _update_states=lambda scheduler_output: ([state], []),
     )
-    runner._execute_request_step = MethodType(DiffusionModelRunner._execute_request_step, runner)
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "clear_pipeline_stage_durations", lambda pipeline: None)
     monkeypatch.setattr(model_runner_module, "consume_pipeline_stage_durations", lambda pipeline: {})
@@ -1055,7 +1045,6 @@ def test_step_pipeline_runs_one_forward_per_request_with_different_shapes(monkey
         _cleanup_finished_step_requests=lambda scheduler_output: None,
         _update_states=lambda scheduler_output: (states, []),
     )
-    runner._execute_request_step = MethodType(DiffusionModelRunner._execute_request_step, runner)
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "clear_pipeline_stage_durations", lambda pipeline: None)
     monkeypatch.setattr(model_runner_module, "consume_pipeline_stage_durations", lambda pipeline: {})

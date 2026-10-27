@@ -218,7 +218,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # When pumps are active they are the sole readers of the worker result
         # queues; non-async messages are placed here for collective_rpc().
         self._sync_result_buffer: queue.Queue = queue.Queue()
-        if not self.od_config.step_execution or self._step_pipeline_parallel_enabled():
+        if not self.od_config.step_execution or self.od_config.parallel_config.pipeline_parallel_size > 1:
             self._start_result_pump()
 
         self._start_worker_monitor()
@@ -234,10 +234,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if result_handle is None:
             raise RuntimeError("Failed to get result queue handle from workers")
         return MessageQueue.create_from_handle(result_handle, 0)
-
-    def _step_pipeline_parallel_enabled(self) -> bool:
-        parallel = getattr(self.od_config, "parallel_config", None)
-        return bool(self.od_config.step_execution and getattr(parallel, "pipeline_parallel_size", 1) > 1)
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -802,70 +798,50 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def _execute_rank_rpc(
+        self,
+        method: str,
+        args: tuple,
+        rank: int,
+    ) -> concurrent.futures.Future[AsyncDiffusionOutput]:
+        """Submit one rank-local operation through the existing RPC result pump."""
+        self._ensure_open()
+        rpc_id = self._next_rpc_id()
+        request = {
+            "type": "rpc",
+            "method": method,
+            "args": args,
+            "kwargs": {},
+            "output_rank": rank,
+            "exec_all_ranks": False,
+            "collect_rank_status": False,
+            "rpc_id": rpc_id,
+        }
+        if method == "decode_pipeline_request":
+            request["async_output"] = True
+        future: concurrent.futures.Future[AsyncDiffusionOutput] = concurrent.futures.Future()
+        with self._futures_lock:
+            self._rpc_futures[rpc_id] = future
+        self._broadcast_mq.enqueue(request)  # pyright: ignore[reportOptionalMemberAccess]
+        return future
+
     def execute_rank_step(
         self,
         scheduler_output: DiffusionSchedulerOutput,
         rank: int,
     ) -> concurrent.futures.Future[AsyncDiffusionOutput]:
         """Execute one PP stage on one rank and return its completion future."""
-        self._ensure_open()
-        rpc_id = self._next_rpc_id()
-        request = {
-            "type": "rpc",
-            "method": "execute_stepwise",
-            "args": (scheduler_output,),
-            "kwargs": {},
-            "output_rank": rank,
-            "exec_all_ranks": False,
-            "collect_rank_status": False,
-            "rpc_id": rpc_id,
-        }
-        future: concurrent.futures.Future[AsyncDiffusionOutput] = concurrent.futures.Future()
-        with self._futures_lock:
-            self._rpc_futures[rpc_id] = future
-        self._broadcast_mq.enqueue(request)  # pyright: ignore[reportOptionalMemberAccess]
-        return future
+        return self._execute_rank_rpc("execute_stepwise", (scheduler_output,), rank)
 
     def release_rank_step_requests(self, request_ids: list[str], rank: int) -> concurrent.futures.Future:
         """Release one rank's completed request state without a collective wait."""
-        self._ensure_open()
-        rpc_id = self._next_rpc_id()
-        request = {
-            "type": "rpc",
-            "method": "release_step_requests",
-            "args": (request_ids,),
-            "kwargs": {},
-            "output_rank": rank,
-            "exec_all_ranks": False,
-            "collect_rank_status": False,
-            "rpc_id": rpc_id,
-        }
-        future: concurrent.futures.Future[AsyncDiffusionOutput] = concurrent.futures.Future()
-        with self._futures_lock:
-            self._rpc_futures[rpc_id] = future
-        self._broadcast_mq.enqueue(request)  # pyright: ignore[reportOptionalMemberAccess]
-        return future
+        return self._execute_rank_rpc("release_step_requests", (request_ids,), rank)
 
     def execute_rank_decode(self, request_id: str) -> concurrent.futures.Future[BaseRunnerOutput]:
         """Decode one request asynchronously on the last PP rank."""
-        self._ensure_open()
-        rpc_id = self._next_rpc_id()
         rank = self.od_config.parallel_config.pipeline_parallel_size - 1
-        request = {
-            "type": "rpc",
-            "method": "decode_pipeline_requests",
-            "args": ([request_id],),
-            "kwargs": {},
-            "output_rank": rank,
-            "exec_all_ranks": False,
-            "collect_rank_status": False,
-            "rpc_id": rpc_id,
-            "async_output": True,
-        }
-        rpc_future: concurrent.futures.Future[AsyncDiffusionOutput] = concurrent.futures.Future()
+        rpc_future = self._execute_rank_rpc("decode_pipeline_request", (request_id,), rank)
         output_future: concurrent.futures.Future[BaseRunnerOutput] = concurrent.futures.Future()
-        with self._futures_lock:
-            self._rpc_futures[rpc_id] = rpc_future
 
         def complete_decode(future: concurrent.futures.Future[AsyncDiffusionOutput]) -> None:
             try:
@@ -879,7 +855,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 try_set_result(output_future, output)
 
         rpc_future.add_done_callback(complete_decode)
-        self._broadcast_mq.enqueue(request)  # pyright: ignore[reportOptionalMemberAccess]
         return output_future
 
     def collective_rpc(
@@ -912,19 +887,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "collect_rank_status": collect_rank_status,
         }
 
-        pipeline_parallel_size = getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1)
-        async_pipeline_decode = (
-            self.od_config.step_execution and pipeline_parallel_size > 1 and method == "decode_pipeline_requests"
-        )
-        async_request_batch = (not self.od_config.step_execution or pipeline_parallel_size > 1) and method in (
-            "execute_model",
-            "execute_model_batch",
-        )
-        if (async_pipeline_decode or async_request_batch) and not multi_rank_reply:
+        if (
+            not self.od_config.step_execution
+            and method in ("execute_model", "execute_model_batch")
+            and not multi_rank_reply
+        ):
             rpc_id = self._next_rpc_id()
             rpc_request["rpc_id"] = rpc_id
-            if async_pipeline_decode:
-                rpc_request["async_output"] = True
             fut: concurrent.futures.Future = concurrent.futures.Future()
             with self._futures_lock:
                 self._rpc_futures[rpc_id] = fut

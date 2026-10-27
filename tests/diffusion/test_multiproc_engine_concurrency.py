@@ -270,11 +270,6 @@ class TestStepModeTimeout:
 
 
 class TestAsyncPipelineDispatch:
-    def test_step_pipeline_parallel_disabled_without_parallel_config(self):
-        executor, _, _ = _make_executor()
-
-        assert not executor._step_pipeline_parallel_enabled()
-
     def _executor(self):
         executor, req_q, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(

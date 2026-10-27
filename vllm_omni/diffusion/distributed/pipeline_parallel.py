@@ -20,6 +20,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     get_pp_group,
     is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 
 
@@ -167,7 +168,11 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 if get_pipeline_parallel_world_size() > 2:
                     z = get_pp_group().broadcast(z, src=0)
                 return orig_decode(z, *args, **kwargs)
-            elif is_pipeline_first_stage() or getattr(self, "_pipeline_decode_owner", False):
+            elif (
+                is_pipeline_last_stage()
+                if getattr(getattr(self, "od_config", None), "step_execution", False)
+                else is_pipeline_first_stage()
+            ):
                 return orig_decode(z, *args, **kwargs)
             return (None,)  # decoder returns a tuple
 

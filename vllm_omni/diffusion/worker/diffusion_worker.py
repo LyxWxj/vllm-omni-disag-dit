@@ -897,12 +897,11 @@ class DiffusionWorker:
             profiler.step()
         return output
 
-    def decode_pipeline_requests(self, request_ids: list[str]) -> BaseRunnerOutput:
-        """Decode a completed step-PP cohort on the final PP rank."""
+    def decode_pipeline_request(self, request_id: str) -> BaseRunnerOutput:
+        """Decode one completed Step-PP request on the final PP rank."""
         assert self.model_runner is not None, "Model runner not initialized"
-        output = self.model_runner.decode_pipeline_requests(request_ids)
-        for request_id in request_ids:
-            self._step_lora_state.pop(request_id, None)
+        output = self.model_runner.decode_pipeline_request(request_id)
+        self._step_lora_state.pop(request_id, None)
         return output
 
     def release_step_requests(self, request_ids: list[str]) -> None:
@@ -1394,8 +1393,7 @@ class WorkerProc:
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
         pipeline_parallel_size = getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)
-        async_pipeline_decode = self.od_config.step_execution and pipeline_parallel_size > 1
-        if not self.od_config.step_execution or async_pipeline_decode:
+        if not self.od_config.step_execution or pipeline_parallel_size > 1:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
                 target=self._async_output_loop,
@@ -1481,10 +1479,7 @@ class WorkerProc:
             return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H/SHM.
-        pipeline_parallel_size = getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)
-        if (not self.od_config.step_execution or pipeline_parallel_size > 1) and isinstance(
-            output, (DiffusionOutput, BatchRunnerOutput)
-        ):
+        if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             self._enqueue_async_output(output, rpc_id)
             return
 
@@ -1494,8 +1489,10 @@ class WorkerProc:
         except (TypeError, ValueError):
             raise
         except Exception as e:
-            # Packing is failure-atomic. Typed media and opted-in PP outputs
-            # must fail rather than enqueue a device payload after a copy error.
+            # Typed media that fails to pack is left unprepared/on device (the
+            # pack is failure-atomic and does not mutate it), so enqueueing it
+            # would ship a broken payload. Re-raise memory/packing failures here
+            # instead of swallowing them for typed media.
             if payload_carries_typed_media(output):
                 raise
             if hasattr(output, "output"):
