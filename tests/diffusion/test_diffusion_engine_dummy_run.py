@@ -32,7 +32,7 @@ def test_startup_rank_result_does_not_block_result_pump(mocker) -> None:
     engine._loop_started = False
     engine._cv = threading.Condition(threading.RLock())
     engine._pipeline_step_results = queue.Queue()
-    task = _RankPipelineTask("step-0:startup", "startup", mocker.Mock())
+    task = _RankPipelineTask("step-0", ("startup",), mocker.Mock())
     future = Future()
     output = mocker.sentinel.output
     future.set_result(output)
@@ -54,8 +54,8 @@ def test_startup_rank_result_does_not_block_result_pump(mocker) -> None:
 
 def test_rank_pipeline_completion_keeps_task_on_its_own_rank_queue() -> None:
     engine = object.__new__(DiffusionEngine)
-    task = _RankPipelineTask("step-0:request-a", "request-a", Mock())
-    next_rank_task = _RankPipelineTask(task.task_id, task.request_id, task.scheduler_output)
+    task = _RankPipelineTask("step-0", ("request-a", "request-b"), Mock())
+    next_rank_task = _RankPipelineTask(task.task_id, task.request_ids, task.scheduler_output)
     engine._rank_pipeline_active = [task, None]
     engine._rank_pipeline_queues = [queue.Queue(), queue.Queue()]
     engine._rank_pipeline_queues[1].put_nowait(next_rank_task)
@@ -70,7 +70,7 @@ def test_rank_pipeline_completion_keeps_task_on_its_own_rank_queue() -> None:
 
 def test_rank_pipeline_decode_releases_other_ranks_without_waiting() -> None:
     engine = object.__new__(DiffusionEngine)
-    task = _RankPipelineTask("decode:step-0:request-a", "request-a", None)
+    task = _RankPipelineTask("decode:step-0:request-a", ("request-a",), None)
     engine._rank_pipeline_active = [None, task]
     engine._rank_pipeline_queues = [queue.Queue(), queue.Queue()]
     engine.executor = Mock()
@@ -88,6 +88,49 @@ def test_rank_pipeline_decode_releases_other_ranks_without_waiting() -> None:
     engine.executor.collective_rpc.assert_not_called()
     engine.scheduler.finish_pipeline_decode.assert_called_once_with(output, ["request-a"])
     assert completion == (["request-a"], output, {"request-a"}, True)
+
+
+def test_enqueue_pipeline_step_keeps_scheduler_batch_intact() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = StepScheduler()
+    engine._prepare_kv_for_forward = Mock()
+    engine._pipeline_scheduler_outputs = {}
+    engine._rank_pipeline_queues = [queue.Queue(), queue.Queue()]
+    scheduler_output = SimpleNamespace(step_id=4, scheduled_request_ids=["request-a", "request-b"])
+
+    engine._enqueue_pipeline_step(scheduler_output)
+
+    tasks = [rank_queue.get_nowait() for rank_queue in engine._rank_pipeline_queues]
+    assert tasks[0].task_id == tasks[1].task_id == "4"
+    assert tasks[0].request_ids == tasks[1].request_ids == ("request-a", "request-b")
+    assert tasks[0].scheduler_output is scheduler_output
+    assert tasks[1].scheduler_output is scheduler_output
+    assert engine.scheduler._pipeline_inflight == {"request-a", "request-b"}
+
+
+def test_rank_pipeline_queues_decode_for_each_completed_batch_request() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = StepScheduler()
+    engine.scheduler.pipeline_decode_pending = Mock(return_value=["request-a", "request-b"])
+    engine._rank_pipeline_active = [None, _RankPipelineTask("step-4", ("request-a", "request-b"), Mock())]
+    engine._rank_pipeline_queues = [queue.Queue(), queue.Queue()]
+    engine._commit_pipeline_step_result = Mock(
+        return_value=(
+            SimpleNamespace(scheduled_request_ids=["request-a", "request-b"]),
+            Mock(),
+            set(),
+        )
+    )
+    engine._dispatch_pipeline_rank_tasks = Mock()
+
+    completion = engine._handle_rank_pipeline_result(_RankPipelineResult("step-4", rank=1, output=Mock()))
+
+    assert [engine._rank_pipeline_queues[1].get_nowait().request_ids for _ in range(2)] == [
+        ("request-a",),
+        ("request-b",),
+    ]
+    assert completion[0] == ["request-a", "request-b"]
+    engine._dispatch_pipeline_rank_tasks.assert_called_once_with()
 
 
 @pytest.mark.parametrize("pp_size", [2, 3])

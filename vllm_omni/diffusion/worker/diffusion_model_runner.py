@@ -1363,7 +1363,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
 
     def _execute_stepwise_pipeline(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Run one request-step forward per scheduled state on every PP rank."""
+        """Run one batched request-step forward on every PP rank."""
         pipeline = self.pipeline
         assert pipeline is not None
 
@@ -1387,16 +1387,27 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             for state in states:
                 if isinstance(state.latents, AsyncLatents):
                     state.latents = state.latents.resolve()
-                input_batch = InputBatch.make_batch((state,))
-                clear_pipeline_stage_durations(pipeline)
-                with set_forward_context(
-                    vllm_config=self.vllm_config,
-                    omni_diffusion_config=self.od_config,
-                    attn_metadata={},
-                ):
-                    noise_pred = pipeline.denoise_step(input_batch)
-                merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
-                pipeline.step_scheduler(state, noise_pred)
+
+            input_batch = InputBatch.make_batch(states)
+            clear_pipeline_stage_durations(pipeline)
+            with set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=self.od_config,
+                attn_metadata={},
+            ):
+                noise_pred = pipeline.denoise_step(input_batch, states=states)
+            denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
+            for state in states:
+                merge_stage_durations(state, denoise_stage_durations)
+
+            offset = 0
+            for state in states:
+                if state.latents is None:
+                    raise RuntimeError(f"Stepwise request {state.request_id} has no latent state.")
+                row_count = state.latents.shape[0]
+                state_noise_pred = noise_pred[offset : offset + row_count] if noise_pred is not None else None
+                pipeline.step_scheduler(state, state_noise_pred)
+                offset += row_count
                 outputs.append(RunnerOutput(request_id=state.request_id, step_index=state.step_index, finished=False))
 
         return BatchRunnerOutput.from_list(outputs)

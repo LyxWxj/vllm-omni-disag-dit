@@ -60,16 +60,6 @@ class StepScheduler(BaseScheduler):
             # solver completion on the last rank.
             self.max_num_running_reqs *= 3 * parallel.pipeline_parallel_size
 
-    def schedule(self) -> DiffusionSchedulerOutput:
-        if not self._pipeline_parallel:
-            return super().schedule()
-        ready_ids = [
-            request_id
-            for request_id in self._running
-            if request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
-        ][: self._pipeline_batch_size]
-        return self._schedule(ready_ids, batch_limit=self._pipeline_batch_size)
-
     def mark_pipeline_inflight(self, request_ids: list[str]) -> None:
         self._pipeline_inflight.update(request_ids)
 
@@ -117,7 +107,32 @@ class StepScheduler(BaseScheduler):
             if progress.wait_deadline is not None and now >= progress.wait_deadline:
                 progress.wait_deadline = None
                 progress.resume = "timeout"
-        output = super().schedule()
+        if self._pipeline_parallel:
+            ready_ids = [
+                request_id
+                for request_id in self._running
+                if request_id not in self._pipeline_inflight and request_id not in self._pipeline_decode_pending
+            ]
+            if ready_ids:
+                batch_key = self._request_states[ready_ids[0]].sampling_params_key
+            else:
+                waiting_state = self._request_states.get(self._waiting[0]) if self._waiting else None
+                batch_key = None if waiting_state is None else waiting_state.sampling_params_key
+            if batch_key is not None:
+                ready_ids = [
+                    request_id
+                    for request_id in ready_ids
+                    if self._request_states[request_id].sampling_params_key == batch_key
+                ][: self._pipeline_batch_size]
+            else:
+                ready_ids = ready_ids[: self._pipeline_batch_size]
+            output = self._schedule(
+                ready_ids,
+                batch_limit=self._pipeline_batch_size,
+                batch_sampling_params_key=batch_key,
+            )
+        else:
+            output = super().schedule()
         for request_id in output.scheduled_request_ids:
             progress = self._request_progress[request_id]
             progress.scheduled_interaction_generation = progress.interaction_generation
@@ -181,11 +196,10 @@ class StepScheduler(BaseScheduler):
         return request_id
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
-        if not super()._can_schedule_waiting(state):
-            return False
-
         if self._pipeline_parallel:
             return True
+        if not super()._can_schedule_waiting(state):
+            return False
 
         is_first_step = self._request_progress[state.request_id].current_step == 0
         for request_id in self._running:

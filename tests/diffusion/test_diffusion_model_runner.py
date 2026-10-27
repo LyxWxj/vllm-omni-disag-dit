@@ -930,7 +930,8 @@ def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
     class FakePipeline:
         supports_step_pipeline_parallel = True
 
-        def denoise_step(self, input_batch):
+        def denoise_step(self, input_batch, *, states):
+            del states
             assert isinstance(input_batch.states[0].latents, torch.Tensor)
             return torch.zeros_like(input_batch.latents)
 
@@ -994,39 +995,42 @@ def test_step_pipeline_resolves_feedback_into_request_state(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_step_pipeline_runs_one_forward_per_request_with_different_shapes(monkeypatch):
+def test_step_pipeline_batches_compatible_requests_in_one_forward(monkeypatch):
     class FakePipeline:
         supports_step_pipeline_parallel = True
 
         def __init__(self):
             self.forward_calls = []
+            self.scheduler_noise = {}
 
-        def denoise_step(self, input_batch):
-            assert len(input_batch.states) == 1
-            state = input_batch.states[0]
-            self.forward_calls.append((state.request_id, tuple(input_batch.latents.shape)))
-            return torch.zeros_like(input_batch.latents)
+        def denoise_step(self, input_batch, *, states):
+            self.forward_calls.append((tuple(state.request_id for state in states), tuple(input_batch.latents.shape)))
+            return torch.cat(
+                [torch.full_like(input_batch.latents[:1], float(row + 1)) for row in range(len(states))],
+                dim=0,
+            )
 
         def step_scheduler(self, state, noise_pred):
             assert noise_pred.shape == state.latents.shape
+            self.scheduler_noise[state.request_id] = noise_pred.clone()
             state.step_index += 1
 
     class FakeSchedulerOutput:
         scheduled_new_reqs = []
-        scheduled_cached_reqs = SimpleNamespace(request_ids=["small", "large"])
+        scheduled_cached_reqs = SimpleNamespace(request_ids=["request-a", "request-b"])
         finished_req_ids = set()
-        scheduled_request_ids = ["small", "large"]
+        scheduled_request_ids = ["request-a", "request-b"]
 
     states = [
         StepRequestState(
             request_id=request_id,
             sampling=OmniDiffusionSamplingParams(num_inference_steps=2),
             prompt_embeds=torch.ones(1, 2, 4),
-            latents=torch.ones(1, 2, 2, side, side),
+            latents=torch.ones(1, 2, 2, 2, 2),
             timesteps=torch.ones(1),
             step_index=0,
         )
-        for request_id, side in (("small", 2), ("large", 3))
+        for request_id in ("request-a", "request-b")
     ]
     pipeline = FakePipeline()
     runner = SimpleNamespace(
@@ -1052,13 +1056,12 @@ def test_step_pipeline_runs_one_forward_per_request_with_different_shapes(monkey
 
     output = DiffusionModelRunner._execute_stepwise_pipeline(runner, FakeSchedulerOutput())
 
-    assert pipeline.forward_calls == [
-        ("small", (1, 2, 2, 2, 2)),
-        ("large", (1, 2, 2, 3, 3)),
-    ]
+    assert pipeline.forward_calls == [(("request-a", "request-b"), (2, 2, 2, 2, 2))]
     assert [state.step_index for state in states] == [1, 1]
-    assert output.get_request_output("small") is not None
-    assert output.get_request_output("large") is not None
+    assert torch.all(pipeline.scheduler_noise["request-a"] == 1)
+    assert torch.all(pipeline.scheduler_noise["request-b"] == 2)
+    assert output.get_request_output("request-a") is not None
+    assert output.get_request_output("request-b") is not None
 
 
 @pytest.mark.core_model

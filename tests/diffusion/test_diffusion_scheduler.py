@@ -2070,6 +2070,43 @@ class TestStepScheduler:
         assert _cached_ids(next_step) == []
         assert next_step.num_running_reqs == 3
 
+    def test_pipeline_admits_a_different_shape_batch_while_other_key_is_inflight(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                step_execution=True,
+                parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+                max_num_seqs=2,
+            )
+        )
+        large = _make_step_request("large", num_inference_steps=3)
+        small_a = _make_step_request("small-a", num_inference_steps=3)
+        small_b = _make_step_request("small-b", num_inference_steps=3)
+        for request, side in ((large, 1024), (small_a, 512), (small_b, 512)):
+            request.sampling_params.height = side
+            request.sampling_params.width = side
+            request.sampling_params.num_frames = 80
+
+        large_id = scheduler.add_request(large)
+        small_a_id = scheduler.add_request(small_a)
+        small_b_id = scheduler.add_request(small_b)
+
+        large_batch = scheduler.schedule()
+        assert _new_ids(large_batch) == [large_id]
+        scheduler.mark_pipeline_inflight(large_batch.scheduled_request_ids)
+
+        small_batch = scheduler.schedule()
+
+        assert _new_ids(small_batch) == [small_a_id, small_b_id]
+        assert scheduler.get_request_state(large_id).sampling_params_key != (
+            scheduler.get_request_state(small_a_id).sampling_params_key
+        )
+        assert scheduler.get_request_state(small_a_id).sampling_params_key == (
+            scheduler.get_request_state(small_b_id).sampling_params_key
+        )
+        assert large_id in scheduler._pipeline_inflight
+        assert small_batch.num_running_reqs == 3
+
     def test_pipeline_completion_is_scheduled_before_other_ready_requests(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(

@@ -166,7 +166,13 @@ class BaseScheduler(ABC):
     def schedule(self) -> DiffusionSchedulerOutput:
         return self._schedule(self._running)
 
-    def _schedule(self, running_request_ids: list[str], *, batch_limit: int | None = None) -> DiffusionSchedulerOutput:
+    def _schedule(
+        self,
+        running_request_ids: list[str],
+        *,
+        batch_limit: int | None = None,
+        batch_sampling_params_key: BatchSamplingParamsKey | None = None,
+    ) -> DiffusionSchedulerOutput:
         """Schedule selected continuations, then admit requests within both limits."""
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_request_ids: list[str] = []
@@ -188,6 +194,9 @@ class BaseScheduler(ABC):
             state = self._request_states.get(request_id)
             if state is None:
                 self._waiting.popleft()
+                continue
+            if batch_sampling_params_key is not None and state.sampling_params_key != batch_sampling_params_key:
+                deferred.append(self._waiting.popleft())
                 continue
             if not self._can_schedule_waiting(state):
                 break
