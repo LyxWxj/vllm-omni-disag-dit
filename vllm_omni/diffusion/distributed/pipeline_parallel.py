@@ -21,7 +21,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pp_group,
     is_pipeline_first_stage,
 )
-from vllm_omni.diffusion.request_pipeline.trace import trace_request_pipeline_event
 
 
 class AsyncLatents:
@@ -168,21 +167,24 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 if get_pipeline_parallel_world_size() > 2:
                     z = get_pp_group().broadcast(z, src=0)
                 return orig_decode(z, *args, **kwargs)
-            elif is_pipeline_first_stage() or getattr(self, "_request_pipeline_decode_owner", False):
+            elif is_pipeline_first_stage() or getattr(self, "_pipeline_decode_owner", False):
                 return orig_decode(z, *args, **kwargs)
             return (None,)  # decoder returns a tuple
 
         self.vae.decode = wrapped_decode
 
     @property
-    def _pp_send_work(self) -> list[torch.distributed.Work]:
+    def _pp_send_work(self) -> list[Any]:
         if not hasattr(self, "_pp_send_work_list"):
-            self._pp_send_work_list: list[torch.distributed.Work] = []
+            self._pp_send_work_list: list[Any] = []
         return self._pp_send_work_list
 
     @_pp_send_work.setter
-    def _pp_send_work(self, work: list[torch.distributed.Work]) -> None:
+    def _pp_send_work(self, work: list[Any]) -> None:
         self._pp_send_work_list = work
+
+    def _prune_pp_send_work(self) -> None:
+        self._pp_send_work = [work for work in self._pp_send_work if not work.is_completed()]
 
     def _sync_pp_send(self) -> None:
         """
@@ -196,12 +198,6 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
-
-    def request_pipeline_transport(self, *, window: int = 1):
-        """Create a bounded transport context for request-mode PP tasks."""
-        from vllm_omni.diffusion.request_pipeline.transport import RequestPipelineTransport
-
-        return RequestPipelineTransport(self, window=window)
 
     def predict_noise_maybe_with_cfg(
         self,
@@ -237,19 +233,15 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
 
         CFGParallelMixin._set_transformer_do_true_cfg(self, do_true_cfg)
 
-        # Request-mode microtasks own a bounded send window.  The transport
-        # waits the oldest slot before admitting a new task; synchronizing here
-        # would serialize every request-step pair and remove the overlap.
+        # Step-PP advances request-step forwards asynchronously across ranks.
         step_pp_async = bool(
             getattr(getattr(self, "od_config", None), "step_execution", False)
             and getattr(self, "supports_step_pipeline_parallel", False)
         )
-        transport = getattr(self, "_request_pipeline_transport", None)
-        if transport is None and not step_pp_async:
+        if not step_pp_async:
             self._sync_pp_send()
 
         pp_group = get_pp_group()
-        trace_request_pipeline_event("pp_activation", phase="enter")
 
         cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
         if cfg_parallel_ready:
@@ -274,12 +266,12 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for kwargs, it in zip(all_kwargs, its):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
-                send_work = pp_group.isend_tensor_dict(result.tensors)
-                if transport is None:
-                    self._pp_send_work.extend(send_work)
+                if step_pp_async:
+                    self._prune_pp_send_work()
+                    send_work = pp_group.isend_tensor_dict_nonblocking_metadata(result.tensors)
                 else:
-                    transport.register_send_work(send_work)
-            trace_request_pipeline_event("pp_activation", phase="return")
+                    send_work = pp_group.isend_tensor_dict(result.tensors)
+                self._pp_send_work.extend(send_work)
             return None
 
         # Last rank: run full forward
@@ -294,7 +286,6 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             gathered = [get_cfg_group().all_gather(p, separate_tensors=True) for p in local_pred]
             positive_noise_pred = tuple(g[0] for g in gathered)
             negative_noise_pred = tuple(g[1] for g in gathered)
-            trace_request_pipeline_event("pp_activation", phase="return")
             return self.combine_cfg_noise(positive_noise_pred, negative_noise_pred, true_cfg_scale, cfg_normalize)
 
         # Sequential CFG or no-CFG path.
@@ -305,12 +296,10 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 pos = _slice_pred(pos, output_slice)
                 neg = _slice_pred(neg, output_slice)
             result = self.combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
-            trace_request_pipeline_event("pp_activation", phase="return")
             return result
         pred = _wrap(noise_preds[0])
         if output_slice is not None:
             pred = _slice_pred(pred, output_slice)
-        trace_request_pipeline_event("pp_activation", phase="return")
         return _unwrap(pred)
 
     def scheduler_step_maybe_with_cfg(
@@ -339,8 +328,6 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             )
 
         pp_group = get_pp_group()
-        trace_request_pipeline_event("pp_feedback", phase="enter")
-        transport = getattr(self, "_request_pipeline_transport", None)
         step_pp_async = bool(
             getattr(getattr(self, "od_config", None), "step_execution", False)
             and getattr(self, "supports_step_pipeline_parallel", False)
@@ -349,23 +336,21 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
-            if (transport is not None or step_pp_async) and isinstance(latents, torch.Tensor):
+            if step_pp_async and isinstance(latents, torch.Tensor):
                 # The request-step shape is known on both ranks. Avoid the
                 # blocking CPU metadata exchange so the next stage-0 task can
                 # overlap this rank's current stage-1 transformer work.
                 feedback_work = pp_group.isend_tensor(latents, dst=0)
             else:
                 feedback_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
-            if transport is not None:
-                transport.register_send_work(feedback_work)
-            elif step_pp_async:
+            if step_pp_async:
                 self._pp_send_work.extend(feedback_work)
             else:
                 self._pp_send_work = feedback_work
         elif pp_group.is_first_rank:
             if step_pp_async and isinstance(latents, AsyncLatents):
                 latents = latents.resolve()
-            if (transport is not None or step_pp_async) and isinstance(latents, torch.Tensor):
+            if step_pp_async and isinstance(latents, torch.Tensor):
                 received_latents = torch.empty_like(latents)
                 feedback_handles = pp_group.irecv_tensor(
                     received_latents,
@@ -374,7 +359,4 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
                 latents = AsyncLatents({"latents": received_latents}, feedback_handles, [])
             else:
                 latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
-            if transport is not None:
-                transport.register_feedback(latents)
-        trace_request_pipeline_event("pp_feedback", phase="return")
         return latents

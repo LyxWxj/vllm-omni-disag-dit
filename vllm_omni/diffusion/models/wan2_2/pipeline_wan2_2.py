@@ -455,7 +455,6 @@ class Wan22Pipeline(
 ):
     supports_request_batch = True
     supports_step_execution = True
-    supports_request_pipeline = True
     supports_step_pipeline_parallel = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -2097,8 +2096,6 @@ class Wan22Pipeline(
 
 class WanT2VDMD2Pipeline(DMD2PipelineMixin, Wan22Pipeline):
     """Wan 2.x T2V pipeline for FastGen DMD2-distilled models."""
-
-    supports_request_pipeline = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)

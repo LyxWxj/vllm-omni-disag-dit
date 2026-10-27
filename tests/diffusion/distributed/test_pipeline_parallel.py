@@ -562,6 +562,7 @@ def isend_irecv_worker(
     init_method: str,
     device_kind: DeviceKind,
     result_queue,
+    async_metadata: bool = False,
 ):
     device = init_dist(local_rank, world_size, init_method, device_kind)
     initialize_model_parallel(pipeline_parallel_size=world_size, backend=_mp_backend(device_kind))
@@ -570,7 +571,8 @@ def isend_irecv_worker(
     if pp_group.is_first_rank:
         _seed_device(77, device)
         tensor = torch.randn(3, 5, dtype=torch.float32, device=device)
-        handles = pp_group.isend_tensor_dict({"t": tensor})
+        send = pp_group.isend_tensor_dict_nonblocking_metadata if async_metadata else pp_group.isend_tensor_dict
+        handles = send({"t": tensor})
         for h in handles:
             h.wait()
         result_queue.put(("sent", tensor.cpu()))
@@ -583,13 +585,19 @@ def isend_irecv_worker(
     _cleanup_distributed()
 
 
-def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) -> None:
+def _run_isend_irecv(
+    pp_size: int,
+    device_kind: DeviceKind,
+    init_method: str,
+    *,
+    async_metadata: bool = False,
+) -> None:
     mp_context = collective_context(device_kind)
     manager = mp_context.Manager()
     q = manager.Queue()
     start_collective_workers(
         isend_irecv_worker,
-        args=(pp_size, init_method, device_kind, q),
+        args=(pp_size, init_method, device_kind, q, async_metadata),
         nprocs=pp_size,
         device_kind=device_kind,
     )
@@ -653,6 +661,18 @@ def _run_direct_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: 
 def test_isend_irecv_tensor_dict(pp_size: int):
     """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
     _run_isend_irecv(pp_size, device_kind="cpu", init_method=get_file_store_init_method())
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_isend_irecv_tensor_dict_nonblocking_metadata():
+    _run_isend_irecv(
+        2,
+        device_kind="cpu",
+        init_method=get_file_store_init_method(),
+        async_metadata=True,
+    )
 
 
 @pytest.mark.core_model
@@ -977,7 +997,6 @@ def test_step_pipeline_feedback_resolves_prior_async_latents_before_direct_recei
     pipeline = object.__new__(MockPipelineParallel)
     pipeline.od_config = SimpleNamespace(step_execution=True)
     pipeline.supports_step_pipeline_parallel = True
-    pipeline._request_pipeline_transport = None
     previous_handle = FakeHandle()
     previous = AsyncLatents({"latents": torch.randn(1, 4, 2, 2)}, [previous_handle], [])
 

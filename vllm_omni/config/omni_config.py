@@ -395,8 +395,6 @@ def _stage_cli_overrides(
     # argument. Keep global and stage-scoped CLI values off AR/generation stages.
     if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
         result.pop("step_execution", None)
-        result.pop("request_pipeline_parallel", None)
-        result.pop("request_pipeline_parallel_window", None)
     if execution_type == StageExecutionType.DIFFUSION:
         prefix = f"stage_{stage_id}_"
         for key, value in cli_overrides.items():
@@ -894,8 +892,6 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
-    request_pipeline_parallel: bool = False
-    request_pipeline_parallel_window: int = 1
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False

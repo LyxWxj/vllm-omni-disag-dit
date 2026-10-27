@@ -20,6 +20,21 @@ logger = init_logger(__name__)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+
+class _PendingSend:
+    __slots__ = ("works", "buffers")
+
+    def __init__(self, works: list[Any], buffers: tuple[torch.Tensor, ...]) -> None:
+        self.works = works
+        self.buffers = buffers
+
+    def wait(self) -> None:
+        for work in self.works:
+            work.wait()
+
+    def is_completed(self) -> bool:
+        return all(work.is_completed() for work in self.works)
+
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
 
 
@@ -471,6 +486,35 @@ class GroupCoordinator:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
         return handles
+
+    def isend_tensor_dict_nonblocking_metadata(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
+    ) -> list[Any]:
+        """Send tensor metadata and data without waiting for the receiver."""
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return []
+        if dst is None:
+            dst = self.group_next_rank
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        metadata, tensors = _split_tensor_dict(tensor_dict)
+        metadata_tensor = torch.frombuffer(pickle.dumps(metadata), dtype=torch.uint8)
+        size_tensor = torch.tensor([metadata_tensor.numel()], dtype=torch.long, device="cpu")
+        handles = [
+            torch.distributed.isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group),
+            torch.distributed.isend(metadata_tensor, dst=self.ranks[dst], group=self.cpu_group),
+        ]
+        buffers = [size_tensor, metadata_tensor]
+        for tensor in tensors:
+            if tensor.numel() == 0:
+                continue
+            group = self.cpu_group if tensor.is_cpu else self.device_group
+            handles.append(torch.distributed.isend(tensor, dst=self.ranks[dst], group=group))
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        return [_PendingSend(handles, tuple(buffers))]
 
     def isend_tensor(
         self,

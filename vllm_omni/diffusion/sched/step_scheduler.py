@@ -135,16 +135,8 @@ class StepScheduler(BaseScheduler):
     def pipeline_decode_pending(self) -> list[str]:
         return [request_id for request_id in self._running if request_id in self._pipeline_decode_pending]
 
-    def should_decode_pipeline(self, *, scheduling_exhausted: bool = False) -> bool:
-        """Request a decode barrier for a full cohort or an underfilled tail."""
-        return bool(self._pipeline_decode_pending) and (
-            scheduling_exhausted
-            or len(self._pipeline_decode_pending) >= self.od_config.parallel_config.pipeline_parallel_size
-            or not self.has_pipeline_ready
-        )
-
-    def finish_pipeline_decode(self, output: BaseRunnerOutput) -> set[str]:
-        request_ids = self.pipeline_decode_pending()
+    def finish_pipeline_decode(self, output: BaseRunnerOutput, request_ids: list[str]) -> set[str]:
+        request_ids = [request_id for request_id in request_ids if request_id in self._pipeline_decode_pending]
         if not request_ids:
             return set()
         sched_output = DiffusionSchedulerOutput(

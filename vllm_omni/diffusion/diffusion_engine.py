@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import dataclasses
 import inspect
 import math
 import os
@@ -207,6 +208,23 @@ class _RpcTask:
     deadline: float | None
     unique_reply_rank: int | None
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+
+
+@dataclass
+class _RankPipelineTask:
+    task_id: str
+    request_id: str
+    scheduler_output: DiffusionSchedulerOutput | None
+    is_decode: bool = False
+    started_at: float = 0.0
+
+
+@dataclass
+class _RankPipelineResult:
+    task_id: str
+    rank: int
+    output: BaseRunnerOutput | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -470,11 +488,16 @@ class DiffusionEngine:
         parallel = getattr(self.od_config, "parallel_config", None)
         self.step_pipeline_parallel = bool(self.step_execution and getattr(parallel, "pipeline_parallel_size", 1) > 1)
         self._pipeline_scheduler_outputs: dict[str, tuple[DiffusionSchedulerOutput, float]] = {}
-        self._pipeline_step_results: queue.Queue[AsyncDiffusionOutput] = queue.Queue()
+        self._pipeline_step_results: queue.Queue[AsyncDiffusionOutput | _RankPipelineResult] = queue.Queue()
+        self._rank_pipeline_queues: list[queue.Queue[_RankPipelineTask]] = []
+        self._rank_pipeline_active: list[_RankPipelineTask | None] = []
         if self.step_pipeline_parallel and not isinstance(self.scheduler, StepScheduler):
             raise ValueError("step-execution pipeline parallelism requires StepScheduler")
         pipeline_executor_methods = (
             "execute_step_pipeline",
+            "execute_rank_step",
+            "execute_rank_decode",
+            "release_rank_step_requests",
             "decode_pipeline_requests",
             "set_pipeline_step_callback",
         )
@@ -482,6 +505,9 @@ class DiffusionEngine:
             raise ValueError("step-execution pipeline parallelism requires the multiprocessing diffusion executor")
         if self.step_pipeline_parallel:
             self.executor.set_pipeline_step_callback(self._notify_pipeline_step_result)
+            pp_size = getattr(parallel, "pipeline_parallel_size", 1)
+            self._rank_pipeline_queues = [queue.Queue() for _ in range(pp_size)]
+            self._rank_pipeline_active = [None] * pp_size
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -492,11 +518,9 @@ class DiffusionEngine:
     def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
         if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
             logger.info(
-                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s request_pipeline_parallel=%s window=%s",
+                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
                 getattr(od_config, "max_num_seqs", None),
                 getattr(od_config, "request_batch_max_wait_ms", None),
-                getattr(od_config, "request_pipeline_parallel", False),
-                getattr(od_config, "request_pipeline_parallel_window", 1),
             )
 
     async def _check_and_start_background_loop(self):
@@ -687,9 +711,6 @@ class DiffusionEngine:
                     pending_finished = self.scheduler.pending_finished_request_ids()
                 self._emit_finished_outputs(pending_finished, None)
 
-            if self.step_pipeline_parallel and self._wait_or_decode_pipeline_if_needed():
-                continue
-
             with self._cv:
                 if self._rpc_queue.empty() and self.abort_queue.empty() and not self.stop_event.is_set():
                     now = time.monotonic()
@@ -760,13 +781,16 @@ class DiffusionEngine:
                     if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
                 }
                 self._emit_finished_outputs(finished_ids, None)
-                if self.step_pipeline_parallel:
-                    self._wait_or_decode_pipeline_if_needed(scheduling_exhausted=True)
+                if self.step_pipeline_parallel and (
+                    any(self._rank_pipeline_active) or any(not tasks.empty() for tasks in self._rank_pipeline_queues)
+                ):
+                    self._wait_for_pipeline_step_result()
                 continue
 
             if self.step_pipeline_parallel:
                 try:
-                    self._submit_pipeline_step(sched_output)
+                    self._enqueue_pipeline_step(sched_output)
+                    self._dispatch_pipeline_rank_tasks()
                 except Exception as exc:
                     if self._closed:
                         break
@@ -845,7 +869,10 @@ class DiffusionEngine:
                 event = self._pipeline_step_results.get_nowait()
             except queue.Empty:
                 break
-            self._handle_pipeline_step_result(event)
+            if isinstance(event, _RankPipelineResult):
+                self._handle_rank_pipeline_result(event)
+            else:
+                self._handle_pipeline_step_result(event)
         now = time.monotonic()
         timeout = _async_output_timeout()
         for step_id, (_, submitted_at) in list(self._pipeline_scheduler_outputs.items()):
@@ -857,6 +884,11 @@ class DiffusionEngine:
                         error="Timed out waiting for the last pipeline rank",
                     )
                 )
+        if any(
+            task is not None and task.is_decode and now - task.started_at >= timeout
+            for task in self._rank_pipeline_active
+        ):
+            self._fail_engine(TimeoutError("Timed out waiting for Step-PP decode"))
 
     def _notify_pipeline_step_result(self, event: AsyncDiffusionOutput) -> None:
         self._pipeline_step_results.put(event)
@@ -864,26 +896,150 @@ class DiffusionEngine:
             with self._cv:
                 self._cv.notify_all()
 
+    def _enqueue_pipeline_step(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Queue one scheduler step for rank-local stage execution."""
+        assert isinstance(self.scheduler, StepScheduler)
+        self._prepare_kv_for_forward(scheduler_output)
+        for request_id, request_output in self._split_pipeline_scheduler_output(scheduler_output):
+            task_id = f"{scheduler_output.step_id}:{request_id}"
+            self._pipeline_scheduler_outputs[task_id] = (request_output, time.monotonic())
+            for tasks in self._rank_pipeline_queues:
+                tasks.put_nowait(_RankPipelineTask(task_id, request_id, request_output))
+        self.scheduler.mark_pipeline_inflight(scheduler_output.scheduled_request_ids)
+
+    @staticmethod
+    def _split_pipeline_scheduler_output(
+        scheduler_output: DiffusionSchedulerOutput,
+    ) -> list[tuple[str, DiffusionSchedulerOutput]]:
+        """Make one stage task per request without copying request state."""
+        outputs: list[tuple[str, DiffusionSchedulerOutput]] = []
+        for request in scheduler_output.scheduled_new_reqs:
+            request_output = dataclasses.replace(
+                scheduler_output,
+                scheduled_new_reqs=[request],
+                scheduled_cached_reqs=CachedRequestData.make_empty(),
+                finished_req_ids=set(),
+            )
+            outputs.append((request.request_id, request_output))
+        for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
+            request_output = dataclasses.replace(
+                scheduler_output,
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData([request_id]),
+                finished_req_ids=set(),
+            )
+            outputs.append((request_id, request_output))
+        return outputs
+
+    def _dispatch_pipeline_rank_tasks(self) -> None:
+        """Submit at most one stage task per idle rank."""
+        for rank, tasks in enumerate(self._rank_pipeline_queues):
+            if self._rank_pipeline_active[rank] is not None or tasks.empty():
+                continue
+            task = tasks.get_nowait()
+            task.started_at = time.monotonic()
+            self._rank_pipeline_active[rank] = task
+            try:
+                if task.is_decode:
+                    future = self.executor.execute_rank_decode(task.request_id)
+                else:
+                    assert task.scheduler_output is not None
+                    future = self.executor.execute_rank_step(task.scheduler_output, rank)
+            except Exception as exc:
+                self._pipeline_step_results.put(_RankPipelineResult(task.task_id, rank, error=str(exc)))
+                continue
+            future.add_done_callback(
+                lambda completed, task=task, rank=rank: self._notify_rank_pipeline_result(task, rank, completed)
+            )
+
+    def _notify_rank_pipeline_result(
+        self,
+        task: _RankPipelineTask,
+        rank: int,
+        future: concurrent.futures.Future[Any],
+    ) -> None:
+        try:
+            output = future.result()
+        except BaseException as exc:
+            self._pipeline_step_results.put(_RankPipelineResult(task.task_id, rank, error=str(exc)))
+        else:
+            if isinstance(output, AsyncDiffusionOutput):
+                if output.error:
+                    self._pipeline_step_results.put(_RankPipelineResult(task.task_id, rank, error=output.error))
+                elif output.result is None:
+                    self._pipeline_step_results.put(
+                        _RankPipelineResult(task.task_id, rank, error="Pipeline rank returned no step output")
+                    )
+                else:
+                    self._pipeline_step_results.put(_RankPipelineResult(task.task_id, rank, output=output.result))
+            elif output is None:
+                self._pipeline_step_results.put(
+                    _RankPipelineResult(task.task_id, rank, error="Pipeline task returned no output")
+                )
+            else:
+                self._pipeline_step_results.put(_RankPipelineResult(task.task_id, rank, output=output))
+        with self._cv:
+            self._cv.notify_all()
+
     def _wait_for_pipeline_step_result(self) -> None:
         with self._cv:
             if self._pipeline_step_results.empty():
                 self._cv.wait(timeout=1.0)
 
-    def _wait_or_decode_pipeline_if_needed(self, *, scheduling_exhausted: bool = False) -> bool:
-        """Wait for in-flight steps or decode a ready cohort; return if handled."""
+    def _handle_rank_pipeline_result(self, event: _RankPipelineResult) -> None:
+        rank = event.rank
+        task = self._rank_pipeline_active[rank]
+        if task is None or task.task_id != event.task_id:
+            return
+        self._rank_pipeline_active[rank] = None
+        if event.error is not None:
+            if task.is_decode:
+                assert isinstance(self.scheduler, StepScheduler)
+                request_ids = [task.request_id]
+                self._release_pipeline_requests_async(request_ids)
+                output = self._pipeline_error_output(request_ids, event.error)
+                finished_ids = self.scheduler.finish_pipeline_decode(output, request_ids)
+                self._emit_outputs(
+                    finished_ids,
+                    request_ids,
+                    output,
+                    worker_execution_completed=False,
+                )
+            else:
+                self._handle_pipeline_step_result(
+                    AsyncDiffusionOutput(
+                        kind=AsyncOutputKind.PIPELINE_STEP_DONE,
+                        async_output_id=task.task_id,
+                        error=event.error,
+                    )
+                )
+            self._dispatch_pipeline_rank_tasks()
+            return
+        if task.is_decode:
+            assert isinstance(self.scheduler, StepScheduler)
+            request_ids = [task.request_id]
+            self._release_pipeline_requests_async(request_ids, include_last_rank=False)
+            assert event.output is not None
+            finished_ids = self.scheduler.finish_pipeline_decode(event.output, request_ids)
+            self._emit_outputs(finished_ids, request_ids, event.output, worker_execution_completed=True)
+            self._dispatch_pipeline_rank_tasks()
+            return
+        if rank < len(self._rank_pipeline_queues) - 1:
+            self._dispatch_pipeline_rank_tasks()
+            return
+
+        self._handle_pipeline_step_result(
+            AsyncDiffusionOutput(
+                kind=AsyncOutputKind.PIPELINE_STEP_DONE,
+                async_output_id=task.task_id,
+                result=event.output,
+            )
+        )
         assert isinstance(self.scheduler, StepScheduler)
-        if self.scheduler.has_pipeline_inflight:
-            if self.scheduler.should_decode_pipeline(scheduling_exhausted=scheduling_exhausted):
-                self._wait_for_pipeline_step_result()
-                return True
-            if len(self._pipeline_scheduler_outputs) >= self.scheduler.od_config.parallel_config.pipeline_parallel_size:
-                self._wait_for_pipeline_step_result()
-                return True
-            return False
-        if self.scheduler.should_decode_pipeline(scheduling_exhausted=scheduling_exhausted):
-            self._run_pipeline_decode()
-            return True
-        return False
+        if task.request_id in self.scheduler.pipeline_decode_pending():
+            decode_task = _RankPipelineTask(f"decode:{task.task_id}", task.request_id, None, True)
+            self._rank_pipeline_queues[rank].put_nowait(decode_task)
+        self._dispatch_pipeline_rank_tasks()
 
     @staticmethod
     def _pipeline_error_output(request_ids: list[str], error: BaseException | str) -> BatchRunnerOutput:
@@ -928,6 +1084,22 @@ class DiffusionEngine:
         except Exception as exc:
             self._fail_engine(exc)
             raise
+
+    def _release_pipeline_requests_async(self, request_ids: list[str], *, include_last_rank: bool = True) -> None:
+        if not request_ids:
+            return
+        rank_count = len(self._rank_pipeline_queues)
+        rank_limit = rank_count if include_last_rank else rank_count - 1
+        for rank in range(rank_limit):
+            future = self.executor.release_rank_step_requests(request_ids, rank)
+
+            def log_failure(completed: concurrent.futures.Future, rank: int = rank) -> None:
+                try:
+                    completed.result()
+                except Exception:
+                    logger.exception("Failed to release Step-PP request state on rank %s", rank)
+
+            future.add_done_callback(log_failure)
 
     def _commit_pipeline_step_result(
         self, event: AsyncDiffusionOutput
@@ -995,8 +1167,13 @@ class DiffusionEngine:
             _, output, finished_ids = committed
             break
 
-        if self.scheduler.should_decode_pipeline(scheduling_exhausted=True):
-            output, decoded_ids = self._decode_pipeline_requests(self.scheduler.pipeline_decode_pending())
+        decode_request_ids = [
+            request_id
+            for request_id in scheduler_output.scheduled_request_ids
+            if request_id in self.scheduler.pipeline_decode_pending()
+        ]
+        if decode_request_ids:
+            output, decoded_ids = self._decode_pipeline_requests(decode_request_ids)
             finished_ids |= decoded_ids
         return output, finished_ids
 
@@ -1016,20 +1193,14 @@ class DiffusionEngine:
         assert isinstance(self.scheduler, StepScheduler)
         try:
             output = self.executor.decode_pipeline_requests(request_ids)
+            self._release_pipeline_requests(request_ids)
         except Exception as exc:
             if self._closed:
                 raise
             logger.error("Pipeline decode failed for requests %s", request_ids, exc_info=True)
             self._release_pipeline_requests(request_ids)
             output = self._pipeline_error_output(request_ids, exc)
-        return output, self.scheduler.finish_pipeline_decode(output)
-
-    def _run_pipeline_decode(self) -> None:
-        assert isinstance(self.scheduler, StepScheduler)
-        request_ids = self.scheduler.pipeline_decode_pending()
-        if request_ids:
-            output, finished_ids = self._decode_pipeline_requests(request_ids)
-            self._emit_outputs(finished_ids, request_ids, output, worker_execution_completed=True)
+        return output, self.scheduler.finish_pipeline_decode(output, request_ids)
 
     def _emit_request_started_outputs(self, sched_output: DiffusionSchedulerOutput) -> None:
         """Notify opted-in callers when requests leave the scheduler queue."""

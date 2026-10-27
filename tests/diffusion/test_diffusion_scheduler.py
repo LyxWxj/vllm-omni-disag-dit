@@ -2168,10 +2168,10 @@ class TestStepScheduler:
                 )
             ]
         )
-        assert scheduler.finish_pipeline_decode(decoded) == {request_id}
+        assert scheduler.finish_pipeline_decode(decoded, [request_id]) == {request_id}
         assert scheduler.has_requests() is False
 
-    def test_pipeline_decodes_full_cohort_while_other_requests_are_ready(self) -> None:
+    def test_pipeline_decode_pending_does_not_block_other_requests(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
             SimpleNamespace(
@@ -2185,7 +2185,6 @@ class TestStepScheduler:
         step = scheduler.schedule()
         scheduler.mark_pipeline_inflight(step.scheduled_request_ids)
         scheduler.add_request(_make_step_request("ready", num_inference_steps=1))
-        assert _new_ids(scheduler.schedule()) == ["ready"]
         scheduler.pipeline_step_completed(step.scheduled_request_ids)
         scheduler.update_from_output(
             step,
@@ -2193,8 +2192,7 @@ class TestStepScheduler:
         )
 
         assert scheduler.pipeline_decode_pending() == [req_a, req_b]
-        assert scheduler.has_pipeline_ready
-        assert scheduler.should_decode_pipeline()
+        assert _new_ids(scheduler.schedule()) == ["ready"]
 
     def test_pipeline_decode_can_finish_before_async_output_is_ready(self) -> None:
         scheduler = StepScheduler()
@@ -2214,7 +2212,7 @@ class TestStepScheduler:
         async_decode = BatchRunnerOutput.from_list(
             [RunnerOutput(request_id=request_id, step_index=1, finished=True, async_output_id="decode-1/async-final")]
         )
-        assert scheduler.finish_pipeline_decode(async_decode) == {request_id}
+        assert scheduler.finish_pipeline_decode(async_decode, [request_id]) == {request_id}
         assert scheduler.has_requests() is False
 
     def test_mixed_batch_error_finishes_only_failed_request(self) -> None:

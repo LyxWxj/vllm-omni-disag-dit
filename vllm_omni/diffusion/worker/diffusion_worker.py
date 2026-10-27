@@ -898,7 +898,7 @@ class DiffusionWorker:
         return output
 
     def decode_pipeline_requests(self, request_ids: list[str]) -> BaseRunnerOutput:
-        """Decode a completed step-PP cohort after the Engine barrier."""
+        """Decode a completed step-PP cohort on the final PP rank."""
         assert self.model_runner is not None, "Model runner not initialized"
         output = self.model_runner.decode_pipeline_requests(request_ids)
         for request_id in request_ids:
@@ -1394,7 +1394,7 @@ class WorkerProc:
         # unsynchronized writers can target the same block and drop a message.
         self._result_mq_lock = threading.Lock()
         pipeline_parallel_size = getattr(self.od_config.parallel_config, "pipeline_parallel_size", 1)
-        async_pipeline_decode = self.od_config.step_execution and pipeline_parallel_size > 1 and self.gpu_id == 0
+        async_pipeline_decode = self.od_config.step_execution and pipeline_parallel_size > 1
         if not self.od_config.step_execution or async_pipeline_decode:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(

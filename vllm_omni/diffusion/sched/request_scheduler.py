@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields, replace
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -109,19 +109,7 @@ class RequestScheduler(BaseScheduler):
         )
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        key = build_request_batch_sampling_params_key(request)
-        if getattr(self.od_config, "request_pipeline_parallel", False):
-            # These fields are request-local in the closed PP task plan.
-            key = replace(
-                key,
-                height=None,
-                width=None,
-                num_frames=1,
-                num_inference_steps=None,
-                sample_solver=None,
-                flow_shift=None,
-            )
-        return key
+        return build_request_batch_sampling_params_key(request)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

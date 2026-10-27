@@ -197,7 +197,6 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     """
 
     supports_step_pipeline_parallel = False
-    supports_request_pipeline = False
 
     # VACE's forward() defaults to 50 steps, not the base pipeline's 40.
     default_num_inference_steps: int = 50

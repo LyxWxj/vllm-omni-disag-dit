@@ -498,6 +498,43 @@ def test_update_states_carries_prepared_layout() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_step_pipeline_state_update_skips_empty_kv_collective() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.od_config.step_execution = True
+    runner.od_config.parallel_config.pipeline_parallel_size = 2
+    runner.kv_transfer_manager.receive_multi_kv_cache_distributed = Mock()
+    request = _make_request()
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    DiffusionModelRunner._update_states(runner, scheduler_output)
+
+    runner.kv_transfer_manager.receive_multi_kv_cache_distributed.assert_not_called()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_step_pipeline_rejects_request_kv_transfer() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.od_config.step_execution = True
+    runner.od_config.parallel_config.pipeline_parallel_size = 2
+    request = _make_request()
+    request.kv_sender_info = {"sender": "upstream"}
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    with pytest.raises(ValueError, match="Step-PP does not support request KV transfer"):
+        DiffusionModelRunner._update_states(runner, scheduler_output)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("use_hsdp", [False, True])
 def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
     runner = _make_compile_runner(use_hsdp=use_hsdp)
@@ -863,7 +900,7 @@ def test_decode_pipeline_requests_disables_gradients(monkeypatch):
 
     class FakePipeline:
         supports_step_pipeline_parallel = True
-        _request_pipeline_decode_owner = False
+        _pipeline_decode_owner = False
 
         def _sync_pp_send(self):
             pass

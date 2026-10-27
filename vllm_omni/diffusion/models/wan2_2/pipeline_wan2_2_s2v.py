@@ -539,7 +539,6 @@ class Wan22S2VPipeline(
     supports_step_pipeline_parallel = False
     # Default config values from Wan2.2/wan/configs/wan_s2v_14B.py
     supports_request_batch = True
-    supports_request_pipeline = False
     _DEFAULT_MOTION_FRAMES = 73
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16

@@ -661,9 +661,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 
         self._ensure_open()
-        if len(scheduler_output.scheduled_new_reqs) <= 1 and not getattr(
-            self.od_config, "request_pipeline_parallel", False
-        ):
+        if len(scheduler_output.scheduled_new_reqs) <= 1:
             return self.execute_request(scheduler_output)
         if _uses_dlo_dp_concurrency(self.od_config):
             return self.execute_request(scheduler_output)
