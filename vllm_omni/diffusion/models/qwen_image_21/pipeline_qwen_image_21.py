@@ -24,6 +24,11 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.config.stage_config import (
+    DiffusionStageOperator,
+    DiffusionStageRole,
+    resolve_diffusion_stage_role,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
@@ -33,7 +38,7 @@ from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_21_MAX_INPUT_IMAGES
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (
     calculate_shift,
     retrieve_timesteps,
@@ -47,6 +52,7 @@ from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21KVCache,
     QwenImage21Transformer2DModel,
 )
+from vllm_omni.diffusion.models.stage_mixin import DiffusionStageMixin
 from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -295,6 +301,7 @@ def get_qwen_image_21_post_process_func(
 
 
 class QwenImage21Pipeline(
+    DiffusionStageMixin,
     nn.Module,
     QwenImage21CFGParallelMixin,
     DiffusionPipelineProfilerMixin,
@@ -331,23 +338,37 @@ class QwenImage21Pipeline(
         od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
-        super().__init__()
+        super().__init__(od_config=od_config)
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
+        self.stage_role = resolve_diffusion_stage_role(
+            getattr(od_config, "stage_role", None),
+            getattr(od_config, "model_stage", None),
+        )
+        load_encoder = role_loads_component(self.stage_role, "encoder") and bool(self._encoder_modules)
+        load_dit = role_loads_component(self.stage_role, "dit") and bool(self._dit_modules)
+        # Qwen-Image 2.1 encodes condition images twice: the VLM consumes the
+        # resized PIL image and the VAE supplies image latents to the DiT. Keep
+        # the VAE on ENCODE stages for image-conditioned requests; T2I still
+        # takes the same path without invoking it.
+        load_vae = role_loads_component(self.stage_role, "vae") and bool(self._vae_modules)
+        load_vae = load_vae or self.stage_role is DiffusionStageRole.ENCODE
         # Model-level sampling grid from model_index.json (diffusers PR
         # 14950): when the request carries no explicit sigmas, this grid
         # drives the schedule and its length decides the step count.
         sample_sigmas = od_config.extras.get("sample_sigmas")
         self.sample_sigmas = [float(s) for s in sample_sigmas] if sample_sigmas else None
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
+        self.weights_sources = []
+        if load_dit:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                )
             )
-        ]
 
         self.device = get_local_device()
         model = od_config.model
@@ -356,7 +377,11 @@ class QwenImage21Pipeline(
 
         # Guard against transformers v5 multi-worker race on partial subfolder
         # shard sets (see pipeline_qwen_image_edit_plus, Buildkite #1043).
-        qwen_subfolders = ["scheduler", "text_encoder", "vae", "processor"]
+        qwen_subfolders = ["scheduler"]
+        if load_encoder:
+            qwen_subfolders.extend(["text_encoder", "processor"])
+        if load_vae:
+            qwen_subfolders.append("vae")
         prefetch_subfolders(
             model,
             qwen_subfolders,
@@ -368,8 +393,12 @@ class QwenImage21Pipeline(
         )
         # Unlike the 2.0 T2I pipeline, the vision tower is required: condition
         # images are encoded jointly with the prompt by the VLM.
-        text_encoder_quant_config = _resolve_text_encoder_quant_config(od_config.quantization_config)
-        if text_encoder_quant_config is None:
+        text_encoder_quant_config = (
+            _resolve_text_encoder_quant_config(od_config.quantization_config) if load_encoder else None
+        )
+        if not load_encoder:
+            self.text_encoder = None
+        elif text_encoder_quant_config is None:
             self.text_encoder = from_pretrained_with_prefetch(
                 Qwen3VLForConditionalGeneration.from_pretrained,
                 model,
@@ -403,33 +432,47 @@ class QwenImage21Pipeline(
                     prefix="text_encoder.",
                 )
             )
-        self.vae = from_pretrained_with_prefetch(
-            DistributedAutoencoderKLQwenImage21.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImage21Transformer2DModel)
-        self.transformer = QwenImage21Transformer2DModel(
-            od_config=od_config,
-            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
-            **transformer_kwargs,
-        )
-        self.processor = from_pretrained_with_prefetch(
-            Qwen3VLProcessor.from_pretrained,
-            model,
-            subfolder="processor",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        )
+        if load_vae:
+            self.vae = from_pretrained_with_prefetch(
+                DistributedAutoencoderKLQwenImage21.from_pretrained,
+                model,
+                subfolder="vae",
+                prefetch_list=qwen_subfolders,
+                local_files_only=local_files_only,
+            ).to(self.device)
+        else:
+            self.vae = None
+        if load_dit:
+            transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImage21Transformer2DModel)
+            self.transformer = QwenImage21Transformer2DModel(
+                od_config=od_config,
+                quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
+                **transformer_kwargs,
+            )
+        else:
+            self.transformer = None
+        if load_encoder:
+            self.processor = from_pretrained_with_prefetch(
+                Qwen3VLProcessor.from_pretrained,
+                model,
+                subfolder="processor",
+                prefetch_list=qwen_subfolders,
+                local_files_only=local_files_only,
+            )
+        else:
+            self.processor = None
 
         self.stage = None
 
         # The VAE compresses 16x spatially and the transformer consumes latents
         # unpatched, so one token covers a 16x16 pixel tile.
         self.vae_scale_factor = 16
-        self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 64
+        if self.vae is not None:
+            self.latent_channels = self.vae.config.z_dim
+        elif self.transformer is not None:
+            self.latent_channels = self.transformer.in_channels
+        else:
+            self.latent_channels = 64
 
         self.sys_prompt = "Comprehend and analyze the provided prompt."
         # The prompt is built as a raw template string and passed straight to
@@ -450,10 +493,14 @@ class QwenImage21Pipeline(
         # Number of leading system-role tokens to drop from the hidden states.
         # Derived from the tokenized system message rather than hardcoded, so it
         # tracks the processor's template.
-        sys_message = [{"role": "system", "content": [{"type": "text", "text": self.sys_prompt}]}]
-        sys_tokens = self.processor.apply_chat_template(sys_message, tokenize=True, return_dict=False)
-        self._drop_idx = len(sys_tokens[0])
-        self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
+        if self.processor is not None:
+            sys_message = [{"role": "system", "content": [{"type": "text", "text": self.sys_prompt}]}]
+            sys_tokens = self.processor.apply_chat_template(sys_message, tokenize=True, return_dict=False)
+            self._drop_idx = len(sys_tokens[0])
+            self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
+        else:
+            self._drop_idx = 0
+            self._img_token_id = None
         self._max_length = 8192
 
         self.setup_diffusion_pipeline_profiler(
@@ -1119,6 +1166,8 @@ class QwenImage21Pipeline(
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
+        if self.vae is None:
+            raise RuntimeError("Qwen-Image 2.1 decode requires a loaded VAE.")
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents = latents.to(self.vae.dtype)
         latents_mean = (
@@ -1138,21 +1187,28 @@ class QwenImage21Pipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self._forward_impl(req)
+    @staticmethod
+    def _get_stage_payload_field(prompt: Any, name: str) -> Any:
+        if isinstance(prompt, str):
+            return None
+        value = prompt.get(name)
+        if value is None:
+            additional = prompt.get("additional_information")
+            if isinstance(additional, dict):
+                value = additional.get(name)
+        return value
 
-    def _forward_impl(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        sampling_params_list = req.sampling_params_list
-        common_sampling_params = sampling_params_list[0]
-        prompt, negative_prompt = self._extract_prompts(req.prompts)
-        per_request_images = self._extract_request_images(req.prompts)
+    def _prepare_disaggregated_context(self, req: DiffusionRequestBatch) -> dict[str, Any]:
+        if self.transformer is None:
+            raise RuntimeError("Qwen-Image 2.1 denoise stage requires a loaded DiT.")
 
+        self._interrupt = False
+        common_sampling_params = req.sampling_params_list[0]
         height = common_sampling_params.height or OUTPUT_RESOLUTION
         width = common_sampling_params.width or OUTPUT_RESOLUTION
         height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
         num_inference_steps = common_sampling_params.num_inference_steps or 50
         sigmas = common_sampling_params.sigmas
-        max_sequence_length = common_sampling_params.max_sequence_length or self._max_length
         num_images_per_prompt = (
             common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
@@ -1161,36 +1217,356 @@ class QwenImage21Pipeline(
         true_cfg_scale = (
             common_sampling_params.true_cfg_scale if common_sampling_params.true_cfg_scale is not None else 1.0
         )
-        output_type = common_sampling_params.output_type or "pil"
 
-        # Batch homogeneity decides the attention path: a homogeneous batch
-        # (same condition-image count and sizes per request) can use the
-        # piecewise-span backend; heterogeneous batches take the dense 4D mask.
-        signatures = [
-            (
-                len(entry["vae_images"] or []),
-                tuple(entry["input_image_sizes"] or ()),
-            )
-            for entry in per_request_images
-        ]
-        homogeneous = all(sig == signatures[0] for sig in signatures)
-        attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
-
-        ctx = self._prepare_generation_context(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            sigmas=sigmas,
-            num_images_per_prompt=num_images_per_prompt,
-            generator=generator,
-            true_cfg_scale=true_cfg_scale,
-            max_sequence_length=max_sequence_length,
-            per_request_images=per_request_images,
-            latents=latents,
-            attention_kwargs=attention_kwargs,
+        fields = req.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": None,
+                "prompt_embeds_mask": None,
+                "negative_prompt_embeds": None,
+                "negative_prompt_embeds_mask": None,
+                "image_pad_mask": None,
+                "negative_image_pad_mask": None,
+            },
         )
+        prompt_embeds = fields["prompt_embeds"]
+        prompt_embeds_mask = fields["prompt_embeds_mask"]
+        image_pad_mask = fields["image_pad_mask"]
+        if not isinstance(prompt_embeds, torch.Tensor) or not isinstance(prompt_embeds_mask, torch.Tensor):
+            raise ValueError("Qwen-Image 2.1 denoise stage requires prompt embeddings from the encode stage.")
+        if not isinstance(image_pad_mask, torch.Tensor):
+            raise ValueError("Qwen-Image 2.1 denoise stage requires image_pad_mask from the encode stage.")
+
+        dtype = next(self.transformer.parameters()).dtype
+        prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
+        prompt_embeds_mask = prompt_embeds_mask.to(device=self.device)
+        image_pad_mask = image_pad_mask.to(device=self.device)
+        prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+        prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+        image_pad_mask = image_pad_mask.repeat_interleave(num_images_per_prompt, dim=0)
+
+        negative_prompt_embeds = fields["negative_prompt_embeds"]
+        negative_prompt_embeds_mask = fields["negative_prompt_embeds_mask"]
+        negative_image_pad_mask = fields["negative_image_pad_mask"]
+        if negative_prompt_embeds is not None:
+            if not isinstance(negative_prompt_embeds, torch.Tensor) or not isinstance(
+                negative_prompt_embeds_mask, torch.Tensor
+            ):
+                raise ValueError("Qwen-Image 2.1 negative prompt payload is incomplete.")
+            negative_prompt_embeds = negative_prompt_embeds.to(device=self.device, dtype=dtype)
+            negative_prompt_embeds_mask = negative_prompt_embeds_mask.to(device=self.device)
+            negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+            negative_prompt_embeds_mask = negative_prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+            if negative_image_pad_mask is None:
+                raise ValueError("Qwen-Image 2.1 negative prompt payload is missing negative_image_pad_mask.")
+            negative_image_pad_mask = negative_image_pad_mask.to(device=self.device)
+            negative_image_pad_mask = negative_image_pad_mask.repeat_interleave(num_images_per_prompt, dim=0)
+
+        do_true_cfg = true_cfg_scale > 1 and negative_prompt_embeds is not None
+        self.check_cfg_parallel_validity(true_cfg_scale, negative_prompt_embeds is not None)
+
+        image_latents_per_request = [self._get_stage_payload_field(prompt, "image_latents") for prompt in req.prompts]
+        if any(image_latent is not None for image_latent in image_latents_per_request):
+            if not all(isinstance(image_latent, torch.Tensor) for image_latent in image_latents_per_request):
+                raise ValueError("Cannot batch Qwen-Image 2.1 requests with mixed image_latents payloads.")
+            image_latents = torch.stack(image_latents_per_request, dim=0)
+            image_latents = image_latents.to(device=self.device, dtype=dtype)
+            image_latents = image_latents.repeat_interleave(num_images_per_prompt, dim=0)
+        else:
+            image_latents = None
+
+        input_image_sizes = [self._get_stage_payload_field(prompt, "input_image_sizes") or [] for prompt in req.prompts]
+        img_shapes = [
+            [
+                *[(1, image_height // self.vae_scale_factor, image_width // self.vae_scale_factor)
+                  for image_width, image_height in sizes],
+                (1, height // self.vae_scale_factor, width // self.vae_scale_factor),
+            ]
+            for sizes in input_image_sizes
+        ]
+        attention_signatures = [tuple(sizes) for sizes in input_image_sizes]
+        homogeneous = all(signature == attention_signatures[0] for signature in attention_signatures)
+        self._attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
+
+        num_channels_latents = self.transformer.in_channels
+        latents, _ = self.prepare_latents(
+            None,
+            req.num_reqs * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            self.device,
+            generator,
+            latents,
+        )
+        timesteps, _ = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
+        self._num_timesteps = len(timesteps)
+
+        img_mask = self._append_target_slots(image_pad_mask, latents.shape[1])
+        negative_img_mask = (
+            self._append_target_slots(negative_image_pad_mask, latents.shape[1]) if do_true_cfg else None
+        )
+        return {
+            "prompt_embeds": prompt_embeds,
+            "prompt_embeds_mask": prompt_embeds_mask,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            "img_mask": img_mask,
+            "negative_img_mask": negative_img_mask,
+            "latents": latents,
+            "image_latents": image_latents,
+            "img_shapes": img_shapes,
+            "timesteps": timesteps,
+            "do_true_cfg": do_true_cfg,
+            "true_cfg_scale": true_cfg_scale,
+            "height": height,
+            "width": width,
+            "num_images_per_prompt": num_images_per_prompt,
+            "output_type": common_sampling_params.output_type or "pil",
+        }
+
+    def encode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        if self.text_encoder is None or self.processor is None:
+            raise RuntimeError("Qwen-Image 2.1 encode stage requires a loaded text encoder and processor.")
+
+        sampling_params = batch.sampling_params_list[0]
+        prompts, negative_prompts = self._extract_prompts(batch.prompts)
+        per_request_images = self._extract_request_images(batch.prompts)
+        max_sequence_length = sampling_params.max_sequence_length or self._max_length
+        true_cfg_scale = sampling_params.true_cfg_scale if sampling_params.true_cfg_scale is not None else 1.0
+        has_negative_prompt = negative_prompts is not None
+        do_true_cfg = true_cfg_scale > 1 and has_negative_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_negative_prompt)
+
+        prompt_images = [entry["prompt_images"] for entry in per_request_images]
+        has_images = any(prompt_images)
+        if has_images and not all(prompt_images):
+            raise ValueError(
+                "Cannot batch a mix of image-conditioned and text-to-image requests; "
+                "the transformer's joint sequence requires a shared layout."
+            )
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = self.encode_prompt(
+            prompt=prompts,
+            images_per_prompt=prompt_images if has_images else None,
+            num_images_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+        )
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask, negative_image_pad_mask = self.encode_prompt(
+                prompt=negative_prompts,
+                images_per_prompt=prompt_images if has_images else None,
+                num_images_per_prompt=1,
+                max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+            negative_image_pad_mask = None
+
+        image_latents = None
+        if has_images:
+            if self.vae is None:
+                raise RuntimeError("Qwen-Image 2.1 image-conditioned encode requires a loaded VAE.")
+            num_slots = len(per_request_images[0]["vae_images"])
+            for entry in per_request_images:
+                if entry["input_image_sizes"] != per_request_images[0]["input_image_sizes"]:
+                    raise ValueError(
+                        "All image-conditioned requests in a batch must share condition image sizes "
+                        "(the transformer's joint sequence requires a shared layout)."
+                    )
+            encoded_slots = []
+            for slot in range(num_slots):
+                image = torch.cat([entry["vae_images"][slot] for entry in per_request_images], dim=0)
+                image = image.to(device=self.device, dtype=prompt_embeds.dtype)
+                encoded = image if image.shape[1] == self.latent_channels else self._encode_vae_image(image, None)
+                encoded_slots.append(
+                    self._pack_latents(
+                        encoded,
+                        batch.num_reqs,
+                        self.latent_channels,
+                        encoded.shape[3],
+                        encoded.shape[4],
+                    )
+                )
+            image_latents = torch.cat(encoded_slots, dim=1)
+
+        outputs = []
+        for index, entry in enumerate(per_request_images):
+            custom_output: dict[str, Any] = {
+                "prompt_embeds": prompt_embeds[index],
+                "prompt_embeds_mask": prompt_embeds_mask[index],
+                "image_pad_mask": image_pad_mask[index],
+            }
+            if negative_prompt_embeds is not None:
+                custom_output["negative_prompt_embeds"] = negative_prompt_embeds[index]
+                custom_output["negative_prompt_embeds_mask"] = negative_prompt_embeds_mask[index]
+                custom_output["negative_image_pad_mask"] = negative_image_pad_mask[index]
+            if image_latents is not None:
+                custom_output["image_latents"] = image_latents[index]
+                custom_output["input_image_sizes"] = entry["input_image_sizes"]
+            outputs.append(DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True))
+        return outputs
+
+    def decode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        outputs = []
+        for request in batch.requests:
+            latents = DiffusionRequestBatch.get_prompt_field(request.prompt, "latents")
+            if not isinstance(latents, torch.Tensor):
+                raise ValueError("Qwen-Image 2.1 decode stage requires a tensor 'latents' payload.")
+            if latents.ndim == 2:
+                latents = latents.unsqueeze(0)
+            if latents.ndim != 3:
+                raise ValueError(f"Qwen-Image 2.1 decode expects 3-D packed latents, got shape {tuple(latents.shape)}.")
+            height = request.sampling_params.height or OUTPUT_RESOLUTION
+            width = request.sampling_params.width or OUTPUT_RESOLUTION
+            height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+            output_type = request.sampling_params.output_type or "pil"
+            outputs.append(self._decode_latents(latents, height, width, output_type))
+        return outputs
+
+    def stage_forward(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self._forward_impl(batch, operator=DiffusionStageOperator.FORWARD)
+
+    def stage_encode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self.encode_batch(batch)
+
+    def _prepare_dummy_stage_payload(
+        self,
+        batch: DiffusionRequestBatch,
+        *,
+        operator: DiffusionStageOperator | None = None,
+    ) -> None:
+        """Supply the upstream payload omitted by the engine's local warmup."""
+        if operator is None:
+            operator = self.stage_role.default_request_operator
+
+        if operator is DiffusionStageOperator.DIFFUSE:
+            if self.transformer is None:
+                return
+            context_dim = self.transformer.txt_in.text_norm.weight.numel()
+            transformer_dtype = next(self.transformer.parameters()).dtype
+            for request in batch.requests:
+                prompt = request.prompt if isinstance(request.prompt, dict) else {"prompt": request.prompt}
+                sequence_length = request.sampling_params.max_sequence_length or 512
+                prompt["prompt_embeds"] = torch.zeros(
+                    sequence_length,
+                    context_dim,
+                    device=self.device,
+                    dtype=transformer_dtype,
+                )
+                prompt["prompt_embeds_mask"] = torch.ones(
+                    sequence_length,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                prompt["image_pad_mask"] = torch.zeros(
+                    sequence_length,
+                    device=self.device,
+                    dtype=torch.bool,
+                )
+                request.prompt = prompt
+        elif operator is DiffusionStageOperator.DECODE:
+            if self.vae is None:
+                return
+            for request in batch.requests:
+                height = request.sampling_params.height or OUTPUT_RESOLUTION
+                width = request.sampling_params.width or OUTPUT_RESOLUTION
+                height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+                prompt = request.prompt if isinstance(request.prompt, dict) else {"prompt": request.prompt}
+                prompt["latents"] = torch.zeros(
+                    1,
+                    (height // self.vae_scale_factor) * (width // self.vae_scale_factor),
+                    self.latent_channels,
+                    device=self.device,
+                    dtype=self.vae.dtype,
+                )
+                request.prompt = prompt
+
+    def stage_diffuse(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self._forward_impl(
+            batch,
+            operator=DiffusionStageOperator.DIFFUSE,
+            decode_output=self.stage_role is DiffusionStageRole.DENOISE_DECODE,
+        )
+
+    def stage_decode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self.decode_batch(batch)
+
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        operator = self.stage_role.default_request_operator
+        if operator is DiffusionStageOperator.ENCODE:
+            return self.stage_encode(req)
+        if operator is DiffusionStageOperator.DECODE:
+            return self.stage_decode(req)
+        return self._forward_impl(req, operator=operator)
+
+    def _forward_impl(
+        self,
+        req: DiffusionRequestBatch,
+        *,
+        operator: DiffusionStageOperator,
+        decode_output: bool | None = None,
+    ) -> list[DiffusionOutput]:
+        if decode_output is None:
+            decode_output = (
+                operator is DiffusionStageOperator.FORWARD
+                or self.stage_role is DiffusionStageRole.DENOISE_DECODE
+            )
+
+        if operator is DiffusionStageOperator.DIFFUSE:
+            ctx = self._prepare_disaggregated_context(req)
+            height = ctx["height"]
+            width = ctx["width"]
+            num_images_per_prompt = ctx["num_images_per_prompt"]
+            output_type = ctx["output_type"]
+            true_cfg_scale = ctx["true_cfg_scale"]
+        else:
+            sampling_params_list = req.sampling_params_list
+            common_sampling_params = sampling_params_list[0]
+            prompt, negative_prompt = self._extract_prompts(req.prompts)
+            per_request_images = self._extract_request_images(req.prompts)
+
+            height = common_sampling_params.height or OUTPUT_RESOLUTION
+            width = common_sampling_params.width or OUTPUT_RESOLUTION
+            height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+            num_inference_steps = common_sampling_params.num_inference_steps or 50
+            sigmas = common_sampling_params.sigmas
+            max_sequence_length = common_sampling_params.max_sequence_length or self._max_length
+            num_images_per_prompt = (
+                common_sampling_params.num_outputs_per_prompt
+                if common_sampling_params.num_outputs_per_prompt > 0
+                else 1
+            )
+            generator = req.collate_request_generators(num_images_per_prompt, None)
+            latents = req.collate_request_tensors("latents", None)
+            true_cfg_scale = (
+                common_sampling_params.true_cfg_scale if common_sampling_params.true_cfg_scale is not None else 1.0
+            )
+            output_type = common_sampling_params.output_type or "pil"
+
+            signatures = [
+                (len(entry["vae_images"] or []), tuple(entry["input_image_sizes"] or ()))
+                for entry in per_request_images
+            ]
+            homogeneous = all(signature == signatures[0] for signature in signatures)
+            attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
+            ctx = self._prepare_generation_context(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                sigmas=sigmas,
+                num_images_per_prompt=num_images_per_prompt,
+                generator=generator,
+                true_cfg_scale=true_cfg_scale,
+                max_sequence_length=max_sequence_length,
+                per_request_images=per_request_images,
+                latents=latents,
+                attention_kwargs=attention_kwargs,
+            )
 
         latents = self.diffuse(
             ctx["prompt_embeds"],
@@ -1206,12 +1582,21 @@ class QwenImage21Pipeline(
             ctx["do_true_cfg"],
             true_cfg_scale,
             attention_kwargs=self.attention_kwargs,
-            additional_transformer_kwargs={
-                "return_dict": False,
-            },
+            additional_transformer_kwargs={"return_dict": False},
         )
 
         self._current_timestep = None
+        if not decode_output:
+            return [
+                DiffusionOutput(
+                    output=None,
+                    custom_output={
+                        "latents": latents[index * num_images_per_prompt : (index + 1) * num_images_per_prompt]
+                    },
+                    to_cpu=True,
+                )
+                for index in range(req.num_reqs)
+            ]
 
         result = self._decode_latents(latents, height, width, output_type)
         return split_diffusion_output_by_request(
@@ -1653,6 +2038,11 @@ class QwenImage21Pipeline(
 
         return self._decode_latents(state.latents, height, width, output_type)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str] | None:
+        if not self.weights_sources:
+            # The ENCODE and DECODE roles load their complete components with
+            # `from_pretrained` during initialization and intentionally have no
+            # DiT source for the generic loader to consume.
+            return None
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
