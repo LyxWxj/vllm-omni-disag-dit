@@ -25,7 +25,11 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
-from vllm_omni.config.stage_config import DiffusionStageOperator
+from vllm_omni.config.stage_config import (
+    DiffusionStageOperator,
+    DiffusionStageRole,
+    resolve_diffusion_stage_role,
+)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
@@ -1110,6 +1114,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _diffusion_stage_role(self) -> DiffusionStageRole:
+        """Return the configured role for the currently loaded pipeline."""
+        pipeline = self.pipeline
+        return resolve_diffusion_stage_role(
+            getattr(pipeline, "stage_role", None) or getattr(self.od_config, "stage_role", None),
+            getattr(pipeline, "model_stage", None) or getattr(self.od_config, "model_stage", None),
+        )
+
     def release_step_requests(self, request_ids: Sequence[str]) -> None:
         """Drop request-owned state after execution/output preparation has returned.
 
@@ -1332,6 +1344,35 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             record_output_peak_memory=True,
         )
 
+    def _execute_atomic_step_stage(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Run an encode/decode role once while preserving step-mode routing."""
+        if scheduler_output.scheduled_cached_reqs.request_ids:
+            raise ValueError("An atomic diffusion stage cannot contain cached stepwise requests.")
+
+        runner_outputs: list[RunnerOutput] = []
+        for new_req in scheduler_output.scheduled_new_reqs:
+            try:
+                result = self.execute_model(
+                    new_req.req,
+                    diffusion_kv_metadata=new_req.diffusion_kv_metadata,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Atomic step-stage execution failed for %s",
+                    new_req.request_id,
+                    exc_info=True,
+                )
+                result = DiffusionOutput.from_exception(exc)
+            runner_outputs.append(
+                RunnerOutput(
+                    request_id=new_req.request_id,
+                    step_index=0,
+                    finished=True,
+                    result=result,
+                )
+            )
+        return BatchRunnerOutput.from_list(runner_outputs)
+
     def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Run a complete legacy forward for requests excluded from step mode."""
         if scheduler_output.scheduled_cached_reqs.request_ids:
@@ -1407,11 +1448,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, editing inputs, and
-        # similar features are not supported here yet.
+        # Stepwise mode supports the state-driven denoise path and the
+        # request-shaped atomic ENCODE/DECODE roles. Request-mode extras such
+        # as cache backends remain unsupported here.
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
+
+        if self._diffusion_stage_role() in (DiffusionStageRole.ENCODE, DiffusionStageRole.DECODE):
+            return self._execute_atomic_step_stage(scheduler_output)
 
         # Scheduler metadata is installed only for newly admitted requests;
         # cached requests continue to use the row installed on their first
@@ -1448,6 +1492,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         with grad_context:
             pipeline = self.pipeline
             assert pipeline is not None, "Model not loaded. Call load_model() first."
+            stage_role = self._diffusion_stage_role()
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1525,7 +1570,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         cast(SupportsInteractionApply, pipeline).peek_chunk_media(req).duration_s
                                     )
                                 clear_pipeline_stage_durations(pipeline)
-                                result = self._run_stage_operator(req, DiffusionStageOperator.POST_DECODE)
+                                output_operator = (
+                                    DiffusionStageOperator.STEP_OUTPUT
+                                    if stage_role is DiffusionStageRole.DENOISE
+                                    else DiffusionStageOperator.POST_DECODE
+                                )
+                                result = self._run_stage_operator(req, output_operator)
                                 if result is not None:
                                     result = self._prepare_output_for_transport(result, req.sampling)
                                     self._attach_stepwise_metadata(

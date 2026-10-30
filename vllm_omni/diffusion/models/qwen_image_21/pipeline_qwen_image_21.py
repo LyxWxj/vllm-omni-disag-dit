@@ -1607,12 +1607,195 @@ class QwenImage21Pipeline(
 
     # ── Step-execution protocol ──
 
+    @staticmethod
+    def _normalize_step_payload_tensor(
+        value: Any,
+        *,
+        name: str,
+        ndim: int,
+    ) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f"Qwen-Image 2.1 step payload requires tensor '{name}'.")
+        if value.ndim == ndim - 1:
+            value = value.unsqueeze(0)
+        if value.ndim != ndim:
+            raise ValueError(
+                f"Qwen-Image 2.1 step payload '{name}' must be {ndim}-D, got shape {tuple(value.shape)}."
+            )
+        if value.shape[0] != 1:
+            raise ValueError(
+                f"Qwen-Image 2.1 step payload '{name}' must contain one request row, got {value.shape[0]}."
+            )
+        return value
+
+    def _prepare_disaggregated_step_state(self, state: "StepRequestState") -> "StepRequestState":
+        """Build denoise state from conditioning emitted by an ENCODE stage."""
+        if self.transformer is None:
+            raise RuntimeError("Qwen-Image 2.1 denoise step requires a loaded DiT.")
+        if not isinstance(state.prompt, dict):
+            raise ValueError("Qwen-Image 2.1 denoise step requires a staged payload prompt.")
+
+        def payload(name: str) -> Any:
+            return self._get_stage_payload_field(state.prompt, name)
+
+        sampling = state.sampling
+        height = sampling.height or OUTPUT_RESOLUTION
+        width = sampling.width or OUTPUT_RESOLUTION
+        height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        dtype = next(self.transformer.parameters()).dtype
+
+        prompt_embeds_payload = payload("prompt_embeds")
+        prompt_embeds_mask_payload = payload("prompt_embeds_mask")
+        image_pad_mask_payload = payload("image_pad_mask")
+        if prompt_embeds_payload is None and OmniDiffusionRequest.is_dummy_run_request_id(state.request_id):
+            sequence_length = sampling.max_sequence_length or 512
+            context_dim = self.transformer.txt_in.text_norm.weight.numel()
+            prompt_embeds_payload = torch.zeros(
+                1,
+                sequence_length,
+                context_dim,
+                device=self.device,
+                dtype=dtype,
+            )
+            prompt_embeds_mask_payload = torch.ones(
+                1,
+                sequence_length,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            image_pad_mask_payload = torch.zeros(
+                1,
+                sequence_length,
+                device=self.device,
+                dtype=torch.bool,
+            )
+
+        prompt_embeds = self._normalize_step_payload_tensor(
+            prompt_embeds_payload,
+            name="prompt_embeds",
+            ndim=3,
+        ).to(device=self.device, dtype=dtype)
+        prompt_embeds_mask = self._normalize_step_payload_tensor(
+            prompt_embeds_mask_payload,
+            name="prompt_embeds_mask",
+            ndim=2,
+        ).to(device=self.device)
+        image_pad_mask = self._normalize_step_payload_tensor(
+            image_pad_mask_payload,
+            name="image_pad_mask",
+            ndim=2,
+        ).to(device=self.device, dtype=torch.bool)
+        prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+        prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+        image_pad_mask = image_pad_mask.repeat_interleave(num_images_per_prompt, dim=0)
+
+        negative_prompt_embeds = payload("negative_prompt_embeds")
+        negative_prompt_embeds_mask = payload("negative_prompt_embeds_mask")
+        negative_image_pad_mask = payload("negative_image_pad_mask")
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = self._normalize_step_payload_tensor(
+                negative_prompt_embeds,
+                name="negative_prompt_embeds",
+                ndim=3,
+            ).to(device=self.device, dtype=dtype)
+            negative_prompt_embeds_mask = self._normalize_step_payload_tensor(
+                negative_prompt_embeds_mask,
+                name="negative_prompt_embeds_mask",
+                ndim=2,
+            ).to(device=self.device)
+            negative_image_pad_mask = self._normalize_step_payload_tensor(
+                negative_image_pad_mask,
+                name="negative_image_pad_mask",
+                ndim=2,
+            ).to(device=self.device, dtype=torch.bool)
+            negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+            negative_prompt_embeds_mask = negative_prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+            negative_image_pad_mask = negative_image_pad_mask.repeat_interleave(num_images_per_prompt, dim=0)
+        elif negative_prompt_embeds_mask is not None or negative_image_pad_mask is not None:
+            raise ValueError("Qwen-Image 2.1 negative prompt payload is incomplete.")
+
+        image_latents = payload("image_latents")
+        if image_latents is None:
+            image_latents = sampling.image_latent
+        if image_latents is not None:
+            image_latents = self._normalize_step_payload_tensor(
+                image_latents,
+                name="image_latents",
+                ndim=3,
+            ).to(device=self.device, dtype=dtype)
+            image_latents = image_latents.repeat_interleave(num_images_per_prompt, dim=0)
+
+        latents, _ = self.prepare_latents(
+            None,
+            num_images_per_prompt,
+            self.transformer.in_channels,
+            height,
+            width,
+            dtype,
+            self.device,
+            sampling.generator,
+            sampling.latents,
+        )
+        timesteps, _ = self.prepare_timesteps(
+            sampling.num_inference_steps or 50,
+            sampling.sigmas,
+            latents.shape[1],
+        )
+        self._num_timesteps = len(timesteps)
+        self._attention_kwargs = {"attn_path": "auto"}
+        self._current_timestep = None
+        self._interrupt = False
+
+        input_image_sizes = payload("input_image_sizes") or []
+        img_shapes = [
+            [
+                *[
+                    (1, image_height // self.vae_scale_factor, image_width // self.vae_scale_factor)
+                    for image_width, image_height in input_image_sizes
+                ],
+                (1, height // self.vae_scale_factor, width // self.vae_scale_factor),
+            ]
+        ]
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+
+        state.prompt_embeds = prompt_embeds
+        state.prompt_embeds_mask = prompt_embeds_mask
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = (
+            (sampling.true_cfg_scale if sampling.true_cfg_scale is not None else 1.0) > 1
+            and negative_prompt_embeds is not None
+        )
+        state.guidance = None
+        state.img_shapes = img_shapes
+        sampling.cfg_normalize = False
+
+        state.extra["image_pad_mask"] = image_pad_mask
+        state.extra["negative_image_pad_mask"] = negative_image_pad_mask
+        state.extra["image_latents"] = image_latents
+        state.extra["height"] = height
+        state.extra["width"] = width
+        cache_enabled = getattr(self.transformer, "causal_condition", False)
+        state.extra["kv_cache"] = (
+            QwenImage21KVCache({} for _ in self.transformer.transformer_blocks) if cache_enabled else None
+        )
+        return state
+
     def prepare_encode(
         self,
         state: "StepRequestState",
         **kwargs: Any,
     ) -> "StepRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
+        if self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE):
+            return self._prepare_disaggregated_step_state(state)
+
         sampling = state.sampling
         prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
         per_request_images = self._extract_request_images([state.prompt] if state.prompt is not None else [])
@@ -2037,6 +2220,21 @@ class QwenImage21Pipeline(
         output_type = kwargs.get("output_type") or state.sampling.output_type or "pil"
 
         return self._decode_latents(state.latents, height, width, output_type)
+
+    def step_output(
+        self,
+        state: "StepRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Return final denoise latents for a downstream DECODE stage."""
+        del kwargs
+        if state.latents is None:
+            raise ValueError("Qwen-Image 2.1 denoise stage has no latents to transfer.")
+        return DiffusionOutput(
+            output=None,
+            custom_output={"latents": state.latents},
+            to_cpu=True,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str] | None:
         if not self.weights_sources:

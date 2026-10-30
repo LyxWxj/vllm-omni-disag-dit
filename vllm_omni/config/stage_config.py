@@ -267,6 +267,7 @@ class DiffusionStageOperator(str, Enum):
     PREPARE_ENCODE = "prepare_encode"
     DENOISE_STEP = "denoise_step"
     STEP_SCHEDULER = "step_scheduler"
+    STEP_OUTPUT = "step_output"
     POST_DECODE = "post_decode"
 
     @property
@@ -333,12 +334,8 @@ class DiffusionStageRole(str, Enum):
 
     @property
     def step_operators(self) -> frozenset[DiffusionStageOperator]:
-        """Return the step-level operators required by this role."""
-        return frozenset(
-            operator
-            for operator in DiffusionStageOperator
-            if not operator.is_request_operator and operator.required_stages <= self.stages
-        )
+        """Return the operators required by this role in step execution."""
+        return _ROLE_STEP_OPERATORS[self]
 
     def allows(self, stage: DiffusionStage) -> bool:
         """Return whether this role contains an atomic stage."""
@@ -383,6 +380,35 @@ _ROLE_DEFAULT_REQUEST_OPERATORS: dict[DiffusionStageRole, DiffusionStageOperator
     DiffusionStageRole.DECODE: DiffusionStageOperator.DECODE,
 }
 
+_ROLE_STEP_OPERATORS: dict[DiffusionStageRole, frozenset[DiffusionStageOperator]] = {
+    DiffusionStageRole.FULL: frozenset(
+        {
+            DiffusionStageOperator.PREPARE_ENCODE,
+            DiffusionStageOperator.DENOISE_STEP,
+            DiffusionStageOperator.STEP_SCHEDULER,
+            DiffusionStageOperator.POST_DECODE,
+        }
+    ),
+    DiffusionStageRole.ENCODE: frozenset({DiffusionStageOperator.ENCODE}),
+    DiffusionStageRole.DENOISE: frozenset(
+        {
+            DiffusionStageOperator.PREPARE_ENCODE,
+            DiffusionStageOperator.DENOISE_STEP,
+            DiffusionStageOperator.STEP_SCHEDULER,
+            DiffusionStageOperator.STEP_OUTPUT,
+        }
+    ),
+    DiffusionStageRole.DENOISE_DECODE: frozenset(
+        {
+            DiffusionStageOperator.PREPARE_ENCODE,
+            DiffusionStageOperator.DENOISE_STEP,
+            DiffusionStageOperator.STEP_SCHEDULER,
+            DiffusionStageOperator.POST_DECODE,
+        }
+    ),
+    DiffusionStageRole.DECODE: frozenset({DiffusionStageOperator.DECODE}),
+}
+
 _OPERATOR_REQUIRED_STAGES: dict[DiffusionStageOperator, frozenset[DiffusionStage]] = {
     DiffusionStageOperator.FORWARD: frozenset(
         {
@@ -394,9 +420,13 @@ _OPERATOR_REQUIRED_STAGES: dict[DiffusionStageOperator, frozenset[DiffusionStage
     DiffusionStageOperator.ENCODE: frozenset({DiffusionStage.ENCODE}),
     DiffusionStageOperator.DIFFUSE: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.DECODE: frozenset({DiffusionStage.DECODE}),
-    DiffusionStageOperator.PREPARE_ENCODE: frozenset({DiffusionStage.ENCODE}),
+    # This is the one-time state preparation hook for the iterative path. It
+    # is also used by a DENOISE-only stage after conditioning has arrived from
+    # an upstream ENCODE stage.
+    DiffusionStageOperator.PREPARE_ENCODE: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.DENOISE_STEP: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.STEP_SCHEDULER: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.STEP_OUTPUT: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.POST_DECODE: frozenset({DiffusionStage.DECODE}),
 }
 
@@ -408,6 +438,7 @@ _OPERATOR_PRIMITIVES: dict[DiffusionStageOperator, str] = {
     DiffusionStageOperator.PREPARE_ENCODE: "prepare_encode",
     DiffusionStageOperator.DENOISE_STEP: "denoise_step",
     DiffusionStageOperator.STEP_SCHEDULER: "step_scheduler",
+    DiffusionStageOperator.STEP_OUTPUT: "step_output",
     DiffusionStageOperator.POST_DECODE: "post_decode",
 }
 
