@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_omni.config.stage_config import DiffusionStageOperator
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
@@ -946,6 +947,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output.completed_event_ids = list(meta.completed_event_ids)
             output.coalesced_event_ids = list(meta.coalesced_event_ids)
 
+    def _run_stage_operator(self, payload: Any, operator: DiffusionStageOperator, **kwargs: Any) -> Any:
+        pipeline = self.pipeline
+        assert pipeline is not None, "Model not loaded. Call load_model() first."
+        run_stage = getattr(pipeline, "run_stage", None)
+        if callable(run_stage) and getattr(pipeline, "supports_stage_operator_dispatch", False):
+            return run_stage(payload, operator=operator, **kwargs)
+        return getattr(pipeline, operator.primitive_name)(payload, **kwargs)
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
@@ -1233,7 +1242,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         ) is not None and not supports_interaction_apply(pipeline):
                             raise ValueError("playback feedback requires an interactive chunked pipeline")
                         self._initialize_generator(state.sampling)
-                        pipeline.prepare_encode(state)
+                        self._run_stage_operator(state, DiffusionStageOperator.PREPARE_ENCODE)
                 except Exception as exc:
                     per_req_exc = exc
                 # Pipelines that do rank-0-only work (e.g. MiniMax H3
@@ -1465,7 +1474,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                noise_pred = self._run_stage_operator(
+                    input_batch,
+                    DiffusionStageOperator.DENOISE_STEP,
+                    states=states,
+                )
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(
@@ -1492,8 +1505,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                            self._run_stage_operator(
+                                req,
+                                DiffusionStageOperator.STEP_SCHEDULER,
+                                noise_pred=noise_pred[offset : offset + row_num]
+                                if noise_pred is not None
+                                else None,
                             )
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
@@ -1508,7 +1525,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         cast(SupportsInteractionApply, pipeline).peek_chunk_media(req).duration_s
                                     )
                                 clear_pipeline_stage_durations(pipeline)
-                                result = pipeline.post_decode(req)
+                                result = self._run_stage_operator(req, DiffusionStageOperator.POST_DECODE)
                                 if result is not None:
                                     result = self._prepare_output_for_transport(result, req.sampling)
                                     self._attach_stepwise_metadata(

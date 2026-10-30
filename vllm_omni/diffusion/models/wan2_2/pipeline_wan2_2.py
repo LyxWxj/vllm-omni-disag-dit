@@ -19,7 +19,11 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
+from vllm_omni.config.stage_config import (
+    DiffusionStageOperator,
+    DiffusionStageRole,
+    resolve_diffusion_stage_role,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -41,6 +45,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.stage_mixin import DiffusionStageMixin
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
     resolve_wan_preencode_batch_frames,
@@ -431,6 +436,7 @@ _WAN_TEXT_ENCODER_OFFLOAD_PLAN = OffloadPlan(
 
 
 class Wan22Pipeline(
+    DiffusionStageMixin,
     nn.Module,
     PipelineParallelMixin,
     CFGParallelMixin,
@@ -456,7 +462,7 @@ class Wan22Pipeline(
         od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
-        super().__init__()
+        super().__init__(od_config=od_config)
         self.od_config = od_config
 
         self.device = get_local_device()
@@ -503,19 +509,20 @@ class Wan22Pipeline(
         # a ``DiffusionStageRole``. ``role_loads_component`` then decides, model
         # -agnostically, which component groups this stage instantiates. Wan's
         # TI2V ENCODE stage additionally owns the image VAE encoder below.
-        # ``forward`` is never called on an encode-only stage.
+        # Request execution is dispatched through ``DiffusionStageMixin``;
+        # ``forward`` remains a compatibility wrapper for direct callers.
         self.stage_role = resolve_diffusion_stage_role(
             getattr(od_config, "stage_role", None),
             getattr(od_config, "model_stage", None),
         )
-        role = self.stage_role.value
-        self.encode_only = not role_loads_component(role, "dit")
-        load_encoder = role_loads_component(role, "encoder")
-        load_dit = role_loads_component(role, "dit")
+        role = self.stage_role
+        load_encoder = role_loads_component(role, "encoder") and bool(self._encoder_modules)
+        load_dit = role_loads_component(role, "dit") and bool(self._dit_modules)
+        self.encode_only = not load_dit
         # Wan-specific capability; do not broaden the generic role groups for
         # other models. TI2V E owns image encoding, while G owns only DiT(s).
         load_image_encoder = self.stage_role == DiffusionStageRole.ENCODE and self.expand_timesteps
-        load_vae = role_loads_component(role, "vae") or load_image_encoder
+        load_vae = (role_loads_component(role, "vae") and bool(self._vae_modules)) or load_image_encoder
         self._conditioning_patch_size = (1, 2, 2)
         if load_image_encoder:
             config = load_transformer_config(model, "transformer", local_files_only)
@@ -800,24 +807,32 @@ class Wan22Pipeline(
 
         return latents
 
-    def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput | list[DiffusionOutput]:
-        """Dispatch to the computation for this pipeline's stage role.
-
-        Centralizes diffusion disaggregation dispatch so the model runner stays
-        stage-agnostic: E encodes text and optional TI2V image conditioning, G
-        consumes conditioning without text/VAE encoding, and D decodes latents.
-        """
-        if self.stage_role == DiffusionStageRole.ENCODE:
-            return self.encode_batch(batch)
-        if batch.is_dummy_run():
-            self._prepare_dummy_stage_payload(batch)
-        if self.stage_role == DiffusionStageRole.DECODE:
-            return self.decode_batch(batch)
+    def stage_forward(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
         return self.forward(batch)
 
-    def _prepare_dummy_stage_payload(self, batch: DiffusionRequestBatch) -> None:
+    def stage_encode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self.encode_batch(batch)
+
+    def stage_diffuse(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self._forward_impl(
+            batch,
+            operator=DiffusionStageOperator.DIFFUSE,
+            decode_output=self.stage_role is DiffusionStageRole.DENOISE_DECODE,
+        )
+
+    def stage_decode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self.decode_batch(batch)
+
+    def _prepare_dummy_stage_payload(
+        self,
+        batch: DiffusionRequestBatch,
+        *,
+        operator: DiffusionStageOperator | None = None,
+    ) -> None:
         """Supply the upstream payload omitted by the engine's local warmup."""
-        if self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE):
+        if operator is None:
+            operator = self.stage_role.default_request_operator
+        if operator is DiffusionStageOperator.DIFFUSE:
             text_dim = self.transformer_config.text_dim
             transformer = self.transformer if self.transformer is not None else self.transformer_2
             for req in batch.requests:
@@ -858,7 +873,7 @@ class Wan22Pipeline(
                             dtype=torch.float32,
                         )
                 req.prompt = prompt
-        elif self.stage_role == DiffusionStageRole.DECODE:
+        elif operator is DiffusionStageOperator.DECODE:
             height = batch.sampling_params.height or 512
             width = batch.sampling_params.width or 512
             num_frames = batch.sampling_params.num_frames or 1
@@ -1182,7 +1197,13 @@ class Wan22Pipeline(
         # without pinning a CUDA/XPU context on the receiver.
         return DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True)
 
-    def _validate_generation_batch(self, batch: DiffusionRequestBatch, *, uses_text_encoder: bool) -> None:
+    def _validate_generation_batch(
+        self,
+        batch: DiffusionRequestBatch,
+        *,
+        uses_text_encoder: bool,
+        operator: DiffusionStageOperator = DiffusionStageOperator.FORWARD,
+    ) -> None:
         # Do not reuse the scheduler's raw/global key: FULL also supports direct
         # SimpleNamespace callers, rounded-equivalent dimensions and precomputed
         # embeddings. Only settings consumed from the first request belong here.
@@ -1206,7 +1227,7 @@ class Wan22Pipeline(
             }
             if uses_text_encoder:
                 current["max_sequence_length"] = sampling.max_sequence_length or 512
-            if self.stage_role != DiffusionStageRole.DENOISE:
+            if operator is not DiffusionStageOperator.DIFFUSE or self.stage_role is DiffusionStageRole.DENOISE_DECODE:
                 current["output_type"] = sampling.output_type or "np"
             if not self.is_dmd:
                 current["num_inference_steps"] = (
@@ -1218,9 +1239,28 @@ class Wan22Pipeline(
         validate_wan_batch_settings(settings, stage="generation")
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        operator = self.stage_role.default_request_operator
+        if operator is DiffusionStageOperator.ENCODE:
+            return self.stage_encode(req)
+        if operator is DiffusionStageOperator.DECODE:
+            return self.stage_decode(req)
+        return self._forward_impl(req, operator=operator)
+
+    def _forward_impl(
+        self,
+        req: DiffusionRequestBatch,
+        *,
+        operator: DiffusionStageOperator,
+        decode_output: bool | None = None,
+    ) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
-        disaggregated = self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE)
+        if decode_output is None:
+            decode_output = (
+                operator is DiffusionStageOperator.FORWARD
+                or self.stage_role is DiffusionStageRole.DENOISE_DECODE
+            )
+        disaggregated = operator is DiffusionStageOperator.DIFFUSE
         if disaggregated:
             for request_prompt in req.prompts:
                 positive = DiffusionRequestBatch.get_prompt_field(request_prompt, "prompt_embeds")
@@ -1252,6 +1292,7 @@ class Wan22Pipeline(
             req,
             uses_text_encoder=not disaggregated
             and (prompt_embeds is None or (negative_prompt_embeds is None and max(guidance_low, guidance_high) > 1.0)),
+            operator=operator,
         )
         prompt: list[str] | None = prompt_texts if prompt_embeds is None else None
         negative_prompt: list[str] | None = None
@@ -1488,7 +1529,7 @@ class Wan22Pipeline(
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
-        if self.stage_role == DiffusionStageRole.DENOISE:
+        if operator is DiffusionStageOperator.DIFFUSE and not decode_output:
             return self._denoise_outputs(req, latents, num_outputs_per_prompt)
 
         if DEBUG_PERF:

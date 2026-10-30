@@ -249,6 +249,42 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
+class DiffusionStage(str, Enum):
+    """Atomic stages that can be composed into a diffusion stage role."""
+
+    ENCODE = "encode"
+    DENOISE = "denoise"
+    DECODE = "decode"
+
+
+class DiffusionStageOperator(str, Enum):
+    """A concrete operation requested from a diffusion pipeline."""
+
+    FORWARD = "forward"
+    ENCODE = "encode"
+    DIFFUSE = "diffuse"
+    DECODE = "decode"
+    PREPARE_ENCODE = "prepare_encode"
+    DENOISE_STEP = "denoise_step"
+    STEP_SCHEDULER = "step_scheduler"
+    POST_DECODE = "post_decode"
+
+    @property
+    def required_stages(self) -> frozenset[DiffusionStage]:
+        """Return the atomic stage capabilities required by this operator."""
+        return _OPERATOR_REQUIRED_STAGES[self]
+
+    @property
+    def primitive_name(self) -> str:
+        """Return the pipeline method that implements this operator."""
+        return _OPERATOR_PRIMITIVES[self]
+
+    @property
+    def is_request_operator(self) -> bool:
+        """Whether this operator consumes a request-level batch."""
+        return self in _REQUEST_OPERATORS
+
+
 class DiffusionStageRole(str, Enum):
     """Role of a diffusion stage within a (possibly disaggregated) pipeline.
 
@@ -258,23 +294,131 @@ class DiffusionStageRole(str, Enum):
     DiT-style models become disaggregatable through configuration alone, with no
     per-model source changes:
 
-    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
-                   stage. This is the default / single-stage behavior.
     - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
                    embeddings for a downstream stage.
     - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
                    and emit latents for a downstream decode stage.
-    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
-                          generation stage of E/G disaggregation).
     - ``DECODE``:  run only the VAE decode on upstream latents (the trailing
                    stage of a 3-way E/G/D split).
+    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
+                       stage. This is the default / single-stage behavior.
+    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
+                              generation stage of E/G disaggregation).
     """
-
-    FULL = "full"
     ENCODE = "encode"
     DENOISE = "denoise"
-    DENOISE_DECODE = "denoise_decode"
     DECODE = "decode"
+    # compound roles
+    FULL = "full"
+    DENOISE_DECODE = "denoise_decode"
+
+    @property
+    def stages(self) -> frozenset[DiffusionStage]:
+        """Return the atomic stages composed by this role."""
+        return _ROLE_STAGES[self]
+
+    @property
+    def default_request_operator(self) -> DiffusionStageOperator:
+        """Return the compatibility operator for request-batch execution."""
+        return _ROLE_DEFAULT_REQUEST_OPERATORS[self]
+
+    @property
+    def request_operators(self) -> frozenset[DiffusionStageOperator]:
+        """Return all request-level operators authorized by this role."""
+        return frozenset(
+            operator
+            for operator in DiffusionStageOperator
+            if operator.is_request_operator and operator.required_stages <= self.stages
+        )
+
+    @property
+    def step_operators(self) -> frozenset[DiffusionStageOperator]:
+        """Return the step-level operators required by this role."""
+        return frozenset(
+            operator
+            for operator in DiffusionStageOperator
+            if not operator.is_request_operator and operator.required_stages <= self.stages
+        )
+
+    def allows(self, stage: DiffusionStage) -> bool:
+        """Return whether this role contains an atomic stage."""
+        return stage in self.stages
+
+
+_ROLE_COMPOSITION: dict[DiffusionStageRole, tuple[DiffusionStage | DiffusionStageRole, ...]] = {
+    DiffusionStageRole.ENCODE: (DiffusionStage.ENCODE,),
+    DiffusionStageRole.DENOISE: (DiffusionStage.DENOISE,),
+    DiffusionStageRole.DECODE: (DiffusionStage.DECODE,),
+    DiffusionStageRole.FULL: (
+        DiffusionStageRole.ENCODE,
+        DiffusionStageRole.DENOISE,
+        DiffusionStageRole.DECODE,
+    ),
+    DiffusionStageRole.DENOISE_DECODE: (
+        DiffusionStageRole.DENOISE,
+        DiffusionStageRole.DECODE,
+    ),
+}
+
+
+def _expand_role_stages(role: DiffusionStageRole) -> frozenset[DiffusionStage]:
+    stages: set[DiffusionStage] = set()
+    for component in _ROLE_COMPOSITION[role]:
+        if isinstance(component, DiffusionStage):
+            stages.add(component)
+        else:
+            stages.update(_expand_role_stages(component))
+    return frozenset(stages)
+
+
+_ROLE_STAGES: dict[DiffusionStageRole, frozenset[DiffusionStage]] = {
+    role: _expand_role_stages(role) for role in DiffusionStageRole
+}
+
+_ROLE_DEFAULT_REQUEST_OPERATORS: dict[DiffusionStageRole, DiffusionStageOperator] = {
+    DiffusionStageRole.FULL: DiffusionStageOperator.FORWARD,
+    DiffusionStageRole.ENCODE: DiffusionStageOperator.ENCODE,
+    DiffusionStageRole.DENOISE: DiffusionStageOperator.DIFFUSE,
+    DiffusionStageRole.DENOISE_DECODE: DiffusionStageOperator.DIFFUSE,
+    DiffusionStageRole.DECODE: DiffusionStageOperator.DECODE,
+}
+
+_OPERATOR_REQUIRED_STAGES: dict[DiffusionStageOperator, frozenset[DiffusionStage]] = {
+    DiffusionStageOperator.FORWARD: frozenset(
+        {
+            DiffusionStage.ENCODE,
+            DiffusionStage.DENOISE,
+            DiffusionStage.DECODE,
+        }
+    ),
+    DiffusionStageOperator.ENCODE: frozenset({DiffusionStage.ENCODE}),
+    DiffusionStageOperator.DIFFUSE: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.DECODE: frozenset({DiffusionStage.DECODE}),
+    DiffusionStageOperator.PREPARE_ENCODE: frozenset({DiffusionStage.ENCODE}),
+    DiffusionStageOperator.DENOISE_STEP: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.STEP_SCHEDULER: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.POST_DECODE: frozenset({DiffusionStage.DECODE}),
+}
+
+_OPERATOR_PRIMITIVES: dict[DiffusionStageOperator, str] = {
+    DiffusionStageOperator.FORWARD: "stage_forward",
+    DiffusionStageOperator.ENCODE: "stage_encode",
+    DiffusionStageOperator.DIFFUSE: "stage_diffuse",
+    DiffusionStageOperator.DECODE: "stage_decode",
+    DiffusionStageOperator.PREPARE_ENCODE: "prepare_encode",
+    DiffusionStageOperator.DENOISE_STEP: "denoise_step",
+    DiffusionStageOperator.STEP_SCHEDULER: "step_scheduler",
+    DiffusionStageOperator.POST_DECODE: "post_decode",
+}
+
+_REQUEST_OPERATORS = frozenset(
+    {
+        DiffusionStageOperator.FORWARD,
+        DiffusionStageOperator.ENCODE,
+        DiffusionStageOperator.DIFFUSE,
+        DiffusionStageOperator.DECODE,
+    }
+)
 
 
 # Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
