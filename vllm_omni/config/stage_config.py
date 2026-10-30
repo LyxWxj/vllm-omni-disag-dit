@@ -257,6 +257,13 @@ class DiffusionStage(str, Enum):
     DECODE = "decode"
 
 
+@dataclass(frozen=True)
+class _DiffusionStageOperatorSpec:
+    primitive_name: str
+    required_stages: frozenset[DiffusionStage]
+    is_request_operator: bool
+
+
 class DiffusionStageOperator(str, Enum):
     """A concrete operation requested from a diffusion pipeline."""
 
@@ -273,17 +280,17 @@ class DiffusionStageOperator(str, Enum):
     @property
     def required_stages(self) -> frozenset[DiffusionStage]:
         """Return the atomic stage capabilities required by this operator."""
-        return _OPERATOR_REQUIRED_STAGES[self]
+        return _OPERATOR_SPECS[self].required_stages
 
     @property
     def primitive_name(self) -> str:
         """Return the pipeline method that implements this operator."""
-        return _OPERATOR_PRIMITIVES[self]
+        return _OPERATOR_SPECS[self].primitive_name
 
     @property
     def is_request_operator(self) -> bool:
         """Whether this operator consumes a request-level batch."""
-        return self in _REQUEST_OPERATORS
+        return _OPERATOR_SPECS[self].is_request_operator
 
 
 class DiffusionStageRole(str, Enum):
@@ -321,7 +328,7 @@ class DiffusionStageRole(str, Enum):
     @property
     def default_request_operator(self) -> DiffusionStageOperator:
         """Return the compatibility operator for request-batch execution."""
-        return _ROLE_DEFAULT_REQUEST_OPERATORS[self]
+        return _ROLE_SPECS[self].default_request_operator
 
     @property
     def request_operators(self) -> frozenset[DiffusionStageOperator]:
@@ -332,35 +339,70 @@ class DiffusionStageRole(str, Enum):
             if operator.is_request_operator and operator.required_stages <= self.stages
         )
 
+    def required_operators(self, *, step_execution: bool) -> frozenset[DiffusionStageOperator]:
+        """Return the primitive contract required by this role and execution mode.
+
+        ENCODE and DECODE remain request-shaped even when the global runner is
+        configured for step execution because they are executed atomically by
+        the runner's request path.
+        """
+        if not step_execution or not self.allows(DiffusionStage.DENOISE):
+            return frozenset({self.default_request_operator})
+
+        terminal_operator = (
+            DiffusionStageOperator.POST_DECODE
+            if self.allows(DiffusionStage.DECODE)
+            else DiffusionStageOperator.STEP_OUTPUT
+        )
+        return _DENOISE_STEP_OPERATORS | {terminal_operator}
+
     @property
     def step_operators(self) -> frozenset[DiffusionStageOperator]:
         """Return the operators required by this role in step execution."""
-        return _ROLE_STEP_OPERATORS[self]
+        return self.required_operators(step_execution=True)
 
     def allows(self, stage: DiffusionStage) -> bool:
         """Return whether this role contains an atomic stage."""
         return stage in self.stages
 
 
-_ROLE_COMPOSITION: dict[DiffusionStageRole, tuple[DiffusionStage | DiffusionStageRole, ...]] = {
-    DiffusionStageRole.ENCODE: (DiffusionStage.ENCODE,),
-    DiffusionStageRole.DENOISE: (DiffusionStage.DENOISE,),
-    DiffusionStageRole.DECODE: (DiffusionStage.DECODE,),
-    DiffusionStageRole.FULL: (
-        DiffusionStageRole.ENCODE,
-        DiffusionStageRole.DENOISE,
-        DiffusionStageRole.DECODE,
+@dataclass(frozen=True)
+class _DiffusionStageRoleSpec:
+    components: tuple[DiffusionStage | DiffusionStageRole, ...]
+    default_request_operator: DiffusionStageOperator
+
+
+_ROLE_SPECS: dict[DiffusionStageRole, _DiffusionStageRoleSpec] = {
+    DiffusionStageRole.ENCODE: _DiffusionStageRoleSpec(
+        components=(DiffusionStage.ENCODE,),
+        default_request_operator=DiffusionStageOperator.ENCODE,
     ),
-    DiffusionStageRole.DENOISE_DECODE: (
-        DiffusionStageRole.DENOISE,
-        DiffusionStageRole.DECODE,
+    DiffusionStageRole.DENOISE: _DiffusionStageRoleSpec(
+        components=(DiffusionStage.DENOISE,),
+        default_request_operator=DiffusionStageOperator.DIFFUSE,
+    ),
+    DiffusionStageRole.DECODE: _DiffusionStageRoleSpec(
+        components=(DiffusionStage.DECODE,),
+        default_request_operator=DiffusionStageOperator.DECODE,
+    ),
+    DiffusionStageRole.FULL: _DiffusionStageRoleSpec(
+        components=(
+            DiffusionStageRole.ENCODE,
+            DiffusionStageRole.DENOISE,
+            DiffusionStageRole.DECODE,
+        ),
+        default_request_operator=DiffusionStageOperator.FORWARD,
+    ),
+    DiffusionStageRole.DENOISE_DECODE: _DiffusionStageRoleSpec(
+        components=(DiffusionStageRole.DENOISE, DiffusionStageRole.DECODE),
+        default_request_operator=DiffusionStageOperator.DIFFUSE,
     ),
 }
 
 
 def _expand_role_stages(role: DiffusionStageRole) -> frozenset[DiffusionStage]:
     stages: set[DiffusionStage] = set()
-    for component in _ROLE_COMPOSITION[role]:
+    for component in _ROLE_SPECS[role].components:
         if isinstance(component, DiffusionStage):
             stages.add(component)
         else:
@@ -372,84 +414,70 @@ _ROLE_STAGES: dict[DiffusionStageRole, frozenset[DiffusionStage]] = {
     role: _expand_role_stages(role) for role in DiffusionStageRole
 }
 
-_ROLE_DEFAULT_REQUEST_OPERATORS: dict[DiffusionStageRole, DiffusionStageOperator] = {
-    DiffusionStageRole.FULL: DiffusionStageOperator.FORWARD,
-    DiffusionStageRole.ENCODE: DiffusionStageOperator.ENCODE,
-    DiffusionStageRole.DENOISE: DiffusionStageOperator.DIFFUSE,
-    DiffusionStageRole.DENOISE_DECODE: DiffusionStageOperator.DIFFUSE,
-    DiffusionStageRole.DECODE: DiffusionStageOperator.DECODE,
-}
+_DENOISE_STEP_OPERATORS = frozenset(
+    {
+        DiffusionStageOperator.PREPARE_ENCODE,
+        DiffusionStageOperator.DENOISE_STEP,
+        DiffusionStageOperator.STEP_SCHEDULER,
+    }
+)
 
-_ROLE_STEP_OPERATORS: dict[DiffusionStageRole, frozenset[DiffusionStageOperator]] = {
-    DiffusionStageRole.FULL: frozenset(
-        {
-            DiffusionStageOperator.PREPARE_ENCODE,
-            DiffusionStageOperator.DENOISE_STEP,
-            DiffusionStageOperator.STEP_SCHEDULER,
-            DiffusionStageOperator.POST_DECODE,
-        }
+_OPERATOR_SPECS: dict[DiffusionStageOperator, _DiffusionStageOperatorSpec] = {
+    DiffusionStageOperator.FORWARD: _DiffusionStageOperatorSpec(
+        primitive_name="stage_forward",
+        required_stages=frozenset(
+            {
+                DiffusionStage.ENCODE,
+                DiffusionStage.DENOISE,
+                DiffusionStage.DECODE,
+            }
+        ),
+        is_request_operator=True,
     ),
-    DiffusionStageRole.ENCODE: frozenset({DiffusionStageOperator.ENCODE}),
-    DiffusionStageRole.DENOISE: frozenset(
-        {
-            DiffusionStageOperator.PREPARE_ENCODE,
-            DiffusionStageOperator.DENOISE_STEP,
-            DiffusionStageOperator.STEP_SCHEDULER,
-            DiffusionStageOperator.STEP_OUTPUT,
-        }
+    DiffusionStageOperator.ENCODE: _DiffusionStageOperatorSpec(
+        primitive_name="stage_encode",
+        required_stages=frozenset({DiffusionStage.ENCODE}),
+        is_request_operator=True,
     ),
-    DiffusionStageRole.DENOISE_DECODE: frozenset(
-        {
-            DiffusionStageOperator.PREPARE_ENCODE,
-            DiffusionStageOperator.DENOISE_STEP,
-            DiffusionStageOperator.STEP_SCHEDULER,
-            DiffusionStageOperator.POST_DECODE,
-        }
+    DiffusionStageOperator.DIFFUSE: _DiffusionStageOperatorSpec(
+        primitive_name="stage_diffuse",
+        required_stages=frozenset({DiffusionStage.DENOISE}),
+        is_request_operator=True,
     ),
-    DiffusionStageRole.DECODE: frozenset({DiffusionStageOperator.DECODE}),
-}
-
-_OPERATOR_REQUIRED_STAGES: dict[DiffusionStageOperator, frozenset[DiffusionStage]] = {
-    DiffusionStageOperator.FORWARD: frozenset(
-        {
-            DiffusionStage.ENCODE,
-            DiffusionStage.DENOISE,
-            DiffusionStage.DECODE,
-        }
+    DiffusionStageOperator.DECODE: _DiffusionStageOperatorSpec(
+        primitive_name="stage_decode",
+        required_stages=frozenset({DiffusionStage.DECODE}),
+        is_request_operator=True,
     ),
-    DiffusionStageOperator.ENCODE: frozenset({DiffusionStage.ENCODE}),
-    DiffusionStageOperator.DIFFUSE: frozenset({DiffusionStage.DENOISE}),
-    DiffusionStageOperator.DECODE: frozenset({DiffusionStage.DECODE}),
     # This is the one-time state preparation hook for the iterative path. It
     # is also used by a DENOISE-only stage after conditioning has arrived from
     # an upstream ENCODE stage.
-    DiffusionStageOperator.PREPARE_ENCODE: frozenset({DiffusionStage.DENOISE}),
-    DiffusionStageOperator.DENOISE_STEP: frozenset({DiffusionStage.DENOISE}),
-    DiffusionStageOperator.STEP_SCHEDULER: frozenset({DiffusionStage.DENOISE}),
-    DiffusionStageOperator.STEP_OUTPUT: frozenset({DiffusionStage.DENOISE}),
-    DiffusionStageOperator.POST_DECODE: frozenset({DiffusionStage.DECODE}),
+    DiffusionStageOperator.PREPARE_ENCODE: _DiffusionStageOperatorSpec(
+        primitive_name="prepare_encode",
+        required_stages=frozenset({DiffusionStage.DENOISE}),
+        is_request_operator=False,
+    ),
+    DiffusionStageOperator.DENOISE_STEP: _DiffusionStageOperatorSpec(
+        primitive_name="denoise_step",
+        required_stages=frozenset({DiffusionStage.DENOISE}),
+        is_request_operator=False,
+    ),
+    DiffusionStageOperator.STEP_SCHEDULER: _DiffusionStageOperatorSpec(
+        primitive_name="step_scheduler",
+        required_stages=frozenset({DiffusionStage.DENOISE}),
+        is_request_operator=False,
+    ),
+    DiffusionStageOperator.STEP_OUTPUT: _DiffusionStageOperatorSpec(
+        primitive_name="step_output",
+        required_stages=frozenset({DiffusionStage.DENOISE}),
+        is_request_operator=False,
+    ),
+    DiffusionStageOperator.POST_DECODE: _DiffusionStageOperatorSpec(
+        primitive_name="post_decode",
+        required_stages=frozenset({DiffusionStage.DECODE}),
+        is_request_operator=False,
+    ),
 }
-
-_OPERATOR_PRIMITIVES: dict[DiffusionStageOperator, str] = {
-    DiffusionStageOperator.FORWARD: "stage_forward",
-    DiffusionStageOperator.ENCODE: "stage_encode",
-    DiffusionStageOperator.DIFFUSE: "stage_diffuse",
-    DiffusionStageOperator.DECODE: "stage_decode",
-    DiffusionStageOperator.PREPARE_ENCODE: "prepare_encode",
-    DiffusionStageOperator.DENOISE_STEP: "denoise_step",
-    DiffusionStageOperator.STEP_SCHEDULER: "step_scheduler",
-    DiffusionStageOperator.STEP_OUTPUT: "step_output",
-    DiffusionStageOperator.POST_DECODE: "post_decode",
-}
-
-_REQUEST_OPERATORS = frozenset(
-    {
-        DiffusionStageOperator.FORWARD,
-        DiffusionStageOperator.ENCODE,
-        DiffusionStageOperator.DIFFUSE,
-        DiffusionStageOperator.DECODE,
-    }
-)
 
 
 # Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was

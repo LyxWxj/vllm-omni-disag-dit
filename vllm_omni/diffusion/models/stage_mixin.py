@@ -44,7 +44,7 @@ class DiffusionStageMixin:
                 getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False)
             )
         stage_role = self._diffusion_stage_role()
-        operators = stage_role.step_operators if step_execution else frozenset({stage_role.default_request_operator})
+        operators = stage_role.required_operators(step_execution=step_execution)
         missing = sorted(
             {
                 operator.primitive_name
