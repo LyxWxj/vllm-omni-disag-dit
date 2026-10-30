@@ -1139,6 +1139,9 @@ class QwenImage21Pipeline(
         )
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        return self._forward_impl(req)
+
+    def _forward_impl(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common_sampling_params = sampling_params_list[0]
         prompt, negative_prompt = self._extract_prompts(req.prompts)
