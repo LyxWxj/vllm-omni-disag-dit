@@ -10,6 +10,7 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
@@ -961,6 +962,18 @@ class _BatchPipeline:
         return list(self._outputs)
 
 
+class _SeparatedPipeline:
+    supports_request_batch = False
+
+    def __init__(self, stage_role):
+        self.stage_role = stage_role
+        self.batches = []
+
+    def forward(self, batch):
+        self.batches.append(batch.request_ids)
+        return [DiffusionOutput(custom_output={"request_id": request_id}) for request_id in batch.request_ids]
+
+
 class _SingleRequestPipeline:
     def forward(self, batch):
         del batch
@@ -1035,6 +1048,35 @@ def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
     assert result.runner_outputs[0].result.output == "a"
     assert result.runner_outputs[1].request_id == "req-1"
     assert result.runner_outputs[1].result.output == "b"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "stage_role",
+    [
+        DiffusionStageRole.ENCODE,
+        DiffusionStageRole.DENOISE,
+        DiffusionStageRole.DENOISE_DECODE,
+        DiffusionStageRole.DECODE,
+    ],
+)
+def test_execute_model_batch_isolates_separated_stage_requests(monkeypatch, stage_role):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    pipeline = _SeparatedPipeline(stage_role)
+    runner = _make_batch_runner(pipeline)
+    runner._kv_prefetch_enabled = False
+    sched = _make_scheduler_output(num_reqs=2)
+
+    result = DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+    assert pipeline.batches == [["req-0"], ["req-1"]]
+    assert [runner_output.request_id for runner_output in result.runner_outputs] == ["req-0", "req-1"]
+    assert [runner_output.result.custom_output["request_id"] for runner_output in result.runner_outputs] == [
+        "req-0",
+        "req-1",
+    ]
 
 
 @pytest.mark.core_model

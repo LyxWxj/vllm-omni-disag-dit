@@ -11,11 +11,13 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.config.stage_config import DiffusionStageRole
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
     get_qwen_image_21_post_process_func,
 )
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -28,6 +30,75 @@ def _toy_pipeline() -> QwenImage21Pipeline:
     pipeline.vae_scale_factor = 16
     pipeline.latent_channels = 4
     return pipeline
+
+
+def test_decode_batch_decodes_each_request_independently(monkeypatch):
+    pipeline = _toy_pipeline()
+    first_latents = torch.full((1, 4, 4), 1.0)
+    second_latents = torch.full((1, 4, 4), 2.0)
+    requests = [
+        SimpleNamespace(
+            request_id="first",
+            prompt={"latents": first_latents},
+            sampling_params=SimpleNamespace(height=512, width=512, output_type="pil"),
+        ),
+        SimpleNamespace(
+            request_id="second",
+            prompt={"latents": second_latents},
+            sampling_params=SimpleNamespace(height=512, width=512, output_type="pil"),
+        ),
+    ]
+    calls = []
+
+    def decode_single(latents, height, width, output_type):
+        calls.append((latents.clone(), height, width, output_type))
+        return DiffusionOutput(output=latents[:, :1])
+
+    monkeypatch.setattr(pipeline, "_decode_latents", decode_single)
+
+    outputs = pipeline.decode_batch(DiffusionRequestBatch(requests=requests))
+
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[0][0], first_latents)
+    torch.testing.assert_close(calls[1][0], second_latents)
+    assert calls[0][1:] == (512, 512, "pil")
+    assert calls[1][1:] == (512, 512, "pil")
+    assert len(outputs) == 2
+    torch.testing.assert_close(outputs[0].output, first_latents[:, :1])
+    torch.testing.assert_close(outputs[1].output, second_latents[:, :1])
+
+
+@pytest.mark.parametrize("stage_role", [DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE])
+def test_separated_forward_runs_each_request_independently(monkeypatch, stage_role):
+    pipeline = _toy_pipeline()
+    pipeline.stage_role = stage_role
+    requests = [SimpleNamespace(request_id=request_id) for request_id in ("first", "second")]
+    calls = []
+
+    def forward_single(batch):
+        calls.append(batch.request_ids)
+        return [DiffusionOutput(custom_output={"request_id": batch.requests[0].request_id})]
+
+    monkeypatch.setattr(pipeline, "_forward_disaggregated", forward_single)
+
+    outputs = pipeline.forward(DiffusionRequestBatch(requests=requests))
+
+    assert calls == [["first"], ["second"]]
+    assert [output.custom_output["request_id"] for output in outputs] == ["first", "second"]
+
+
+def test_decode_batch_rejects_missing_decoded_tensor(monkeypatch):
+    pipeline = _toy_pipeline()
+    request = SimpleNamespace(
+        request_id="missing",
+        prompt={"latents": torch.zeros(1, 4, 4)},
+        sampling_params=SimpleNamespace(height=512, width=512, output_type="pil"),
+    )
+
+    monkeypatch.setattr(pipeline, "_decode_latents", lambda *args: DiffusionOutput(output=None))
+
+    with pytest.raises(RuntimeError, match="must return a tensor output"):
+        pipeline.decode_batch(DiffusionRequestBatch(requests=[request]))
 
 
 # ---------------------------------------------------------------------------

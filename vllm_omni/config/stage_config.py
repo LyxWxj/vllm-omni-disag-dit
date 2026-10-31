@@ -257,13 +257,6 @@ class DiffusionStage(str, Enum):
     DECODE = "decode"
 
 
-@dataclass(frozen=True)
-class _DiffusionStageOperatorSpec:
-    primitive_name: str
-    required_stages: frozenset[DiffusionStage]
-    is_request_operator: bool
-
-
 class DiffusionStageOperator(str, Enum):
     """A concrete operation requested from a diffusion pipeline."""
 
@@ -278,19 +271,26 @@ class DiffusionStageOperator(str, Enum):
     POST_DECODE = "post_decode"
 
     @property
-    def required_stages(self) -> frozenset[DiffusionStage]:
-        """Return the atomic stage capabilities required by this operator."""
-        return _OPERATOR_SPECS[self].required_stages
+    def is_request_operator(self) -> bool:
+        """Whether this operator consumes a request-level batch."""
+        return self in _REQUEST_OPERATORS
 
     @property
     def primitive_name(self) -> str:
-        """Return the pipeline method that implements this operator."""
-        return _OPERATOR_SPECS[self].primitive_name
+        """Return the legacy method name used by non-mixin pipelines."""
+        if self.is_request_operator:
+            return f"stage_{self.value}"
+        return self.value
 
-    @property
-    def is_request_operator(self) -> bool:
-        """Whether this operator consumes a request-level batch."""
-        return _OPERATOR_SPECS[self].is_request_operator
+
+_REQUEST_OPERATORS = frozenset(
+    {
+        DiffusionStageOperator.FORWARD,
+        DiffusionStageOperator.ENCODE,
+        DiffusionStageOperator.DIFFUSE,
+        DiffusionStageOperator.DECODE,
+    }
+)
 
 
 class DiffusionStageRole(str, Enum):
@@ -332,15 +332,11 @@ class DiffusionStageRole(str, Enum):
 
     @property
     def request_operators(self) -> frozenset[DiffusionStageOperator]:
-        """Return all request-level operators authorized by this role."""
-        return frozenset(
-            operator
-            for operator in DiffusionStageOperator
-            if operator.is_request_operator and operator.required_stages <= self.stages
-        )
+        """Return the request-level operator associated with this role."""
+        return frozenset({self.default_request_operator})
 
     def required_operators(self, *, step_execution: bool) -> frozenset[DiffusionStageOperator]:
-        """Return the primitive contract required by this role and execution mode.
+        """Return the execution contract required by this role and mode.
 
         ENCODE and DECODE remain request-shaped even when the global runner is
         configured for step execution because they are executed atomically by
@@ -354,7 +350,14 @@ class DiffusionStageRole(str, Enum):
             if self.allows(DiffusionStage.DECODE)
             else DiffusionStageOperator.STEP_OUTPUT
         )
-        return _DENOISE_STEP_OPERATORS | {terminal_operator}
+        return frozenset(
+            {
+                DiffusionStageOperator.PREPARE_ENCODE,
+                DiffusionStageOperator.DENOISE_STEP,
+                DiffusionStageOperator.STEP_SCHEDULER,
+                terminal_operator,
+            }
+        )
 
     @property
     def step_operators(self) -> frozenset[DiffusionStageOperator]:
@@ -413,72 +416,6 @@ def _expand_role_stages(role: DiffusionStageRole) -> frozenset[DiffusionStage]:
 _ROLE_STAGES: dict[DiffusionStageRole, frozenset[DiffusionStage]] = {
     role: _expand_role_stages(role) for role in DiffusionStageRole
 }
-
-_DENOISE_STEP_OPERATORS = frozenset(
-    {
-        DiffusionStageOperator.PREPARE_ENCODE,
-        DiffusionStageOperator.DENOISE_STEP,
-        DiffusionStageOperator.STEP_SCHEDULER,
-    }
-)
-
-_OPERATOR_SPECS: dict[DiffusionStageOperator, _DiffusionStageOperatorSpec] = {
-    DiffusionStageOperator.FORWARD: _DiffusionStageOperatorSpec(
-        primitive_name="stage_forward",
-        required_stages=frozenset(
-            {
-                DiffusionStage.ENCODE,
-                DiffusionStage.DENOISE,
-                DiffusionStage.DECODE,
-            }
-        ),
-        is_request_operator=True,
-    ),
-    DiffusionStageOperator.ENCODE: _DiffusionStageOperatorSpec(
-        primitive_name="stage_encode",
-        required_stages=frozenset({DiffusionStage.ENCODE}),
-        is_request_operator=True,
-    ),
-    DiffusionStageOperator.DIFFUSE: _DiffusionStageOperatorSpec(
-        primitive_name="stage_diffuse",
-        required_stages=frozenset({DiffusionStage.DENOISE}),
-        is_request_operator=True,
-    ),
-    DiffusionStageOperator.DECODE: _DiffusionStageOperatorSpec(
-        primitive_name="stage_decode",
-        required_stages=frozenset({DiffusionStage.DECODE}),
-        is_request_operator=True,
-    ),
-    # This is the one-time state preparation hook for the iterative path. It
-    # is also used by a DENOISE-only stage after conditioning has arrived from
-    # an upstream ENCODE stage.
-    DiffusionStageOperator.PREPARE_ENCODE: _DiffusionStageOperatorSpec(
-        primitive_name="prepare_encode",
-        required_stages=frozenset({DiffusionStage.DENOISE}),
-        is_request_operator=False,
-    ),
-    DiffusionStageOperator.DENOISE_STEP: _DiffusionStageOperatorSpec(
-        primitive_name="denoise_step",
-        required_stages=frozenset({DiffusionStage.DENOISE}),
-        is_request_operator=False,
-    ),
-    DiffusionStageOperator.STEP_SCHEDULER: _DiffusionStageOperatorSpec(
-        primitive_name="step_scheduler",
-        required_stages=frozenset({DiffusionStage.DENOISE}),
-        is_request_operator=False,
-    ),
-    DiffusionStageOperator.STEP_OUTPUT: _DiffusionStageOperatorSpec(
-        primitive_name="step_output",
-        required_stages=frozenset({DiffusionStage.DENOISE}),
-        is_request_operator=False,
-    ),
-    DiffusionStageOperator.POST_DECODE: _DiffusionStageOperatorSpec(
-        primitive_name="post_decode",
-        required_stages=frozenset({DiffusionStage.DECODE}),
-        is_request_operator=False,
-    ),
-}
-
 
 # Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
 # a free-form string ("text_encode"/"dit") before roles existed; keep the map so

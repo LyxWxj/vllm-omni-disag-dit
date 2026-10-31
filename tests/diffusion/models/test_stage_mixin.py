@@ -78,28 +78,25 @@ class _RequestPipeline(DiffusionStageMixin):
         self.calls: list[str] = []
         self.initialize_stage_execution(step_execution=False)
 
-    def stage_forward(self, batch):
+    def forward(self, batch):
         del batch
         self.calls.append("forward")
         return [DiffusionOutput(output="forward")]
 
-    def stage_encode(self, batch):
+    def encode_batch(self, batch):
         del batch
         self.calls.append("encode")
         return [DiffusionOutput(custom_output={"payload": "encode"})]
 
-    def stage_diffuse(self, batch):
+    def diffuse_batch(self, batch):
         del batch
         self.calls.append("diffuse")
         return [DiffusionOutput(output="decode", custom_output={"latents": torch.zeros(1)})]
 
-    def stage_decode(self, batch):
+    def decode_batch(self, batch):
         del batch
         self.calls.append("decode")
         return [DiffusionOutput(output="decode", stage_durations=getattr(self, "stage_durations", {}))]
-
-    def forward(self, batch):
-        return self.run_stage(batch)
 
 
 @pytest.mark.parametrize(
@@ -172,10 +169,6 @@ class _StepPipeline(DiffusionStageMixin):
     def step_scheduler(self, state, noise_pred, **kwargs):
         del state, noise_pred, kwargs
 
-    def step_output(self, state, **kwargs):
-        del state, kwargs
-        return None
-
     def post_decode(self, state, **kwargs):
         del state, kwargs
         return None
@@ -197,11 +190,22 @@ def test_run_stage_uses_one_denoise_step_when_enabled():
     assert pipeline.seen_states == batch.states
 
 
-def test_forward_uses_the_same_role_dispatch():
-    pipeline = _RequestPipeline(DiffusionStageRole.DENOISE_DECODE)
+def test_step_output_defaults_to_latent_transport():
+    pipeline = _StepPipeline()
+    state = SimpleNamespace(latents=torch.zeros(1))
 
-    assert pipeline.forward(_request_batch())[0].output == "decode"
-    assert pipeline.calls == ["diffuse"]
+    result = pipeline.step_output(state)
+
+    assert result.output is None
+    assert torch.equal(result.custom_output["latents"], state.latents)
+    assert result.to_cpu is True
+
+
+def test_forward_remains_the_pipeline_implementation():
+    pipeline = _RequestPipeline(DiffusionStageRole.FULL)
+
+    assert pipeline.forward(_request_batch())[0].output == "forward"
+    assert pipeline.calls == ["forward"]
 
 
 @pytest.mark.parametrize("completed", [False, True])
@@ -245,7 +249,7 @@ def test_run_stage_rejects_pipeline_without_step_protocol():
     pipeline = UnsupportedStepPipeline()
 
     assert not supports_step_execution(pipeline)
-    with pytest.raises(TypeError, match="required step-execution primitives"):
+    with pytest.raises(TypeError, match="required step-execution methods"):
         pipeline.initialize_stage_execution(step_execution=True)
 
 
@@ -260,5 +264,5 @@ def test_legacy_stage_rejects_explicit_step_execution_for_denoise():
 
     pipeline = LegacyPipeline(DiffusionStageRole.DENOISE)
 
-    with pytest.raises(TypeError, match="required step-execution primitives"):
+    with pytest.raises(TypeError, match="required step-execution methods"):
         pipeline.initialize_stage_execution(step_execution=True)

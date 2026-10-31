@@ -807,22 +807,6 @@ class Wan22Pipeline(
 
         return latents
 
-    def stage_forward(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self.forward(batch)
-
-    def stage_encode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self.encode_batch(batch)
-
-    def stage_diffuse(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self._forward_impl(
-            batch,
-            operator=DiffusionStageOperator.DIFFUSE,
-            decode_output=self.stage_role is DiffusionStageRole.DENOISE_DECODE,
-        )
-
-    def stage_decode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self.decode_batch(batch)
-
     def _prepare_dummy_stage_payload(
         self,
         batch: DiffusionRequestBatch,
@@ -1202,7 +1186,6 @@ class Wan22Pipeline(
         batch: DiffusionRequestBatch,
         *,
         uses_text_encoder: bool,
-        operator: DiffusionStageOperator = DiffusionStageOperator.FORWARD,
     ) -> None:
         # Do not reuse the scheduler's raw/global key: FULL also supports direct
         # SimpleNamespace callers, rounded-equivalent dimensions and precomputed
@@ -1227,7 +1210,7 @@ class Wan22Pipeline(
             }
             if uses_text_encoder:
                 current["max_sequence_length"] = sampling.max_sequence_length or 512
-            if operator is not DiffusionStageOperator.DIFFUSE or self.stage_role is DiffusionStageRole.DENOISE_DECODE:
+            if self.stage_role != DiffusionStageRole.DENOISE:
                 current["output_type"] = sampling.output_type or "np"
             if not self.is_dmd:
                 current["num_inference_steps"] = (
@@ -1239,28 +1222,13 @@ class Wan22Pipeline(
         validate_wan_batch_settings(settings, stage="generation")
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        operator = self.stage_role.default_request_operator
-        if operator is DiffusionStageOperator.ENCODE:
-            return self.stage_encode(req)
-        if operator is DiffusionStageOperator.DECODE:
-            return self.stage_decode(req)
-        return self._forward_impl(req, operator=operator)
-
-    def _forward_impl(
-        self,
-        req: DiffusionRequestBatch,
-        *,
-        operator: DiffusionStageOperator,
-        decode_output: bool | None = None,
-    ) -> list[DiffusionOutput]:
+        if self.stage_role is DiffusionStageRole.ENCODE:
+            return self.encode_batch(req)
+        if self.stage_role is DiffusionStageRole.DECODE:
+            return self.decode_batch(req)
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
-        if decode_output is None:
-            decode_output = (
-                operator is DiffusionStageOperator.FORWARD
-                or self.stage_role is DiffusionStageRole.DENOISE_DECODE
-            )
-        disaggregated = operator is DiffusionStageOperator.DIFFUSE
+        disaggregated = self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE)
         if disaggregated:
             for request_prompt in req.prompts:
                 positive = DiffusionRequestBatch.get_prompt_field(request_prompt, "prompt_embeds")
@@ -1292,7 +1260,6 @@ class Wan22Pipeline(
             req,
             uses_text_encoder=not disaggregated
             and (prompt_embeds is None or (negative_prompt_embeds is None and max(guidance_low, guidance_high) > 1.0)),
-            operator=operator,
         )
         prompt: list[str] | None = prompt_texts if prompt_embeds is None else None
         negative_prompt: list[str] | None = None
@@ -1529,7 +1496,7 @@ class Wan22Pipeline(
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
-        if operator is DiffusionStageOperator.DIFFUSE and not decode_output:
+        if self.stage_role == DiffusionStageRole.DENOISE:
             return self._denoise_outputs(req, latents, num_outputs_per_prompt)
 
         if DEBUG_PERF:

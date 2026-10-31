@@ -1410,7 +1410,7 @@ class QwenImage21Pipeline(
         return outputs
 
     def decode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        outputs = []
+        outputs: list[DiffusionOutput] = []
         for request in batch.requests:
             latents = DiffusionRequestBatch.get_prompt_field(request.prompt, "latents")
             if not isinstance(latents, torch.Tensor):
@@ -1423,14 +1423,13 @@ class QwenImage21Pipeline(
             width = request.sampling_params.width or OUTPUT_RESOLUTION
             height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
             output_type = request.sampling_params.output_type or "pil"
-            outputs.append(self._decode_latents(latents, height, width, output_type))
+            decoded = self._decode_latents(latents, height, width, output_type)
+            if not isinstance(decoded, DiffusionOutput):
+                raise RuntimeError("Qwen-Image 2.1 VAE decode must return a DiffusionOutput.")
+            if not isinstance(decoded.output, torch.Tensor):
+                raise RuntimeError("Qwen-Image 2.1 VAE decode must return a tensor output.")
+            outputs.append(decoded)
         return outputs
-
-    def stage_forward(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self._forward_impl(batch, operator=DiffusionStageOperator.FORWARD)
-
-    def stage_encode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self.encode_batch(batch)
 
     def _prepare_dummy_stage_payload(
         self,
@@ -1484,89 +1483,68 @@ class QwenImage21Pipeline(
                 )
                 request.prompt = prompt
 
-    def stage_diffuse(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self._forward_impl(
-            batch,
-            operator=DiffusionStageOperator.DIFFUSE,
-            decode_output=self.stage_role is DiffusionStageRole.DENOISE_DECODE,
-        )
-
-    def stage_decode(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return self.decode_batch(batch)
-
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        operator = self.stage_role.default_request_operator
-        if operator is DiffusionStageOperator.ENCODE:
-            return self.stage_encode(req)
-        if operator is DiffusionStageOperator.DECODE:
-            return self.stage_decode(req)
-        return self._forward_impl(req, operator=operator)
+        if self.stage_role is not DiffusionStageRole.FULL and req.num_reqs > 1:
+            outputs: list[DiffusionOutput] = []
+            for request in req.requests:
+                outputs.extend(self.forward(DiffusionRequestBatch(requests=[request])))
+            return outputs
+        if self.stage_role is DiffusionStageRole.ENCODE:
+            return self.encode_batch(req)
+        if self.stage_role is DiffusionStageRole.DECODE:
+            return self.decode_batch(req)
+        if self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE):
+            return self._forward_disaggregated(req)
 
-    def _forward_impl(
-        self,
-        req: DiffusionRequestBatch,
-        *,
-        operator: DiffusionStageOperator,
-        decode_output: bool | None = None,
-    ) -> list[DiffusionOutput]:
-        if decode_output is None:
-            decode_output = (
-                operator is DiffusionStageOperator.FORWARD
-                or self.stage_role is DiffusionStageRole.DENOISE_DECODE
-            )
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
+        prompt, negative_prompt = self._extract_prompts(req.prompts)
+        per_request_images = self._extract_request_images(req.prompts)
 
-        if operator is DiffusionStageOperator.DIFFUSE:
-            ctx = self._prepare_disaggregated_context(req)
-            height = ctx["height"]
-            width = ctx["width"]
-            num_images_per_prompt = ctx["num_images_per_prompt"]
-            output_type = ctx["output_type"]
-            true_cfg_scale = ctx["true_cfg_scale"]
-        else:
-            sampling_params_list = req.sampling_params_list
-            common_sampling_params = sampling_params_list[0]
-            prompt, negative_prompt = self._extract_prompts(req.prompts)
-            per_request_images = self._extract_request_images(req.prompts)
+        height = common_sampling_params.height or OUTPUT_RESOLUTION
+        width = common_sampling_params.width or OUTPUT_RESOLUTION
+        height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+        num_inference_steps = common_sampling_params.num_inference_steps or 50
+        sigmas = common_sampling_params.sigmas
+        max_sequence_length = common_sampling_params.max_sequence_length or self._max_length
+        num_images_per_prompt = (
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
+        )
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        latents = req.collate_request_tensors("latents", None)
+        true_cfg_scale = (
+            common_sampling_params.true_cfg_scale if common_sampling_params.true_cfg_scale is not None else 1.0
+        )
+        output_type = common_sampling_params.output_type or "pil"
 
-            height = common_sampling_params.height or OUTPUT_RESOLUTION
-            width = common_sampling_params.width or OUTPUT_RESOLUTION
-            height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
-            num_inference_steps = common_sampling_params.num_inference_steps or 50
-            sigmas = common_sampling_params.sigmas
-            max_sequence_length = common_sampling_params.max_sequence_length or self._max_length
-            num_images_per_prompt = (
-                common_sampling_params.num_outputs_per_prompt
-                if common_sampling_params.num_outputs_per_prompt > 0
-                else 1
+        # Batch homogeneity decides the attention path: a homogeneous batch
+        # (same condition-image count and sizes per request) can use the
+        # piecewise-span backend; heterogeneous batches take the dense 4D mask.
+        signatures = [
+            (
+                len(entry["vae_images"] or []),
+                tuple(entry["input_image_sizes"] or ()),
             )
-            generator = req.collate_request_generators(num_images_per_prompt, None)
-            latents = req.collate_request_tensors("latents", None)
-            true_cfg_scale = (
-                common_sampling_params.true_cfg_scale if common_sampling_params.true_cfg_scale is not None else 1.0
-            )
-            output_type = common_sampling_params.output_type or "pil"
+            for entry in per_request_images
+        ]
+        homogeneous = all(sig == signatures[0] for sig in signatures)
+        attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
 
-            signatures = [
-                (len(entry["vae_images"] or []), tuple(entry["input_image_sizes"] or ()))
-                for entry in per_request_images
-            ]
-            homogeneous = all(signature == signatures[0] for signature in signatures)
-            attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
-            ctx = self._prepare_generation_context(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                sigmas=sigmas,
-                num_images_per_prompt=num_images_per_prompt,
-                generator=generator,
-                true_cfg_scale=true_cfg_scale,
-                max_sequence_length=max_sequence_length,
-                per_request_images=per_request_images,
-                latents=latents,
-                attention_kwargs=attention_kwargs,
-            )
+        ctx = self._prepare_generation_context(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            true_cfg_scale=true_cfg_scale,
+            max_sequence_length=max_sequence_length,
+            per_request_images=per_request_images,
+            latents=latents,
+            attention_kwargs=attention_kwargs,
+        )
 
         latents = self.diffuse(
             ctx["prompt_embeds"],
@@ -1582,27 +1560,59 @@ class QwenImage21Pipeline(
             ctx["do_true_cfg"],
             true_cfg_scale,
             attention_kwargs=self.attention_kwargs,
-            additional_transformer_kwargs={"return_dict": False},
+            additional_transformer_kwargs={
+                "return_dict": False,
+            },
         )
 
         self._current_timestep = None
-        if not decode_output:
-            return [
-                DiffusionOutput(
-                    output=None,
-                    custom_output={
-                        "latents": latents[index * num_images_per_prompt : (index + 1) * num_images_per_prompt]
-                    },
-                    to_cpu=True,
-                )
-                for index in range(req.num_reqs)
-            ]
 
         result = self._decode_latents(latents, height, width, output_type)
         return split_diffusion_output_by_request(
             result,
             req,
             num_outputs_per_prompt=num_images_per_prompt,
+        )
+
+    def _forward_disaggregated(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        ctx = self._prepare_disaggregated_context(req)
+        latents = self.diffuse(
+            ctx["prompt_embeds"],
+            ctx["prompt_embeds_mask"],
+            ctx["negative_prompt_embeds"],
+            ctx["negative_prompt_embeds_mask"],
+            ctx["img_mask"],
+            ctx["negative_img_mask"],
+            ctx["latents"],
+            ctx["image_latents"],
+            ctx["img_shapes"],
+            ctx["timesteps"],
+            ctx["do_true_cfg"],
+            ctx["true_cfg_scale"],
+            attention_kwargs=self.attention_kwargs,
+            additional_transformer_kwargs={"return_dict": False},
+        )
+
+        self._current_timestep = None
+        if self.stage_role is DiffusionStageRole.DENOISE:
+            return [
+                DiffusionOutput(
+                    output=None,
+                    custom_output={
+                        "latents": latents[
+                            index * ctx["num_images_per_prompt"] : (index + 1) * ctx["num_images_per_prompt"]
+                        ]
+                    },
+                    to_cpu=True,
+                )
+                for index in range(req.num_reqs)
+            ]
+
+        result = self._decode_latents(latents, ctx["height"], ctx["width"], ctx["output_type"])
+        return split_diffusion_output_by_request(
+            result,
+            req,
+            num_outputs_per_prompt=ctx["num_images_per_prompt"],
         )
 
     # ── Step-execution protocol ──

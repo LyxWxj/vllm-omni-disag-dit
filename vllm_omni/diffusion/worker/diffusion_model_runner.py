@@ -798,6 +798,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         for req in reqs:
             if req.prompt is None:
                 raise ValueError("Cannot execute model with empty prompt")
+        stage_role = self._diffusion_stage_role()
+        if len(reqs) > 1 and stage_role is not DiffusionStageRole.FULL:
+            return self._execute_separated_requests_serially(
+                reqs,
+                od_config=od_config,
+                kv_prefetch_job=kv_prefetch_job,
+                record_name=record_name,
+                record_output_peak_memory=record_output_peak_memory,
+                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+                diffusion_kv_metadata=diffusion_kv_metadata,
+            )
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
 
@@ -930,6 +941,48 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self._maybe_send_stage_payload(reqs, outputs)
 
         return self._runner_output_from_outputs(reqs, outputs)
+
+    def _execute_separated_requests_serially(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        *,
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_job: KVPrefetchJob | None,
+        record_name: str,
+        record_output_peak_memory: bool,
+        in_diffusion_kv_memory_profile: bool,
+        diffusion_kv_metadata: list[DiffusionKVMetadata] | None,
+    ) -> BatchRunnerOutput:
+        """Execute separated-stage requests independently.
+
+        Separated stage outputs are request-local and their numerical results
+        must match single-request execution. Keep the request wave together
+        only at the scheduler boundary; do not run multiple requests through
+        one separated-stage forward. FULL retains its request-batch path.
+        """
+        if diffusion_kv_metadata is not None and len(diffusion_kv_metadata) != len(reqs):
+            raise ValueError(
+                "Diffusion KV metadata count must match the request batch: "
+                f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
+            )
+
+        runner_outputs: list[RunnerOutput] = []
+        for index, request in enumerate(reqs):
+            metadata = None if diffusion_kv_metadata is None else diffusion_kv_metadata[index]
+            result = self._execute_request_list(
+                [request],
+                od_config=od_config,
+                allow_single_output=True,
+                require_request_batch_support=False,
+                kv_prefetch_job=kv_prefetch_job if index == 0 else None,
+                record_name=record_name,
+                record_output_peak_memory=record_output_peak_memory,
+                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+                diffusion_kv_metadata=[metadata] if metadata is not None else None,
+            )
+            runner_outputs.extend(result.runner_outputs)
+
+        return BatchRunnerOutput.from_list(runner_outputs)
 
     def _attach_stepwise_metadata(
         self,
@@ -1071,8 +1124,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Execute scheduled request-mode requests through the batch forward path.
 
         Builds a ``DiffusionRequestBatch`` from scheduled new requests, runs
-        per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
-        must declare ``supports_request_batch = True``.
+        per-request setup, and calls ``pipeline.forward(batch)``. FULL pipelines
+        must declare ``supports_request_batch = True``; separated roles are
+        dispatched one request at a time even when the scheduler admits a wave.
         """
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
